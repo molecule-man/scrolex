@@ -39,6 +39,10 @@ impl ZoomHandler {
             child = c.next_sibling();
         }
     }
+
+    fn reset(&mut self) {
+        self.zoom = 1.0;
+    }
 }
 
 fn main() -> glib::ExitCode {
@@ -114,7 +118,7 @@ fn build_ui(app: &Application) {
     });
 
     let load_doc = clone!(@weak scroll_win, @weak pages_box, @strong zoom_handler => move |fname: PathBuf| {
-        //zoom.set(1.0);
+        zoom_handler.borrow_mut().reset();
 
         let fname = fname.to_str().unwrap();
         let doc = Document::from_file(&format!("file://{fname}"), None).unwrap();
