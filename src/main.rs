@@ -2,48 +2,14 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use gtk::{glib, glib::clone, Application, ApplicationWindow, Button, DrawingArea};
+use gtk::{glib, glib::clone, Application, ApplicationWindow, Button};
 use gtk::{prelude::*, EventControllerScrollFlags};
 use poppler::Document;
-//use poppler::PopplerDocument;
+
+mod page;
+mod zoom;
 
 const APP_ID: &str = "com.andr2i.hallyview";
-
-struct ZoomHandler {
-    zoom: f64,
-    pages_box: gtk::Box,
-}
-
-impl ZoomHandler {
-    fn new(pages_box: gtk::Box) -> Self {
-        ZoomHandler {
-            zoom: 1.0,
-            pages_box,
-        }
-    }
-
-    fn apply_zoom(&mut self, zoom_factor: f64) {
-        self.zoom *= zoom_factor;
-
-        let mut child = self.pages_box.first_child();
-        while let Some(c) = child {
-            if let Some(page) = c.downcast_ref::<DrawingArea>() {
-                let width = page.width();
-                let height = page.height();
-                page.set_size_request(
-                    (width as f64 * zoom_factor) as i32,
-                    (height as f64 * zoom_factor) as i32,
-                );
-                page.queue_draw();
-            }
-            child = c.next_sibling();
-        }
-    }
-
-    fn reset(&mut self) {
-        self.zoom = 1.0;
-    }
-}
 
 fn main() -> glib::ExitCode {
     let app = Application::builder().application_id(APP_ID).build();
@@ -105,7 +71,7 @@ fn build_ui(app: &Application) {
 
     window.set_child(Some(&scroll_win));
 
-    let zoom_handler = Rc::new(RefCell::new(ZoomHandler::new(pages_box.clone())));
+    let zoom_handler = Rc::new(RefCell::new(zoom::ZoomHandler::new(pages_box.clone())));
 
     let zoom_handler_clone = zoom_handler.clone();
     zoom_in_button.connect_clicked(move |_| {
@@ -117,46 +83,41 @@ fn build_ui(app: &Application) {
         zoom_handler_clone.borrow_mut().apply_zoom(1. / 1.1);
     });
 
-    let load_doc = clone!(@weak scroll_win, @weak pages_box, @strong zoom_handler => move |fname: PathBuf| {
-        zoom_handler.borrow_mut().reset();
-
-        let fname = fname.to_str().unwrap();
-        let doc = Document::from_file(&format!("file://{fname}"), None).unwrap();
-
-        while let Some(child) = pages_box.first_child() {
-            pages_box.remove(&child);
-        }
-
-        for page_num in 0..doc.n_pages() {
-            let page = doc.page(page_num).unwrap();
-            let (width, height) = page.size();
-
-            let drawing_area = DrawingArea::new();
-            drawing_area.set_size_request(width as i32, height as i32);
-            drawing_area.set_draw_func(clone!(@strong zoom_handler => move |_, cr, _width, _height| {
-                let zoom = zoom_handler.borrow().zoom;
-                cr.scale(zoom, zoom);
-                page.render(cr);
-            }));
-
-            pages_box.append(&drawing_area);
-        }
-    });
-
     let test_pdf_path = Path::new("./test.pdf").canonicalize().unwrap();
-    load_doc(test_pdf_path);
 
-    open_button.connect_clicked(clone!(@weak app, @strong load_doc => move |_| {
+    let pm = Rc::new(RefCell::new(page::PageManager::new(
+        Document::from_file(&format!("file://{}", test_pdf_path.to_str().unwrap()), None).unwrap(),
+        pages_box.clone(),
+        zoom_handler.clone(),
+    )));
+
+    pm.borrow_mut().load();
+
+    let pm_clone = pm.clone();
+    let pages_box = pages_box.clone();
+    let zoom_handler = zoom_handler.clone();
+
+    open_button.connect_clicked(clone!(@weak app => move |_| {
         let dialog = gtk::FileDialog::builder()
             .title("Open PDF File")
             .modal(true)
             .build();
-        dialog.open(app.active_window().as_ref(), gtk::gio::Cancellable::NONE, clone!(@strong load_doc => move |file| {
+        let pm_clone = pm_clone.clone();
+        let pages_box = pages_box.clone();
+        let zoom_handler = zoom_handler.clone();
+
+        dialog.open(app.active_window().as_ref(), gtk::gio::Cancellable::NONE, move |file| {
             if let Ok(file) = file {
                 let path = file.path().expect("File has no path");
-                load_doc(path);
+
+                pm_clone.replace(page::PageManager::new(
+                    Document::from_file(&format!("file://{}", path.to_str().unwrap()), None).unwrap(),
+                    pages_box,
+                    zoom_handler,
+                ));
+                pm_clone.borrow_mut().load();
             }
-        }))
+        })
     }));
 
     window.present();
