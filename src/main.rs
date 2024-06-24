@@ -1,4 +1,6 @@
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use gtk::{glib, glib::clone, Application, ApplicationWindow, Button, DrawingArea};
 use gtk::{prelude::*, EventControllerScrollFlags};
@@ -34,6 +36,12 @@ fn build_ui(app: &Application) {
 
     header_bar.pack_start(&open_button);
 
+    let zoom_out_button = gtk::Button::from_icon_name("zoom-out");
+    let zoom_in_button = gtk::Button::from_icon_name("zoom-in");
+
+    header_bar.pack_start(&zoom_out_button);
+    header_bar.pack_start(&zoom_in_button);
+
     let window = ApplicationWindow::builder()
         .application(app)
         .title("My GTK App")
@@ -45,26 +53,38 @@ fn build_ui(app: &Application) {
         .orientation(gtk::Orientation::Horizontal)
         .build();
 
-    let scroll_controller = gtk::EventControllerScroll::new(
-        EventControllerScrollFlags::DISCRETE | EventControllerScrollFlags::VERTICAL,
-    );
-    scroll_controller.connect_scroll(|_, dx, dy| {
-        dbg!(std::time::Instant::now());
-        dbg!(dx);
-        dbg!(dy);
-        glib::signal::Propagation::Stop
-    });
-    pages_box.add_controller(scroll_controller);
-
     let scroll_win = gtk::ScrolledWindow::builder()
         .hexpand(true)
         .hscrollbar_policy(gtk::PolicyType::Automatic)
         .child(&pages_box)
         .build();
 
+    let scroll_controller = gtk::EventControllerScroll::new(
+        EventControllerScrollFlags::DISCRETE | EventControllerScrollFlags::VERTICAL,
+    );
+    scroll_controller.connect_scroll(clone!( @weak scroll_win, @weak pages_box => @default-return glib::Propagation::Stop, move |_, _dx, dy| {
+        if let Some(last_page) = pages_box.last_child() {
+            let increment = last_page.width();
+            // scroll by one page
+            if dy < 0.0 {
+                // scroll left
+                scroll_win.hadjustment().set_value(scroll_win.hadjustment().value() - increment as f64);
+            } else {
+                // scroll right
+                scroll_win.hadjustment().set_value(scroll_win.hadjustment().value() + increment as f64);
+                //scroll_win.hadjustment().set_value(scroll_win.hadjustment().value() + scroll_win.hadjustment().page_increment());
+            }
+        }
+
+        glib::Propagation::Stop
+    }));
+    pages_box.add_controller(scroll_controller);
+
     window.set_child(Some(&scroll_win));
 
-    let load_doc = clone!(@weak scroll_win, @weak pages_box => move |fname: PathBuf| {
+    let zoom = Rc::new(Cell::new(1.0));
+
+    let load_doc = clone!(@weak scroll_win, @weak pages_box, @strong zoom => move |fname: PathBuf| {
         let fname = fname.to_str().unwrap();
         let doc = Document::from_file(&format!("file://{fname}"), None).unwrap();
 
@@ -74,52 +94,25 @@ fn build_ui(app: &Application) {
 
         dbg!(doc.n_pages());
 
-        let page1 = doc.page(0).unwrap();
-        let (width, height) = page1.size();
-
-        dbg!(page1.size());
-
-        let drawing_area = DrawingArea::new();
-        drawing_area.set_size_request(width as i32, height as i32);
-        drawing_area.set_draw_func(move |_, cr, _width, _height| {
-            page1.render(cr);
-        });
-
-        pages_box.append(&drawing_area);
-
-        let page2 = doc.page(1).unwrap();
-        let (width, height) = page2.size();
-
-        dbg!(page2.size());
-
-        let drawing_area = DrawingArea::new();
-        drawing_area.set_size_request(width as i32, height as i32);
-        drawing_area.set_draw_func(move |_, cr, _width, _height| {
-            page2.render(cr);
-        });
+        for page_num in 0..doc.n_pages() {
+            let page = doc.page(page_num).unwrap();
+            let (width, height) = page.size();
 
 
+            dbg!(page.size());
 
-        pages_box.append(&drawing_area);
+            let drawing_area = DrawingArea::new();
+            drawing_area.set_size_request(width as i32, height as i32);
+            drawing_area.set_draw_func(clone!(@strong zoom => move |_, cr, _width, _height| {
+                dbg!(_width);
+                dbg!(_height);
+                dbg!(zoom.get());
+                cr.scale(zoom.get(), zoom.get());
+                page.render(cr);
+            }));
 
-        dbg!(scroll_win.hadjustment().value());
-        dbg!(scroll_win.parent().unwrap().width());
-        dbg!(pages_box.last_child().unwrap().width());
-        dbg!(pages_box.last_child().unwrap().bounds());
-        //scroll_win.hadjustment().unwrap().set_value(0.0);
-
-        let page3 = doc.page(2).unwrap();
-        let (width, height) = page3.size();
-
-        dbg!(page3.size());
-
-        let drawing_area = DrawingArea::new();
-        drawing_area.set_size_request(width as i32, height as i32);
-        drawing_area.set_draw_func(move |_, cr, _width, _height| {
-            page3.render(cr);
-        });
-
-        pages_box.append(&drawing_area);
+            pages_box.append(&drawing_area);
+        }
     });
 
     let test_pdf_path = Path::new("./test.pdf").canonicalize().unwrap();
@@ -136,6 +129,18 @@ fn build_ui(app: &Application) {
                 load_doc(path);
             }
         }))
+    }));
+
+    zoom_in_button.connect_clicked(clone!(@weak pages_box, @strong zoom => move |_| {
+        if let Some(first_page) = pages_box.first_child() {
+            zoom.set(zoom.get() * 1.1);
+            dbg!("clicked", zoom.get());
+            let page = first_page.downcast_ref::<DrawingArea>().unwrap();
+            let width = page.width();
+            let height = page.height();
+            page.set_size_request((width as f64 * 1.1) as i32, (height as f64 * 1.1) as i32);
+            page.queue_draw();
+        }
     }));
 
     window.present();
