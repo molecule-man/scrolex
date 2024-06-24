@@ -1,12 +1,8 @@
 use crate::zoom::ZoomHandler;
 use gtk::prelude::*;
-use gtk::{
-    glib::clone, Application, ApplicationWindow, Box, Button, DrawingArea, HeaderBar, Orientation,
-    ScrolledWindow,
-};
+use gtk::{glib::clone, Box, DrawingArea};
 use poppler::Document;
-use std::cell::{Ref, RefCell};
-use std::path::PathBuf;
+use std::cell::RefCell;
 use std::rc::Rc;
 use std::usize;
 
@@ -15,7 +11,7 @@ pub(crate) struct PageManager {
     zoom_handler: Rc<RefCell<ZoomHandler>>,
     pages_box: Box,
     current_page: usize,
-    buffer_size: usize,
+    _buffer_size: usize,
 }
 
 impl PageManager {
@@ -29,14 +25,21 @@ impl PageManager {
             zoom_handler,
             pages_box,
             current_page: 0,
-            buffer_size: 10,
+            _buffer_size: 10,
         }
+    }
+
+    pub(crate) fn reload(&mut self, doc: Document) {
+        self.doc = doc;
+        self.load();
     }
 
     pub(crate) fn load(&mut self) {
         while let Some(child) = self.pages_box.first_child() {
             self.pages_box.remove(&child);
         }
+
+        self.zoom_handler.borrow_mut().reset();
 
         //let end = (start + self.buffer_size).min(self.doc.n_pages() as usize);
         let start = 0;

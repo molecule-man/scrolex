@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::rc::Rc;
 
 use gtk::{glib, glib::clone, Application, ApplicationWindow, Button};
@@ -93,29 +93,22 @@ fn build_ui(app: &Application) {
 
     pm.borrow_mut().load();
 
-    let pm_clone = pm.clone();
-    let pages_box = pages_box.clone();
-    let zoom_handler = zoom_handler.clone();
+    //let pm_clone = pm.clone();
 
-    open_button.connect_clicked(clone!(@weak app => move |_| {
+    open_button.connect_clicked(clone!(@weak app, @strong pm => move |_| {
         let dialog = gtk::FileDialog::builder()
             .title("Open PDF File")
             .modal(true)
             .build();
-        let pm_clone = pm_clone.clone();
-        let pages_box = pages_box.clone();
-        let zoom_handler = zoom_handler.clone();
+        let pm_clone = pm.clone();
 
         dialog.open(app.active_window().as_ref(), gtk::gio::Cancellable::NONE, move |file| {
             if let Ok(file) = file {
                 let path = file.path().expect("File has no path");
 
-                pm_clone.replace(page::PageManager::new(
+                pm_clone.borrow_mut().reload(
                     Document::from_file(&format!("file://{}", path.to_str().unwrap()), None).unwrap(),
-                    pages_box,
-                    zoom_handler,
-                ));
-                pm_clone.borrow_mut().load();
+                );
             }
         })
     }));
