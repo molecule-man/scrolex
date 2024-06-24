@@ -72,6 +72,8 @@ fn build_ui(app: &Application) {
     let zoom = Rc::new(Cell::new(1.0));
 
     let load_doc = clone!(@weak scroll_win, @weak pages_box, @strong zoom => move |fname: PathBuf| {
+        zoom.set(1.0);
+
         let fname = fname.to_str().unwrap();
         let doc = Document::from_file(&format!("file://{fname}"), None).unwrap();
 
