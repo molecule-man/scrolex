@@ -39,11 +39,14 @@ impl PageManager {
             self.pages_box.remove(&child);
         }
 
-        self.zoom_handler.borrow_mut().reset();
-
         //let end = (start + self.buffer_size).min(self.doc.n_pages() as usize);
         let start = 0;
         let end = self.doc.n_pages() as usize;
+
+        let (width, height) = self.doc.page(start as i32).unwrap().size();
+        self.zoom_handler
+            .borrow_mut()
+            .reset(width as i32, height as i32);
 
         for i in start..end {
             let page = self.new_page_widget(i);
