@@ -72,14 +72,12 @@ fn build_ui(app: &Application) {
 
     pm.borrow_mut().load();
 
-    let pm_clone = pm.clone();
-
-    open_button.connect_clicked(clone!(@weak app, @strong pm_clone => move |_| {
+    open_button.connect_clicked(clone!(@weak app, @strong pm => move |_| {
         let dialog = gtk::FileDialog::builder()
             .title("Open PDF File")
             .modal(true)
             .build();
-        let pm_clone = pm_clone.clone();
+        let pm_clone = pm.clone();
 
         dialog.open(app.active_window().as_ref(), gtk::gio::Cancellable::NONE, move |file| {
             if let Ok(file) = file {

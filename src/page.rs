@@ -104,12 +104,13 @@ impl PageManager {
 
     fn new_page_widget(&mut self, i: usize) -> DrawingArea {
         let zoom_handler = self.zoom_handler.clone();
+        let zoom = zoom_handler.borrow().zoom();
 
         let page = self.doc.page(i as i32).unwrap();
         let (width, height) = page.size();
 
         let drawing_area = DrawingArea::new();
-        drawing_area.set_size_request(width as i32, height as i32);
+        drawing_area.set_size_request((width * zoom) as i32, (height * zoom) as i32);
         drawing_area.set_draw_func(
             clone!(@strong zoom_handler => move |_, cr, _width, _height| {
                 let zoom = zoom_handler.borrow().zoom();
