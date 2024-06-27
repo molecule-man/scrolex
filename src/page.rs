@@ -11,7 +11,9 @@ pub(crate) struct PageManager {
     zoom_handler: Rc<RefCell<ZoomHandler>>,
     pages_box: Box,
     current_page: usize,
-    _buffer_size: usize,
+    buffer_size: usize,
+    loaded_from: usize,
+    loaded_to: usize,
 }
 
 impl PageManager {
@@ -25,7 +27,9 @@ impl PageManager {
             zoom_handler,
             pages_box,
             current_page: 0,
-            _buffer_size: 10,
+            buffer_size: 10,
+            loaded_from: 0,
+            loaded_to: 0,
         }
     }
 
@@ -39,9 +43,9 @@ impl PageManager {
             self.pages_box.remove(&child);
         }
 
-        //let end = (start + self.buffer_size).min(self.doc.n_pages() as usize);
         let start = 0;
-        let end = self.doc.n_pages() as usize;
+        let end = (start + self.buffer_size).min(self.doc.n_pages() as usize);
+        //let end = self.doc.n_pages() as usize;
 
         let (width, height) = self.doc.page(start as i32).unwrap().size();
         self.zoom_handler
@@ -53,6 +57,9 @@ impl PageManager {
             self.pages_box.append(&page);
         }
 
+        self.loaded_from = start;
+        self.loaded_to = end;
+
         // Update the adjustment values for the ScrolledWindow
         //let total_height = (self.total_pages as f64 * 100.0 * self.zoom) as i32; // Assume each page is 100px high for example
         //let adjustment = self.pages_box.vadjustment().unwrap();
@@ -60,6 +67,39 @@ impl PageManager {
         //adjustment.set_page_size((self.buffer_size as f64 * 100.0 * self.zoom) as f64); // Adjust to buffer size
 
         self.current_page = start;
+    }
+
+    pub(crate) fn shift_loading_buffer_right(&mut self) -> bool {
+        if self.loaded_to >= self.doc.n_pages() as usize {
+            return false;
+        }
+
+        self.pages_box
+            .remove(&self.pages_box.first_child().unwrap());
+
+        let new_page = self.new_page_widget(self.loaded_to);
+        self.pages_box.append(&new_page);
+
+        self.loaded_from += 1;
+        self.loaded_to += 1;
+
+        true
+    }
+
+    pub(crate) fn shift_loading_buffer_left(&mut self) -> bool {
+        if self.loaded_from == 0 {
+            return false;
+        }
+
+        self.pages_box.remove(&self.pages_box.last_child().unwrap());
+
+        let new_page = self.new_page_widget(self.loaded_from - 1);
+        self.pages_box.prepend(&new_page);
+
+        self.loaded_from -= 1;
+        self.loaded_to -= 1;
+
+        true
     }
 
     fn new_page_widget(&mut self, i: usize) -> DrawingArea {

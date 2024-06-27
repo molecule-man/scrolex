@@ -48,27 +48,6 @@ fn build_ui(app: &Application) {
         .child(&pages_box)
         .build();
 
-    let scroll_controller = gtk::EventControllerScroll::new(
-        EventControllerScrollFlags::DISCRETE | EventControllerScrollFlags::VERTICAL,
-    );
-    scroll_controller.connect_scroll(clone!( @weak scroll_win, @weak pages_box => @default-return glib::Propagation::Stop, move |_, _dx, dy| {
-        if let Some(last_page) = pages_box.last_child() {
-            let increment = last_page.width();
-            // scroll by one page
-            if dy < 0.0 {
-                // scroll left
-                scroll_win.hadjustment().set_value(scroll_win.hadjustment().value() - increment as f64);
-            } else {
-                // scroll right
-                scroll_win.hadjustment().set_value(scroll_win.hadjustment().value() + increment as f64);
-                //scroll_win.hadjustment().set_value(scroll_win.hadjustment().value() + scroll_win.hadjustment().page_increment());
-            }
-        }
-
-        glib::Propagation::Stop
-    }));
-    pages_box.add_controller(scroll_controller);
-
     window.set_child(Some(&scroll_win));
 
     let zoom_handler = Rc::new(RefCell::new(zoom::ZoomHandler::new(pages_box.clone())));
@@ -93,14 +72,14 @@ fn build_ui(app: &Application) {
 
     pm.borrow_mut().load();
 
-    //let pm_clone = pm.clone();
+    let pm_clone = pm.clone();
 
-    open_button.connect_clicked(clone!(@weak app, @strong pm => move |_| {
+    open_button.connect_clicked(clone!(@weak app, @strong pm_clone => move |_| {
         let dialog = gtk::FileDialog::builder()
             .title("Open PDF File")
             .modal(true)
             .build();
-        let pm_clone = pm.clone();
+        let pm_clone = pm_clone.clone();
 
         dialog.open(app.active_window().as_ref(), gtk::gio::Cancellable::NONE, move |file| {
             if let Ok(file) = file {
@@ -112,6 +91,31 @@ fn build_ui(app: &Application) {
             }
         })
     }));
+
+    let scroll_controller = gtk::EventControllerScroll::new(
+        EventControllerScrollFlags::DISCRETE | EventControllerScrollFlags::VERTICAL,
+    );
+    scroll_controller.connect_scroll(clone!( @weak scroll_win, @weak pages_box, @weak pm => @default-return glib::Propagation::Stop, move |_, _dx, dy| {
+        if let Some(last_page) = pages_box.last_child() {
+            let increment = last_page.width();
+            // scroll by one page
+            if dy < 0.0 {
+                // scroll left
+                if !pm.borrow_mut().shift_loading_buffer_left() {
+                    scroll_win.hadjustment().set_value(scroll_win.hadjustment().value() - increment as f64);
+                }
+            } else {
+                // scroll right
+                if !pm.borrow_mut().shift_loading_buffer_right() {
+                    scroll_win.hadjustment().set_value(scroll_win.hadjustment().value() + increment as f64);
+                }
+                //scroll_win.hadjustment().set_value(scroll_win.hadjustment().value() + scroll_win.hadjustment().page_increment());
+            }
+        }
+
+        glib::Propagation::Stop
+    }));
+    pages_box.add_controller(scroll_controller);
 
     window.present();
 }
