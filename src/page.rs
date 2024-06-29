@@ -1,3 +1,4 @@
+use crate::state;
 use crate::zoom::ZoomHandler;
 use gtk::prelude::*;
 use gtk::{glib::clone, Box, DrawingArea};
@@ -33,24 +34,32 @@ impl PageManager {
         }
     }
 
-    pub(crate) fn reload(&mut self, doc: Document) {
-        self.doc = doc;
-        self.load();
+    pub(crate) fn current_state(&self) -> state::DocumentState {
+        state::DocumentState {
+            zoom: self.zoom_handler.borrow().zoom(),
+            scroll_position: 0.0,
+            start: self.loaded_from,
+        }
     }
 
-    pub(crate) fn load(&mut self) {
+    pub(crate) fn reload(&mut self, doc: Document, state: state::DocumentState) {
+        self.doc = doc;
+        self.load(state);
+    }
+
+    pub(crate) fn load(&mut self, state: state::DocumentState) {
         while let Some(child) = self.pages_box.first_child() {
             self.pages_box.remove(&child);
         }
 
-        let start = 0;
+        let start = state.start;
         let end = (start + self.buffer_size).min(self.doc.n_pages() as usize);
         //let end = self.doc.n_pages() as usize;
 
         let (width, height) = self.doc.page(start as i32).unwrap().size();
         self.zoom_handler
             .borrow_mut()
-            .reset(width as i32, height as i32);
+            .reset(width as i32, height as i32, state.zoom);
 
         for i in start..end {
             let page = self.new_page_widget(i);

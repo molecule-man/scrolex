@@ -38,8 +38,8 @@ impl ZoomHandler {
         }
     }
 
-    pub(crate) fn reset(&mut self, width: i32, height: i32) {
-        self.zoom = 1.0;
+    pub(crate) fn reset(&mut self, width: i32, height: i32, zoom: f64) {
+        self.zoom = zoom;
         self.width = width;
         self.height = height;
     }
