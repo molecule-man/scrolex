@@ -7,6 +7,8 @@ pub(crate) struct DocumentState {
     pub(crate) zoom: f64,
     pub(crate) scroll_position: f64,
     pub(crate) start: usize,
+    pub(crate) crop_left: i32,
+    pub(crate) crop_right: i32,
 }
 
 pub(crate) fn load(path: &Path) -> DocumentState {
@@ -16,6 +18,8 @@ pub(crate) fn load(path: &Path) -> DocumentState {
         zoom: 1.0,
         scroll_position: 0.0,
         start: 0,
+        crop_left: 0,
+        crop_right: 0,
     };
 
     if state_path.exists() {
@@ -34,6 +38,14 @@ pub(crate) fn load(path: &Path) -> DocumentState {
                 Some(("start", value)) => {
                     let start = value.parse().unwrap_or(0);
                     state.start = start;
+                }
+                Some(("crop_left", value)) => {
+                    let crop_left = value.parse().unwrap_or(0);
+                    state.crop_left = crop_left;
+                }
+                Some(("crop_right", value)) => {
+                    let crop_right = value.parse().unwrap_or(0);
+                    state.crop_right = crop_right;
                 }
                 _ => {}
             }
@@ -60,6 +72,8 @@ pub(crate) fn save(path: &Path, state: &DocumentState) -> io::Result<()> {
     writeln!(file, "zoom={}", state.zoom)?;
     writeln!(file, "scroll_position={}", state.scroll_position)?;
     writeln!(file, "start={}", state.start)?;
+    writeln!(file, "crop_left={}", state.crop_left)?;
+    writeln!(file, "crop_right={}", state.crop_right)?;
 
     file.flush()
 }

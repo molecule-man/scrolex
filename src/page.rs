@@ -17,8 +17,8 @@ pub(crate) struct PageManager {
     zoom: Rc<Cell<f64>>,
     width: i32,
     height: i32,
-    crop_left: usize,
-    crop_right: usize,
+    crop_left: Rc<Cell<i32>>,
+    crop_right: Rc<Cell<i32>>,
 }
 
 impl PageManager {
@@ -34,8 +34,8 @@ impl PageManager {
             zoom: Rc::new(Cell::new(1.0)),
             width: 800,
             height: 800,
-            crop_left: 0,
-            crop_right: 0,
+            crop_left: Rc::new(Cell::new(0)),
+            crop_right: Rc::new(Cell::new(0)),
         }
     }
 
@@ -44,6 +44,8 @@ impl PageManager {
             zoom: self.zoom.get(),
             scroll_position: 0.0,
             start: self.loaded_from,
+            crop_left: self.crop_left.get(),
+            crop_right: self.crop_right.get(),
         }
     }
 
@@ -66,11 +68,15 @@ impl PageManager {
         self.zoom.replace(state.zoom);
         self.width = width as i32;
         self.height = height as i32;
+        self.crop_left.replace(state.crop_left);
+        self.crop_right.replace(state.crop_right);
 
         for i in start..end {
             let page = self.new_page_widget(i);
             self.pages_box.append(&page);
         }
+
+        self.resize_all(false);
 
         self.loaded_from = start;
         self.loaded_to = end;
@@ -117,123 +123,57 @@ impl PageManager {
         true
     }
 
-    fn new_page_widget(&mut self, i: usize) -> gtk::Fixed {
-        let zoom = self.zoom.get();
-
+    fn new_page_widget(&mut self, i: usize) -> gtk::DrawingArea {
         let page = self.doc.page(i as i32).unwrap();
-        let (width, height) = page.size();
 
         let drawing_area = DrawingArea::new();
-        drawing_area.set_size_request((width * zoom) as i32, (height * zoom) as i32);
         drawing_area.set_draw_func(
-            clone!(@strong self.zoom as zoom  => move |_, cr, _width, _height| {
+            clone!(@strong self.zoom as zoom, @strong self.crop_left as crop_left => move |_, cr, _width, _height| {
                 let zoom = zoom.get();
+                cr.translate(crop_left.get() as f64 * (-zoom), 0.0);
                 cr.scale(zoom, zoom);
                 page.render(cr);
             }),
         );
 
-        let fixed = gtk::Fixed::new();
-        fixed.set_overflow(gtk::Overflow::Hidden);
-        fixed.put(&drawing_area, 0.0, 0.0);
+        self.resize_page(&drawing_area);
 
-        self.set_page_wrapper_sizes(&fixed);
-
-        fixed
+        drawing_area
     }
 
     pub(crate) fn apply_zoom(&mut self, zoom_factor: f64) {
         self.zoom.replace(self.zoom.get() * zoom_factor);
-        let zoom = self.zoom.get();
-
-        let mut child = self.pages_box.first_child();
-        while let Some(c) = child {
-            if let Some(container) = c.downcast_ref::<gtk::Fixed>() {
-                container.set_size_request(
-                    (self.width as f64 * zoom) as i32,
-                    (self.height as f64 * zoom) as i32,
-                );
-
-                let drawing_area = container.first_child().unwrap();
-
-                if let Some(page) = drawing_area.downcast_ref::<DrawingArea>() {
-                    page.set_size_request(
-                        (self.width as f64 * zoom) as i32,
-                        (self.height as f64 * zoom) as i32,
-                    );
-                    page.queue_draw();
-                }
-            }
-
-            child = c.next_sibling();
-        }
+        self.resize_all(true);
     }
 
     pub(crate) fn adjust_crop(&mut self, left: i32, right: i32) {
-        if self.crop_left as i32 + left >= 0 {
-            self.crop_left = (self.crop_left as i32 + left) as usize;
-        }
+        self.crop_right
+            .replace(std::cmp::max(self.crop_right.get() + right, 0));
+        self.crop_left
+            .replace(std::cmp::max(self.crop_left.get() + left, 0));
 
-        if self.crop_right as i32 + right >= 0 {
-            self.crop_right = (self.crop_right as i32 + right) as usize;
-        }
-
-        self.redraw();
+        self.resize_all(true);
     }
 
-    fn redraw(&self) {
+    fn resize_all(&self, redraw: bool) {
         let mut child = self.pages_box.first_child();
-        while let Some(c) = child {
-            if let Some(container) = c.downcast_ref::<gtk::Fixed>() {
-                self.set_page_wrapper_sizes(container);
-
-                let drawing_area = container.first_child().unwrap();
-
-                if let Some(page) = drawing_area.downcast_ref::<DrawingArea>() {
-                    self.set_page_sizes(page);
-                    page.queue_draw();
-                }
-
-                container.queue_draw();
+        while let Some(page) = child {
+            let da = page.clone().downcast::<gtk::DrawingArea>().unwrap();
+            self.resize_page(&da);
+            if redraw {
+                da.queue_draw();
             }
-
-            child = c.next_sibling();
+            child = page.next_sibling();
         }
     }
 
-    fn set_page_wrapper_sizes(&self, wrapper: &gtk::Fixed) {
+    fn resize_page(&self, page: &gtk::DrawingArea) {
         let zoom = self.zoom.get();
 
-        let new_wrapper_width = self.width - self.crop_left as i32 - self.crop_right as i32;
-        dbg!(self.width);
-        dbg!(self.crop_right);
-        dbg!(wrapper.width());
-        dbg!(new_wrapper_width);
-        dbg!(new_wrapper_width as f64 * zoom);
-        dbg!(((self.width - self.crop_left as i32 - self.crop_right as i32) as f64 * zoom) as i32);
+        let new_width =
+            ((self.width - self.crop_left.get() - self.crop_right.get()) as f64 * zoom) as i32;
+        let new_height = (self.height as f64 * zoom) as i32;
 
-        if self.crop_left > 0 {
-            wrapper.set_size_request(300, (self.height as f64 * zoom) as i32);
-        } else {
-            wrapper.set_size_request(
-                ((self.width - self.crop_left as i32 - self.crop_right as i32) as f64 * zoom)
-                    as i32,
-                (self.height as f64 * zoom) as i32,
-            );
-        }
-        wrapper.move_(
-            &wrapper.first_child().unwrap(),
-            (self.crop_left as f64) * (-zoom),
-            0.0,
-        );
-    }
-
-    fn set_page_sizes(&self, page: &gtk::DrawingArea) {
-        let zoom = self.zoom.get();
-
-        page.set_size_request(
-            (self.width as f64 * zoom) as i32,
-            (self.height as f64 * zoom) as i32,
-        );
+        page.set_size_request(new_width, new_height);
     }
 }

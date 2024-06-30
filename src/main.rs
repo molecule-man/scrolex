@@ -56,6 +56,7 @@ fn build_ui(app: &Application) {
 
     let pages_box = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
+        .spacing(2)
         .build();
 
     let scroll_win = gtk::ScrolledWindow::builder()
