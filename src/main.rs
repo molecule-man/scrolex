@@ -8,7 +8,6 @@ use poppler::Document;
 
 mod page;
 mod state;
-mod zoom;
 
 const APP_ID: &str = "com.andr2i.hallyview";
 
@@ -31,6 +30,22 @@ fn build_ui(app: &Application) {
 
     header_bar.pack_start(&zoom_out_button);
     header_bar.pack_start(&zoom_in_button);
+
+    let crop_left_minus_button = Button::from_icon_name("pan-start");
+    let crop_left_text = gtk::Label::new(Some("Left crop"));
+    let crop_left_plus_button = Button::from_icon_name("pan-end");
+
+    let crop_right_minus_button = Button::from_icon_name("pan-start");
+    let crop_right_text = gtk::Label::new(Some("Right crop"));
+    let crop_right_plus_button = Button::from_icon_name("pan-end");
+
+    header_bar.pack_end(&crop_right_plus_button);
+    header_bar.pack_end(&crop_right_text);
+    header_bar.pack_end(&crop_right_minus_button);
+
+    header_bar.pack_end(&crop_left_plus_button);
+    header_bar.pack_end(&crop_left_text);
+    header_bar.pack_end(&crop_left_minus_button);
 
     let window = ApplicationWindow::builder()
         .application(app)
@@ -69,6 +84,18 @@ fn build_ui(app: &Application) {
     zoom_out_button.connect_clicked(move |_| {
         pm_clone.borrow_mut().apply_zoom(1. / 1.1);
     });
+
+    let pm_clone = pm.clone();
+    crop_left_plus_button.connect_clicked(move |_| pm_clone.borrow_mut().adjust_crop(1, 0));
+
+    let pm_clone = pm.clone();
+    crop_left_minus_button.connect_clicked(move |_| pm_clone.borrow_mut().adjust_crop(-1, 0));
+
+    let pm_clone = pm.clone();
+    crop_right_plus_button.connect_clicked(move |_| pm_clone.borrow_mut().adjust_crop(0, 1));
+
+    let pm_clone = pm.clone();
+    crop_right_minus_button.connect_clicked(move |_| pm_clone.borrow_mut().adjust_crop(0, -1));
 
     pm.borrow_mut().load(state::load(&test_pdf_path));
 
