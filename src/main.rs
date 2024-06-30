@@ -51,18 +51,6 @@ fn build_ui(app: &Application) {
 
     window.set_child(Some(&scroll_win));
 
-    let zoom_handler = Rc::new(RefCell::new(zoom::ZoomHandler::new(pages_box.clone())));
-
-    let zoom_handler_clone = zoom_handler.clone();
-    zoom_in_button.connect_clicked(move |_| {
-        zoom_handler_clone.borrow_mut().apply_zoom(1.1);
-    });
-
-    let zoom_handler_clone = zoom_handler.clone();
-    zoom_out_button.connect_clicked(move |_| {
-        zoom_handler_clone.borrow_mut().apply_zoom(1. / 1.1);
-    });
-
     let test_pdf_path = Path::new("./test.pdf").canonicalize().unwrap();
 
     let last_loaded_document_path = Rc::new(RefCell::new(test_pdf_path.clone()));
@@ -70,18 +58,27 @@ fn build_ui(app: &Application) {
     let pm = Rc::new(RefCell::new(page::PageManager::new(
         Document::from_file(&format!("file://{}", test_pdf_path.to_str().unwrap()), None).unwrap(),
         pages_box.clone(),
-        zoom_handler.clone(),
     )));
+
+    let pm_clone = pm.clone();
+    zoom_in_button.connect_clicked(move |_| {
+        pm_clone.borrow_mut().apply_zoom(1.1);
+    });
+
+    let pm_clone = pm.clone();
+    zoom_out_button.connect_clicked(move |_| {
+        pm_clone.borrow_mut().apply_zoom(1. / 1.1);
+    });
 
     pm.borrow_mut().load(state::load(&test_pdf_path));
 
-    open_button.connect_clicked(clone!(@weak app, @weak zoom_handler, @strong pm, @weak scroll_win, @strong last_loaded_document_path => move |_| {
+    open_button.connect_clicked(clone!(@weak app, @strong pm, @weak scroll_win, @strong last_loaded_document_path => move |_| {
         let dialog = gtk::FileDialog::builder()
             .title("Open PDF File")
             .modal(true)
             .build();
 
-        dialog.open(app.active_window().as_ref(), gtk::gio::Cancellable::NONE, clone!(@strong pm, @weak zoom_handler, @weak scroll_win, @strong last_loaded_document_path => move |file| {
+        dialog.open(app.active_window().as_ref(), gtk::gio::Cancellable::NONE, clone!(@strong pm, @weak scroll_win, @strong last_loaded_document_path => move |file| {
             if let Ok(file) = file {
                 let path = file.path().expect("File has no path").canonicalize().unwrap();
 

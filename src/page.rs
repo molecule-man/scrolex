@@ -1,42 +1,43 @@
 use crate::state;
-use crate::zoom::ZoomHandler;
 use gtk::prelude::*;
 use gtk::{glib::clone, Box, DrawingArea};
 use poppler::Document;
-use std::cell::RefCell;
+use std::cell::Cell;
 use std::rc::Rc;
 use std::usize;
 
 pub(crate) struct PageManager {
     doc: Document,
-    zoom_handler: Rc<RefCell<ZoomHandler>>,
     pages_box: Box,
     current_page: usize,
     buffer_size: usize,
     loaded_from: usize,
     loaded_to: usize,
+
+    zoom: Rc<Cell<f64>>,
+    width: i32,
+    height: i32,
 }
 
 impl PageManager {
-    pub(crate) fn new(
-        doc: Document,
-        pages_box: Box,
-        zoom_handler: Rc<RefCell<ZoomHandler>>,
-    ) -> Self {
+    pub(crate) fn new(doc: Document, pages_box: Box) -> Self {
         PageManager {
             doc,
-            zoom_handler,
             pages_box,
             current_page: 0,
             buffer_size: 10,
             loaded_from: 0,
             loaded_to: 0,
+
+            zoom: Rc::new(Cell::new(1.0)),
+            width: 800,
+            height: 800,
         }
     }
 
     pub(crate) fn current_state(&self) -> state::DocumentState {
         state::DocumentState {
-            zoom: self.zoom_handler.borrow().zoom(),
+            zoom: self.zoom.get(),
             scroll_position: 0.0,
             start: self.loaded_from,
         }
@@ -57,9 +58,10 @@ impl PageManager {
         //let end = self.doc.n_pages() as usize;
 
         let (width, height) = self.doc.page(start as i32).unwrap().size();
-        self.zoom_handler
-            .borrow_mut()
-            .reset(width as i32, height as i32, state.zoom);
+
+        self.zoom.replace(state.zoom);
+        self.width = width as i32;
+        self.height = height as i32;
 
         for i in start..end {
             let page = self.new_page_widget(i);
@@ -111,9 +113,8 @@ impl PageManager {
         true
     }
 
-    fn new_page_widget(&mut self, i: usize) -> DrawingArea {
-        let zoom_handler = self.zoom_handler.clone();
-        let zoom = zoom_handler.borrow().zoom();
+    fn new_page_widget(&mut self, i: usize) -> gtk::Fixed {
+        let zoom = self.zoom.get();
 
         let page = self.doc.page(i as i32).unwrap();
         let (width, height) = page.size();
@@ -121,13 +122,43 @@ impl PageManager {
         let drawing_area = DrawingArea::new();
         drawing_area.set_size_request((width * zoom) as i32, (height * zoom) as i32);
         drawing_area.set_draw_func(
-            clone!(@strong zoom_handler => move |_, cr, _width, _height| {
-                let zoom = zoom_handler.borrow().zoom();
+            clone!(@strong self.zoom as zoom  => move |_, cr, _width, _height| {
+                let zoom = zoom.get();
                 cr.scale(zoom, zoom);
                 page.render(cr);
             }),
         );
 
-        drawing_area
+        let fixed = gtk::Fixed::new();
+        fixed.put(&drawing_area, 0.0, 0.0);
+
+        fixed
+    }
+
+    pub(crate) fn apply_zoom(&mut self, zoom_factor: f64) {
+        self.zoom.replace(self.zoom.get() * zoom_factor);
+        let zoom = self.zoom.get();
+
+        let mut child = self.pages_box.first_child();
+        while let Some(c) = child {
+            if let Some(container) = c.downcast_ref::<gtk::Fixed>() {
+                container.set_size_request(
+                    (self.width as f64 * zoom) as i32,
+                    (self.height as f64 * zoom) as i32,
+                );
+
+                let drawing_area = container.first_child().unwrap();
+
+                if let Some(page) = drawing_area.downcast_ref::<DrawingArea>() {
+                    page.set_size_request(
+                        (self.width as f64 * zoom) as i32,
+                        (self.height as f64 * zoom) as i32,
+                    );
+                    page.queue_draw();
+                }
+            }
+
+            child = c.next_sibling();
+        }
     }
 }
