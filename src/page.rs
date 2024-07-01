@@ -58,7 +58,6 @@ impl PageManager {
 
         let start = state.start.min(self.doc.n_pages() as usize);
         let end = (start + self.buffer_size).min(self.doc.n_pages() as usize);
-        //let end = self.doc.n_pages() as usize;
 
         let (width, height) = self.doc.page(start as i32).unwrap().size();
 
