@@ -9,7 +9,6 @@ use std::usize;
 pub(crate) struct PageManager {
     doc: Document,
     pages_box: Box,
-    current_page: usize,
     buffer_size: usize,
     loaded_from: usize,
     loaded_to: usize,
@@ -26,7 +25,6 @@ impl PageManager {
         PageManager {
             doc,
             pages_box,
-            current_page: 0,
             buffer_size: 10,
             loaded_from: 0,
             loaded_to: 0,
@@ -59,7 +57,7 @@ impl PageManager {
             self.pages_box.remove(&child);
         }
 
-        let start = state.start;
+        let start = state.start.min(self.doc.n_pages() as usize);
         let end = (start + self.buffer_size).min(self.doc.n_pages() as usize);
         //let end = self.doc.n_pages() as usize;
 
@@ -86,8 +84,6 @@ impl PageManager {
         //let adjustment = self.pages_box.vadjustment().unwrap();
         //adjustment.set_upper(total_height as f64);
         //adjustment.set_page_size((self.buffer_size as f64 * 100.0 * self.zoom) as f64); // Adjust to buffer size
-
-        self.current_page = start;
     }
 
     pub(crate) fn shift_loading_buffer_right(&mut self) -> bool {
@@ -147,10 +143,9 @@ impl PageManager {
     }
 
     pub(crate) fn adjust_crop(&mut self, left: i32, right: i32) {
+        self.crop_left.replace((self.crop_left.get() + left).max(0));
         self.crop_right
-            .replace(std::cmp::max(self.crop_right.get() + right, 0));
-        self.crop_left
-            .replace(std::cmp::max(self.crop_left.get() + left, 0));
+            .replace((self.crop_right.get() + right).max(0));
 
         self.resize_all(true);
     }
