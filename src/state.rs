@@ -5,7 +5,6 @@ use std::{env, fs};
 #[derive(Debug)]
 pub(crate) struct DocumentState {
     pub(crate) zoom: f64,
-    pub(crate) scroll_position: f64,
     pub(crate) start: usize,
     pub(crate) crop_left: i32,
     pub(crate) crop_right: i32,
@@ -16,7 +15,6 @@ pub(crate) fn load(path: &Path) -> DocumentState {
 
     let mut state = DocumentState {
         zoom: 1.0,
-        scroll_position: 0.0,
         start: 0,
         crop_left: 0,
         crop_right: 0,
@@ -30,10 +28,6 @@ pub(crate) fn load(path: &Path) -> DocumentState {
                     if zoom > 0.0 {
                         state.zoom = zoom;
                     }
-                }
-                Some(("scroll_position", value)) => {
-                    let scroll_position = value.parse().unwrap_or(0.0);
-                    state.scroll_position = scroll_position;
                 }
                 Some(("start", value)) => {
                     let start = value.parse().unwrap_or(0);
@@ -70,7 +64,6 @@ pub(crate) fn save(path: &Path, state: &DocumentState) -> io::Result<()> {
         .open(&state_path)?;
 
     writeln!(file, "zoom={}", state.zoom)?;
-    writeln!(file, "scroll_position={}", state.scroll_position)?;
     writeln!(file, "start={}", state.start)?;
     writeln!(file, "crop_left={}", state.crop_left)?;
     writeln!(file, "crop_right={}", state.crop_right)?;

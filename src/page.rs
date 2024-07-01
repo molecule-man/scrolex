@@ -40,7 +40,6 @@ impl PageManager {
     pub(crate) fn current_state(&self) -> state::DocumentState {
         state::DocumentState {
             zoom: self.zoom.get(),
-            scroll_position: 0.0,
             start: self.loaded_from,
             crop_left: self.crop_left.get(),
             crop_right: self.crop_right.get(),
@@ -78,12 +77,6 @@ impl PageManager {
 
         self.loaded_from = start;
         self.loaded_to = end;
-
-        // Update the adjustment values for the ScrolledWindow
-        //let total_height = (self.total_pages as f64 * 100.0 * self.zoom) as i32; // Assume each page is 100px high for example
-        //let adjustment = self.pages_box.vadjustment().unwrap();
-        //adjustment.set_upper(total_height as f64);
-        //adjustment.set_page_size((self.buffer_size as f64 * 100.0 * self.zoom) as f64); // Adjust to buffer size
     }
 
     pub(crate) fn shift_loading_buffer_right(&mut self) -> bool {
