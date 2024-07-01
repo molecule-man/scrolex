@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
-use gtk::{glib, glib::clone, Application, ApplicationWindow, Button};
+use gtk::{gio::ApplicationFlags, glib, glib::clone, Application, ApplicationWindow, Button};
 use gtk::{prelude::*, EventControllerScrollFlags};
 use poppler::Document;
 
@@ -12,13 +12,19 @@ mod state;
 const APP_ID: &str = "com.andr2i.hallyview";
 
 fn main() -> glib::ExitCode {
-    let app = Application::builder().application_id(APP_ID).build();
+    let app = Application::builder()
+        .application_id(APP_ID)
+        .flags(ApplicationFlags::HANDLES_OPEN | ApplicationFlags::HANDLES_COMMAND_LINE)
+        .build();
 
-    app.connect_activate(build_ui);
-    app.run()
+    app.connect_command_line(|app, cmd| {
+        build_ui(app, cmd.arguments());
+        0
+    });
+    app.run_with_args(&std::env::args().collect::<Vec<_>>())
 }
 
-fn build_ui(app: &Application) {
+fn build_ui(app: &Application, args: Vec<std::ffi::OsString>) {
     let header_bar = gtk::HeaderBar::builder().build();
 
     let open_button = Button::from_icon_name("document-open");
@@ -39,6 +45,10 @@ fn build_ui(app: &Application) {
     });
 
     let loader = Rc::new(RefCell::new(loader));
+
+    if let Some(fname) = args.get(1) {
+        loader.borrow_mut().load(Path::new(fname));
+    }
 
     open_button.connect_clicked(clone!(@strong loader, @weak app => move |_| {
         let dialog = gtk::FileDialog::builder()
@@ -74,6 +84,8 @@ impl Loader {
     }
 
     fn load(&mut self, path: &Path) {
+        let path = path.canonicalize().unwrap();
+
         match &mut self.loaded {
             Some(loaded) => {
                 state::save(
@@ -85,7 +97,7 @@ impl Loader {
                 loaded.pm.borrow_mut().reload(
                     Document::from_file(&format!("file://{}", path.to_str().unwrap()), None)
                         .unwrap(),
-                    state::load(path),
+                    state::load(&path),
                 );
 
                 loaded.path.replace(path.to_path_buf());
@@ -100,7 +112,7 @@ impl Loader {
                 let pm = self.init.init(doc, move |pm| {
                     state::save(path_buf_clone.borrow().as_path(), &pm.current_state()).unwrap();
                 });
-                pm.borrow_mut().load(state::load(path));
+                pm.borrow_mut().load(state::load(&path));
                 self.loaded = Some(Loaded { pm, path: path_buf });
             }
         }
