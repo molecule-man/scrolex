@@ -4,6 +4,7 @@ use std::rc::Rc;
 
 use gtk::{gio::ApplicationFlags, glib, glib::clone, Application, ApplicationWindow, Button};
 use gtk::{prelude::*, EventControllerScrollFlags};
+use page::PageManager;
 use poppler::Document;
 
 mod page;
@@ -74,7 +75,7 @@ fn open_file_dialog(app: &Application, loader: &Rc<RefCell<Loader>>) {
 }
 
 struct Loaded {
-    pm: Rc<RefCell<page::PageManager>>,
+    pm: Rc<RefCell<PageManager>>,
     path: Rc<RefCell<PathBuf>>,
 }
 
@@ -142,14 +143,17 @@ impl Init {
     fn init(
         &self,
         doc: Document,
-        shutdown_fn: impl Fn(&page::PageManager) + 'static,
-    ) -> Rc<RefCell<page::PageManager>> {
+        shutdown_fn: impl Fn(&PageManager) + 'static,
+    ) -> Rc<RefCell<PageManager>> {
         let pages_box = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
             .spacing(2)
             .build();
 
-        let pm = Rc::new(RefCell::new(page::PageManager::new(doc, pages_box.clone())));
+        let pm = Rc::new(RefCell::new(PageManager::new(doc, pages_box.clone())));
+
+        self.add_header_buttons(&pm);
+
         let scroll_win = gtk::ScrolledWindow::builder()
             .hexpand(true)
             .hscrollbar_policy(gtk::PolicyType::Automatic)
@@ -157,8 +161,6 @@ impl Init {
             .build();
 
         self.window.set_child(Some(&scroll_win));
-
-        self.add_header_buttons(&pm);
 
         let scroll_controller = gtk::EventControllerScroll::new(
             EventControllerScrollFlags::DISCRETE | EventControllerScrollFlags::VERTICAL,
@@ -191,54 +193,49 @@ impl Init {
         pm
     }
 
-    fn add_header_buttons(&self, pm: &Rc<RefCell<page::PageManager>>) {
-        self.header_bar.pack_start(&self.button(
-            "zoom-out",
-            clone!(@strong pm => move |_| {
-                pm.borrow_mut().apply_zoom(1. / 1.1);
-            }),
-        ));
-        self.header_bar.pack_start(&self.button(
-            "zoom-in",
-            clone!(@strong pm => move |_| {
-                pm.borrow_mut().apply_zoom(1.1);
-            }),
-        ));
+    fn add_header_buttons(&self, pm: &Rc<RefCell<PageManager>>) {
+        self.header_bar
+            .pack_start(&self.create_button("zoom-out", pm.clone(), |pm| {
+                pm.apply_zoom(1. / 1.1);
+            }));
+        self.header_bar
+            .pack_start(&self.create_button("zoom-in", pm.clone(), |pm| {
+                pm.apply_zoom(1.1);
+            }));
 
-        self.header_bar.pack_end(&self.button(
-            "pan-end",
-            clone!(@strong pm => move |_| {
-                pm.borrow_mut().adjust_crop(0, 1);
-            }),
-        ));
+        self.header_bar
+            .pack_end(&self.create_button("pan-end", pm.clone(), |pm| {
+                pm.adjust_crop(0, 1);
+            }));
         self.header_bar
             .pack_end(&gtk::Label::new(Some("Right crop")));
-        self.header_bar.pack_end(&self.button(
-            "pan-start",
-            clone!(@strong pm => move |_| {
-                pm.borrow_mut().adjust_crop(0, -1);
-            }),
-        ));
+        self.header_bar
+            .pack_end(&self.create_button("pan-start", pm.clone(), |pm| {
+                pm.adjust_crop(0, -1);
+            }));
 
-        self.header_bar.pack_end(&self.button(
-            "pan-end",
-            clone!(@strong pm => move |_| {
-                pm.borrow_mut().adjust_crop(1, 0);
-            }),
-        ));
+        self.header_bar
+            .pack_end(&self.create_button("pan-end", pm.clone(), |pm| {
+                pm.adjust_crop(1, 0);
+            }));
         self.header_bar
             .pack_end(&gtk::Label::new(Some("Left crop")));
-        self.header_bar.pack_end(&self.button(
-            "pan-start",
-            clone!(@strong pm => move |_| {
-                pm.borrow_mut().adjust_crop(-1, 0);
-            }),
-        ));
+        self.header_bar
+            .pack_end(&self.create_button("pan-start", pm.clone(), |pm| {
+                pm.adjust_crop(-1, 0);
+            }));
     }
 
-    fn button(&self, icon: &str, on_click: impl Fn(&Button) + 'static) -> Button {
+    fn create_button(
+        &self,
+        icon: &str,
+        pm: Rc<RefCell<PageManager>>,
+        on_click: impl Fn(&mut PageManager) + 'static,
+    ) -> Button {
         let button = Button::from_icon_name(icon);
-        button.connect_clicked(on_click);
+        button.connect_clicked(clone!(@weak pm => move |_| {
+            on_click(&mut pm.borrow_mut());
+        }));
         button
     }
 }
