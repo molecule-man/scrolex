@@ -116,10 +116,13 @@ impl PageManager {
 
         let drawing_area = DrawingArea::new();
         drawing_area.set_draw_func(
-            clone!(@strong self.zoom as zoom, @strong self.crop_left as crop_left => move |_, cr, _width, _height| {
+            clone!(@strong self.zoom as zoom, @strong self.crop_left as crop_left => move |_, cr, width, height| {
                 let zoom = zoom.get();
                 cr.translate(crop_left.get() as f64 * (-zoom), 0.0);
                 cr.scale(zoom, zoom);
+                cr.set_source_rgba(1.0, 1.0, 1.0, 1.0);
+                cr.rectangle(0.0, 0.0, width as f64, height as f64);
+                cr.fill().expect("Failed to fill");
                 page.render(cr);
             }),
         );
