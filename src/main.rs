@@ -26,7 +26,6 @@ fn main() -> glib::ExitCode {
 
 fn build_ui(app: &Application, args: Vec<std::ffi::OsString>) {
     let header_bar = gtk::HeaderBar::builder().build();
-
     let open_button = Button::from_icon_name("document-open");
 
     header_bar.pack_start(&open_button);
@@ -38,34 +37,40 @@ fn build_ui(app: &Application, args: Vec<std::ffi::OsString>) {
 
     window.set_titlebar(Some(&header_bar));
 
-    let loader = Loader::new(Init {
+    let loader = Rc::new(RefCell::new(Loader::new(Init {
         window: window.clone(),
         header_bar,
         app: app.clone(),
-    });
-
-    let loader = Rc::new(RefCell::new(loader));
+    })));
 
     if let Some(fname) = args.get(1) {
         loader.borrow_mut().load(Path::new(fname));
     }
 
     open_button.connect_clicked(clone!(@strong loader, @weak app => move |_| {
-        let dialog = gtk::FileDialog::builder()
-            .title("Open PDF File")
-            .modal(true)
-            .build();
-
-
-        dialog.open(app.active_window().as_ref(), gtk::gio::Cancellable::NONE, clone!(@strong loader => move |file| {
-            if let Ok(file) = file {
-                let path = file.path().expect("File has no path").canonicalize().unwrap();
-                loader.borrow_mut().load(&path);
-            }
-        }))
+        open_file_dialog(&app, &loader);
     }));
 
     window.present();
+}
+
+fn open_file_dialog(app: &Application, loader: &Rc<RefCell<Loader>>) {
+    let dialog = gtk::FileDialog::builder()
+        .title("Open PDF File")
+        .modal(true)
+        .build();
+
+    dialog.open(
+        app.active_window().as_ref(),
+        gtk::gio::Cancellable::NONE,
+        clone!(@strong loader => move |file| {
+            if let Ok(file) = file {
+                if let Some(Ok(path)) = file.path().map(|p| p.canonicalize()) {
+                    loader.borrow_mut().load(&path);
+                }
+            }
+        }),
+    );
 }
 
 struct Loaded {
@@ -84,37 +89,45 @@ impl Loader {
     }
 
     fn load(&mut self, path: &Path) {
-        let path = path.canonicalize().unwrap();
-
-        match &mut self.loaded {
-            Some(loaded) => {
-                state::save(
-                    loaded.path.borrow().as_path(),
-                    &loaded.pm.borrow().current_state(),
-                )
-                .unwrap();
-
-                loaded.pm.borrow_mut().reload(
-                    Document::from_file(&format!("file://{}", path.to_str().unwrap()), None)
-                        .unwrap(),
-                    state::load(&path),
-                );
-
-                loaded.path.replace(path.to_path_buf());
+        if let Ok(canonical_path) = path.canonicalize() {
+            let mut loaded = None;
+            std::mem::swap(&mut self.loaded, &mut loaded);
+            match loaded {
+                Some(mut loaded_instance) => {
+                    self.reload(&mut loaded_instance, &canonical_path);
+                    self.loaded = Some(loaded_instance);
+                }
+                None => {
+                    self.initialize(&canonical_path);
+                }
             }
-            None => {
-                let doc = Document::from_file(&format!("file://{}", path.to_str().unwrap()), None)
-                    .unwrap();
+        }
+    }
 
-                let path_buf = Rc::new(RefCell::new(path.to_path_buf()));
-                let path_buf_clone = path_buf.clone();
+    fn reload(&mut self, loaded: &mut Loaded, path: &Path) {
+        if let Err(err) = state::save(
+            loaded.path.borrow().as_path(),
+            &loaded.pm.borrow().current_state(),
+        ) {
+            eprintln!("Error saving state: {}", err);
+        }
 
-                let pm = self.init.init(doc, move |pm| {
-                    state::save(path_buf_clone.borrow().as_path(), &pm.current_state()).unwrap();
-                });
-                pm.borrow_mut().load(state::load(&path));
-                self.loaded = Some(Loaded { pm, path: path_buf });
-            }
+        if let Ok(doc) = Document::from_file(&format!("file://{}", path.to_str().unwrap()), None) {
+            loaded.pm.borrow_mut().reload(doc, state::load(path));
+            loaded.path.replace(path.to_path_buf());
+        }
+    }
+
+    fn initialize(&mut self, path: &Path) {
+        if let Ok(doc) = Document::from_file(&format!("file://{}", path.to_str().unwrap()), None) {
+            let path_buf = Rc::new(RefCell::new(path.to_path_buf()));
+            let pm = self.init.init(doc, clone!(@strong path_buf => move |pm| {
+                if let Err(err) = state::save(path_buf.borrow().as_path(), &pm.current_state()) {
+                    eprintln!("Error saving state: {}", err);
+                }
+            }));
+            pm.borrow_mut().load(state::load(path));
+            self.loaded = Some(Loaded { pm, path: path_buf });
         }
     }
 }
@@ -137,7 +150,6 @@ impl Init {
             .build();
 
         let pm = Rc::new(RefCell::new(page::PageManager::new(doc, pages_box.clone())));
-
         let scroll_win = gtk::ScrolledWindow::builder()
             .hexpand(true)
             .hscrollbar_policy(gtk::PolicyType::Automatic)
@@ -146,49 +158,7 @@ impl Init {
 
         self.window.set_child(Some(&scroll_win));
 
-        let zoom_out_button = Button::from_icon_name("zoom-out");
-        let zoom_in_button = Button::from_icon_name("zoom-in");
-
-        self.header_bar.pack_start(&zoom_out_button);
-        self.header_bar.pack_start(&zoom_in_button);
-
-        let crop_left_minus_button = Button::from_icon_name("pan-start");
-        let crop_left_text = gtk::Label::new(Some("Left crop"));
-        let crop_left_plus_button = Button::from_icon_name("pan-end");
-
-        let crop_right_minus_button = Button::from_icon_name("pan-start");
-        let crop_right_text = gtk::Label::new(Some("Right crop"));
-        let crop_right_plus_button = Button::from_icon_name("pan-end");
-
-        self.header_bar.pack_end(&crop_right_plus_button);
-        self.header_bar.pack_end(&crop_right_text);
-        self.header_bar.pack_end(&crop_right_minus_button);
-
-        self.header_bar.pack_end(&crop_left_plus_button);
-        self.header_bar.pack_end(&crop_left_text);
-        self.header_bar.pack_end(&crop_left_minus_button);
-
-        let pm_clone = pm.clone();
-        zoom_in_button.connect_clicked(move |_| {
-            pm_clone.borrow_mut().apply_zoom(1.1);
-        });
-
-        let pm_clone = pm.clone();
-        zoom_out_button.connect_clicked(move |_| {
-            pm_clone.borrow_mut().apply_zoom(1. / 1.1);
-        });
-
-        let pm_clone = pm.clone();
-        crop_left_plus_button.connect_clicked(move |_| pm_clone.borrow_mut().adjust_crop(1, 0));
-
-        let pm_clone = pm.clone();
-        crop_left_minus_button.connect_clicked(move |_| pm_clone.borrow_mut().adjust_crop(-1, 0));
-
-        let pm_clone = pm.clone();
-        crop_right_plus_button.connect_clicked(move |_| pm_clone.borrow_mut().adjust_crop(0, 1));
-
-        let pm_clone = pm.clone();
-        crop_right_minus_button.connect_clicked(move |_| pm_clone.borrow_mut().adjust_crop(0, -1));
+        self.add_header_buttons(&pm);
 
         let scroll_controller = gtk::EventControllerScroll::new(
             EventControllerScrollFlags::DISCRETE | EventControllerScrollFlags::VERTICAL,
@@ -219,5 +189,51 @@ impl Init {
         }));
 
         pm
+    }
+
+    fn add_header_buttons(&self, pm: &Rc<RefCell<page::PageManager>>) {
+        self.header_bar
+            .pack_start(&self.create_button("zoom-out", pm.clone(), |pm| {
+                pm.borrow_mut().apply_zoom(1. / 1.1);
+            }));
+        self.header_bar
+            .pack_start(&self.create_button("zoom-in", pm.clone(), |pm| {
+                pm.borrow_mut().apply_zoom(1.1);
+            }));
+
+        self.header_bar
+            .pack_end(&self.create_button("pan-end", pm.clone(), |pm| {
+                pm.borrow_mut().adjust_crop(0, 1);
+            }));
+        self.header_bar
+            .pack_end(&gtk::Label::new(Some("Right crop")));
+        self.header_bar
+            .pack_end(&self.create_button("pan-start", pm.clone(), |pm| {
+                pm.borrow_mut().adjust_crop(0, -1);
+            }));
+
+        self.header_bar
+            .pack_end(&self.create_button("pan-end", pm.clone(), |pm| {
+                pm.borrow_mut().adjust_crop(1, 0);
+            }));
+        self.header_bar
+            .pack_end(&gtk::Label::new(Some("Left crop")));
+        self.header_bar
+            .pack_end(&self.create_button("pan-start", pm.clone(), |pm| {
+                pm.borrow_mut().adjust_crop(-1, 0);
+            }));
+    }
+
+    fn create_button(
+        &self,
+        icon: &str,
+        pm: Rc<RefCell<page::PageManager>>,
+        callback: impl Fn(Rc<RefCell<page::PageManager>>) + 'static,
+    ) -> Button {
+        let button = Button::from_icon_name(icon);
+        button.connect_clicked(clone!(@weak pm => move |_| {
+            callback(pm.clone());
+        }));
+        button
     }
 }
