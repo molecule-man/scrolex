@@ -192,48 +192,53 @@ impl Init {
     }
 
     fn add_header_buttons(&self, pm: &Rc<RefCell<page::PageManager>>) {
-        self.header_bar
-            .pack_start(&self.create_button("zoom-out", pm.clone(), |pm| {
+        self.header_bar.pack_start(&self.button(
+            "zoom-out",
+            clone!(@strong pm => move |_| {
                 pm.borrow_mut().apply_zoom(1. / 1.1);
-            }));
-        self.header_bar
-            .pack_start(&self.create_button("zoom-in", pm.clone(), |pm| {
+            }),
+        ));
+        self.header_bar.pack_start(&self.button(
+            "zoom-in",
+            clone!(@strong pm => move |_| {
                 pm.borrow_mut().apply_zoom(1.1);
-            }));
+            }),
+        ));
 
-        self.header_bar
-            .pack_end(&self.create_button("pan-end", pm.clone(), |pm| {
+        self.header_bar.pack_end(&self.button(
+            "pan-end",
+            clone!(@strong pm => move |_| {
                 pm.borrow_mut().adjust_crop(0, 1);
-            }));
+            }),
+        ));
         self.header_bar
             .pack_end(&gtk::Label::new(Some("Right crop")));
-        self.header_bar
-            .pack_end(&self.create_button("pan-start", pm.clone(), |pm| {
+        self.header_bar.pack_end(&self.button(
+            "pan-start",
+            clone!(@strong pm => move |_| {
                 pm.borrow_mut().adjust_crop(0, -1);
-            }));
+            }),
+        ));
 
-        self.header_bar
-            .pack_end(&self.create_button("pan-end", pm.clone(), |pm| {
+        self.header_bar.pack_end(&self.button(
+            "pan-end",
+            clone!(@strong pm => move |_| {
                 pm.borrow_mut().adjust_crop(1, 0);
-            }));
+            }),
+        ));
         self.header_bar
             .pack_end(&gtk::Label::new(Some("Left crop")));
-        self.header_bar
-            .pack_end(&self.create_button("pan-start", pm.clone(), |pm| {
+        self.header_bar.pack_end(&self.button(
+            "pan-start",
+            clone!(@strong pm => move |_| {
                 pm.borrow_mut().adjust_crop(-1, 0);
-            }));
+            }),
+        ));
     }
 
-    fn create_button(
-        &self,
-        icon: &str,
-        pm: Rc<RefCell<page::PageManager>>,
-        callback: impl Fn(Rc<RefCell<page::PageManager>>) + 'static,
-    ) -> Button {
+    fn button(&self, icon: &str, on_click: impl Fn(&Button) + 'static) -> Button {
         let button = Button::from_icon_name(icon);
-        button.connect_clicked(clone!(@weak pm => move |_| {
-            callback(pm.clone());
-        }));
+        button.connect_clicked(on_click);
         button
     }
 }
