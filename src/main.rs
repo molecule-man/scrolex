@@ -45,7 +45,12 @@ fn build_ui(app: &Application, args: Vec<std::ffi::OsString>) {
     })));
 
     if let Some(fname) = args.get(1) {
-        loader.borrow_mut().load(Path::new(fname));
+        loader
+            .borrow_mut()
+            .load(Path::new(fname))
+            .unwrap_or_else(|err| {
+                show_error_dialog(app, &format!("Error loading file: {}", err));
+            });
     }
 
     open_button.connect_clicked(clone!(@strong loader, @weak app => move |_| {
@@ -64,10 +69,17 @@ fn open_file_dialog(app: &Application, loader: &Rc<RefCell<Loader>>) {
     dialog.open(
         app.active_window().as_ref(),
         gtk::gio::Cancellable::NONE,
-        clone!(@strong loader => move |file| {
-            if let Ok(file) = file {
-                if let Some(Ok(path)) = file.path().map(|p| p.canonicalize()) {
-                    loader.borrow_mut().load(&path);
+        clone!(@strong loader, @strong app => move |file| {
+            match file {
+                Ok(file) => {
+                    if let Some(path) = file.path() {
+                        loader.borrow_mut().load(&path).unwrap();
+                    } else {
+                        show_error_dialog(&app, "No path returned from file dialog");
+                    }
+                }
+                Err(err) => {
+                    show_error_dialog(&app, &format!("Error opening file: {}", err));
                 }
             }
         }),
@@ -89,8 +101,8 @@ impl Loader {
         Self { init, loaded: None }
     }
 
-    fn load(&mut self, path: &Path) {
-        let canonical_path = path.canonicalize().unwrap();
+    fn load(&mut self, path: &Path) -> Result<(), std::io::Error> {
+        let canonical_path = path.canonicalize()?;
         let mut loaded = None;
         std::mem::swap(&mut self.loaded, &mut loaded);
         match loaded {
@@ -102,6 +114,7 @@ impl Loader {
                 self.initialize(&canonical_path);
             }
         }
+        Ok(())
     }
 
     fn reload(&mut self, loaded: &mut Loaded, path: &Path) {
@@ -237,4 +250,11 @@ impl Init {
         }));
         button
     }
+}
+
+fn show_error_dialog(app: &Application, message: &str) {
+    gtk::AlertDialog::builder()
+        .message(message)
+        .build()
+        .show(app.active_window().as_ref());
 }
