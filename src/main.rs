@@ -1,7 +1,9 @@
 use std::cell::RefCell;
-use std::path::{Path, PathBuf};
+use std::ffi::OsString;
+use std::path::PathBuf;
 use std::rc::Rc;
 
+use gtk::glib::Uri;
 use gtk::{gio::ApplicationFlags, glib, glib::clone, Application, ApplicationWindow, Button};
 use gtk::{prelude::*, EventControllerScrollFlags};
 use page::PageManager;
@@ -25,7 +27,7 @@ fn main() -> glib::ExitCode {
     app.run_with_args(&std::env::args().collect::<Vec<_>>())
 }
 
-fn build_ui(app: &Application, args: Vec<std::ffi::OsString>) {
+fn build_ui(app: &Application, args: Vec<OsString>) {
     let header_bar = gtk::HeaderBar::builder().build();
     let open_button = Button::from_icon_name("document-open");
 
@@ -45,13 +47,9 @@ fn build_ui(app: &Application, args: Vec<std::ffi::OsString>) {
     })));
 
     if let Some(fname) = args.get(1) {
-        let fname = PathBuf::from(fname).canonicalize().unwrap();
-        loader
-            .borrow_mut()
-            .load(&format!("file://{}", fname.to_str().unwrap()))
-            .unwrap_or_else(|err| {
-                show_error_dialog(app, &format!("Error loading file: {}", err));
-            });
+        loader.borrow_mut().load(fname).unwrap_or_else(|err| {
+            show_error_dialog(app, &format!("Error loading file: {}", err));
+        });
     }
 
     open_button.connect_clicked(clone!(@strong loader, @weak app => move |_| {
@@ -73,7 +71,7 @@ fn open_file_dialog(app: &Application, loader: &Rc<RefCell<Loader>>) {
         clone!(@strong loader, @strong app => move |file| {
             match file {
                 Ok(file) => {
-                    loader.borrow_mut().load(&file.uri()).unwrap_or_else(|err| {
+                    loader.borrow_mut().load(file).unwrap_or_else(|err| {
                         show_error_dialog(&app, &format!("Error loading file: {}", err));
                     });
                 }
@@ -100,35 +98,41 @@ impl Loader {
         Self { init, loaded: None }
     }
 
-    fn load(&mut self, uri: &str) -> Result<(), Box<dyn std::error::Error>> {
+    fn load<D: DocumentOpen>(&mut self, opener: D) -> Result<(), Box<dyn std::error::Error>> {
         let mut loaded = None;
         std::mem::swap(&mut self.loaded, &mut loaded);
         match loaded {
             Some(mut loaded_instance) => {
-                self.reload(&mut loaded_instance, uri)?;
+                self.reload(&mut loaded_instance, opener)?;
                 self.loaded = Some(loaded_instance);
             }
             None => {
-                self.initialize(uri)?;
+                self.initialize(opener)?;
             }
         }
         Ok(())
     }
 
-    fn reload(&mut self, loaded: &mut Loaded, uri: &str) -> Result<(), glib::Error> {
+    fn reload<D: DocumentOpen>(
+        &mut self,
+        loaded: &mut Loaded,
+        opener: D,
+    ) -> Result<(), DocumentOpenError> {
         if let Err(err) = state::save(&loaded.uri.borrow(), &loaded.pm.borrow().current_state()) {
             eprintln!("Error saving state: {}", err);
         }
 
-        let doc = Document::from_file(uri, None)?;
-        loaded.pm.borrow_mut().reload(doc, state::load(uri));
-        loaded.uri.replace(uri.to_owned());
+        let doc = opener.open()?;
+        let uri = opener.uri_string();
+        loaded.pm.borrow_mut().reload(doc, state::load(&uri));
+        loaded.uri.replace(uri);
         Ok(())
     }
 
-    fn initialize(&mut self, uri: &str) -> Result<(), glib::Error> {
-        let doc = Document::from_file(uri, None)?;
-        let uri_cell = Rc::new(RefCell::new(uri.to_owned()));
+    fn initialize<D: DocumentOpen>(&mut self, opener: D) -> Result<(), DocumentOpenError> {
+        let doc = opener.open()?;
+        let uri = opener.uri_string();
+        let uri_cell = Rc::new(RefCell::new(uri.clone()));
         let pm = self.init.init(
             doc,
             clone!(@strong uri_cell => move |pm| {
@@ -137,7 +141,7 @@ impl Loader {
                 }
             }),
         );
-        pm.borrow_mut().load(state::load(uri));
+        pm.borrow_mut().load(state::load(&uri));
         self.loaded = Some(Loaded { pm, uri: uri_cell });
 
         Ok(())
@@ -256,4 +260,72 @@ fn show_error_dialog(app: &Application, message: &str) {
         .message(message)
         .build()
         .show(app.active_window().as_ref());
+}
+
+#[derive(Debug)]
+struct DocumentOpenError {
+    message: String,
+}
+
+impl std::fmt::Display for DocumentOpenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "Error opening document: {}", self.message)
+    }
+}
+
+impl std::error::Error for DocumentOpenError {}
+
+trait DocumentOpen {
+    fn uri_string(&self) -> String;
+    fn open(&self) -> Result<Document, DocumentOpenError>;
+}
+
+impl DocumentOpen for gtk::gio::File {
+    fn uri_string(&self) -> String {
+        self.uri().to_string()
+    }
+
+    fn open(&self) -> Result<Document, DocumentOpenError> {
+        Document::from_gfile(self, None, gtk::gio::Cancellable::NONE).map_err(|err| {
+            DocumentOpenError {
+                message: err.to_string(),
+            }
+        })
+    }
+}
+
+impl DocumentOpen for &OsString {
+    fn uri_string(&self) -> String {
+        if let Ok(u) = from_str_to_uri(self) {
+            return u;
+        }
+
+        String::from("unknown")
+    }
+
+    fn open(&self) -> Result<Document, DocumentOpenError> {
+        let uri = from_str_to_uri(self).map_err(|err| DocumentOpenError {
+            message: err.to_string(),
+        })?;
+
+        Document::from_file(&uri, None).map_err(|err| DocumentOpenError {
+            message: err.to_string(),
+        })
+    }
+}
+
+fn from_str_to_uri(oss: &OsString) -> Result<String, std::io::Error> {
+    if let Ok(u) = Uri::parse(&oss.to_string_lossy(), glib::UriFlags::NONE) {
+        return Ok(u.to_string());
+    }
+
+    let path = PathBuf::from(&oss).canonicalize()?;
+    if path.is_file() {
+        return Ok(format!("file://{}", path.to_string_lossy()));
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        format!("File not found: {:?}", oss),
+    ))
 }
