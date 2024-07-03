@@ -90,17 +90,16 @@ impl Loader {
     }
 
     fn load(&mut self, path: &Path) {
-        if let Ok(canonical_path) = path.canonicalize() {
-            let mut loaded = None;
-            std::mem::swap(&mut self.loaded, &mut loaded);
-            match loaded {
-                Some(mut loaded_instance) => {
-                    self.reload(&mut loaded_instance, &canonical_path);
-                    self.loaded = Some(loaded_instance);
-                }
-                None => {
-                    self.initialize(&canonical_path);
-                }
+        let canonical_path = path.canonicalize().unwrap();
+        let mut loaded = None;
+        std::mem::swap(&mut self.loaded, &mut loaded);
+        match loaded {
+            Some(mut loaded_instance) => {
+                self.reload(&mut loaded_instance, &canonical_path);
+                self.loaded = Some(loaded_instance);
+            }
+            None => {
+                self.initialize(&canonical_path);
             }
         }
     }
