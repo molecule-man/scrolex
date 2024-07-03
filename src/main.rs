@@ -45,9 +45,10 @@ fn build_ui(app: &Application, args: Vec<std::ffi::OsString>) {
     })));
 
     if let Some(fname) = args.get(1) {
+        let fname = PathBuf::from(fname).canonicalize().unwrap();
         loader
             .borrow_mut()
-            .load(Path::new(fname))
+            .load(&format!("file://{}", fname.to_str().unwrap()))
             .unwrap_or_else(|err| {
                 show_error_dialog(app, &format!("Error loading file: {}", err));
             });
@@ -72,11 +73,9 @@ fn open_file_dialog(app: &Application, loader: &Rc<RefCell<Loader>>) {
         clone!(@strong loader, @strong app => move |file| {
             match file {
                 Ok(file) => {
-                    if let Some(path) = file.path() {
-                        loader.borrow_mut().load(&path).unwrap();
-                    } else {
-                        show_error_dialog(&app, "No path returned from file dialog");
-                    }
+                    loader.borrow_mut().load(&file.uri()).unwrap_or_else(|err| {
+                        show_error_dialog(&app, &format!("Error loading file: {}", err));
+                    });
                 }
                 Err(err) => {
                     show_error_dialog(&app, &format!("Error opening file: {}", err));
@@ -88,7 +87,7 @@ fn open_file_dialog(app: &Application, loader: &Rc<RefCell<Loader>>) {
 
 struct Loaded {
     pm: Rc<RefCell<PageManager>>,
-    path: Rc<RefCell<PathBuf>>,
+    uri: Rc<RefCell<String>>,
 }
 
 struct Loader {
@@ -101,47 +100,47 @@ impl Loader {
         Self { init, loaded: None }
     }
 
-    fn load(&mut self, path: &Path) -> Result<(), std::io::Error> {
-        let canonical_path = path.canonicalize()?;
+    fn load(&mut self, uri: &str) -> Result<(), Box<dyn std::error::Error>> {
         let mut loaded = None;
         std::mem::swap(&mut self.loaded, &mut loaded);
         match loaded {
             Some(mut loaded_instance) => {
-                self.reload(&mut loaded_instance, &canonical_path);
+                self.reload(&mut loaded_instance, uri)?;
                 self.loaded = Some(loaded_instance);
             }
             None => {
-                self.initialize(&canonical_path);
+                self.initialize(uri)?;
             }
         }
         Ok(())
     }
 
-    fn reload(&mut self, loaded: &mut Loaded, path: &Path) {
-        if let Err(err) = state::save(
-            loaded.path.borrow().as_path(),
-            &loaded.pm.borrow().current_state(),
-        ) {
+    fn reload(&mut self, loaded: &mut Loaded, uri: &str) -> Result<(), glib::Error> {
+        if let Err(err) = state::save(&loaded.uri.borrow(), &loaded.pm.borrow().current_state()) {
             eprintln!("Error saving state: {}", err);
         }
 
-        if let Ok(doc) = Document::from_file(&format!("file://{}", path.to_str().unwrap()), None) {
-            loaded.pm.borrow_mut().reload(doc, state::load(path));
-            loaded.path.replace(path.to_path_buf());
-        }
+        let doc = Document::from_file(uri, None)?;
+        loaded.pm.borrow_mut().reload(doc, state::load(uri));
+        loaded.uri.replace(uri.to_owned());
+        Ok(())
     }
 
-    fn initialize(&mut self, path: &Path) {
-        if let Ok(doc) = Document::from_file(&format!("file://{}", path.to_str().unwrap()), None) {
-            let path_buf = Rc::new(RefCell::new(path.to_path_buf()));
-            let pm = self.init.init(doc, clone!(@strong path_buf => move |pm| {
-                if let Err(err) = state::save(path_buf.borrow().as_path(), &pm.current_state()) {
+    fn initialize(&mut self, uri: &str) -> Result<(), glib::Error> {
+        let doc = Document::from_file(uri, None)?;
+        let uri_cell = Rc::new(RefCell::new(uri.to_owned()));
+        let pm = self.init.init(
+            doc,
+            clone!(@strong uri_cell => move |pm| {
+                if let Err(err) = state::save(&uri_cell.borrow(), &pm.current_state()) {
                     eprintln!("Error saving state: {}", err);
                 }
-            }));
-            pm.borrow_mut().load(state::load(path));
-            self.loaded = Some(Loaded { pm, path: path_buf });
-        }
+            }),
+        );
+        pm.borrow_mut().load(state::load(uri));
+        self.loaded = Some(Loaded { pm, uri: uri_cell });
+
+        Ok(())
     }
 }
 

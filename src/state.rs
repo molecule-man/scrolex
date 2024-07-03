@@ -1,5 +1,5 @@
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::{env, fs};
 
 #[derive(Debug)]
@@ -10,8 +10,8 @@ pub(crate) struct DocumentState {
     pub(crate) crop_right: i32,
 }
 
-pub(crate) fn load(path: &Path) -> DocumentState {
-    let state_path = get_state_file_path(path).unwrap();
+pub(crate) fn load(uri: &str) -> DocumentState {
+    let state_path = get_state_file_path(uri).unwrap();
 
     let mut state = DocumentState {
         zoom: 1.0,
@@ -49,8 +49,8 @@ pub(crate) fn load(path: &Path) -> DocumentState {
     state
 }
 
-pub(crate) fn save(path: &Path, state: &DocumentState) -> io::Result<()> {
-    let state_path = get_state_file_path(path).unwrap();
+pub(crate) fn save(uri: &str, state: &DocumentState) -> io::Result<()> {
+    let state_path = get_state_file_path(uri).unwrap();
     let state_dir = state_path.parent().unwrap();
 
     if !state_dir.exists() {
@@ -71,16 +71,13 @@ pub(crate) fn save(path: &Path, state: &DocumentState) -> io::Result<()> {
     file.flush()
 }
 
-fn get_state_file_path(path: &Path) -> Result<PathBuf, env::VarError> {
+fn get_state_file_path(uri: &str) -> Result<PathBuf, env::VarError> {
     let mut state_path = env::var("XDG_STATE_HOME")
         .or_else(|_| env::var("HOME").map(|home| format!("{}/.local/state", home)))
         .map(PathBuf::from)?;
 
     state_path.push("pdf-viewer");
-
-    for component in path.components().skip(1) {
-        state_path.push(component);
-    }
+    state_path.push(uri);
     state_path.set_extension("ini");
 
     Ok(state_path)
