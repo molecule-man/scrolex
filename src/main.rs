@@ -8,6 +8,7 @@ use page::PageManager;
 use poppler::Document;
 
 mod page;
+mod page2;
 mod state;
 
 const APP_ID: &str = "com.andr2i.hallyview";
