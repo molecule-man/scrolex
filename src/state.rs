@@ -5,9 +5,9 @@ use std::{env, fs};
 #[derive(Debug)]
 pub(crate) struct DocumentState {
     pub(crate) zoom: f64,
-    pub(crate) start: usize,
     pub(crate) crop_left: i32,
     pub(crate) crop_right: i32,
+    pub(crate) page: u32,
 }
 
 pub(crate) fn load(path: &Path) -> DocumentState {
@@ -15,9 +15,9 @@ pub(crate) fn load(path: &Path) -> DocumentState {
 
     let mut state = DocumentState {
         zoom: 1.0,
-        start: 0,
         crop_left: 0,
         crop_right: 0,
+        page: 0,
     };
 
     if state_path.exists() {
@@ -29,10 +29,6 @@ pub(crate) fn load(path: &Path) -> DocumentState {
                         state.zoom = zoom;
                     }
                 }
-                Some(("start", value)) => {
-                    let start = value.parse().unwrap_or(0);
-                    state.start = start;
-                }
                 Some(("crop_left", value)) => {
                     let crop_left = value.parse().unwrap_or(0);
                     state.crop_left = crop_left;
@@ -40,6 +36,10 @@ pub(crate) fn load(path: &Path) -> DocumentState {
                 Some(("crop_right", value)) => {
                     let crop_right = value.parse().unwrap_or(0);
                     state.crop_right = crop_right;
+                }
+                Some(("page", value)) => {
+                    let page = value.parse().unwrap_or(0);
+                    state.page = page;
                 }
                 _ => {}
             }
@@ -64,9 +64,9 @@ pub(crate) fn save(path: &Path, state: &DocumentState) -> io::Result<()> {
         .open(&state_path)?;
 
     writeln!(file, "zoom={}", state.zoom)?;
-    writeln!(file, "start={}", state.start)?;
     writeln!(file, "crop_left={}", state.crop_left)?;
     writeln!(file, "crop_right={}", state.crop_right)?;
+    writeln!(file, "page={}", state.page)?;
 
     file.flush()
 }
