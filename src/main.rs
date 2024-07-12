@@ -5,7 +5,7 @@ use std::rc::Rc;
 
 use gtk::glib::Uri;
 use gtk::{gio::ApplicationFlags, glib, glib::clone, Application, ApplicationWindow, Button};
-use gtk::{prelude::*, EventControllerScrollFlags};
+use gtk::{prelude::*, ScrolledWindow};
 use page::PageManager;
 use poppler::Document;
 
@@ -40,8 +40,24 @@ fn build_ui(app: &Application, args: Vec<OsString>) {
 
     window.set_titlebar(Some(&header_bar));
 
+    let scroll_win = gtk::ScrolledWindow::builder()
+        .hexpand(true)
+        .hscrollbar_policy(gtk::PolicyType::Automatic)
+        .build();
+
+    let model = gtk::gio::ListStore::new::<page::PageNumber>();
+    let factory = gtk::SignalListItemFactory::new();
+    let selection = gtk::SingleSelection::new(Some(model.clone()));
+    let list_view = gtk::ListView::new(Some(selection.clone()), Some(factory.clone()));
+    list_view.set_hexpand(true);
+    list_view.set_orientation(gtk::Orientation::Horizontal);
+    scroll_win.set_child(Some(&list_view));
+
+    window.set_child(Some(&scroll_win));
+
     let loader = Rc::new(RefCell::new(Loader::new(Init {
-        window: window.clone(),
+        window: scroll_win,
+        list_view,
         header_bar,
         app: app.clone(),
     })));
@@ -149,7 +165,8 @@ impl Loader {
 }
 
 struct Init {
-    window: ApplicationWindow,
+    window: ScrolledWindow,
+    list_view: gtk::ListView,
     header_bar: gtk::HeaderBar,
     app: Application,
 }
@@ -160,46 +177,10 @@ impl Init {
         doc: Document,
         shutdown_fn: impl Fn(&PageManager) + 'static,
     ) -> Rc<RefCell<PageManager>> {
-        let pages_box = gtk::Box::builder()
-            .orientation(gtk::Orientation::Horizontal)
-            .spacing(2)
-            .build();
-
-        let pm = Rc::new(RefCell::new(PageManager::new(doc, pages_box.clone())));
+        let pm = Rc::new(RefCell::new(PageManager::new(self.list_view.clone(), doc)));
 
         self.add_header_buttons(&pm);
-
-        let scroll_win = gtk::ScrolledWindow::builder()
-            .hexpand(true)
-            .hscrollbar_policy(gtk::PolicyType::Automatic)
-            .child(&pages_box)
-            .build();
-
-        self.window.set_child(Some(&scroll_win));
-
-        let scroll_controller = gtk::EventControllerScroll::new(
-            EventControllerScrollFlags::DISCRETE | EventControllerScrollFlags::VERTICAL,
-        );
-        scroll_controller.connect_scroll(clone!( @weak scroll_win, @weak pages_box, @weak pm => @default-return glib::Propagation::Stop, move |_, _dx, dy| {
-            if let Some(last_page) = pages_box.last_child() {
-                let increment = last_page.width();
-                // scroll by one page
-                if dy < 0.0 {
-                    // scroll left
-                    if !pm.borrow_mut().shift_loading_buffer_left() {
-                        scroll_win.hadjustment().set_value(scroll_win.hadjustment().value() - increment as f64);
-                    }
-                } else {
-                    // scroll right
-                    if !pm.borrow_mut().shift_loading_buffer_right() {
-                        scroll_win.hadjustment().set_value(scroll_win.hadjustment().value() + increment as f64);
-                    }
-                }
-            }
-
-            glib::Propagation::Stop
-        }));
-        pages_box.add_controller(scroll_controller);
+        self.window.set_child(Some(&pm.borrow().list_view()));
 
         self.app.connect_shutdown(clone!(@strong pm => move |_| {
             shutdown_fn(&pm.borrow());
