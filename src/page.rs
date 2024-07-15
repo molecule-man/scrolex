@@ -133,8 +133,6 @@ impl PageManager {
             self.model.append(&num);
         }
 
-        self.list_view.model().unwrap().select_item(5, true);
-
         let lv = self.list_view.clone();
         let scroll_to = state.page.min(self.model.n_items() - 1);
 
