@@ -46,8 +46,6 @@ impl PageManager {
         let page_drawer = Rc::new(RefCell::new(PageDrawer {
             doc: doc.clone(),
             zoom: Rc::new(Cell::new(1.0)),
-            width: 800,
-            height: 800,
             crop: Rc::new(Cell::new(false)),
         }));
 
@@ -117,14 +115,10 @@ impl PageManager {
     pub(crate) fn load(&mut self, state: state::DocumentState) {
         self.model.remove_all();
 
-        let (width, height) = self.doc.page(0).unwrap().size();
-
         {
             let mut drawer = self.page_drawer.borrow_mut();
             drawer.doc = self.doc.clone();
             drawer.zoom.replace(state.zoom);
-            drawer.width = width as i32;
-            drawer.height = height as i32;
             drawer.crop.replace(state.crop);
         }
 
@@ -170,8 +164,6 @@ impl PageManager {
 struct PageDrawer {
     doc: Document,
     zoom: Rc<Cell<f64>>,
-    width: i32,
-    height: i32,
     crop: Rc<Cell<bool>>,
 }
 
