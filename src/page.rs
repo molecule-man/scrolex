@@ -46,10 +46,9 @@ impl PageManager {
         let page_drawer = Rc::new(RefCell::new(PageDrawer {
             doc: doc.clone(),
             zoom: Rc::new(Cell::new(1.0)),
-            crop_left: Rc::new(Cell::new(0)),
-            crop_right: Rc::new(Cell::new(0)),
             width: 800,
             height: 800,
+            crop: Rc::new(Cell::new(false)),
         }));
 
         let scroll_controller = gtk::EventControllerScroll::new(
@@ -105,9 +104,8 @@ impl PageManager {
 
         state::DocumentState {
             zoom: drawer.zoom.get(),
-            crop_left: drawer.crop_left.get(),
-            crop_right: drawer.crop_right.get(),
             page: self.selection.selected(),
+            crop: drawer.crop.get(),
         }
     }
 
@@ -127,8 +125,7 @@ impl PageManager {
             drawer.zoom.replace(state.zoom);
             drawer.width = width as i32;
             drawer.height = height as i32;
-            drawer.crop_left.replace(state.crop_left);
-            drawer.crop_right.replace(state.crop_right);
+            drawer.crop.replace(state.crop);
         }
 
         for i in 0..self.doc.n_pages() {
@@ -136,12 +133,6 @@ impl PageManager {
             self.model.append(&num);
         }
 
-        self.resize_all(false);
-
-        println!(
-            "loaded. scrolling to {}",
-            state.page.min(self.model.n_items() - 1)
-        );
         self.list_view.model().unwrap().select_item(5, true);
 
         let lv = self.list_view.clone();
@@ -159,23 +150,19 @@ impl PageManager {
 
     pub(crate) fn apply_zoom(&mut self, zoom_factor: f64) {
         self.page_drawer.borrow().apply_zoom(zoom_factor);
-        self.resize_all(true);
+        self.redraw_all();
     }
 
-    pub(crate) fn adjust_crop(&mut self, left: i32, right: i32) {
-        self.page_drawer.borrow().adjust_crop(left, right);
-
-        self.resize_all(true);
+    pub(crate) fn toggle_crop(&mut self, enabled: bool) {
+        self.page_drawer.borrow().crop.replace(enabled);
+        self.redraw_all();
     }
 
-    fn resize_all(&self, redraw: bool) {
+    fn redraw_all(&self) {
         let mut child = self.list_view.first_child();
         while let Some(page) = child {
             if let Some(da) = page.first_child() {
-                self.page_drawer.borrow().resize_page(&da);
-                if redraw {
-                    da.queue_draw();
-                }
+                da.queue_draw();
             }
             child = page.next_sibling();
         }
@@ -185,10 +172,9 @@ impl PageManager {
 struct PageDrawer {
     doc: Document,
     zoom: Rc<Cell<f64>>,
-    crop_left: Rc<Cell<i32>>,
-    crop_right: Rc<Cell<i32>>,
     width: i32,
     height: i32,
+    crop: Rc<Cell<bool>>,
 }
 
 impl PageDrawer {
@@ -197,18 +183,28 @@ impl PageDrawer {
 
         let drawing_area = DrawingArea::new();
         drawing_area.set_draw_func(
-            clone!(@strong self.zoom as zoom, @strong self.crop_left as crop_left => move |_, cr, width, height| {
+            clone!(@strong self.zoom as zoom, @strong self.crop as crop, @strong page => move |da, cr, _width, _height| {
                 let zoom = zoom.get();
-                cr.translate(crop_left.get() as f64 * (-zoom), 0.0);
+
+                if crop.get() {
+                    let mut rect = poppler::Rectangle::default();
+                    page.get_bounding_box(&mut rect);
+                    cr.translate((-rect.x1()+5.0) * zoom, 0.0);
+                }
+
+
+                resize_page(&page, da, zoom, crop.get());
+
+                let (width, height) = page.size();
+                cr.rectangle(0.0, 0.0, width*zoom, height*zoom);
                 cr.scale(zoom, zoom);
                 cr.set_source_rgba(1.0, 1.0, 1.0, 1.0);
-                cr.rectangle(0.0, 0.0, width as f64, height as f64);
                 cr.fill().expect("Failed to fill");
                 page.render(cr);
             }),
         );
 
-        self.resize_page(&drawing_area);
+        resize_page(&page, &drawing_area, self.zoom.get(), self.crop.get());
 
         drawing_area
     }
@@ -216,22 +212,24 @@ impl PageDrawer {
     pub(crate) fn apply_zoom(&self, zoom_factor: f64) {
         self.zoom.replace(self.zoom.get() * zoom_factor);
     }
+}
 
-    pub(crate) fn adjust_crop(&self, left: i32, right: i32) {
-        self.crop_left.replace((self.crop_left.get() + left).max(0));
-        self.crop_right
-            .replace((self.crop_right.get() + right).max(0));
+fn resize_page(
+    page: &poppler::Page,
+    page_widget: &impl IsA<gtk::Widget>,
+    zoom: f64,
+    crop_margins: bool,
+) {
+    let (mut page_width, page_height) = page.size();
+    if crop_margins {
+        let mut rect = poppler::Rectangle::default();
+        page.get_bounding_box(&mut rect);
+        page_width = rect.x2() - rect.x1() + 10.0;
     }
+    let new_width = page_width * zoom;
+    let new_height = page_height * zoom;
 
-    fn resize_page(&self, page: &impl IsA<gtk::Widget>) {
-        let zoom = self.zoom.get();
-
-        let new_width =
-            ((self.width - self.crop_left.get() - self.crop_right.get()) as f64 * zoom) as i32;
-        let new_height = (self.height as f64 * zoom) as i32;
-
-        page.set_size_request(new_width, new_height);
-    }
+    page_widget.set_size_request(new_width as i32, new_height as i32);
 }
 
 glib::wrapper! {

@@ -199,27 +199,14 @@ impl Init {
                 pm.apply_zoom(1.1);
             }));
 
-        self.header_bar
-            .pack_end(&self.create_button("pan-end", pm.clone(), |pm| {
-                pm.adjust_crop(0, 1);
-            }));
-        self.header_bar
-            .pack_end(&gtk::Label::new(Some("Right crop")));
-        self.header_bar
-            .pack_end(&self.create_button("pan-start", pm.clone(), |pm| {
-                pm.adjust_crop(0, -1);
-            }));
+        let crop_btn = gtk::ToggleButton::builder()
+            .icon_name("object-flip-horizontal")
+            .build();
 
-        self.header_bar
-            .pack_end(&self.create_button("pan-end", pm.clone(), |pm| {
-                pm.adjust_crop(1, 0);
-            }));
-        self.header_bar
-            .pack_end(&gtk::Label::new(Some("Left crop")));
-        self.header_bar
-            .pack_end(&self.create_button("pan-start", pm.clone(), |pm| {
-                pm.adjust_crop(-1, 0);
-            }));
+        crop_btn.connect_toggled(clone!(@weak pm => move |btn| {
+            pm.borrow_mut().toggle_crop(btn.is_active());
+        }));
+        self.header_bar.pack_end(&crop_btn);
     }
 
     fn create_button(
