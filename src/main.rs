@@ -68,9 +68,15 @@ fn build_ui(app: &Application, args: Vec<OsString>) {
         });
     }
 
-    open_button.connect_clicked(clone!(@strong loader, @weak app => move |_| {
-        open_file_dialog(&app, &loader);
-    }));
+    open_button.connect_clicked(clone!(
+        #[strong]
+        loader,
+        #[weak]
+        app,
+        move |_| {
+            open_file_dialog(&app, &loader);
+        },
+    ));
 
     window.present();
 }
@@ -84,18 +90,24 @@ fn open_file_dialog(app: &Application, loader: &Rc<RefCell<Loader>>) {
     dialog.open(
         app.active_window().as_ref(),
         gtk::gio::Cancellable::NONE,
-        clone!(@strong loader, @strong app => move |file| {
-            match file {
-                Ok(file) => {
-                    loader.borrow_mut().load(file).unwrap_or_else(|err| {
-                        show_error_dialog(&app, &format!("Error loading file: {}", err));
-                    });
-                }
-                Err(err) => {
-                    show_error_dialog(&app, &format!("Error opening file: {}", err));
+        clone!(
+            #[strong]
+            loader,
+            #[strong]
+            app,
+            move |file| {
+                match file {
+                    Ok(file) => {
+                        loader.borrow_mut().load(file).unwrap_or_else(|err| {
+                            show_error_dialog(&app, &format!("Error loading file: {}", err));
+                        });
+                    }
+                    Err(err) => {
+                        show_error_dialog(&app, &format!("Error opening file: {}", err));
+                    }
                 }
             }
-        }),
+        ),
     );
 }
 
@@ -151,11 +163,15 @@ impl Loader {
         let uri_cell = Rc::new(RefCell::new(uri.clone()));
         let pm = self.init.init(
             doc,
-            clone!(@strong uri_cell => move |pm| {
-                if let Err(err) = state::save(&uri_cell.borrow(), &pm.current_state()) {
-                    eprintln!("Error saving state: {}", err);
+            clone!(
+                #[strong]
+                uri_cell,
+                move |pm| {
+                    if let Err(err) = state::save(&uri_cell.borrow(), &pm.current_state()) {
+                        eprintln!("Error saving state: {}", err);
+                    }
                 }
-            }),
+            ),
         );
         pm.borrow_mut().load(state::load(&uri));
         self.loaded = Some(Loaded { pm, uri: uri_cell });
@@ -182,9 +198,13 @@ impl Init {
         self.add_header_buttons(&pm);
         self.window.set_child(Some(&pm.borrow().list_view()));
 
-        self.app.connect_shutdown(clone!(@strong pm => move |_| {
-            shutdown_fn(&pm.borrow());
-        }));
+        self.app.connect_shutdown(clone!(
+            #[strong]
+            pm,
+            move |_| {
+                shutdown_fn(&pm.borrow());
+            }
+        ));
 
         pm
     }
@@ -203,9 +223,13 @@ impl Init {
             .icon_name("object-flip-horizontal")
             .build();
 
-        crop_btn.connect_toggled(clone!(@weak pm => move |btn| {
-            pm.borrow_mut().toggle_crop(btn.is_active());
-        }));
+        crop_btn.connect_toggled(clone!(
+            #[weak]
+            pm,
+            move |btn| {
+                pm.borrow_mut().toggle_crop(btn.is_active());
+            }
+        ));
         self.header_bar.pack_end(&crop_btn);
     }
 
@@ -216,9 +240,13 @@ impl Init {
         on_click: impl Fn(&mut PageManager) + 'static,
     ) -> Button {
         let button = Button::from_icon_name(icon);
-        button.connect_clicked(clone!(@weak pm => move |_| {
-            on_click(&mut pm.borrow_mut());
-        }));
+        button.connect_clicked(clone!(
+            #[weak]
+            pm,
+            move |_| {
+                on_click(&mut pm.borrow_mut());
+            }
+        ));
         button
     }
 }

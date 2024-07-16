@@ -52,24 +52,34 @@ impl PageManager {
         let scroll_controller = gtk::EventControllerScroll::new(
             EventControllerScrollFlags::DISCRETE | EventControllerScrollFlags::VERTICAL,
         );
-        scroll_controller.connect_scroll(clone!(@weak list_view, @weak selection, @weak model => @default-return glib::Propagation::Stop, move |_, _dx, dy| {
-            if dy < 0.0 {
-                // scroll left
-                list_view.scroll_to(
-                    selection.selected().saturating_sub(1),
-                    gtk::ListScrollFlags::FOCUS | gtk::ListScrollFlags::SELECT,
-                    None,
-                );
-            } else {
-                list_view.scroll_to(
-                    (selection.selected() + 1).min(model.n_items() - 1),
-                    gtk::ListScrollFlags::FOCUS | gtk::ListScrollFlags::SELECT,
-                    None,
-                );
-            }
+        scroll_controller.connect_scroll(clone!(
+            #[weak]
+            list_view,
+            #[weak]
+            selection,
+            #[weak]
+            model,
+            #[upgrade_or]
+            glib::Propagation::Stop,
+            move |_, _dx, dy| {
+                if dy < 0.0 {
+                    // scroll left
+                    list_view.scroll_to(
+                        selection.selected().saturating_sub(1),
+                        gtk::ListScrollFlags::FOCUS | gtk::ListScrollFlags::SELECT,
+                        None,
+                    );
+                } else {
+                    list_view.scroll_to(
+                        (selection.selected() + 1).min(model.n_items() - 1),
+                        gtk::ListScrollFlags::FOCUS | gtk::ListScrollFlags::SELECT,
+                        None,
+                    );
+                }
 
-            glib::Propagation::Stop
-        }));
+                glib::Propagation::Stop
+            }
+        ));
         list_view.add_controller(scroll_controller);
 
         let pm = PageManager {
@@ -172,27 +182,32 @@ impl PageDrawer {
         let page = self.doc.page(i).unwrap();
 
         let drawing_area = DrawingArea::new();
-        drawing_area.set_draw_func(
-            clone!(@strong self.zoom as zoom, @strong self.crop as crop, @strong page => move |da, cr, _width, _height| {
+        drawing_area.set_draw_func(clone!(
+            #[strong(rename_to = zoom)]
+            self.zoom,
+            #[strong(rename_to = crop)]
+            self.crop,
+            #[strong]
+            page,
+            move |da, cr, _width, _height| {
                 let zoom = zoom.get();
 
                 if crop.get() {
                     let mut rect = poppler::Rectangle::default();
                     page.get_bounding_box(&mut rect);
-                    cr.translate((-rect.x1()+5.0) * zoom, 0.0);
+                    cr.translate((-rect.x1() + 5.0) * zoom, 0.0);
                 }
-
 
                 resize_page(&page, da, zoom, crop.get());
 
                 let (width, height) = page.size();
-                cr.rectangle(0.0, 0.0, width*zoom, height*zoom);
+                cr.rectangle(0.0, 0.0, width * zoom, height * zoom);
                 cr.scale(zoom, zoom);
                 cr.set_source_rgba(1.0, 1.0, 1.0, 1.0);
                 cr.fill().expect("Failed to fill");
                 page.render(cr);
-            }),
-        );
+            }
+        ));
 
         resize_page(&page, &drawing_area, self.zoom.get(), self.crop.get());
 
