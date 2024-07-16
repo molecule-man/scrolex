@@ -180,6 +180,10 @@ struct PageDrawer {
 impl PageDrawer {
     fn new_drawing_area(&self, i: i32) -> gtk::DrawingArea {
         let page = self.doc.page(i).unwrap();
+        let (width, height) = page.size();
+        let mut rect = poppler::Rectangle::default();
+        page.get_bounding_box(&mut rect);
+        let (x1, x2) = (rect.x1(), rect.x2());
 
         let drawing_area = DrawingArea::new();
         drawing_area.set_draw_func(clone!(
@@ -195,12 +199,11 @@ impl PageDrawer {
                 if crop.get() {
                     let mut rect = poppler::Rectangle::default();
                     page.get_bounding_box(&mut rect);
-                    cr.translate((-rect.x1() + 5.0) * zoom, 0.0);
+                    cr.translate((-x1 + 5.0) * zoom, 0.0);
                 }
 
-                resize_page(&page, da, zoom, crop.get());
+                resize_page(da, zoom, crop.get(), width, height, x1, x2);
 
-                let (width, height) = page.size();
                 cr.rectangle(0.0, 0.0, width * zoom, height * zoom);
                 cr.scale(zoom, zoom);
                 cr.set_source_rgba(1.0, 1.0, 1.0, 1.0);
@@ -209,7 +212,15 @@ impl PageDrawer {
             }
         ));
 
-        resize_page(&page, &drawing_area, self.zoom.get(), self.crop.get());
+        resize_page(
+            &drawing_area,
+            self.zoom.get(),
+            self.crop.get(),
+            width,
+            height,
+            x1,
+            x2,
+        );
 
         drawing_area
     }
@@ -220,21 +231,20 @@ impl PageDrawer {
 }
 
 fn resize_page(
-    page: &poppler::Page,
     page_widget: &impl IsA<gtk::Widget>,
     zoom: f64,
     crop_margins: bool,
+    width: f64,
+    height: f64,
+    x1: f64,
+    x2: f64,
 ) {
-    let (mut page_width, page_height) = page.size();
+    let mut width = width;
     if crop_margins {
-        let mut rect = poppler::Rectangle::default();
-        page.get_bounding_box(&mut rect);
-        page_width = rect.x2() - rect.x1() + 10.0;
+        width = x2 - x1 + 10.0;
     }
-    let new_width = page_width * zoom;
-    let new_height = page_height * zoom;
 
-    page_widget.set_size_request(new_width as i32, new_height as i32);
+    page_widget.set_size_request((width * zoom) as i32, (height * zoom) as i32);
 }
 
 glib::wrapper! {
