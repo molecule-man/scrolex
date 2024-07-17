@@ -1,8 +1,8 @@
 use crate::state;
 use gtk::gio::prelude::*;
 use gtk::glib::subclass::prelude::*;
+use gtk::prelude::*;
 use gtk::{glib, glib::clone, DrawingArea};
-use gtk::{prelude::*, EventControllerScrollFlags};
 use poppler::Document;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -10,6 +10,7 @@ use std::usize;
 
 pub(crate) struct PageManager {
     doc: Document,
+    uri: String,
     model: gtk::gio::ListStore,
     selection: gtk::SingleSelection,
     list_view: gtk::ListView,
@@ -17,15 +18,27 @@ pub(crate) struct PageManager {
 }
 
 impl PageManager {
-    pub(crate) fn new(list_view: gtk::ListView, doc: Document) -> Self {
-        //let model = gtk::gio::ListStore::new::<PageNumber>();
+    pub(crate) fn new(
+        list_view: gtk::ListView,
+        f: &gtk::gio::File,
+    ) -> Result<Self, DocumentOpenError> {
+        //let (doc_send, doc_recv) = std::sync::mpsc::channel();
+        //let (bbox_send, bbox_recv) = std::sync::mpsc::channel();
         //
-        //let factory = gtk::SignalListItemFactory::new();
+        //let doc_path = "some path";
         //
-        //let selection = gtk::SingleSelection::new(Some(model.clone()));
-        //let list_view = gtk::ListView::new(Some(selection.clone()), Some(factory.clone()));
-        //list_view.set_hexpand(true);
-        //list_view.set_orientation(gtk::Orientation::Horizontal);
+        //std::thread::spawn(move || {
+        //    for doc_path in doc_recv {
+        //        let doc = Document::from_file(doc_path, None).unwrap();
+        //        for i in 0..doc.n_pages() {
+        //            let mut rect = poppler::Rectangle::default();
+        //            doc.page(i).unwrap().get_bounding_box(&mut rect);
+        //            bbox_send.send(rect).unwrap();
+        //        }
+        //    }
+        //});
+        //
+        //doc_send.send(doc_path).unwrap();
 
         let selection = list_view
             .model()
@@ -43,47 +56,17 @@ impl PageManager {
             .downcast::<gtk::SignalListItemFactory>()
             .unwrap();
 
-        let page_drawer = Rc::new(RefCell::new(PageDrawer {
-            doc: doc.clone(),
-            zoom: Rc::new(Cell::new(1.0)),
-            crop: Rc::new(Cell::new(false)),
-        }));
-
-        let scroll_controller = gtk::EventControllerScroll::new(
-            EventControllerScrollFlags::DISCRETE | EventControllerScrollFlags::VERTICAL,
-        );
-        scroll_controller.connect_scroll(clone!(
-            #[weak]
-            list_view,
-            #[weak]
-            selection,
-            #[weak]
-            model,
-            #[upgrade_or]
-            glib::Propagation::Stop,
-            move |_, _dx, dy| {
-                if dy < 0.0 {
-                    // scroll left
-                    list_view.scroll_to(
-                        selection.selected().saturating_sub(1),
-                        gtk::ListScrollFlags::FOCUS | gtk::ListScrollFlags::SELECT,
-                        None,
-                    );
-                } else {
-                    list_view.scroll_to(
-                        (selection.selected() + 1).min(model.n_items() - 1),
-                        gtk::ListScrollFlags::FOCUS | gtk::ListScrollFlags::SELECT,
-                        None,
-                    );
-                }
-
-                glib::Propagation::Stop
+        let doc = Document::from_gfile(f, None, gtk::gio::Cancellable::NONE).map_err(|err| {
+            DocumentOpenError {
+                message: err.to_string(),
             }
-        ));
-        list_view.add_controller(scroll_controller);
+        })?;
+
+        let page_drawer = Rc::new(RefCell::new(PageDrawer::new(doc.clone())));
 
         let pm = PageManager {
-            doc: doc.clone(),
+            doc,
+            uri: f.uri().to_string(),
             model,
             list_view,
             page_drawer: page_drawer.clone(),
@@ -100,11 +83,7 @@ impl PageManager {
             list_item.set_child(Some(&drawing_area));
         });
 
-        pm
-    }
-
-    pub(crate) fn list_view(&self) -> gtk::ListView {
-        self.list_view.clone()
+        Ok(pm)
     }
 
     pub(crate) fn current_state(&self) -> state::DocumentState {
@@ -117,9 +96,20 @@ impl PageManager {
         }
     }
 
-    pub(crate) fn reload(&mut self, doc: Document, state: state::DocumentState) {
+    pub(crate) fn reload(
+        &mut self,
+        f: &gtk::gio::File,
+        state: state::DocumentState,
+    ) -> Result<(), DocumentOpenError> {
+        let doc = Document::from_gfile(f, None, gtk::gio::Cancellable::NONE).map_err(|err| {
+            DocumentOpenError {
+                message: err.to_string(),
+            }
+        })?;
+        self.uri = f.uri().to_string();
         self.doc = doc;
         self.load(state);
+        Ok(())
     }
 
     pub(crate) fn load(&mut self, state: state::DocumentState) {
@@ -178,7 +168,15 @@ struct PageDrawer {
 }
 
 impl PageDrawer {
-    fn new_drawing_area(&self, i: i32) -> gtk::DrawingArea {
+    pub(crate) fn new(doc: Document) -> Self {
+        PageDrawer {
+            doc,
+            zoom: Rc::new(Cell::new(1.0)),
+            crop: Rc::new(Cell::new(false)),
+        }
+    }
+
+    pub(crate) fn new_drawing_area(&self, i: i32) -> gtk::DrawingArea {
         let page = self.doc.page(i).unwrap();
         let (width, height) = page.size();
         let mut rect = poppler::Rectangle::default();
@@ -278,3 +276,16 @@ mod imp {
     #[glib::derived_properties]
     impl ObjectImpl for PageNumber {}
 }
+
+#[derive(Debug, Clone)]
+pub(crate) struct DocumentOpenError {
+    message: String,
+}
+
+impl std::fmt::Display for DocumentOpenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "Error opening document: {}", self.message)
+    }
+}
+
+impl std::error::Error for DocumentOpenError {}

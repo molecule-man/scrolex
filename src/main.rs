@@ -5,9 +5,8 @@ use std::rc::Rc;
 
 use gtk::glib::Uri;
 use gtk::{gio::ApplicationFlags, glib, glib::clone, Application, ApplicationWindow, Button};
-use gtk::{prelude::*, ScrolledWindow};
+use gtk::{prelude::*, EventControllerScrollFlags, ScrolledWindow};
 use page::PageManager;
-use poppler::Document;
 
 mod page;
 mod state;
@@ -45,19 +44,10 @@ fn build_ui(app: &Application, args: Vec<OsString>) {
         .hscrollbar_policy(gtk::PolicyType::Automatic)
         .build();
 
-    let model = gtk::gio::ListStore::new::<page::PageNumber>();
-    let factory = gtk::SignalListItemFactory::new();
-    let selection = gtk::SingleSelection::new(Some(model.clone()));
-    let list_view = gtk::ListView::new(Some(selection.clone()), Some(factory.clone()));
-    list_view.set_hexpand(true);
-    list_view.set_orientation(gtk::Orientation::Horizontal);
-    scroll_win.set_child(Some(&list_view));
-
     window.set_child(Some(&scroll_win));
 
     let loader = Rc::new(RefCell::new(Loader::new(Init {
         window: scroll_win,
-        list_view,
         header_bar,
         app: app.clone(),
     })));
@@ -154,33 +144,27 @@ impl Loader {
         Ok(())
     }
 
-    fn reload(&mut self, loaded: &mut Loaded, f: &gtk::gio::File) -> Result<(), DocumentOpenError> {
+    fn reload(
+        &mut self,
+        loaded: &mut Loaded,
+        f: &gtk::gio::File,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         if let Err(err) = state::save(&loaded.uri.borrow(), &loaded.pm.borrow().current_state()) {
             eprintln!("Error saving state: {}", err);
         }
 
         let uri = f.uri();
-        let doc = Document::from_gfile(f, None, gtk::gio::Cancellable::NONE).map_err(|err| {
-            DocumentOpenError {
-                message: err.to_string(),
-            }
-        })?;
-        loaded.pm.borrow_mut().reload(doc, state::load(&uri));
+        loaded.pm.borrow_mut().reload(f, state::load(&uri));
         loaded.uri.replace(uri.into());
         Ok(())
     }
 
-    fn initialize(&mut self, f: &gtk::gio::File) -> Result<(), DocumentOpenError> {
+    fn initialize(&mut self, f: &gtk::gio::File) -> Result<(), Box<dyn std::error::Error>> {
         let uri = f.uri();
-        let doc = Document::from_gfile(f, None, gtk::gio::Cancellable::NONE).map_err(|err| {
-            DocumentOpenError {
-                message: err.to_string(),
-            }
-        })?;
 
         let uri_cell = Rc::new(RefCell::new(uri.to_string()));
         let pm = self.init.init(
-            doc,
+            f,
             clone!(
                 #[strong]
                 uri_cell,
@@ -190,7 +174,7 @@ impl Loader {
                     }
                 }
             ),
-        );
+        )?;
         pm.borrow_mut().load(state::load(&uri));
         self.loaded = Some(Loaded { pm, uri: uri_cell });
 
@@ -200,7 +184,6 @@ impl Loader {
 
 struct Init {
     window: ScrolledWindow,
-    list_view: gtk::ListView,
     header_bar: gtk::HeaderBar,
     app: Application,
 }
@@ -208,13 +191,54 @@ struct Init {
 impl Init {
     fn init(
         &self,
-        doc: Document,
+        f: &gtk::gio::File,
         shutdown_fn: impl Fn(&PageManager) + 'static,
-    ) -> Rc<RefCell<PageManager>> {
-        let pm = Rc::new(RefCell::new(PageManager::new(self.list_view.clone(), doc)));
+    ) -> Result<Rc<RefCell<PageManager>>, Box<dyn std::error::Error>> {
+        let model = gtk::gio::ListStore::new::<page::PageNumber>();
+        let factory = gtk::SignalListItemFactory::new();
+        let selection = gtk::SingleSelection::new(Some(model.clone()));
+        let list_view = gtk::ListView::new(Some(selection.clone()), Some(factory.clone()));
+        list_view.set_hexpand(true);
+        list_view.set_orientation(gtk::Orientation::Horizontal);
+        self.window.set_child(Some(&list_view));
+
+        let scroll_controller = gtk::EventControllerScroll::new(
+            EventControllerScrollFlags::DISCRETE | EventControllerScrollFlags::VERTICAL,
+        );
+        scroll_controller.connect_scroll(clone!(
+            #[weak]
+            list_view,
+            #[weak]
+            selection,
+            #[weak]
+            model,
+            #[upgrade_or]
+            glib::Propagation::Stop,
+            move |_, _dx, dy| {
+                if dy < 0.0 {
+                    // scroll left
+                    list_view.scroll_to(
+                        selection.selected().saturating_sub(1),
+                        gtk::ListScrollFlags::FOCUS | gtk::ListScrollFlags::SELECT,
+                        None,
+                    );
+                } else {
+                    list_view.scroll_to(
+                        (selection.selected() + 1).min(model.n_items() - 1),
+                        gtk::ListScrollFlags::FOCUS | gtk::ListScrollFlags::SELECT,
+                        None,
+                    );
+                }
+
+                glib::Propagation::Stop
+            }
+        ));
+        list_view.add_controller(scroll_controller);
+
+        let pm = PageManager::new(list_view, f)?;
+        let pm = Rc::new(RefCell::new(pm));
 
         self.add_header_buttons(&pm);
-        self.window.set_child(Some(&pm.borrow().list_view()));
 
         self.app.connect_shutdown(clone!(
             #[strong]
@@ -224,7 +248,7 @@ impl Init {
             }
         ));
 
-        pm
+        Ok(pm)
     }
 
     fn add_header_buttons(&self, pm: &Rc<RefCell<PageManager>>) {
