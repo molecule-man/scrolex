@@ -46,17 +46,17 @@ fn build_ui(app: &Application, args: Vec<OsString>) {
 
     window.set_child(Some(&scroll_win));
 
-    let loader = Rc::new(RefCell::new(Loader::new(Init {
+    let ui = Rc::new(RefCell::new(UI {
         window: scroll_win,
         header_bar,
         app: app.clone(),
-    })));
+        pm: None,
+    }));
 
     if let Some(fname) = args.get(1) {
         match from_str_to_uri(fname) {
             Ok(uri) => {
-                loader
-                    .borrow_mut()
+                ui.borrow_mut()
                     .load(&gtk::gio::File::for_uri(&uri))
                     .unwrap_or_else(|err| {
                         show_error_dialog(app, &format!("Error loading file: {}", err));
@@ -73,18 +73,18 @@ fn build_ui(app: &Application, args: Vec<OsString>) {
 
     open_button.connect_clicked(clone!(
         #[strong]
-        loader,
+        ui,
         #[weak]
         app,
         move |_| {
-            open_file_dialog(&app, &loader);
+            open_file_dialog(&app, &ui);
         },
     ));
 
     window.present();
 }
 
-fn open_file_dialog(app: &Application, loader: &Rc<RefCell<Loader>>) {
+fn open_file_dialog(app: &Application, ui: &Rc<RefCell<UI>>) {
     let dialog = gtk::FileDialog::builder()
         .title("Open PDF File")
         .modal(true)
@@ -95,13 +95,13 @@ fn open_file_dialog(app: &Application, loader: &Rc<RefCell<Loader>>) {
         gtk::gio::Cancellable::NONE,
         clone!(
             #[strong]
-            loader,
+            ui,
             #[strong]
             app,
             move |file| {
                 match file {
                     Ok(file) => {
-                        loader.borrow_mut().load(&file).unwrap_or_else(|err| {
+                        ui.borrow_mut().load(&file).unwrap_or_else(|err| {
                             show_error_dialog(&app, &format!("Error loading file: {}", err));
                         });
                     }
@@ -114,72 +114,29 @@ fn open_file_dialog(app: &Application, loader: &Rc<RefCell<Loader>>) {
     );
 }
 
-struct Loaded {
-    pm: Rc<RefCell<PageManager>>,
-    uri: Rc<RefCell<String>>,
+struct UI {
+    window: ScrolledWindow,
+    header_bar: gtk::HeaderBar,
+    app: Application,
+    pm: Option<Rc<RefCell<PageManager>>>,
 }
 
-struct Loader {
-    loaded: Option<Loaded>,
-    init: Init,
-}
-
-impl Loader {
-    fn new(init: Init) -> Self {
-        Self { init, loaded: None }
-    }
-
+impl UI {
     fn load(&mut self, f: &gtk::gio::File) -> Result<(), Box<dyn std::error::Error>> {
-        let mut loaded = None;
-        std::mem::swap(&mut self.loaded, &mut loaded);
-        match loaded {
-            Some(mut loaded_instance) => {
-                self.reload(&mut loaded_instance, f)?;
-                self.loaded = Some(loaded_instance);
-            }
-            None => {
-                self.initialize(f)?;
-            }
+        if let Some(pm) = &self.pm {
+            pm.borrow_mut().reset(f)?;
+            pm.borrow_mut().load();
+        } else {
+            let pm = self.init(f)?;
+            pm.borrow_mut().load();
+            self.pm = Some(pm);
         }
         Ok(())
     }
 
-    fn reload(
-        &mut self,
-        loaded: &mut Loaded,
-        f: &gtk::gio::File,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let uri = f.uri();
-        loaded.pm.borrow_mut().reload(f)?;
-        loaded.uri.replace(uri.into());
-        Ok(())
-    }
-
-    fn initialize(&mut self, f: &gtk::gio::File) -> Result<(), Box<dyn std::error::Error>> {
-        let uri = f.uri();
-
-        let uri_cell = Rc::new(RefCell::new(uri.to_string()));
-        let pm = self.init.init(f, move |pm| {
-            pm.store_state();
-        })?;
-        pm.borrow_mut().load();
-        self.loaded = Some(Loaded { pm, uri: uri_cell });
-
-        Ok(())
-    }
-}
-
-struct Init {
-    window: ScrolledWindow,
-    header_bar: gtk::HeaderBar,
-    app: Application,
-}
-
-impl Init {
     fn init(
         &self,
         f: &gtk::gio::File,
-        shutdown_fn: impl Fn(&PageManager) + 'static,
     ) -> Result<Rc<RefCell<PageManager>>, Box<dyn std::error::Error>> {
         let model = gtk::gio::ListStore::new::<page::PageNumber>();
         let factory = gtk::SignalListItemFactory::new();
@@ -231,7 +188,7 @@ impl Init {
             #[strong]
             pm,
             move |_| {
-                shutdown_fn(&pm.borrow());
+                pm.borrow().store_state();
             }
         ));
 

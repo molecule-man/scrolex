@@ -101,7 +101,7 @@ impl PageManager {
         }
     }
 
-    pub(crate) fn reload(&mut self, f: &gtk::gio::File) -> Result<(), DocumentOpenError> {
+    pub(crate) fn reset(&mut self, f: &gtk::gio::File) -> Result<(), DocumentOpenError> {
         self.store_state();
 
         let doc = Document::from_gfile(f, None, gtk::gio::Cancellable::NONE).map_err(|err| {
@@ -111,7 +111,7 @@ impl PageManager {
         })?;
         self.uri = f.uri().to_string();
         self.doc = doc;
-        self.load();
+
         Ok(())
     }
 
