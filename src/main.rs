@@ -63,9 +63,22 @@ fn build_ui(app: &Application, args: Vec<OsString>) {
     })));
 
     if let Some(fname) = args.get(1) {
-        loader.borrow_mut().load(fname).unwrap_or_else(|err| {
-            show_error_dialog(app, &format!("Error loading file: {}", err));
-        });
+        match from_str_to_uri(fname) {
+            Ok(uri) => {
+                loader
+                    .borrow_mut()
+                    .load(&gtk::gio::File::for_uri(&uri))
+                    .unwrap_or_else(|err| {
+                        show_error_dialog(app, &format!("Error loading file: {}", err));
+                    });
+            }
+            Err(err) => {
+                show_error_dialog(
+                    app,
+                    &format!("Invalid file name: {:?}. Error: {}", fname, err),
+                );
+            }
+        }
     }
 
     open_button.connect_clicked(clone!(
@@ -98,7 +111,7 @@ fn open_file_dialog(app: &Application, loader: &Rc<RefCell<Loader>>) {
             move |file| {
                 match file {
                     Ok(file) => {
-                        loader.borrow_mut().load(file).unwrap_or_else(|err| {
+                        loader.borrow_mut().load(&file).unwrap_or_else(|err| {
                             show_error_dialog(&app, &format!("Error loading file: {}", err));
                         });
                     }
@@ -126,41 +139,46 @@ impl Loader {
         Self { init, loaded: None }
     }
 
-    fn load<D: DocumentOpen>(&mut self, opener: D) -> Result<(), Box<dyn std::error::Error>> {
+    fn load(&mut self, f: &gtk::gio::File) -> Result<(), Box<dyn std::error::Error>> {
         let mut loaded = None;
         std::mem::swap(&mut self.loaded, &mut loaded);
         match loaded {
             Some(mut loaded_instance) => {
-                self.reload(&mut loaded_instance, opener)?;
+                self.reload(&mut loaded_instance, f)?;
                 self.loaded = Some(loaded_instance);
             }
             None => {
-                self.initialize(opener)?;
+                self.initialize(f)?;
             }
         }
         Ok(())
     }
 
-    fn reload<D: DocumentOpen>(
-        &mut self,
-        loaded: &mut Loaded,
-        opener: D,
-    ) -> Result<(), DocumentOpenError> {
+    fn reload(&mut self, loaded: &mut Loaded, f: &gtk::gio::File) -> Result<(), DocumentOpenError> {
         if let Err(err) = state::save(&loaded.uri.borrow(), &loaded.pm.borrow().current_state()) {
             eprintln!("Error saving state: {}", err);
         }
 
-        let doc = opener.open()?;
-        let uri = opener.uri_string();
+        let uri = f.uri();
+        let doc = Document::from_gfile(f, None, gtk::gio::Cancellable::NONE).map_err(|err| {
+            DocumentOpenError {
+                message: err.to_string(),
+            }
+        })?;
         loaded.pm.borrow_mut().reload(doc, state::load(&uri));
-        loaded.uri.replace(uri);
+        loaded.uri.replace(uri.into());
         Ok(())
     }
 
-    fn initialize<D: DocumentOpen>(&mut self, opener: D) -> Result<(), DocumentOpenError> {
-        let doc = opener.open()?;
-        let uri = opener.uri_string();
-        let uri_cell = Rc::new(RefCell::new(uri.clone()));
+    fn initialize(&mut self, f: &gtk::gio::File) -> Result<(), DocumentOpenError> {
+        let uri = f.uri();
+        let doc = Document::from_gfile(f, None, gtk::gio::Cancellable::NONE).map_err(|err| {
+            DocumentOpenError {
+                message: err.to_string(),
+            }
+        })?;
+
+        let uri_cell = Rc::new(RefCell::new(uri.to_string()));
         let pm = self.init.init(
             doc,
             clone!(
@@ -270,45 +288,6 @@ impl std::fmt::Display for DocumentOpenError {
 }
 
 impl std::error::Error for DocumentOpenError {}
-
-trait DocumentOpen {
-    fn uri_string(&self) -> String;
-    fn open(&self) -> Result<Document, DocumentOpenError>;
-}
-
-impl DocumentOpen for gtk::gio::File {
-    fn uri_string(&self) -> String {
-        self.uri().to_string()
-    }
-
-    fn open(&self) -> Result<Document, DocumentOpenError> {
-        Document::from_gfile(self, None, gtk::gio::Cancellable::NONE).map_err(|err| {
-            DocumentOpenError {
-                message: err.to_string(),
-            }
-        })
-    }
-}
-
-impl DocumentOpen for &OsString {
-    fn uri_string(&self) -> String {
-        if let Ok(u) = from_str_to_uri(self) {
-            return u;
-        }
-
-        String::from("unknown")
-    }
-
-    fn open(&self) -> Result<Document, DocumentOpenError> {
-        let uri = from_str_to_uri(self).map_err(|err| DocumentOpenError {
-            message: err.to_string(),
-        })?;
-
-        Document::from_file(&uri, None).map_err(|err| DocumentOpenError {
-            message: err.to_string(),
-        })
-    }
-}
 
 fn from_str_to_uri(oss: &OsString) -> Result<String, std::io::Error> {
     if let Ok(u) = Uri::parse(&oss.to_string_lossy(), glib::UriFlags::NONE) {
