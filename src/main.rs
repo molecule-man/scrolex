@@ -149,12 +149,8 @@ impl Loader {
         loaded: &mut Loaded,
         f: &gtk::gio::File,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        if let Err(err) = state::save(&loaded.uri.borrow(), &loaded.pm.borrow().current_state()) {
-            eprintln!("Error saving state: {}", err);
-        }
-
         let uri = f.uri();
-        loaded.pm.borrow_mut().reload(f, state::load(&uri));
+        loaded.pm.borrow_mut().reload(f)?;
         loaded.uri.replace(uri.into());
         Ok(())
     }
@@ -163,19 +159,10 @@ impl Loader {
         let uri = f.uri();
 
         let uri_cell = Rc::new(RefCell::new(uri.to_string()));
-        let pm = self.init.init(
-            f,
-            clone!(
-                #[strong]
-                uri_cell,
-                move |pm| {
-                    if let Err(err) = state::save(&uri_cell.borrow(), &pm.current_state()) {
-                        eprintln!("Error saving state: {}", err);
-                    }
-                }
-            ),
-        )?;
-        pm.borrow_mut().load(state::load(&uri));
+        let pm = self.init.init(f, move |pm| {
+            pm.store_state();
+        })?;
+        pm.borrow_mut().load();
         self.loaded = Some(Loaded { pm, uri: uri_cell });
 
         Ok(())
@@ -299,19 +286,6 @@ fn show_error_dialog(app: &Application, message: &str) {
         .build()
         .show(app.active_window().as_ref());
 }
-
-#[derive(Debug)]
-struct DocumentOpenError {
-    message: String,
-}
-
-impl std::fmt::Display for DocumentOpenError {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "Error opening document: {}", self.message)
-    }
-}
-
-impl std::error::Error for DocumentOpenError {}
 
 fn from_str_to_uri(oss: &OsString) -> Result<String, std::io::Error> {
     if let Ok(u) = Uri::parse(&oss.to_string_lossy(), glib::UriFlags::NONE) {

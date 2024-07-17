@@ -86,21 +86,24 @@ impl PageManager {
         Ok(pm)
     }
 
-    pub(crate) fn current_state(&self) -> state::DocumentState {
+    pub(crate) fn store_state(&self) {
         let drawer = self.page_drawer.borrow();
 
-        state::DocumentState {
-            zoom: drawer.zoom.get(),
-            page: self.selection.selected(),
-            crop: drawer.crop.get(),
+        if let Err(err) = state::save(
+            &self.uri,
+            &state::DocumentState {
+                zoom: drawer.zoom.get(),
+                page: self.selection.selected(),
+                crop: drawer.crop.get(),
+            },
+        ) {
+            eprintln!("Error saving state: {}", err);
         }
     }
 
-    pub(crate) fn reload(
-        &mut self,
-        f: &gtk::gio::File,
-        state: state::DocumentState,
-    ) -> Result<(), DocumentOpenError> {
+    pub(crate) fn reload(&mut self, f: &gtk::gio::File) -> Result<(), DocumentOpenError> {
+        self.store_state();
+
         let doc = Document::from_gfile(f, None, gtk::gio::Cancellable::NONE).map_err(|err| {
             DocumentOpenError {
                 message: err.to_string(),
@@ -108,13 +111,14 @@ impl PageManager {
         })?;
         self.uri = f.uri().to_string();
         self.doc = doc;
-        self.load(state);
+        self.load();
         Ok(())
     }
 
-    pub(crate) fn load(&mut self, state: state::DocumentState) {
-        self.model.remove_all();
+    pub(crate) fn load(&mut self) {
+        let state = state::load(&self.uri);
 
+        self.model.remove_all();
         {
             let mut drawer = self.page_drawer.borrow_mut();
             drawer.doc = self.doc.clone();
