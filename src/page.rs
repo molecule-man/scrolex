@@ -6,10 +6,12 @@ use gtk::{glib, glib::clone, DrawingArea};
 use poppler::Document;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::sync::mpsc;
 use std::usize;
 
 pub(crate) struct PageManager {
     doc: Document,
+    doc_send: mpsc::Sender<String>,
     uri: String,
     model: gtk::gio::ListStore,
     selection: gtk::SingleSelection,
@@ -22,23 +24,28 @@ impl PageManager {
         list_view: gtk::ListView,
         f: &gtk::gio::File,
     ) -> Result<Self, DocumentOpenError> {
-        //let (doc_send, doc_recv) = std::sync::mpsc::channel();
-        //let (bbox_send, bbox_recv) = std::sync::mpsc::channel();
-        //
-        //let doc_path = "some path";
-        //
-        //std::thread::spawn(move || {
-        //    for doc_path in doc_recv {
-        //        let doc = Document::from_file(doc_path, None).unwrap();
-        //        for i in 0..doc.n_pages() {
-        //            let mut rect = poppler::Rectangle::default();
-        //            doc.page(i).unwrap().get_bounding_box(&mut rect);
-        //            bbox_send.send(rect).unwrap();
-        //        }
-        //    }
-        //});
-        //
-        //doc_send.send(doc_path).unwrap();
+        let (doc_send, doc_recv) = mpsc::channel::<String>();
+        let (bbox_send, bbox_recv) = mpsc::channel();
+
+        std::thread::spawn(move || {
+            for doc_path in doc_recv {
+                let f = gtk::gio::File::for_uri(&doc_path);
+                let doc = Document::from_gfile(&f, None, gtk::gio::Cancellable::NONE).unwrap();
+                let mut bboxs = Vec::new();
+                //let start = std::time::Instant::now();
+                for i in 0..doc.n_pages() {
+                    let mut rect = poppler::Rectangle::default();
+                    doc.page(i).unwrap().get_bounding_box(&mut rect);
+                    bboxs.push(rect);
+                }
+                bbox_send.send(bboxs).unwrap();
+                //println!(
+                //    "Finished sending bounding boxes for {}. Time took: {}",
+                //    doc_path,
+                //    start.elapsed().as_millis(),
+                //);
+            }
+        });
 
         let selection = list_view
             .model()
@@ -62,10 +69,11 @@ impl PageManager {
             }
         })?;
 
-        let page_drawer = Rc::new(RefCell::new(PageDrawer::new(doc.clone())));
+        let page_drawer = Rc::new(RefCell::new(PageDrawer::new(doc.clone(), bbox_recv)));
 
         let pm = PageManager {
             doc,
+            doc_send,
             uri: f.uri().to_string(),
             model,
             list_view,
@@ -116,15 +124,14 @@ impl PageManager {
     }
 
     pub(crate) fn load(&mut self) {
+        self.doc_send.send(self.uri.clone()).unwrap();
+
         let state = state::load(&self.uri);
 
         self.model.remove_all();
-        {
-            let mut drawer = self.page_drawer.borrow_mut();
-            drawer.doc = self.doc.clone();
-            drawer.zoom.replace(state.zoom);
-            drawer.crop.replace(state.crop);
-        }
+        self.page_drawer
+            .borrow_mut()
+            .reset(self.doc.clone(), &state);
 
         for i in 0..self.doc.n_pages() {
             let num = PageNumber::new(i);
@@ -169,23 +176,33 @@ struct PageDrawer {
     doc: Document,
     zoom: Rc<Cell<f64>>,
     crop: Rc<Cell<bool>>,
+    bbox_recv: Rc<RefCell<mpsc::Receiver<Vec<poppler::Rectangle>>>>,
+    bboxs: Rc<RefCell<Option<Vec<poppler::Rectangle>>>>,
 }
 
 impl PageDrawer {
-    pub(crate) fn new(doc: Document) -> Self {
+    pub(crate) fn new(doc: Document, bbox_recv: mpsc::Receiver<Vec<poppler::Rectangle>>) -> Self {
         PageDrawer {
             doc,
+            bbox_recv: Rc::new(RefCell::new(bbox_recv)),
             zoom: Rc::new(Cell::new(1.0)),
             crop: Rc::new(Cell::new(false)),
+            bboxs: Rc::new(RefCell::new(None)),
         }
     }
 
+    pub(crate) fn reset(&mut self, doc: Document, state: &state::DocumentState) {
+        self.doc = doc;
+        self.zoom.replace(state.zoom);
+        self.crop.replace(state.crop);
+        self.bboxs.replace(None);
+    }
+
     pub(crate) fn new_drawing_area(&self, i: i32) -> gtk::DrawingArea {
+        //println!("Creating drawing area for page {}", i);
+
         let page = self.doc.page(i).unwrap();
         let (width, height) = page.size();
-        let mut rect = poppler::Rectangle::default();
-        page.get_bounding_box(&mut rect);
-        let (x1, x2) = (rect.x1(), rect.x2());
 
         let drawing_area = DrawingArea::new();
         drawing_area.set_draw_func(clone!(
@@ -193,10 +210,19 @@ impl PageDrawer {
             self.zoom,
             #[strong(rename_to = crop)]
             self.crop,
+            #[strong(rename_to = bbox_recv)]
+            self.bbox_recv,
+            #[strong(rename_to = bboxs)]
+            self.bboxs,
             #[strong]
             page,
             move |da, cr, _width, _height| {
+                //println!("Drawing page {}", page.index());
+
                 let zoom = zoom.get();
+
+                let bbox = get_bbox(&bboxs, &page, &bbox_recv.borrow());
+                let (x1, x2) = (bbox.x1(), bbox.x2());
 
                 if crop.get() {
                     let mut rect = poppler::Rectangle::default();
@@ -214,10 +240,21 @@ impl PageDrawer {
             }
         ));
 
+        let (mut crop_margins, mut x1, mut x2) = (false, 0.0, 0.0);
+
+        if self.crop.get() {
+            if let Some(bboxs) = self.bboxs.borrow().as_ref() {
+                let bbox = bboxs[i as usize];
+                x1 = bbox.x1();
+                x2 = bbox.x2();
+                crop_margins = true;
+            }
+        }
+
         resize_page(
             &drawing_area,
             self.zoom.get(),
-            self.crop.get(),
+            crop_margins,
             width,
             height,
             x1,
@@ -230,6 +267,26 @@ impl PageDrawer {
     pub(crate) fn apply_zoom(&self, zoom_factor: f64) {
         self.zoom.replace(self.zoom.get() * zoom_factor);
     }
+}
+
+fn get_bbox(
+    bbox_store: &Rc<RefCell<Option<Vec<poppler::Rectangle>>>>,
+    page: &poppler::Page,
+    bbox_recv: &mpsc::Receiver<Vec<poppler::Rectangle>>,
+) -> poppler::Rectangle {
+    if let Some(bboxs) = bbox_store.borrow().as_ref() {
+        return bboxs[page.index() as usize];
+    }
+
+    if let Ok(bboxs) = bbox_recv.try_recv() {
+        let bbox = bboxs[page.index() as usize];
+        bbox_store.replace(Some(bboxs));
+        return bbox;
+    }
+
+    let mut rect = poppler::Rectangle::default();
+    page.get_bounding_box(&mut rect);
+    rect
 }
 
 fn resize_page(
