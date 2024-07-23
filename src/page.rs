@@ -1,13 +1,13 @@
+mod imp;
+
 use crate::state;
 use gtk::gio::prelude::*;
-use gtk::glib::subclass::prelude::*;
 use gtk::prelude::*;
-use gtk::{glib, glib::clone, DrawingArea};
+use gtk::{glib, glib::clone};
 use poppler::Document;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::mpsc;
-use std::usize;
 
 pub(crate) struct PageManager {
     doc: Document,
@@ -198,13 +198,13 @@ impl PageDrawer {
         self.bboxs.replace(None);
     }
 
-    pub(crate) fn new_drawing_area(&self, i: i32) -> gtk::DrawingArea {
+    pub(crate) fn new_drawing_area(&self, i: i32) -> Page {
         //println!("Creating drawing area for page {}", i);
 
         let page = self.doc.page(i).unwrap();
         let (width, height) = page.size();
 
-        let drawing_area = DrawingArea::new();
+        let drawing_area = Page::new();
         drawing_area.set_draw_func(clone!(
             #[strong(rename_to = zoom)]
             self.zoom,
@@ -318,26 +318,6 @@ impl PageNumber {
     }
 }
 
-mod imp {
-    use super::*;
-
-    #[derive(Debug, Default, glib::Properties)]
-    #[properties(wrapper_type = super::PageNumber)]
-    pub struct PageNumber {
-        #[property(get, set)]
-        page_number: Cell<i32>,
-    }
-
-    #[glib::object_subclass]
-    impl ObjectSubclass for PageNumber {
-        const NAME: &'static str = "PageNumber";
-        type Type = super::PageNumber;
-    }
-
-    #[glib::derived_properties]
-    impl ObjectImpl for PageNumber {}
-}
-
 #[derive(Debug, Clone)]
 pub(crate) struct DocumentOpenError {
     message: String,
@@ -350,3 +330,21 @@ impl std::fmt::Display for DocumentOpenError {
 }
 
 impl std::error::Error for DocumentOpenError {}
+
+glib::wrapper! {
+    pub struct Page(ObjectSubclass<imp::Page>)
+        @extends gtk::DrawingArea, gtk::Widget,
+        @implements gtk::Accessible, gtk::Buildable, gtk::ConstraintTarget;
+}
+
+impl Page {
+    pub fn new() -> Self {
+        glib::Object::builder().build()
+    }
+}
+
+impl Default for Page {
+    fn default() -> Self {
+        Self::new()
+    }
+}
