@@ -1,4 +1,5 @@
 mod imp;
+mod imp2;
 
 use crate::state;
 use gtk::gio::prelude::*;
@@ -204,7 +205,7 @@ impl PageDrawer {
         let page = self.doc.page(i).unwrap();
         let (width, height) = page.size();
 
-        let drawing_area = Page::new();
+        let drawing_area = Page::new(page.clone());
         drawing_area.set_draw_func(clone!(
             #[strong(rename_to = zoom)]
             self.zoom,
@@ -216,7 +217,10 @@ impl PageDrawer {
             self.bboxs,
             #[strong]
             page,
+            #[strong]
+            drawing_area,
             move |da, cr, _width, _height| {
+                drawing_area.draw();
                 //println!("Drawing page {}", page.index());
 
                 let zoom = zoom.get();
@@ -307,7 +311,7 @@ fn resize_page(
 }
 
 glib::wrapper! {
-    pub struct PageNumber(ObjectSubclass<imp::PageNumber>);
+    pub struct PageNumber(ObjectSubclass<imp2::PageNumber>);
 }
 
 impl PageNumber {
@@ -338,13 +342,21 @@ glib::wrapper! {
 }
 
 impl Page {
-    pub fn new() -> Self {
-        glib::Object::builder().build()
+    pub fn new(poppler_page: poppler::Page) -> Self {
+        glib::Object::builder()
+            .property("poppler_page", &poppler_page)
+            .build()
     }
-}
 
-impl Default for Page {
-    fn default() -> Self {
-        Self::new()
+    pub fn draw(&self) {
+        dbg!(self.poppler_page());
+        //let self_ = imp::Page::from_instance(self);
+        //let page = self_.poppler_page.get().unwrap();
+        //let draw_func = self_.draw_func.get().unwrap();
+        //let width = self.allocated_width();
+        //let height = self.allocated_height();
+        //
+        //let cr = self.window().unwrap().create_cairo_context();
+        //draw_func(&self, &cr, width, height);
     }
 }

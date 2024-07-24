@@ -3,26 +3,20 @@ use gtk::glib;
 use gtk::glib::subclass::prelude::*;
 use gtk::subclass::prelude::*;
 use gtk::DrawingArea;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
-#[derive(Debug, Default, glib::Properties)]
-#[properties(wrapper_type = super::PageNumber)]
-pub struct PageNumber {
+#[derive(Default, glib::Properties)]
+#[properties(wrapper_type = super::Page)]
+pub struct Page {
     #[property(get, set)]
-    page_number: Cell<i32>,
+    poppler_page: RefCell<Option<poppler::Page>>,
+    //poppler_page: Cell<i32>,
+    #[property(get, set)]
+    zoom: Cell<f64>,
+
+    #[property(get, set)]
+    crob: Cell<bool>,
 }
-
-#[glib::object_subclass]
-impl ObjectSubclass for PageNumber {
-    const NAME: &'static str = "PageNumber";
-    type Type = super::PageNumber;
-}
-
-#[glib::derived_properties]
-impl ObjectImpl for PageNumber {}
-
-#[derive(Default)]
-pub struct Page;
 
 #[glib::object_subclass]
 impl ObjectSubclass for Page {
@@ -31,6 +25,7 @@ impl ObjectSubclass for Page {
     type ParentType = DrawingArea;
 }
 
+#[glib::derived_properties]
 impl ObjectImpl for Page {}
 impl WidgetImpl for Page {}
 impl DrawingAreaImpl for Page {}
