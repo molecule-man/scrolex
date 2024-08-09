@@ -82,14 +82,28 @@ impl PageManager {
             selection,
         };
 
+        factory.connect_setup(move |_, list_item| {
+            let list_item = list_item.downcast_ref::<gtk::ListItem>().unwrap();
+            let page = Page::new();
+            page.set_size_request(600, 800);
+            list_item.set_child(Some(&page));
+        });
+
         factory.connect_bind(move |_, list_item| {
             let list_item = list_item.downcast_ref::<gtk::ListItem>().unwrap();
             let page_number = list_item.item().and_downcast::<PageNumber>().unwrap();
+            let child = list_item.child().unwrap();
+            let page = child.downcast_ref::<Page>().unwrap();
 
-            let drawing_area = page_drawer
+            page_drawer
                 .borrow()
-                .new_drawing_area(page_number.page_number());
-            list_item.set_child(Some(&drawing_area));
+                .bind_draw(page, page_number.page_number());
+            page_drawer.borrow().resize(page, page_number.page_number());
+
+            //let drawing_area = page_drawer
+            //    .borrow()
+            //    .new_drawing_area(page_number.page_number());
+            //list_item.set_child(Some(&drawing_area));
         });
 
         Ok(pm)
@@ -205,7 +219,7 @@ impl PageDrawer {
         let page = self.doc.page(i).unwrap();
         let (width, height) = page.size();
 
-        let drawing_area = Page::new(page.clone());
+        let drawing_area = Page::new();
         drawing_area.set_draw_func(clone!(
             #[strong(rename_to = zoom)]
             self.zoom,
@@ -268,8 +282,88 @@ impl PageDrawer {
         drawing_area
     }
 
+    pub(crate) fn bind_draw(&self, drawing_area: &Page, i: i32) {
+        //println!("Creating drawing area for page {}", i);
+
+        let page = self.doc.page(i).unwrap();
+        let (width, height) = page.size();
+
+        drawing_area.set_draw_func(clone!(
+            #[strong(rename_to = zoom)]
+            self.zoom,
+            #[strong(rename_to = crop)]
+            self.crop,
+            #[strong(rename_to = bbox_recv)]
+            self.bbox_recv,
+            #[strong(rename_to = bboxs)]
+            self.bboxs,
+            #[strong]
+            page,
+            move |da, cr, _width, _height| {
+                //println!("Drawing page {}", page.index());
+
+                let zoom = zoom.get();
+
+                let bbox = get_bbox(&bboxs, &page, &bbox_recv.borrow());
+                let (x1, x2) = (bbox.x1(), bbox.x2());
+
+                if crop.get() {
+                    let mut rect = poppler::Rectangle::default();
+                    page.get_bounding_box(&mut rect);
+                    cr.translate((-x1 + 5.0) * zoom, 0.0);
+                }
+
+                resize_page(da, zoom, crop.get(), width, height, x1, x2);
+
+                cr.rectangle(0.0, 0.0, width * zoom, height * zoom);
+                cr.scale(zoom, zoom);
+                cr.set_source_rgba(1.0, 1.0, 1.0, 1.0);
+                cr.fill().expect("Failed to fill");
+                page.render(cr);
+            }
+        ));
+
+        let (mut crop_margins, mut x1, mut x2) = (false, 0.0, 0.0);
+
+        if self.crop.get() {
+            if let Some(bboxs) = self.bboxs.borrow().as_ref() {
+                let bbox = bboxs[i as usize];
+                x1 = bbox.x1();
+                x2 = bbox.x2();
+                crop_margins = true;
+            }
+        }
+
+        resize_page(
+            drawing_area,
+            self.zoom.get(),
+            crop_margins,
+            width,
+            height,
+            x1,
+            x2,
+        );
+    }
+
     pub(crate) fn apply_zoom(&self, zoom_factor: f64) {
         self.zoom.replace(self.zoom.get() * zoom_factor);
+    }
+
+    pub(crate) fn resize(&self, page: &Page, page_number: i32) {
+        let poppler_page = self.doc.page(page_number).unwrap();
+        let (width, height) = poppler_page.size();
+        let (mut crop_margins, mut x1, mut x2) = (false, 0.0, 0.0);
+
+        if self.crop.get() {
+            if let Some(bboxs) = self.bboxs.borrow().as_ref() {
+                let bbox = bboxs[poppler_page.index() as usize];
+                x1 = bbox.x1();
+                x2 = bbox.x2();
+                crop_margins = true;
+            }
+        }
+
+        resize_page(page, self.zoom.get(), crop_margins, width, height, x1, x2);
     }
 }
 
@@ -342,14 +436,18 @@ glib::wrapper! {
 }
 
 impl Page {
-    pub fn new(poppler_page: poppler::Page) -> Self {
-        glib::Object::builder()
-            .property("poppler_page", &poppler_page)
-            .build()
+    //pub fn new(poppler_page: poppler::Page) -> Self {
+    //    glib::Object::builder()
+    //        .property("poppler_page", &poppler_page)
+    //        .build()
+    //}
+
+    pub fn new() -> Self {
+        glib::Object::builder().build()
     }
 
     pub fn draw(&self) {
-        dbg!(self.poppler_page());
+        //dbg!(self.poppler_page());
         //let self_ = imp::Page::from_instance(self);
         //let page = self_.poppler_page.get().unwrap();
         //let draw_func = self_.draw_func.get().unwrap();
