@@ -156,51 +156,30 @@ impl UI {
             selection,
             #[weak]
             model,
+            #[weak(rename_to = window)]
+            self.window,
             #[upgrade_or]
             glib::Propagation::Stop,
             move |_, _dx, dy| {
+                let current_pos = window.hadjustment().value();
+
                 if dy < 0.0 {
                     // scroll left
-                    list_view.scroll_to(
-                        selection.selected().saturating_sub(1),
-                        gtk::ListScrollFlags::FOCUS | gtk::ListScrollFlags::SELECT,
-                        None,
-                    );
+                    selection.select_item(selection.selected().saturating_sub(1), true);
+                    let width = list_view.focus_child().unwrap().width() as f64;
+                    window.hadjustment().set_value(current_pos - width);
                 } else {
-                    list_view.scroll_to(
-                        (selection.selected() + 1).min(model.n_items() - 1),
-                        gtk::ListScrollFlags::FOCUS | gtk::ListScrollFlags::SELECT,
-                        None,
-                    );
+                    // scroll right
+                    selection
+                        .select_item((selection.selected() + 1).min(model.n_items() - 1), true);
+                    let width = list_view.focus_child().unwrap().width() as f64;
+                    window.hadjustment().set_value(current_pos + width);
                 }
 
                 glib::Propagation::Stop
             }
         ));
         list_view.add_controller(scroll_controller);
-
-        //selection.connect_selection_changed(clone!(
-        //    #[weak]
-        //    list_view,
-        //    #[weak(rename_to = window)]
-        //    self.window,
-        //    move |_s, _, _| {
-        //        glib::idle_add_local(move || {
-        //            let focused_child = list_view.focus_child().unwrap();
-        //            let bounds = focused_child.compute_bounds(&window).unwrap();
-        //            dbg!(window.hadjustment().value());
-        //            dbg!(bounds.x());
-        //            let pos = bounds.x() - (window.width() as f32 - bounds.width()) / 2.0;
-        //            //window.hadjustment().set_value(bounds.x() as f64);
-        //            window.hadjustment().set_value(pos as f64);
-        //
-        //            //dbg!(s.selected());
-        //            //dbg!(focused_child.compute_bounds(&list_view));
-        //            //dbg!(focused_child.compute_bounds(&window));
-        //            glib::ControlFlow::Break
-        //        });
-        //    }
-        //));
 
         let pm = PageManager::new(list_view, f)?;
         let pm = Rc::new(RefCell::new(pm));
