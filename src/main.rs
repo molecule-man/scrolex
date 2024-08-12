@@ -179,6 +179,29 @@ impl UI {
         ));
         list_view.add_controller(scroll_controller);
 
+        //selection.connect_selection_changed(clone!(
+        //    #[weak]
+        //    list_view,
+        //    #[weak(rename_to = window)]
+        //    self.window,
+        //    move |_s, _, _| {
+        //        glib::idle_add_local(move || {
+        //            let focused_child = list_view.focus_child().unwrap();
+        //            let bounds = focused_child.compute_bounds(&window).unwrap();
+        //            dbg!(window.hadjustment().value());
+        //            dbg!(bounds.x());
+        //            let pos = bounds.x() - (window.width() as f32 - bounds.width()) / 2.0;
+        //            //window.hadjustment().set_value(bounds.x() as f64);
+        //            window.hadjustment().set_value(pos as f64);
+        //
+        //            //dbg!(s.selected());
+        //            //dbg!(focused_child.compute_bounds(&list_view));
+        //            //dbg!(focused_child.compute_bounds(&window));
+        //            glib::ControlFlow::Break
+        //        });
+        //    }
+        //));
+
         let pm = PageManager::new(list_view, f)?;
         let pm = Rc::new(RefCell::new(pm));
 
