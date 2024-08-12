@@ -163,6 +163,8 @@ impl UI {
             move |_, _dx, dy| {
                 let current_pos = window.hadjustment().value();
 
+                // normally I'd use list_view.scroll_to() here, but it doesn't scroll if the item
+                // is already visible :(
                 if dy < 0.0 {
                     // scroll left
                     selection.select_item(selection.selected().saturating_sub(1), true);
