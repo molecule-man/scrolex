@@ -160,29 +160,23 @@ impl UI {
             glib::Propagation::Stop,
             move |_, _dx, dy| {
                 let current_pos = window.hadjustment().value();
+                let width = selection
+                    .selected_item()
+                    .unwrap()
+                    .downcast::<page::PageNumber>()
+                    .unwrap()
+                    .width() as f64;
 
                 // normally I'd use list_view.scroll_to() here, but it doesn't scroll if the item
                 // is already visible :(
                 if dy < 0.0 {
                     // scroll left
                     selection.select_item(selection.selected().saturating_sub(1), true);
-                    let width = selection
-                        .selected_item()
-                        .unwrap()
-                        .downcast::<page::PageNumber>()
-                        .unwrap()
-                        .width() as f64;
                     window.hadjustment().set_value(current_pos - width);
                 } else {
                     // scroll right
                     selection
                         .select_item((selection.selected() + 1).min(model.n_items() - 1), true);
-                    let width = selection
-                        .selected_item()
-                        .unwrap()
-                        .downcast::<page::PageNumber>()
-                        .unwrap()
-                        .width() as f64;
                     window.hadjustment().set_value(current_pos + width);
                 }
 
