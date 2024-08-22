@@ -151,8 +151,6 @@ impl UI {
         );
         scroll_controller.connect_scroll(clone!(
             #[weak]
-            list_view,
-            #[weak]
             selection,
             #[weak]
             model,
@@ -168,13 +166,23 @@ impl UI {
                 if dy < 0.0 {
                     // scroll left
                     selection.select_item(selection.selected().saturating_sub(1), true);
-                    let width = list_view.focus_child().unwrap().width() as f64;
+                    let width = selection
+                        .selected_item()
+                        .unwrap()
+                        .downcast::<page::PageNumber>()
+                        .unwrap()
+                        .width() as f64;
                     window.hadjustment().set_value(current_pos - width);
                 } else {
                     // scroll right
                     selection
                         .select_item((selection.selected() + 1).min(model.n_items() - 1), true);
-                    let width = list_view.focus_child().unwrap().width() as f64;
+                    let width = selection
+                        .selected_item()
+                        .unwrap()
+                        .downcast::<page::PageNumber>()
+                        .unwrap()
+                        .width() as f64;
                     window.hadjustment().set_value(current_pos + width);
                 }
 

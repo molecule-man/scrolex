@@ -16,6 +16,9 @@ pub struct Page {
 
     #[property(get, set)]
     crob: Cell<bool>,
+
+    #[property(get, set)]
+    pub binding: RefCell<Option<glib::Binding>>,
 }
 
 #[glib::object_subclass]

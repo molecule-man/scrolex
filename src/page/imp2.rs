@@ -8,6 +8,9 @@ use std::cell::Cell;
 pub struct PageNumber {
     #[property(get, set)]
     page_number: Cell<i32>,
+
+    #[property(get, set)]
+    width: Cell<i32>,
 }
 
 #[glib::object_subclass]
