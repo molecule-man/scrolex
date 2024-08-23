@@ -7,7 +7,7 @@ use gtk::prelude::*;
 use gtk::subclass::prelude::ObjectSubclassIsExt;
 use gtk::{glib, glib::clone};
 use poppler::Document;
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::mpsc;
 
@@ -86,18 +86,6 @@ impl PageManager {
             page_state,
         };
 
-        //factory.connect_setup(move |_, list_item| {
-        //    let list_item = list_item.downcast_ref::<gtk::ListItem>().unwrap();
-        //    let page = Page::new();
-        //    page.set_size_request(600, 800);
-        //    list_item.set_child(Some(&page));
-        //
-        //    //list_item
-        //    //    .property_expression("item")
-        //    //    .chain_property::<PageNumber>("width")
-        //    //    .bind(&page, "width-request", gtk::Widget::NONE);
-        //});
-
         factory.connect_bind(move |_, list_item| {
             let list_item = list_item.downcast_ref::<gtk::ListItem>().unwrap();
             let page_number = list_item.item().and_downcast::<PageNumber>().unwrap();
@@ -116,12 +104,10 @@ impl PageManager {
     }
 
     pub(crate) fn store_state(&self) {
-        let drawer = self.page_drawer.borrow();
-
         if let Err(err) = state::save(
             &self.uri,
             &state::DocumentState {
-                zoom: drawer.zoom.get(),
+                zoom: self.page_state.zoom(),
                 page: self.selection.selected(),
                 crop: self.page_state.crop(),
             },
@@ -152,9 +138,7 @@ impl PageManager {
         self.page_state.set_zoom(state.zoom);
 
         self.model.remove_all();
-        self.page_drawer
-            .borrow_mut()
-            .reset(self.doc.clone(), &state);
+        self.page_drawer.borrow_mut().reset(self.doc.clone());
 
         for i in 0..self.doc.n_pages() {
             let num = PageNumber::new(i);
@@ -173,26 +157,10 @@ impl PageManager {
             glib::ControlFlow::Break
         });
     }
-
-    pub(crate) fn apply_zoom(&mut self, zoom_factor: f64) {
-        self.page_drawer.borrow().apply_zoom(zoom_factor);
-        self.redraw_all();
-    }
-
-    fn redraw_all(&self) {
-        let mut child = self.list_view.first_child();
-        while let Some(page) = child {
-            if let Some(da) = page.first_child() {
-                da.queue_draw();
-            }
-            child = page.next_sibling();
-        }
-    }
 }
 
 struct PageDrawer {
     doc: Document,
-    zoom: Rc<Cell<f64>>,
     bbox_recv: Rc<RefCell<mpsc::Receiver<Vec<poppler::Rectangle>>>>,
     bboxs: Rc<RefCell<Option<Vec<poppler::Rectangle>>>>,
 }
@@ -202,14 +170,12 @@ impl PageDrawer {
         PageDrawer {
             doc,
             bbox_recv: Rc::new(RefCell::new(bbox_recv)),
-            zoom: Rc::new(Cell::new(1.0)),
             bboxs: Rc::new(RefCell::new(None)),
         }
     }
 
-    pub(crate) fn reset(&mut self, doc: Document, state: &state::DocumentState) {
+    pub(crate) fn reset(&mut self, doc: Document) {
         self.doc = doc;
-        self.zoom.replace(state.zoom);
         self.bboxs.replace(None);
     }
 
@@ -220,8 +186,6 @@ impl PageDrawer {
         let (width, height) = poppler_page.size();
 
         page.set_draw_func(clone!(
-            #[strong(rename_to = zoom)]
-            self.zoom,
             #[strong(rename_to = bbox_recv)]
             self.bbox_recv,
             #[strong(rename_to = bboxs)]
@@ -233,7 +197,7 @@ impl PageDrawer {
             move |_, cr, _width, _height| {
                 //println!("Drawing page {}", page.index());
 
-                let zoom = zoom.get();
+                let zoom = page.zoom();
 
                 let bbox = get_bbox(&bboxs, &poppler_page, &bbox_recv.borrow());
                 let (x1, x2) = (bbox.x1(), bbox.x2());
@@ -265,11 +229,7 @@ impl PageDrawer {
             }
         }
 
-        resize_page(page, self.zoom.get(), crop_margins, width, height, x1, x2);
-    }
-
-    pub(crate) fn apply_zoom(&self, zoom_factor: f64) {
-        self.zoom.replace(self.zoom.get() * zoom_factor);
+        resize_page(page, page.zoom(), crop_margins, width, height, x1, x2);
     }
 
     pub(crate) fn resize(&self, page: &Page, page_number: i32) {
@@ -286,7 +246,7 @@ impl PageDrawer {
             }
         }
 
-        resize_page(page, self.zoom.get(), crop_margins, width, height, x1, x2);
+        resize_page(page, page.zoom(), crop_margins, width, height, x1, x2);
     }
 }
 
@@ -360,12 +320,6 @@ glib::wrapper! {
 }
 
 impl Page {
-    //pub fn new(poppler_page: poppler::Page) -> Self {
-    //    glib::Object::builder()
-    //        .property("poppler_page", &poppler_page)
-    //        .build()
-    //}
-
     pub fn new() -> Self {
         glib::Object::builder().build()
     }
@@ -381,18 +335,6 @@ impl Page {
             .build();
 
         self.imp().binding.replace(Some(new_binding));
-    }
-
-    pub fn draw(&self) {
-        //dbg!(self.poppler_page());
-        //let self_ = imp::Page::from_instance(self);
-        //let page = self_.poppler_page.get().unwrap();
-        //let draw_func = self_.draw_func.get().unwrap();
-        //let width = self.allocated_width();
-        //let height = self.allocated_height();
-        //
-        //let cr = self.window().unwrap().create_cairo_context();
-        //draw_func(&self, &cr, width, height);
     }
 }
 //

@@ -193,14 +193,23 @@ impl UI {
 
         //self.add_header_buttons(&pm);
 
-        self.header_bar
-            .pack_start(&self.create_button("zoom-out", pm.clone(), |pm| {
-                pm.apply_zoom(1. / 1.1);
-            }));
-        self.header_bar
-            .pack_start(&self.create_button("zoom-in", pm.clone(), |pm| {
-                pm.apply_zoom(1.1);
-            }));
+        let zoom_out_btn = Button::from_icon_name("zoom-out");
+        zoom_out_btn.connect_clicked(clone!(
+            #[weak]
+            page_state,
+            move |_| {
+                page_state.set_zoom(page_state.zoom() / 1.1);
+            }
+        ));
+
+        let zoom_in_btn = Button::from_icon_name("zoom-in");
+        zoom_in_btn.connect_clicked(clone!(
+            #[weak]
+            page_state,
+            move |_| {
+                page_state.set_zoom(page_state.zoom() * 1.1);
+            }
+        ));
 
         let crop_btn = gtk::ToggleButton::builder()
             .icon_name("object-flip-horizontal")
@@ -211,6 +220,8 @@ impl UI {
             .bidirectional()
             .build();
 
+        self.header_bar.pack_start(&zoom_out_btn);
+        self.header_bar.pack_start(&zoom_in_btn);
         self.header_bar.pack_end(&crop_btn);
 
         factory.connect_setup(clone!(
@@ -225,17 +236,21 @@ impl UI {
                     .flags(glib::BindingFlags::DEFAULT | glib::BindingFlags::SYNC_CREATE)
                     .build();
 
+                page_state
+                    .bind_property("zoom", &page, "zoom")
+                    .flags(glib::BindingFlags::DEFAULT | glib::BindingFlags::SYNC_CREATE)
+                    .build();
+
                 page.connect_crop_notify(|p| {
+                    p.queue_draw();
+                });
+
+                page.connect_zoom_notify(|p| {
                     p.queue_draw();
                 });
 
                 page.set_size_request(600, 800);
                 list_item.set_child(Some(&page));
-
-                //list_item
-                //    .property_expression("item")
-                //    .chain_property::<PageNumber>("width")
-                //    .bind(&page, "width-request", gtk::Widget::NONE);
             }
         ));
 
@@ -274,22 +289,22 @@ impl UI {
     //    self.header_bar.pack_end(&crop_btn);
     //}
 
-    fn create_button(
-        &self,
-        icon: &str,
-        pm: Rc<RefCell<PageManager>>,
-        on_click: impl Fn(&mut PageManager) + 'static,
-    ) -> Button {
-        let button = Button::from_icon_name(icon);
-        button.connect_clicked(clone!(
-            #[weak]
-            pm,
-            move |_| {
-                on_click(&mut pm.borrow_mut());
-            }
-        ));
-        button
-    }
+    //fn create_button(
+    //    &self,
+    //    icon: &str,
+    //    pm: Rc<RefCell<PageManager>>,
+    //    on_click: impl Fn(&mut PageManager) + 'static,
+    //) -> Button {
+    //    let button = Button::from_icon_name(icon);
+    //    button.connect_clicked(clone!(
+    //        #[weak]
+    //        pm,
+    //        move |_| {
+    //            on_click(&mut pm.borrow_mut());
+    //        }
+    //    ));
+    //    button
+    //}
 }
 
 fn show_error_dialog(app: &Application, message: &str) {
