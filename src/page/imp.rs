@@ -15,7 +15,7 @@ pub struct Page {
     zoom: Cell<f64>,
 
     #[property(get, set)]
-    crob: Cell<bool>,
+    crop: Cell<bool>,
 
     #[property(get, set)]
     pub binding: RefCell<Option<glib::Binding>>,

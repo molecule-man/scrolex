@@ -9,6 +9,7 @@ use gtk::{prelude::*, EventControllerScrollFlags, ScrolledWindow};
 use page::PageManager;
 
 mod page;
+mod page_state;
 mod state;
 
 const APP_ID: &str = "com.andr2i.hallyview";
@@ -185,23 +186,13 @@ impl UI {
         ));
         list_view.add_controller(scroll_controller);
 
-        let pm = PageManager::new(list_view, f)?;
+        let page_state = page_state::PageState::new(1.0, false);
+
+        let pm = PageManager::new(list_view, f, page_state.clone())?;
         let pm = Rc::new(RefCell::new(pm));
 
-        self.add_header_buttons(&pm);
+        //self.add_header_buttons(&pm);
 
-        self.app.connect_shutdown(clone!(
-            #[strong]
-            pm,
-            move |_| {
-                pm.borrow().store_state();
-            }
-        ));
-
-        Ok(pm)
-    }
-
-    fn add_header_buttons(&self, pm: &Rc<RefCell<PageManager>>) {
         self.header_bar
             .pack_start(&self.create_button("zoom-out", pm.clone(), |pm| {
                 pm.apply_zoom(1. / 1.1);
@@ -215,15 +206,73 @@ impl UI {
             .icon_name("object-flip-horizontal")
             .build();
 
-        crop_btn.connect_toggled(clone!(
+        crop_btn
+            .bind_property("active", &page_state, "crop")
+            .bidirectional()
+            .build();
+
+        self.header_bar.pack_end(&crop_btn);
+
+        factory.connect_setup(clone!(
             #[weak]
-            pm,
-            move |btn| {
-                pm.borrow_mut().toggle_crop(btn.is_active());
+            page_state,
+            move |_, list_item| {
+                let list_item = list_item.downcast_ref::<gtk::ListItem>().unwrap();
+                let page = page::Page::new();
+
+                page_state
+                    .bind_property("crop", &page, "crop")
+                    .flags(glib::BindingFlags::DEFAULT | glib::BindingFlags::SYNC_CREATE)
+                    .build();
+
+                page.connect_crop_notify(|p| {
+                    p.queue_draw();
+                });
+
+                page.set_size_request(600, 800);
+                list_item.set_child(Some(&page));
+
+                //list_item
+                //    .property_expression("item")
+                //    .chain_property::<PageNumber>("width")
+                //    .bind(&page, "width-request", gtk::Widget::NONE);
             }
         ));
-        self.header_bar.pack_end(&crop_btn);
+
+        self.app.connect_shutdown(clone!(
+            #[strong]
+            pm,
+            move |_| {
+                pm.borrow().store_state();
+            }
+        ));
+
+        Ok(pm)
     }
+
+    //fn add_header_buttons(&self, pm: &Rc<RefCell<PageManager>>) {
+    //    self.header_bar
+    //        .pack_start(&self.create_button("zoom-out", pm.clone(), |pm| {
+    //            pm.apply_zoom(1. / 1.1);
+    //        }));
+    //    self.header_bar
+    //        .pack_start(&self.create_button("zoom-in", pm.clone(), |pm| {
+    //            pm.apply_zoom(1.1);
+    //        }));
+    //
+    //    let crop_btn = gtk::ToggleButton::builder()
+    //        .icon_name("object-flip-horizontal")
+    //        .build();
+    //
+    //    crop_btn.connect_toggled(clone!(
+    //        #[weak]
+    //        pm,
+    //        move |btn| {
+    //            pm.borrow_mut().toggle_crop(btn.is_active());
+    //        }
+    //    ));
+    //    self.header_bar.pack_end(&crop_btn);
+    //}
 
     fn create_button(
         &self,
