@@ -1,7 +1,7 @@
 use gtk::gio::prelude::*;
 use gtk::glib;
 use gtk::glib::subclass::prelude::*;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
 #[derive(Debug, Default, glib::Properties)]
 #[properties(wrapper_type = super::PageState)]
@@ -11,6 +11,9 @@ pub struct PageState {
 
     #[property(get, set)]
     crop: Cell<bool>,
+
+    #[property(get, set)]
+    doc: RefCell<Option<poppler::Document>>,
 }
 
 #[glib::object_subclass]

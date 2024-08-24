@@ -254,6 +254,20 @@ impl UI {
             }
         ));
 
+        factory.connect_bind(move |_, list_item| {
+            let list_item = list_item.downcast_ref::<gtk::ListItem>().unwrap();
+            let page_number = list_item.item().and_downcast::<page::PageNumber>().unwrap();
+            let child = list_item.child().unwrap();
+            let page = child.downcast_ref::<page::Page>().unwrap();
+
+            if let Some(doc) = page_state.doc() {
+                if let Some(poppler_page) = doc.page(page_number.page_number()) {
+                    page.bind(&page_number, &poppler_page);
+                    page.resize();
+                }
+            }
+        });
+
         self.app.connect_shutdown(clone!(
             #[strong]
             pm,
