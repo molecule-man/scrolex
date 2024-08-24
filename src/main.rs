@@ -263,7 +263,6 @@ impl UI {
             if let Some(doc) = page_state.doc() {
                 if let Some(poppler_page) = doc.page(page_number.page_number()) {
                     page.bind(&page_number, &poppler_page);
-                    page.resize();
                 }
             }
         });

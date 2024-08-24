@@ -222,21 +222,15 @@ impl Page {
 
         self.imp().binding.replace(Some(new_binding));
 
-        let (width, height) = poppler_page.size();
-        self.set_original_w(width);
-        self.set_original_h(height);
-
-        let mut rect = poppler::Rectangle::default();
-        poppler_page.get_bounding_box(&mut rect);
-        self.set_bbox_x1(rect.x1());
-        self.set_bbox_x2(rect.x2());
-
-        //self.set_poppler_page(poppler_page);
         self.bind_draw(poppler_page);
     }
 
     fn bind_draw(&self, poppler_page: &poppler::Page) {
         let (width, height) = poppler_page.size();
+
+        let mut rect = poppler::Rectangle::default();
+        poppler_page.get_bounding_box(&mut rect);
+        let (x1, x2) = (rect.x1(), rect.x2());
 
         self.set_draw_func(clone!(
             #[strong(rename_to = page)]
@@ -247,8 +241,6 @@ impl Page {
             page,
             move |_, cr, _width, _height| {
                 let zoom = page.zoom();
-
-                let (x1, x2) = (page.bbox_x1(), page.bbox_x2());
 
                 if page.crop() {
                     cr.translate((-x1 + 5.0) * zoom, 0.0);
@@ -264,14 +256,6 @@ impl Page {
             }
         ));
 
-        let (x1, x2) = (self.bbox_x1(), self.bbox_x2());
-
-        resize_page(self, self.zoom(), self.crop(), width, height, x1, x2);
-    }
-
-    pub(crate) fn resize(&self) {
-        let (width, height) = (self.original_w(), self.original_h());
-        let (x1, x2) = (self.bbox_x1(), self.bbox_x2());
         resize_page(self, self.zoom(), self.crop(), width, height, x1, x2);
     }
 }

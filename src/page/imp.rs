@@ -9,25 +9,10 @@ use std::cell::{Cell, RefCell};
 #[properties(wrapper_type = super::Page)]
 pub struct Page {
     #[property(get, set)]
-    poppler_page: RefCell<Option<poppler::Page>>,
-
-    #[property(get, set)]
     zoom: Cell<f64>,
 
     #[property(get, set)]
     crop: Cell<bool>,
-
-    #[property(get, set)]
-    original_w: Cell<f64>,
-
-    #[property(get, set)]
-    original_h: Cell<f64>,
-
-    #[property(get, set)]
-    bbox_x1: Cell<f64>,
-
-    #[property(get, set)]
-    bbox_x2: Cell<f64>,
 
     #[property(get, set)]
     pub binding: RefCell<Option<glib::Binding>>,
