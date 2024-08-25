@@ -1,6 +1,8 @@
 mod imp;
+use gtk::gio::prelude::*;
 use gtk::glib;
 use gtk::prelude::ObjectExt;
+use poppler::Document;
 
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -19,8 +21,18 @@ impl State {
             .build()
     }
 
-    pub(crate) fn load(&self, uri: &str, doc: &poppler::Document) {
-        let state_path = get_state_file_path(uri).unwrap();
+    pub(crate) fn load(&self, f: &gtk::gio::File) -> io::Result<()> {
+        if self.doc().is_some() {
+            self.save()?;
+        }
+
+        let doc = Document::from_gfile(f, None, gtk::gio::Cancellable::NONE)
+            .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
+
+        self.emit_by_name::<()>("before-load", &[]);
+
+        let uri = f.uri();
+        let state_path = get_state_file_path(&uri).unwrap();
 
         self.set_uri(uri);
         self.set_doc(doc);
@@ -51,6 +63,8 @@ impl State {
         }
 
         self.emit_by_name::<()>("loaded", &[]);
+
+        Ok(())
     }
 
     pub(crate) fn save(&self) -> io::Result<()> {

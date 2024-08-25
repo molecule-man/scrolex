@@ -6,7 +6,6 @@ use std::rc::Rc;
 use gtk::glib::{closure_local, Uri};
 use gtk::{gio::ApplicationFlags, glib, glib::clone, Application, ApplicationWindow, Button};
 use gtk::{prelude::*, EventControllerScrollFlags, ScrolledWindow};
-use page::PageManager;
 
 mod page;
 mod state;
@@ -50,7 +49,7 @@ fn build_ui(app: &Application, args: Vec<OsString>) {
         window: scroll_win,
         header_bar,
         app: app.clone(),
-        pm: None,
+        state: None,
     }));
 
     if let Some(fname) = args.get(1) {
@@ -118,23 +117,23 @@ struct UI {
     window: ScrolledWindow,
     header_bar: gtk::HeaderBar,
     app: Application,
-    pm: Option<Rc<RefCell<PageManager>>>,
+    // TODO use OnceCell when try_get_or_init is stable
+    state: Option<state::State>,
 }
 
 impl UI {
     fn load(&mut self, f: &gtk::gio::File) -> Result<(), Box<dyn std::error::Error>> {
-        if let Some(pm) = &self.pm {
-            pm.borrow_mut().store_state();
-            pm.borrow_mut().load(f)?;
+        if let Some(state) = &self.state {
+            state.load(f)?;
         } else {
-            let pm = self.init()?;
-            pm.borrow_mut().load(f)?;
-            self.pm = Some(pm);
-        }
+            let state = self.init()?;
+            state.load(f)?;
+            self.state = Some(state.clone());
+        };
         Ok(())
     }
 
-    fn init(&self) -> Result<Rc<RefCell<PageManager>>, Box<dyn std::error::Error>> {
+    fn init(&self) -> Result<state::State, Box<dyn std::error::Error>> {
         let state = state::State::new();
         let model = gtk::gio::ListStore::new::<page::PageNumber>();
         let factory = gtk::SignalListItemFactory::new();
@@ -184,6 +183,18 @@ impl UI {
         list_view.add_controller(scroll_controller);
 
         state.connect_closure(
+            "before-load",
+            false,
+            closure_local!(
+                #[weak]
+                model,
+                move |_: &state::State| {
+                    model.remove_all();
+                }
+            ),
+        );
+
+        state.connect_closure(
             "loaded",
             false,
             closure_local!(
@@ -223,11 +234,6 @@ impl UI {
             .property_expression("selected-item")
             .chain_property::<page::PageNumber>("page_number")
             .bind(&state, "page", gtk::Widget::NONE);
-
-        let pm = PageManager::new(list_view, state.clone());
-        let pm = Rc::new(RefCell::new(pm));
-
-        //self.add_header_buttons(&pm);
 
         let zoom_out_btn = Button::from_icon_name("zoom-out");
         zoom_out_btn.connect_clicked(clone!(
@@ -281,70 +287,35 @@ impl UI {
             }
         ));
 
-        factory.connect_bind(move |_, list_item| {
-            let list_item = list_item.downcast_ref::<gtk::ListItem>().unwrap();
-            let page_number = list_item.item().and_downcast::<page::PageNumber>().unwrap();
-            let child = list_item.child().unwrap();
-            let page = child.downcast_ref::<page::Page>().unwrap();
+        factory.connect_bind(clone!(
+            #[weak]
+            state,
+            move |_, list_item| {
+                let list_item = list_item.downcast_ref::<gtk::ListItem>().unwrap();
+                let page_number = list_item.item().and_downcast::<page::PageNumber>().unwrap();
+                let child = list_item.child().unwrap();
+                let page = child.downcast_ref::<page::Page>().unwrap();
 
-            if let Some(doc) = state.doc() {
-                if let Some(poppler_page) = doc.page(page_number.page_number()) {
-                    page.bind(&page_number, &poppler_page);
+                if let Some(doc) = state.doc() {
+                    if let Some(poppler_page) = doc.page(page_number.page_number()) {
+                        page.bind(&page_number, &poppler_page);
+                    }
                 }
-            }
-        });
-
-        self.app.connect_shutdown(clone!(
-            #[strong]
-            pm,
-            move |_| {
-                pm.borrow().store_state();
             }
         ));
 
-        Ok(pm)
+        self.app.connect_shutdown(clone!(
+            #[strong]
+            state,
+            move |_| {
+                if let Err(err) = state.save() {
+                    eprintln!("Error saving state: {}", err);
+                }
+            }
+        ));
+
+        Ok(state)
     }
-
-    //fn add_header_buttons(&self, pm: &Rc<RefCell<PageManager>>) {
-    //    self.header_bar
-    //        .pack_start(&self.create_button("zoom-out", pm.clone(), |pm| {
-    //            pm.apply_zoom(1. / 1.1);
-    //        }));
-    //    self.header_bar
-    //        .pack_start(&self.create_button("zoom-in", pm.clone(), |pm| {
-    //            pm.apply_zoom(1.1);
-    //        }));
-    //
-    //    let crop_btn = gtk::ToggleButton::builder()
-    //        .icon_name("object-flip-horizontal")
-    //        .build();
-    //
-    //    crop_btn.connect_toggled(clone!(
-    //        #[weak]
-    //        pm,
-    //        move |btn| {
-    //            pm.borrow_mut().toggle_crop(btn.is_active());
-    //        }
-    //    ));
-    //    self.header_bar.pack_end(&crop_btn);
-    //}
-
-    //fn create_button(
-    //    &self,
-    //    icon: &str,
-    //    pm: Rc<RefCell<PageManager>>,
-    //    on_click: impl Fn(&mut PageManager) + 'static,
-    //) -> Button {
-    //    let button = Button::from_icon_name(icon);
-    //    button.connect_clicked(clone!(
-    //        #[weak]
-    //        pm,
-    //        move |_| {
-    //            on_click(&mut pm.borrow_mut());
-    //        }
-    //    ));
-    //    button
-    //}
 }
 
 fn show_error_dialog(app: &Application, message: &str) {

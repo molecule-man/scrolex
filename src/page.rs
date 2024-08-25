@@ -1,136 +1,10 @@
 mod imp;
 mod page_number_imp;
 
-use crate::state;
 use gtk::gio::prelude::*;
 use gtk::prelude::*;
 use gtk::subclass::prelude::ObjectSubclassIsExt;
 use gtk::{glib, glib::clone};
-use poppler::Document;
-//use std::sync::mpsc;
-
-pub(crate) struct PageManager {
-    //doc: Document,
-    //doc_send: mpsc::Sender<String>,
-    //uri: String,
-    model: gtk::gio::ListStore,
-    state: state::State,
-}
-
-impl PageManager {
-    pub(crate) fn new(list_view: gtk::ListView, state: state::State) -> Self {
-        //) -> Result<Self, DocumentOpenError> {
-        //let (doc_send, doc_recv) = mpsc::channel::<String>();
-        //let (bbox_send, bbox_recv) = mpsc::channel();
-        //
-        //std::thread::spawn(move || {
-        //    for doc_path in doc_recv {
-        //        let f = gtk::gio::File::for_uri(&doc_path);
-        //        let doc = Document::from_gfile(&f, None, gtk::gio::Cancellable::NONE).unwrap();
-        //        let mut bboxs = Vec::new();
-        //        //let start = std::time::Instant::now();
-        //        for i in 0..doc.n_pages() {
-        //            let mut rect = poppler::Rectangle::default();
-        //            doc.page(i).unwrap().get_bounding_box(&mut rect);
-        //            bboxs.push(rect);
-        //        }
-        //        bbox_send.send(bboxs).unwrap();
-        //        //println!(
-        //        //    "Finished sending bounding boxes for {}. Time took: {}",
-        //        //    doc_path,
-        //        //    start.elapsed().as_millis(),
-        //        //);
-        //    }
-        //});
-
-        let selection = list_view
-            .model()
-            .unwrap()
-            .downcast::<gtk::SingleSelection>()
-            .unwrap();
-        let model = selection
-            .model()
-            .unwrap()
-            .downcast::<gtk::gio::ListStore>()
-            .unwrap();
-
-        //let doc = Document::from_gfile(f, None, gtk::gio::Cancellable::NONE).map_err(|err| {
-        //    DocumentOpenError {
-        //        message: err.to_string(),
-        //    }
-        //})?;
-
-        //page_state.set_doc(doc.clone());
-
-        //let page_drawer = Rc::new(RefCell::new(PageDrawer::new(doc.clone(), bbox_recv)));
-
-        PageManager {
-            //doc,
-            //doc_send,
-            //uri: f.uri().to_string(),
-            model,
-            state,
-        }
-
-        //Ok(pm)
-    }
-
-    pub(crate) fn store_state(&self) {
-        if let Err(err) = self.state.save() {
-            eprintln!("Error saving state: {}", err);
-        }
-    }
-
-    pub(crate) fn load(&mut self, f: &gtk::gio::File) -> Result<(), DocumentOpenError> {
-        self.model.remove_all();
-
-        let doc = Document::from_gfile(f, None, gtk::gio::Cancellable::NONE).map_err(|err| {
-            DocumentOpenError {
-                message: err.to_string(),
-            }
-        })?;
-        self.state.load(f.uri().as_ref(), &doc);
-
-        Ok(())
-    }
-}
-
-//fn get_bbox(
-//    bbox_store: &Rc<RefCell<Option<Vec<poppler::Rectangle>>>>,
-//    page: &poppler::Page,
-//    bbox_recv: &mpsc::Receiver<Vec<poppler::Rectangle>>,
-//) -> poppler::Rectangle {
-//    if let Some(bboxs) = bbox_store.borrow().as_ref() {
-//        return bboxs[page.index() as usize];
-//    }
-//
-//    if let Ok(bboxs) = bbox_recv.try_recv() {
-//        let bbox = bboxs[page.index() as usize];
-//        bbox_store.replace(Some(bboxs));
-//        return bbox;
-//    }
-//
-//    let mut rect = poppler::Rectangle::default();
-//    page.get_bounding_box(&mut rect);
-//    rect
-//}
-
-fn resize_page(
-    page_widget: &impl IsA<gtk::Widget>,
-    zoom: f64,
-    crop_margins: bool,
-    width: f64,
-    height: f64,
-    x1: f64,
-    x2: f64,
-) {
-    let mut width = width;
-    if crop_margins {
-        width = x2 - x1 + 10.0;
-    }
-
-    page_widget.set_size_request((width * zoom) as i32, (height * zoom) as i32);
-}
 
 glib::wrapper! {
     pub struct PageNumber(ObjectSubclass<page_number_imp::PageNumber>);
@@ -144,19 +18,6 @@ impl PageNumber {
             .build()
     }
 }
-
-#[derive(Debug, Clone)]
-pub(crate) struct DocumentOpenError {
-    message: String,
-}
-
-impl std::fmt::Display for DocumentOpenError {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "Error opening document: {}", self.message)
-    }
-}
-
-impl std::error::Error for DocumentOpenError {}
 
 glib::wrapper! {
     pub struct Page(ObjectSubclass<imp::Page>)
@@ -235,4 +96,21 @@ impl Default for Page {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn resize_page(
+    page_widget: &impl IsA<gtk::Widget>,
+    zoom: f64,
+    crop_margins: bool,
+    width: f64,
+    height: f64,
+    x1: f64,
+    x2: f64,
+) {
+    let mut width = width;
+    if crop_margins {
+        width = x2 - x1 + 10.0;
+    }
+
+    page_widget.set_size_request((width * zoom) as i32, (height * zoom) as i32);
 }

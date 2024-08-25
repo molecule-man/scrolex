@@ -33,6 +33,11 @@ impl ObjectSubclass for State {
 impl ObjectImpl for State {
     fn signals() -> &'static [Signal] {
         static SIGNALS: OnceLock<Vec<Signal>> = OnceLock::new();
-        SIGNALS.get_or_init(|| vec![Signal::builder("loaded").build()])
+        SIGNALS.get_or_init(|| {
+            vec![
+                Signal::builder("before-load").build(),
+                Signal::builder("loaded").build(),
+            ]
+        })
     }
 }
