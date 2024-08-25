@@ -14,8 +14,6 @@ pub(crate) struct PageManager {
     //doc_send: mpsc::Sender<String>,
     //uri: String,
     model: gtk::gio::ListStore,
-    selection: gtk::SingleSelection,
-    list_view: gtk::ListView,
     state: state::State,
 }
 
@@ -71,8 +69,6 @@ impl PageManager {
             //doc_send,
             //uri: f.uri().to_string(),
             model,
-            list_view,
-            selection,
             state,
         }
 
@@ -94,23 +90,6 @@ impl PageManager {
             }
         })?;
         self.state.load(f.uri().as_ref(), &doc);
-        let page_num = self.state.page();
-        //self.doc = doc;
-
-        let vector: Vec<PageNumber> = (0..doc.n_pages()).map(PageNumber::new).collect();
-        self.model.extend_from_slice(&vector);
-
-        let lv = self.list_view.clone();
-        let scroll_to = page_num.min(self.model.n_items() - 1);
-
-        glib::idle_add_local(move || {
-            lv.scroll_to(
-                scroll_to,
-                gtk::ListScrollFlags::FOCUS | gtk::ListScrollFlags::SELECT,
-                None,
-            );
-            glib::ControlFlow::Break
-        });
 
         Ok(())
     }
@@ -187,7 +166,19 @@ glib::wrapper! {
 
 impl Page {
     pub fn new() -> Self {
-        glib::Object::builder().build()
+        let page: Page = glib::Object::builder().build();
+
+        page.connect_crop_notify(|p| {
+            p.queue_draw();
+        });
+
+        page.connect_zoom_notify(|p| {
+            p.queue_draw();
+        });
+
+        page.set_size_request(600, 800);
+
+        page
     }
 
     pub fn bind(&self, pn: &PageNumber, poppler_page: &poppler::Page) {

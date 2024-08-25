@@ -1,5 +1,6 @@
 mod imp;
 use gtk::glib;
+use gtk::prelude::ObjectExt;
 
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -48,6 +49,8 @@ impl State {
                 }
             }
         }
+
+        self.emit_by_name::<()>("loaded", &[]);
     }
 
     pub(crate) fn save(&self) -> io::Result<()> {

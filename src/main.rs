@@ -3,7 +3,7 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 use std::rc::Rc;
 
-use gtk::glib::Uri;
+use gtk::glib::{closure_local, Uri};
 use gtk::{gio::ApplicationFlags, glib, glib::clone, Application, ApplicationWindow, Button};
 use gtk::{prelude::*, EventControllerScrollFlags, ScrolledWindow};
 use page::PageManager;
@@ -183,6 +183,42 @@ impl UI {
         ));
         list_view.add_controller(scroll_controller);
 
+        state.connect_closure(
+            "loaded",
+            false,
+            closure_local!(
+                #[weak]
+                list_view,
+                #[weak]
+                model,
+                move |state: &state::State| {
+                    let page_num = state.page();
+
+                    let doc = if let Some(doc) = state.doc() {
+                        doc
+                    } else {
+                        return;
+                    };
+
+                    let vector: Vec<page::PageNumber> =
+                        (0..doc.n_pages()).map(page::PageNumber::new).collect();
+                    model.extend_from_slice(&vector);
+
+                    let lv = list_view.clone();
+                    let scroll_to = page_num.min(model.n_items() - 1);
+
+                    glib::idle_add_local(move || {
+                        lv.scroll_to(
+                            scroll_to,
+                            gtk::ListScrollFlags::FOCUS | gtk::ListScrollFlags::SELECT,
+                            None,
+                        );
+                        glib::ControlFlow::Break
+                    });
+                }
+            ),
+        );
+
         selection
             .property_expression("selected-item")
             .chain_property::<page::PageNumber>("page_number")
@@ -241,15 +277,6 @@ impl UI {
                     .flags(glib::BindingFlags::DEFAULT | glib::BindingFlags::SYNC_CREATE)
                     .build();
 
-                page.connect_crop_notify(|p| {
-                    p.queue_draw();
-                });
-
-                page.connect_zoom_notify(|p| {
-                    p.queue_draw();
-                });
-
-                page.set_size_request(600, 800);
                 list_item.set_child(Some(&page));
             }
         ));
