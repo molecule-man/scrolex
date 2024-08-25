@@ -1,5 +1,5 @@
 mod imp;
-mod imp2;
+mod page_number_imp;
 
 use crate::{page_state, state};
 use gtk::gio::prelude::*;
@@ -174,7 +174,7 @@ fn resize_page(
 }
 
 glib::wrapper! {
-    pub struct PageNumber(ObjectSubclass<imp2::PageNumber>);
+    pub struct PageNumber(ObjectSubclass<page_number_imp::PageNumber>);
 }
 
 impl PageNumber {
