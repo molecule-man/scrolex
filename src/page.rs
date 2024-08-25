@@ -1,7 +1,7 @@
 mod imp;
 mod page_number_imp;
 
-use crate::{page_state, state};
+use crate::state;
 use gtk::gio::prelude::*;
 use gtk::prelude::*;
 use gtk::subclass::prelude::ObjectSubclassIsExt;
@@ -10,21 +10,18 @@ use poppler::Document;
 //use std::sync::mpsc;
 
 pub(crate) struct PageManager {
-    doc: Document,
+    //doc: Document,
     //doc_send: mpsc::Sender<String>,
-    uri: String,
+    //uri: String,
     model: gtk::gio::ListStore,
     selection: gtk::SingleSelection,
     list_view: gtk::ListView,
-    page_state: page_state::PageState,
+    state: state::State,
 }
 
 impl PageManager {
-    pub(crate) fn new(
-        list_view: gtk::ListView,
-        f: &gtk::gio::File,
-        page_state: page_state::PageState,
-    ) -> Result<Self, DocumentOpenError> {
+    pub(crate) fn new(list_view: gtk::ListView, state: state::State) -> Self {
+        //) -> Result<Self, DocumentOpenError> {
         //let (doc_send, doc_recv) = mpsc::channel::<String>();
         //let (bbox_send, bbox_recv) = mpsc::channel();
         //
@@ -59,71 +56,52 @@ impl PageManager {
             .downcast::<gtk::gio::ListStore>()
             .unwrap();
 
-        let doc = Document::from_gfile(f, None, gtk::gio::Cancellable::NONE).map_err(|err| {
-            DocumentOpenError {
-                message: err.to_string(),
-            }
-        })?;
+        //let doc = Document::from_gfile(f, None, gtk::gio::Cancellable::NONE).map_err(|err| {
+        //    DocumentOpenError {
+        //        message: err.to_string(),
+        //    }
+        //})?;
 
-        page_state.set_doc(doc.clone());
+        //page_state.set_doc(doc.clone());
 
         //let page_drawer = Rc::new(RefCell::new(PageDrawer::new(doc.clone(), bbox_recv)));
 
-        let pm = PageManager {
-            doc,
+        PageManager {
+            //doc,
             //doc_send,
-            uri: f.uri().to_string(),
+            //uri: f.uri().to_string(),
             model,
             list_view,
             selection,
-            page_state: page_state.clone(),
-        };
+            state,
+        }
 
-        Ok(pm)
+        //Ok(pm)
     }
 
     pub(crate) fn store_state(&self) {
-        if let Err(err) = state::save(
-            &self.uri,
-            &state::DocumentState {
-                zoom: self.page_state.zoom(),
-                page: self.selection.selected(),
-                crop: self.page_state.crop(),
-            },
-        ) {
+        if let Err(err) = self.state.save() {
             eprintln!("Error saving state: {}", err);
         }
     }
 
-    pub(crate) fn reset(&mut self, f: &gtk::gio::File) -> Result<(), DocumentOpenError> {
-        self.store_state();
+    pub(crate) fn load(&mut self, f: &gtk::gio::File) -> Result<(), DocumentOpenError> {
+        self.model.remove_all();
 
         let doc = Document::from_gfile(f, None, gtk::gio::Cancellable::NONE).map_err(|err| {
             DocumentOpenError {
                 message: err.to_string(),
             }
         })?;
-        self.page_state.set_doc(doc.clone());
-        self.uri = f.uri().to_string();
-        self.doc = doc;
+        self.state.load(f.uri().as_ref(), &doc);
+        let page_num = self.state.page();
+        //self.doc = doc;
 
-        Ok(())
-    }
-
-    pub(crate) fn load(&mut self) {
-        //self.doc_send.send(self.uri.clone()).unwrap();
-
-        let state = state::load(&self.uri);
-        self.page_state.set_crop(state.crop);
-        self.page_state.set_zoom(state.zoom);
-
-        self.model.remove_all();
-
-        let vector: Vec<PageNumber> = (0..self.doc.n_pages()).map(PageNumber::new).collect();
+        let vector: Vec<PageNumber> = (0..doc.n_pages()).map(PageNumber::new).collect();
         self.model.extend_from_slice(&vector);
 
         let lv = self.list_view.clone();
-        let scroll_to = state.page.min(self.model.n_items() - 1);
+        let scroll_to = page_num.min(self.model.n_items() - 1);
 
         glib::idle_add_local(move || {
             lv.scroll_to(
@@ -133,6 +111,8 @@ impl PageManager {
             );
             glib::ControlFlow::Break
         });
+
+        Ok(())
     }
 }
 

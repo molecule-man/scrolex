@@ -9,7 +9,6 @@ use gtk::{prelude::*, EventControllerScrollFlags, ScrolledWindow};
 use page::PageManager;
 
 mod page;
-mod page_state;
 mod state;
 
 const APP_ID: &str = "com.andr2i.hallyview";
@@ -125,20 +124,18 @@ struct UI {
 impl UI {
     fn load(&mut self, f: &gtk::gio::File) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(pm) = &self.pm {
-            pm.borrow_mut().reset(f)?;
-            pm.borrow_mut().load();
+            pm.borrow_mut().store_state();
+            pm.borrow_mut().load(f)?;
         } else {
-            let pm = self.init(f)?;
-            pm.borrow_mut().load();
+            let pm = self.init()?;
+            pm.borrow_mut().load(f)?;
             self.pm = Some(pm);
         }
         Ok(())
     }
 
-    fn init(
-        &self,
-        f: &gtk::gio::File,
-    ) -> Result<Rc<RefCell<PageManager>>, Box<dyn std::error::Error>> {
+    fn init(&self) -> Result<Rc<RefCell<PageManager>>, Box<dyn std::error::Error>> {
+        let state = state::State::new();
         let model = gtk::gio::ListStore::new::<page::PageNumber>();
         let factory = gtk::SignalListItemFactory::new();
         let selection = gtk::SingleSelection::new(Some(model.clone()));
@@ -186,9 +183,12 @@ impl UI {
         ));
         list_view.add_controller(scroll_controller);
 
-        let page_state = page_state::PageState::new(1.0, false);
+        selection
+            .property_expression("selected-item")
+            .chain_property::<page::PageNumber>("page_number")
+            .bind(&state, "page", gtk::Widget::NONE);
 
-        let pm = PageManager::new(list_view, f, page_state.clone())?;
+        let pm = PageManager::new(list_view, state.clone());
         let pm = Rc::new(RefCell::new(pm));
 
         //self.add_header_buttons(&pm);
@@ -196,18 +196,18 @@ impl UI {
         let zoom_out_btn = Button::from_icon_name("zoom-out");
         zoom_out_btn.connect_clicked(clone!(
             #[weak]
-            page_state,
+            state,
             move |_| {
-                page_state.set_zoom(page_state.zoom() / 1.1);
+                state.set_zoom(state.zoom() / 1.1);
             }
         ));
 
         let zoom_in_btn = Button::from_icon_name("zoom-in");
         zoom_in_btn.connect_clicked(clone!(
             #[weak]
-            page_state,
+            state,
             move |_| {
-                page_state.set_zoom(page_state.zoom() * 1.1);
+                state.set_zoom(state.zoom() * 1.1);
             }
         ));
 
@@ -216,7 +216,7 @@ impl UI {
             .build();
 
         crop_btn
-            .bind_property("active", &page_state, "crop")
+            .bind_property("active", &state, "crop")
             .bidirectional()
             .build();
 
@@ -226,17 +226,17 @@ impl UI {
 
         factory.connect_setup(clone!(
             #[weak]
-            page_state,
+            state,
             move |_, list_item| {
                 let list_item = list_item.downcast_ref::<gtk::ListItem>().unwrap();
                 let page = page::Page::new();
 
-                page_state
+                state
                     .bind_property("crop", &page, "crop")
                     .flags(glib::BindingFlags::DEFAULT | glib::BindingFlags::SYNC_CREATE)
                     .build();
 
-                page_state
+                state
                     .bind_property("zoom", &page, "zoom")
                     .flags(glib::BindingFlags::DEFAULT | glib::BindingFlags::SYNC_CREATE)
                     .build();
@@ -260,7 +260,7 @@ impl UI {
             let child = list_item.child().unwrap();
             let page = child.downcast_ref::<page::Page>().unwrap();
 
-            if let Some(doc) = page_state.doc() {
+            if let Some(doc) = state.doc() {
                 if let Some(poppler_page) = doc.page(page_number.page_number()) {
                     page.bind(&page_number, &poppler_page);
                 }
