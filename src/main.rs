@@ -187,12 +187,12 @@ impl UI {
             glib::Propagation::Stop,
             move |_, _dx, dy| {
                 let current_pos = window.hadjustment().value();
-                let width = selection
+                let pn = selection
                     .selected_item()
                     .unwrap()
                     .downcast::<page::PageNumber>()
-                    .unwrap()
-                    .width() as f64;
+                    .unwrap();
+                let width = pn.width() as f64 + 4.0; // 2px is border. TODO: figure out how to un-hardcode this
 
                 // normally I'd use list_view.scroll_to() here, but it doesn't scroll if the item
                 // is already visible :(
