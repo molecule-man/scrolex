@@ -3,6 +3,7 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 use std::rc::Rc;
 
+use gtk::gdk::BUTTON_MIDDLE;
 use gtk::glib::{closure_local, Uri};
 use gtk::{gio::ApplicationFlags, glib, glib::clone, Application, ApplicationWindow, Button};
 use gtk::{prelude::*, EventControllerScrollFlags, ScrolledWindow};
@@ -42,6 +43,35 @@ fn build_ui(app: &Application, args: Vec<OsString>) {
         .hexpand(true)
         .hscrollbar_policy(gtk::PolicyType::Automatic)
         .build();
+
+    // Middle click drag to scroll
+    let middle_click_drag = gtk::GestureClick::builder().button(BUTTON_MIDDLE).build();
+    let previous_coords = Rc::new(RefCell::new(None::<(f64, f64)>));
+    middle_click_drag.connect_pressed(clone!(
+        #[strong]
+        previous_coords,
+        move |_, _, x, y| {
+            *previous_coords.borrow_mut() = Some((x, y));
+        }
+    ));
+    middle_click_drag.connect_update(clone!(
+        #[strong]
+        previous_coords,
+        #[weak]
+        scroll_win,
+        move |ch, seq| {
+            if let Some((prev_x, _)) = *previous_coords.borrow() {
+                if let Some((x, _)) = ch.point(seq) {
+                    let dx = x - prev_x;
+                    scroll_win
+                        .hadjustment()
+                        .set_value(scroll_win.hadjustment().value() - dx);
+                }
+            }
+            *previous_coords.borrow_mut() = ch.point(seq);
+        }
+    ));
+    scroll_win.add_controller(middle_click_drag);
 
     window.set_child(Some(&scroll_win));
 
