@@ -60,9 +60,8 @@ impl Page {
     fn bind_draw(&self, poppler_page: &poppler::Page) {
         let (width, height) = poppler_page.size();
 
-        let mut rect = poppler::Rectangle::default();
-        poppler_page.get_bounding_box(&mut rect);
-        let (x1, x2) = (rect.x1(), rect.x2());
+        let mut bbox = poppler::Rectangle::default();
+        poppler_page.get_bounding_box(&mut bbox);
 
         self.set_draw_func(clone!(
             #[strong(rename_to = page)]
@@ -75,10 +74,10 @@ impl Page {
                 let zoom = page.zoom();
 
                 if page.crop() {
-                    cr.translate((-x1 + 5.0) * zoom, 0.0);
+                    cr.translate((-bbox.x1() + 5.0) * zoom, (-bbox.y1() + 5.0) * zoom);
                 }
 
-                resize_page(&page, zoom, page.crop(), width, height, x1, x2);
+                resize_page(&page, zoom, page.crop(), width, height, bbox);
 
                 cr.rectangle(0.0, 0.0, width * zoom, height * zoom);
                 cr.scale(zoom, zoom);
@@ -88,7 +87,7 @@ impl Page {
             }
         ));
 
-        resize_page(self, self.zoom(), self.crop(), width, height, x1, x2);
+        resize_page(self, self.zoom(), self.crop(), width, height, bbox);
     }
 }
 
@@ -104,12 +103,13 @@ fn resize_page(
     crop_margins: bool,
     width: f64,
     height: f64,
-    x1: f64,
-    x2: f64,
+    bbox: poppler::Rectangle,
 ) {
     let mut width = width;
+    let mut height = height;
     if crop_margins {
-        width = x2 - x1 + 10.0;
+        width = bbox.x2() - bbox.x1() + 10.0;
+        height = bbox.y2() - bbox.y1() + 10.0;
     }
 
     page_widget.set_size_request((width * zoom) as i32, (height * zoom) as i32);
