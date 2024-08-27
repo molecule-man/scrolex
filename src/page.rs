@@ -101,15 +101,23 @@ fn resize_page(
     page_widget: &impl IsA<gtk::Widget>,
     zoom: f64,
     crop_margins: bool,
-    width: f64,
-    height: f64,
+    orig_width: f64,
+    orig_height: f64,
     bbox: poppler::Rectangle,
 ) {
-    let mut width = width;
-    let mut height = height;
+    let mut width = orig_width;
+    let mut height = orig_height;
     if crop_margins {
         width = bbox.x2() - bbox.x1() + 10.0;
         height = bbox.y2() - bbox.y1() + 10.0;
+    }
+
+    if width < orig_width / 2.0 {
+        width = orig_width / 2.0;
+    }
+
+    if height < orig_height / 2.0 {
+        height = orig_height / 2.0;
     }
 
     page_widget.set_size_request((width * zoom) as i32, (height * zoom) as i32);
