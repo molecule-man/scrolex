@@ -238,31 +238,42 @@ impl UI {
             false,
             closure_local!(
                 #[weak]
-                list_view,
-                #[weak]
                 model,
+                #[weak]
+                selection,
                 move |state: &state::State| {
-                    let page_num = state.page();
-
                     let doc = if let Some(doc) = state.doc() {
                         doc
                     } else {
                         return;
                     };
 
-                    let vector: Vec<page::PageNumber> =
-                        (0..doc.n_pages()).map(page::PageNumber::new).collect();
-                    model.extend_from_slice(&vector);
+                    let n_pages = doc.n_pages() as u32;
+                    let scroll_to = state.page().min(n_pages - 1);
+                    let init_load_from = scroll_to.saturating_sub(1);
+                    let init_load_till = (scroll_to + 10).min(n_pages - 1);
 
-                    let lv = list_view.clone();
-                    let scroll_to = page_num.min(model.n_items() - 1);
+                    let vector: Vec<page::PageNumber> = (init_load_from as i32
+                        ..init_load_till as i32)
+                        .map(page::PageNumber::new)
+                        .collect();
+                    model.extend_from_slice(&vector);
+                    selection.select_item(scroll_to - init_load_from, true);
 
                     glib::idle_add_local(move || {
-                        lv.scroll_to(
-                            scroll_to,
-                            gtk::ListScrollFlags::FOCUS | gtk::ListScrollFlags::SELECT,
-                            None,
-                        );
+                        if init_load_from > 0 {
+                            let vector: Vec<page::PageNumber> = (0..init_load_from as i32)
+                                .map(page::PageNumber::new)
+                                .collect();
+                            model.splice(0, 0, &vector);
+                        }
+                        if init_load_till < n_pages {
+                            let vector: Vec<page::PageNumber> = (init_load_till as i32
+                                ..n_pages as i32)
+                                .map(page::PageNumber::new)
+                                .collect();
+                            model.extend_from_slice(&vector);
+                        }
                         glib::ControlFlow::Break
                     });
                 }
