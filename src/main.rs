@@ -3,10 +3,10 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 use std::rc::Rc;
 
-use gtk::gdk::BUTTON_MIDDLE;
+use gtk::gdk::{Display, BUTTON_MIDDLE};
 use gtk::glib::{closure_local, Uri};
 use gtk::{gio::ApplicationFlags, glib, glib::clone, Application, ApplicationWindow, Button};
-use gtk::{prelude::*, EventControllerScrollFlags, ScrolledWindow};
+use gtk::{prelude::*, CssProvider, EventControllerScrollFlags, ScrolledWindow};
 
 mod page;
 mod state;
@@ -19,11 +19,27 @@ fn main() -> glib::ExitCode {
         .flags(ApplicationFlags::HANDLES_OPEN | ApplicationFlags::HANDLES_COMMAND_LINE)
         .build();
 
+    app.connect_startup(|_| {
+        load_css();
+    });
     app.connect_command_line(|app, cmd| {
         build_ui(app, cmd.arguments());
         0
     });
     app.run_with_args(&std::env::args().collect::<Vec<_>>())
+}
+
+fn load_css() {
+    // Load the CSS file and add it to the provider
+    let provider = CssProvider::new();
+    provider.load_from_string(include_str!("../ui/style.css"));
+
+    // Add the provider to the default screen
+    gtk::style_context_add_provider_for_display(
+        &Display::default().expect("Could not connect to a display."),
+        &provider,
+        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+    );
 }
 
 fn build_ui(app: &Application, args: Vec<OsString>) {
@@ -199,7 +215,7 @@ impl UI {
                         .downcast::<page::PageNumber>()
                         .unwrap()
                         .width() as f64
-                        + 4.0; // 2px is border. TODO: figure out how to un-hardcode this
+                        + 4.0; // 4px is padding of list item widget. TODO: figure out how to un-hardcode this
                     window.hadjustment().set_value(current_pos - width);
                 } else {
                     let width = selection
@@ -208,7 +224,7 @@ impl UI {
                         .downcast::<page::PageNumber>()
                         .unwrap()
                         .width() as f64
-                        + 4.0; // 2px is border. TODO: figure out how to un-hardcode this
+                        + 4.0; // 4px is padding of list item widget. TODO: figure out how to un-hardcode this
 
                     // scroll right
                     selection

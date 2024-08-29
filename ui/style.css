@@ -1,0 +1,15 @@
+row {
+	background-color: #222;
+}
+
+row:hover {
+	background-color: #333;
+}
+
+row:selected {
+	background-color: #444;
+}
+
+row:selected:hover {
+	background-color: #555;
+}
