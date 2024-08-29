@@ -54,6 +54,7 @@ fn build_ui(app: &Application, args: Vec<OsString>) {
         .build();
 
     window.set_titlebar(Some(&header_bar));
+    window.set_widget_name("main");
 
     let scroll_win = gtk::ScrolledWindow::builder()
         .hexpand(true)

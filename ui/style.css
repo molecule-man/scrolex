@@ -1,15 +1,15 @@
-row {
+#main row {
 	background-color: #999;
 }
 
-row:hover {
+#main row:hover {
 	background-color: #888;
 }
 
-row:selected {
+#main row:selected {
 	background-color: #333;
 }
 
-row:selected:hover {
+#main row:selected:hover {
 	background-color: #222;
 }
