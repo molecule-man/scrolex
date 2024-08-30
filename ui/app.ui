@@ -1,0 +1,80 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<interface>
+	<template class="MyApp" parent="GtkApplicationWindow">
+		<property name="title">HallyViewed</property>
+		<child type="titlebar">
+			<object class="GtkHeaderBar" id="headerbar">
+				<child type="title">
+					<object class="GtkLabel" id="title">
+						<property name="label">HallyViewed</property>
+					</object>
+				</child>
+				<child type="start">
+					<object class="GtkButton" id="btn_open">
+						<signal name="clicked" handler="handle_document_open" swapped="true"/>
+						<property name="icon-name">document-open</property>
+						<property name="tooltip-text">Open PDF Document</property>
+						<property name="cursor">
+							<object class="GdkCursor">
+								<property name="name">pointer</property>
+							</object>
+						</property>
+					</object>
+				</child>
+				<child type="start">
+					<object class="GtkButton" id="btn_zoom_out">
+						<signal name="clicked" handler="handle_zoom_out" swapped="true"/>
+						<property name="icon-name">zoom-out</property>
+						<property name="tooltip-text">Zoom Out</property>
+						<property name="cursor">
+							<object class="GdkCursor">
+								<property name="name">pointer</property>
+							</object>
+						</property>
+					</object>
+				</child>
+				<child type="start">
+					<object class="GtkButton" id="btn_zoom_in">
+						<signal name="clicked" handler="handle_zoom_in" swapped="true"/>
+						<property name="icon-name">zoom-in</property>
+						<property name="tooltip-text">Zoom in</property>
+						<property name="cursor">
+							<object class="GdkCursor">
+								<property name="name">pointer</property>
+							</object>
+						</property>
+					</object>
+				</child>
+				<child type="end">
+					<object class="GtkToggleButton" id="btn_crop">
+						<property name="icon-name">object-flip-horizontal</property>
+						<property name="tooltip-text">Crop Margins</property>
+						<property name="cursor">
+							<object class="GdkCursor">
+								<property name="name">pointer</property>
+							</object>
+						</property>
+					</object>
+				</child>
+			</object>
+		</child>
+		<child>
+			<object class="GtkScrolledWindow" id="scrolledwindow">
+				<property name="hscrollbar-policy">automatic</property>
+				<property name="vscrollbar-policy">never</property>
+				<property name="hexpand">true</property>
+				<!--<property name="event-controller-scroll">-->
+				<!--	<object class="GtkEventControllerScroll">-->
+				<!--		<signal name="scroll" handler="handle_scroll" swapped="true" />-->
+				<!--	</object>-->
+				<!--</property>-->
+				<child>
+					<object class="GtkListView" id="listview">
+						<property name="hexpand">true</property>
+						<property name="orientation">horizontal</property>
+					</object>
+				</child>
+			</object>
+		</child>
+	</template>
+</interface>
