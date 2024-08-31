@@ -1,13 +1,10 @@
 mod imp;
 
 use glib::{clone, Object};
-use gtk::gdk::BUTTON_MIDDLE;
 use gtk::glib::closure_local;
 use gtk::glib::subclass::types::ObjectSubclassIsExt;
 use gtk::prelude::*;
 use gtk::{gio, glib, Application};
-use std::cell::RefCell;
-use std::rc::Rc;
 
 use crate::page;
 use crate::state;
@@ -28,42 +25,13 @@ impl Window {
 
         w.setup_model(state);
         w.setup_factory(state);
-        w.setup_drag();
 
         w
     }
 
-    fn setup_drag(&self) {
-        let scroll_win = self.imp().scrolledwindow.clone();
-
-        // Middle click drag to scroll
-        let middle_click_drag = gtk::GestureClick::builder().button(BUTTON_MIDDLE).build();
-        let previous_coords = Rc::new(RefCell::new(None::<(f64, f64)>));
-        middle_click_drag.connect_pressed(clone!(
-            #[strong]
-            previous_coords,
-            move |_, _, x, y| {
-                *previous_coords.borrow_mut() = Some((x, y));
-            }
-        ));
-        middle_click_drag.connect_update(clone!(
-            #[strong]
-            previous_coords,
-            #[weak]
-            scroll_win,
-            move |ch, seq| {
-                if let Some((prev_x, _)) = *previous_coords.borrow() {
-                    if let Some((x, _)) = ch.point(seq) {
-                        let dx = x - prev_x;
-                        scroll_win
-                            .hadjustment()
-                            .set_value(scroll_win.hadjustment().value() - dx);
-                    }
-                }
-                *previous_coords.borrow_mut() = ch.point(seq);
-            }
-        ));
-        scroll_win.add_controller(middle_click_drag);
+    pub(crate) fn scroll_view(&self, dx: f64) {
+        let hadjustment = self.imp().scrolledwindow.hadjustment();
+        hadjustment.set_value(hadjustment.value() - dx);
     }
 
     pub(crate) fn prev_page(&self) {
@@ -82,7 +50,7 @@ impl Window {
             .unwrap()
             .width() as f64
             + 4.0; // 4px is padding of list item widget. TODO: figure out how to un-hardcode this
-                   //
+
         self.imp()
             .scrolledwindow
             .hadjustment()
@@ -105,7 +73,6 @@ impl Window {
             .width() as f64
             + 4.0; // 4px is padding of list item widget. TODO: figure out how to un-hardcode this
 
-        // scroll right
         selection.select_item(
             (selection.selected() + 1).min(selection.n_items() - 1),
             true,

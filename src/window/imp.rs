@@ -1,12 +1,11 @@
 use glib::subclass::InitializingObject;
+use gtk::gdk::EventSequence;
 use gtk::gio::prelude::*;
 use gtk::glib::clone;
 use gtk::glib::subclass::prelude::*;
-use gtk::prelude::*;
 use gtk::subclass::prelude::*;
-use gtk::{
-    glib, Button, CompositeTemplate, EventControllerScroll, ListView, ScrolledWindow, ToggleButton,
-};
+use gtk::{glib, Button, CompositeTemplate, ListView, ScrolledWindow, ToggleButton};
+use gtk::{prelude::*, GestureClick};
 use std::cell::RefCell;
 
 // Object holding the state
@@ -29,6 +28,8 @@ pub struct Window {
 
     #[property(get, set)]
     state: RefCell<crate::state::State>,
+
+    drag_coords: RefCell<Option<(f64, f64)>>,
 }
 
 // The central trait for subclassing a GObject
@@ -71,6 +72,21 @@ impl Window {
             self.obj().next_page();
         }
         glib::Propagation::Stop
+    }
+
+    #[template_callback]
+    pub fn handle_drag_start(&self, _n_press: i32, x: f64, y: f64) {
+        *self.drag_coords.borrow_mut() = Some((x, y));
+    }
+
+    #[template_callback]
+    pub fn handle_drag_move(&self, seq: Option<&EventSequence>, gc: &GestureClick) {
+        if let Some((prev_x, _)) = *self.drag_coords.borrow() {
+            if let Some((x, _)) = gc.point(seq) {
+                self.obj().scroll_view(x - prev_x);
+            }
+        }
+        *self.drag_coords.borrow_mut() = gc.point(seq);
     }
 
     #[template_callback]
