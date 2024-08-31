@@ -81,6 +81,14 @@ impl Window {
             #[upgrade_or]
             glib::Propagation::Stop,
             move |_, _dx, dy| {
+                if model.n_items() == 0 {
+                    return glib::Propagation::Stop;
+                }
+
+                if selection.selected_item().is_none() {
+                    return glib::Propagation::Stop;
+                }
+
                 let current_pos = window.hadjustment().value();
 
                 // normally I'd use list_view.scroll_to() here, but it doesn't scroll if the item
