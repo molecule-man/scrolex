@@ -26,11 +26,15 @@ impl Window {
             .property("state", state)
             .build();
 
-        w.setup(state);
+        let (model, selection) = w.setup_model(state);
+        w.setup_factory(state);
+        w.setup_scroll(&model, &selection);
+        w.setup_drag();
+
         w
     }
 
-    fn setup(&self, state: &state::State) {
+    fn setup_drag(&self) {
         let scroll_win = self.imp().scrolledwindow.clone();
 
         // Middle click drag to scroll
@@ -61,14 +65,9 @@ impl Window {
             }
         ));
         scroll_win.add_controller(middle_click_drag);
+    }
 
-        let model = gtk::gio::ListStore::new::<page::PageNumber>();
-        let factory = gtk::SignalListItemFactory::new();
-        let selection = gtk::SingleSelection::new(Some(model.clone()));
-        let list_view = self.imp().listview.clone();
-        list_view.set_factory(Some(&factory));
-        list_view.set_model(Some(&selection));
-
+    fn setup_scroll(&self, model: &gtk::gio::ListStore, selection: &gtk::SingleSelection) {
         let scroll_controller = gtk::EventControllerScroll::new(
             EventControllerScrollFlags::DISCRETE | EventControllerScrollFlags::VERTICAL,
         );
@@ -115,7 +114,13 @@ impl Window {
                 glib::Propagation::Stop
             }
         ));
-        list_view.add_controller(scroll_controller);
+        self.imp().listview.add_controller(scroll_controller);
+    }
+
+    fn setup_model(&self, state: &state::State) -> (gtk::gio::ListStore, gtk::SingleSelection) {
+        let model = gtk::gio::ListStore::new::<page::PageNumber>();
+        let selection = gtk::SingleSelection::new(Some(model.clone()));
+        self.imp().listview.set_model(Some(&selection));
 
         state.connect_closure(
             "before-load",
@@ -186,6 +191,13 @@ impl Window {
             .bind_property("active", state, "crop")
             .bidirectional()
             .build();
+
+        (model, selection)
+    }
+
+    fn setup_factory(&self, state: &state::State) {
+        let factory = gtk::SignalListItemFactory::new();
+        self.imp().listview.set_factory(Some(&factory));
 
         factory.connect_setup(clone!(
             #[weak(rename_to = state)]
