@@ -4,8 +4,8 @@ use glib::{clone, Object};
 use gtk::gdk::BUTTON_MIDDLE;
 use gtk::glib::closure_local;
 use gtk::glib::subclass::types::ObjectSubclassIsExt;
+use gtk::prelude::*;
 use gtk::{gio, glib, Application};
-use gtk::{prelude::*, EventControllerScrollFlags};
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -26,9 +26,8 @@ impl Window {
             .property("state", state)
             .build();
 
-        let (model, selection) = w.setup_model(state);
+        w.setup_model(state);
         w.setup_factory(state);
-        w.setup_scroll(&model, &selection);
         w.setup_drag();
 
         w
@@ -67,65 +66,73 @@ impl Window {
         scroll_win.add_controller(middle_click_drag);
     }
 
-    fn setup_scroll(&self, model: &gtk::gio::ListStore, selection: &gtk::SingleSelection) {
-        let scroll_controller = gtk::EventControllerScroll::new(
-            EventControllerScrollFlags::DISCRETE | EventControllerScrollFlags::VERTICAL,
-        );
-        scroll_controller.connect_scroll(clone!(
-            #[weak]
-            selection,
-            #[weak]
-            model,
-            #[weak(rename_to = window)]
-            self.imp().scrolledwindow,
-            #[upgrade_or]
-            glib::Propagation::Stop,
-            move |_, _dx, dy| {
-                if model.n_items() == 0 {
-                    return glib::Propagation::Stop;
-                }
+    pub(crate) fn prev_page(&self) {
+        let Some(selection) = self.ensure_ready_selection() else {
+            return;
+        };
 
-                if selection.selected_item().is_none() {
-                    return glib::Propagation::Stop;
-                }
+        let current_pos = self.imp().scrolledwindow.hadjustment().value();
 
-                let current_pos = window.hadjustment().value();
-
-                // normally I'd use list_view.scroll_to() here, but it doesn't scroll if the item
-                // is already visible :(
-                if dy < 0.0 {
-                    // scroll left
-                    selection.select_item(selection.selected().saturating_sub(1), true);
-                    let width = selection
-                        .selected_item()
-                        .unwrap()
-                        .downcast::<page::PageNumber>()
-                        .unwrap()
-                        .width() as f64
-                        + 4.0; // 4px is padding of list item widget. TODO: figure out how to un-hardcode this
-                    window.hadjustment().set_value(current_pos - width);
-                } else {
-                    let width = selection
-                        .selected_item()
-                        .unwrap()
-                        .downcast::<page::PageNumber>()
-                        .unwrap()
-                        .width() as f64
-                        + 4.0; // 4px is padding of list item widget. TODO: figure out how to un-hardcode this
-
-                    // scroll right
-                    selection
-                        .select_item((selection.selected() + 1).min(model.n_items() - 1), true);
-                    window.hadjustment().set_value(current_pos + width);
-                }
-
-                glib::Propagation::Stop
-            }
-        ));
-        self.imp().listview.add_controller(scroll_controller);
+        // normally I'd use list_view.scroll_to() here, but it doesn't scroll if the item
+        // is already visible :(
+        selection.select_item(selection.selected().saturating_sub(1), true);
+        let width = selection
+            .selected_item()
+            .and_downcast::<page::PageNumber>()
+            .unwrap()
+            .width() as f64
+            + 4.0; // 4px is padding of list item widget. TODO: figure out how to un-hardcode this
+                   //
+        self.imp()
+            .scrolledwindow
+            .hadjustment()
+            .set_value(current_pos - width);
     }
 
-    fn setup_model(&self, state: &state::State) -> (gtk::gio::ListStore, gtk::SingleSelection) {
+    pub(crate) fn next_page(&self) {
+        let Some(selection) = self.ensure_ready_selection() else {
+            return;
+        };
+
+        let current_pos = self.imp().scrolledwindow.hadjustment().value();
+
+        // normally I'd use list_view.scroll_to() here, but it doesn't scroll if the item
+        // is already visible :(
+        let width = selection
+            .selected_item()
+            .and_downcast::<page::PageNumber>()
+            .unwrap()
+            .width() as f64
+            + 4.0; // 4px is padding of list item widget. TODO: figure out how to un-hardcode this
+
+        // scroll right
+        selection.select_item(
+            (selection.selected() + 1).min(selection.n_items() - 1),
+            true,
+        );
+        self.imp()
+            .scrolledwindow
+            .hadjustment()
+            .set_value(current_pos + width);
+    }
+
+    fn ensure_ready_selection(&self) -> Option<gtk::SingleSelection> {
+        let selection = self
+            .imp()
+            .listview
+            .model()
+            .and_downcast::<gtk::SingleSelection>()?;
+
+        if selection.n_items() == 0 {
+            return None;
+        }
+
+        selection.selected_item()?;
+
+        Some(selection)
+    }
+
+    fn setup_model(&self, state: &state::State) {
         let model = gtk::gio::ListStore::new::<page::PageNumber>();
         let selection = gtk::SingleSelection::new(Some(model.clone()));
         self.imp().listview.set_model(Some(&selection));
@@ -199,8 +206,6 @@ impl Window {
             .bind_property("active", state, "crop")
             .bidirectional()
             .build();
-
-        (model, selection)
     }
 
     fn setup_factory(&self, state: &state::State) {

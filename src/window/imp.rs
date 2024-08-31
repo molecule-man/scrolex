@@ -64,8 +64,13 @@ impl ObjectImpl for Window {
 #[gtk::template_callbacks]
 impl Window {
     #[template_callback]
-    fn handle_scroll(&self, _: EventControllerScroll, dx: f64, dy: f64) {
-        println!("scroll: dx={}, dy={}", dx, dy);
+    fn handle_scroll(&self, _dx: f64, dy: f64) -> glib::Propagation {
+        if dy < 0.0 {
+            self.obj().prev_page();
+        } else {
+            self.obj().next_page();
+        }
+        glib::Propagation::Stop
     }
 
     #[template_callback]

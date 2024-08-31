@@ -46,7 +46,6 @@ fn load_css() {
 
 fn build_ui(app: &Application, args: Vec<OsString>) {
     let state = &state::State::new();
-    state.set_zoom(2.0);
 
     let window = window::Window::new(app, state);
     window.set_widget_name("main");

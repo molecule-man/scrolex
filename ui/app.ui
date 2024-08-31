@@ -63,15 +63,16 @@
 				<property name="hscrollbar-policy">automatic</property>
 				<property name="vscrollbar-policy">never</property>
 				<property name="hexpand">true</property>
-				<!--<property name="event-controller-scroll">-->
-				<!--	<object class="GtkEventControllerScroll">-->
-				<!--		<signal name="scroll" handler="handle_scroll" swapped="true" />-->
-				<!--	</object>-->
-				<!--</property>-->
 				<child>
 					<object class="GtkListView" id="listview">
 						<property name="hexpand">true</property>
 						<property name="orientation">horizontal</property>
+					</object>
+				</child>
+				<child>
+					<object class="GtkEventControllerScroll">
+						<property name="flags">vertical|discrete</property>
+						<signal name="scroll" handler="handle_scroll" swapped="true" />
 					</object>
 				</child>
 			</object>
