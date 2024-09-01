@@ -20,7 +20,7 @@ pub struct Page {
 
 #[glib::object_subclass]
 impl ObjectSubclass for Page {
-    const NAME: &'static str = "HallyviewedPage";
+    const NAME: &'static str = "HallyviewPage";
     type Type = super::Page;
     type ParentType = DrawingArea;
 }
