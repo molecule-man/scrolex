@@ -1,7 +1,5 @@
 use glib::subclass::InitializingObject;
 use gtk::gdk::EventSequence;
-//use gtk::gio::prelude::*;
-use gtk::glib::clone;
 use gtk::glib::subclass::prelude::*;
 use gtk::subclass::prelude::*;
 use gtk::{
@@ -82,12 +80,12 @@ impl Window {
     }
 
     #[template_callback]
-    pub fn handle_drag_start(&self, _n_press: i32, x: f64, y: f64) {
+    fn handle_drag_start(&self, _n_press: i32, x: f64, y: f64) {
         *self.drag_coords.borrow_mut() = Some((x, y));
     }
 
     #[template_callback]
-    pub fn handle_drag_move(&self, seq: Option<&EventSequence>, gc: &GestureClick) {
+    fn handle_drag_move(&self, seq: Option<&EventSequence>, gc: &GestureClick) {
         if let Some((prev_x, _)) = *self.drag_coords.borrow() {
             if let Some((x, _)) = gc.point(seq) {
                 self.obj().scroll_view(x - prev_x);
@@ -97,42 +95,13 @@ impl Window {
     }
 
     #[template_callback]
-    pub fn handle_document_open(&self, _: &Button) {
-        let dialog = gtk::FileDialog::builder()
-            .title("Open PDF File")
-            .modal(true)
-            .build();
-
-        dialog.open(
-            Some(&self.obj().application().unwrap().active_window().unwrap()),
-            gtk::gio::Cancellable::NONE,
-            clone!(
-                #[strong(rename_to = state)]
-                self.state,
-                #[strong(rename_to = win)]
-                self.obj(),
-                move |file| match file {
-                    Ok(file) => {
-                        state.load(&file).unwrap_or_else(|err| {
-                            win.show_error_dialog(&format!("Error loading file: {}", err));
-                        });
-                    }
-                    Err(err) => {
-                        win.show_error_dialog(&format!("Error opening file: {}", err));
-                    }
-                },
-            ),
-        );
-    }
-
-    #[template_callback]
-    pub fn handle_zoom_out(&self, _: &Button) {
+    fn handle_zoom_out(&self, _: &Button) {
         let zoom = self.state.zoom();
         self.state.set_zoom(zoom / 1.1);
     }
 
     #[template_callback]
-    pub fn handle_zoom_in(&self, _: &Button) {
+    fn handle_zoom_in(&self, _: &Button) {
         let zoom = self.state.zoom();
         self.state.set_zoom(zoom * 1.1);
     }

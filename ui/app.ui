@@ -15,7 +15,7 @@
 				</child>
 				<child type="start">
 					<object class="GtkButton" id="btn_open">
-						<signal name="clicked" handler="handle_document_open" swapped="true"/>
+						<signal name="clicked" handler="open_document" swapped="true"/>
 						<property name="icon-name">document-open</property>
 						<property name="tooltip-text">Open PDF Document</property>
 						<property name="cursor">

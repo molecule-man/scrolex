@@ -106,6 +106,35 @@ impl Window {
     }
 
     #[template_callback]
+    pub fn open_document(&self) {
+        let dialog = gtk::FileDialog::builder()
+            .title("Open PDF File")
+            .modal(true)
+            .build();
+
+        dialog.open(
+            Some(self),
+            gtk::gio::Cancellable::NONE,
+            clone!(
+                #[strong(rename_to = state)]
+                self.imp().state,
+                #[strong(rename_to = win)]
+                self,
+                move |file| match file {
+                    Ok(file) => {
+                        state.load(&file).unwrap_or_else(|err| {
+                            win.show_error_dialog(&format!("Error loading file: {}", err));
+                        });
+                    }
+                    Err(err) => {
+                        win.show_error_dialog(&format!("Error opening file: {}", err));
+                    }
+                },
+            ),
+        );
+    }
+
+    #[template_callback]
     pub fn clear_model(&self) {
         self.imp().model.remove_all();
     }
