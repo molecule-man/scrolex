@@ -1,18 +1,28 @@
 use glib::subclass::InitializingObject;
 use gtk::gdk::EventSequence;
-use gtk::gio::prelude::*;
+//use gtk::gio::prelude::*;
 use gtk::glib::clone;
 use gtk::glib::subclass::prelude::*;
 use gtk::subclass::prelude::*;
-use gtk::{glib, Button, CompositeTemplate, ListView, ScrolledWindow, ToggleButton};
+use gtk::{
+    glib, Button, CompositeTemplate, ListView, ScrolledWindow, SingleSelection, ToggleButton,
+};
 use gtk::{prelude::*, GestureClick};
 use std::cell::RefCell;
 
+use crate::state::State;
+
 // Object holding the state
-#[derive(CompositeTemplate, Default, glib::Properties)]
+#[derive(CompositeTemplate, Default)]
 #[template(resource = "/com/andr2i/hallyview/app.ui")]
-#[properties(wrapper_type = super::Window)]
 pub struct Window {
+    #[template_child]
+    pub state: TemplateChild<State>,
+    #[template_child]
+    pub model: TemplateChild<gtk::gio::ListStore>,
+    #[template_child]
+    pub selection: TemplateChild<SingleSelection>,
+
     #[template_child]
     pub btn_open: TemplateChild<Button>,
     #[template_child]
@@ -25,9 +35,6 @@ pub struct Window {
     pub scrolledwindow: TemplateChild<ScrolledWindow>,
     #[template_child]
     pub listview: TemplateChild<ListView>,
-
-    #[property(get, set)]
-    state: RefCell<crate::state::State>,
 
     drag_coords: RefCell<Option<(f64, f64)>>,
 }
@@ -43,6 +50,7 @@ impl ObjectSubclass for Window {
     fn class_init(klass: &mut Self::Class) {
         klass.bind_template();
         klass.bind_template_callbacks();
+        klass.bind_template_instance_callbacks();
     }
 
     fn instance_init(obj: &InitializingObject<Self>) {
@@ -51,14 +59,13 @@ impl ObjectSubclass for Window {
 }
 
 // Trait shared by all GObjects
-#[glib::derived_properties]
 impl ObjectImpl for Window {
     fn constructed(&self) {
         // Call "constructed" on parent
         self.parent_constructed();
 
-        //let obj = self.obj();
-        //obj.setup();
+        let obj = self.obj();
+        obj.setup();
     }
 }
 
@@ -106,7 +113,7 @@ impl Window {
                 self.obj(),
                 move |file| match file {
                     Ok(file) => {
-                        state.borrow().load(&file).unwrap_or_else(|err| {
+                        state.load(&file).unwrap_or_else(|err| {
                             win.show_error_dialog(&format!("Error loading file: {}", err));
                         });
                     }
@@ -120,14 +127,14 @@ impl Window {
 
     #[template_callback]
     pub fn handle_zoom_out(&self, _: &Button) {
-        let zoom = self.state.borrow().zoom();
-        self.state.borrow().set_zoom(zoom / 1.1);
+        let zoom = self.state.zoom();
+        self.state.set_zoom(zoom / 1.1);
     }
 
     #[template_callback]
     pub fn handle_zoom_in(&self, _: &Button) {
-        let zoom = self.state.borrow().zoom();
-        self.state.borrow().set_zoom(zoom * 1.1);
+        let zoom = self.state.zoom();
+        self.state.set_zoom(zoom * 1.1);
     }
 }
 

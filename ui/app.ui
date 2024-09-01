@@ -1,5 +1,9 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <interface>
+	<object class="DocState" id="state">
+		<signal name="before-load" handler="clear_model" swapped="true"/>
+		<signal name="loaded" handler="handle_document_load" swapped="true"/>
+	</object>
 	<template class="MyApp" parent="GtkApplicationWindow">
 		<property name="title">HallyViewed</property>
 		<child type="titlebar">
@@ -47,6 +51,7 @@
 				</child>
 				<child type="end">
 					<object class="GtkToggleButton" id="btn_crop">
+						<property name="active" bind-source="state" bind-property="crop" bind-flags="bidirectional"/>
 						<property name="icon-name">object-flip-horizontal</property>
 						<property name="tooltip-text">Crop Margins</property>
 						<property name="cursor">
@@ -67,6 +72,13 @@
 					<object class="GtkListView" id="listview">
 						<property name="hexpand">true</property>
 						<property name="orientation">horizontal</property>
+						<property name="model">
+                                                        <object class="GtkSingleSelection" id="selection">
+                                                                <property name="model">
+                                                                        <object class="GListStore" id="model"/>
+                                                                </property>
+                                                        </object>
+						</property>
 					</object>
 				</child>
 				<child>

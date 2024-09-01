@@ -1,13 +1,12 @@
 mod imp;
 
 use glib::{clone, Object};
-use gtk::glib::closure_local;
 use gtk::glib::subclass::types::ObjectSubclassIsExt;
 use gtk::prelude::*;
 use gtk::{gio, glib, Application};
 
 use crate::page;
-use crate::state;
+use crate::state::State;
 
 glib::wrapper! {
     pub struct Window(ObjectSubclass<imp::Window>)
@@ -16,17 +15,19 @@ glib::wrapper! {
                     gtk::ConstraintTarget, gtk::Native, gtk::Root, gtk::ShortcutManager;
 }
 
+#[gtk::template_callbacks]
 impl Window {
-    pub fn new(app: &Application, state: &state::State) -> Self {
-        let w: Self = Object::builder()
-            .property("application", app)
-            .property("state", state)
-            .build();
+    pub fn new(app: &Application) -> Self {
+        Object::builder().property("application", app).build()
+    }
 
-        w.setup_model(state);
-        w.setup_factory(state);
+    pub(crate) fn state(&self) -> &State {
+        self.imp().state.as_ref()
+    }
 
-        w
+    pub(crate) fn setup(&self) {
+        self.setup_model();
+        self.setup_factory();
     }
 
     pub(crate) fn scroll_view(&self, dx: f64) {
@@ -83,12 +84,8 @@ impl Window {
             .set_value(current_pos + width);
     }
 
-    fn ensure_ready_selection(&self) -> Option<gtk::SingleSelection> {
-        let selection = self
-            .imp()
-            .listview
-            .model()
-            .and_downcast::<gtk::SingleSelection>()?;
+    fn ensure_ready_selection(&self) -> Option<&gtk::SingleSelection> {
+        let selection: &gtk::SingleSelection = self.imp().selection.as_ref();
 
         if selection.n_items() == 0 {
             return None;
@@ -99,83 +96,59 @@ impl Window {
         Some(selection)
     }
 
-    fn setup_model(&self, state: &state::State) {
-        let model = gtk::gio::ListStore::new::<page::PageNumber>();
-        let selection = gtk::SingleSelection::new(Some(model.clone()));
-        self.imp().listview.set_model(Some(&selection));
-
-        state.connect_closure(
-            "before-load",
-            false,
-            closure_local!(
-                #[weak]
-                model,
-                move |_: &state::State| {
-                    model.remove_all();
-                }
-            ),
-        );
-
-        state.connect_closure(
-            "loaded",
-            false,
-            closure_local!(
-                #[weak]
-                model,
-                #[weak]
-                selection,
-                move |state: &state::State| {
-                    let doc = if let Some(doc) = state.doc() {
-                        doc
-                    } else {
-                        return;
-                    };
-
-                    let n_pages = doc.n_pages() as u32;
-                    let scroll_to = state.page().min(n_pages - 1);
-                    let init_load_from = scroll_to.saturating_sub(1);
-                    let init_load_till = (scroll_to + 10).min(n_pages - 1);
-
-                    let vector: Vec<page::PageNumber> = (init_load_from as i32
-                        ..init_load_till as i32)
-                        .map(page::PageNumber::new)
-                        .collect();
-                    model.extend_from_slice(&vector);
-                    selection.select_item(scroll_to - init_load_from, true);
-
-                    glib::idle_add_local(move || {
-                        if init_load_from > 0 {
-                            let vector: Vec<page::PageNumber> = (0..init_load_from as i32)
-                                .map(page::PageNumber::new)
-                                .collect();
-                            model.splice(0, 0, &vector);
-                        }
-                        if init_load_till < n_pages {
-                            let vector: Vec<page::PageNumber> = (init_load_till as i32
-                                ..n_pages as i32)
-                                .map(page::PageNumber::new)
-                                .collect();
-                            model.extend_from_slice(&vector);
-                        }
-                        glib::ControlFlow::Break
-                    });
-                }
-            ),
-        );
-
-        selection
+    fn setup_model(&self) {
+        let state: &State = self.imp().state.as_ref();
+        self.imp()
+            .selection
             .property_expression("selected-item")
             .chain_property::<page::PageNumber>("page_number")
             .bind(state, "page", gtk::Widget::NONE);
-
-        self.imp()
-            .btn_crop
-            .bind_property("active", state, "crop")
-            .bidirectional()
-            .build();
     }
 
-    fn setup_factory(&self, state: &state::State) {
+    #[template_callback]
+    pub fn clear_model(&self) {
+        self.imp().model.remove_all();
+    }
+
+    #[template_callback]
+    pub fn handle_document_load(&self, state: &State) {
+        let Some(doc) = state.doc() else {
+            return;
+        };
+
+        let model = self.imp().model.clone();
+        let selection = self.imp().selection.clone();
+
+        let n_pages = doc.n_pages() as u32;
+        let scroll_to = state.page().min(n_pages - 1);
+        let init_load_from = scroll_to.saturating_sub(1);
+        let init_load_till = (scroll_to + 10).min(n_pages - 1);
+
+        let vector: Vec<page::PageNumber> = (init_load_from as i32..init_load_till as i32)
+            .map(page::PageNumber::new)
+            .collect();
+        model.extend_from_slice(&vector);
+        selection.select_item(scroll_to - init_load_from, true);
+
+        glib::idle_add_local(move || {
+            if init_load_from > 0 {
+                let vector: Vec<page::PageNumber> = (0..init_load_from as i32)
+                    .map(page::PageNumber::new)
+                    .collect();
+                model.splice(0, 0, &vector);
+            }
+            if init_load_till < n_pages {
+                let vector: Vec<page::PageNumber> = (init_load_till as i32..n_pages as i32)
+                    .map(page::PageNumber::new)
+                    .collect();
+                model.extend_from_slice(&vector);
+            }
+            glib::ControlFlow::Break
+        });
+    }
+
+    fn setup_factory(&self) {
+        let state: &State = self.imp().state.as_ref();
         let factory = gtk::SignalListItemFactory::new();
         self.imp().listview.set_factory(Some(&factory));
 

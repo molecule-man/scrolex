@@ -45,10 +45,10 @@ fn load_css() {
 }
 
 fn build_ui(app: &Application, args: Vec<OsString>) {
-    let state = &state::State::new();
-
-    let window = window::Window::new(app, state);
+    let window = window::Window::new(app);
     window.set_widget_name("main");
+
+    let state = window.state();
 
     app.connect_shutdown(clone!(
         #[strong]

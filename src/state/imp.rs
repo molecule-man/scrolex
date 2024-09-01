@@ -25,7 +25,7 @@ pub struct State {
 
 #[glib::object_subclass]
 impl ObjectSubclass for State {
-    const NAME: &'static str = "PageState";
+    const NAME: &'static str = "DocState";
     type Type = super::State;
 }
 
