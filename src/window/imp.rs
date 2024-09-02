@@ -1,5 +1,5 @@
 use glib::subclass::InitializingObject;
-use gtk::gdk::EventSequence;
+use gtk::gdk::{EventSequence, Key, ModifierType};
 use gtk::glib::subclass::prelude::*;
 use gtk::subclass::prelude::*;
 use gtk::{
@@ -104,6 +104,35 @@ impl Window {
     fn handle_zoom_in(&self, _: &Button) {
         let zoom = self.state.zoom();
         self.state.set_zoom(zoom * 1.1);
+    }
+
+    #[template_callback]
+    fn handle_key_press(
+        &self,
+        keyval: Key,
+        _keycode: u32,
+        _modifier: ModifierType,
+    ) -> glib::Propagation {
+        match keyval {
+            Key::o => {
+                self.obj().open_document();
+            }
+            Key::l => {
+                self.obj().next_page();
+            }
+            Key::h => {
+                self.obj().prev_page();
+            }
+            Key::bracketleft => {
+                self.state.set_zoom(self.state.zoom() / 1.1);
+            }
+            Key::bracketright => {
+                self.state.set_zoom(self.state.zoom() * 1.1);
+            }
+            _ => return glib::Propagation::Proceed,
+        }
+
+        glib::Propagation::Stop
     }
 }
 

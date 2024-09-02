@@ -94,6 +94,11 @@
 						<signal name="update" handler="handle_drag_move" swapped="true" />
 					</object>
 				</child>
+				<child>
+					<object class="GtkEventControllerKey">
+						<signal name="key-pressed" handler="handle_key_press" swapped="true" />
+					</object>
+				</child>
 			</object>
 		</child>
 	</template>

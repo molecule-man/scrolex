@@ -26,8 +26,53 @@ impl Window {
     }
 
     pub(crate) fn setup(&self) {
-        self.setup_model();
-        self.setup_factory();
+        let state: &State = self.imp().state.as_ref();
+        let factory = gtk::SignalListItemFactory::new();
+
+        self.imp().listview.set_factory(Some(&factory));
+        self.imp()
+            .selection
+            .property_expression("selected-item")
+            .chain_property::<page::PageNumber>("page_number")
+            .bind(state, "page", gtk::Widget::NONE);
+
+        factory.connect_setup(clone!(
+            #[weak]
+            state,
+            move |_, list_item| {
+                let list_item = list_item.downcast_ref::<gtk::ListItem>().unwrap();
+                let page = page::Page::new();
+
+                state
+                    .bind_property("crop", &page, "crop")
+                    .flags(glib::BindingFlags::DEFAULT | glib::BindingFlags::SYNC_CREATE)
+                    .build();
+
+                state
+                    .bind_property("zoom", &page, "zoom")
+                    .flags(glib::BindingFlags::DEFAULT | glib::BindingFlags::SYNC_CREATE)
+                    .build();
+
+                list_item.set_child(Some(&page));
+            }
+        ));
+
+        factory.connect_bind(clone!(
+            #[weak]
+            state,
+            move |_, list_item| {
+                let list_item = list_item.downcast_ref::<gtk::ListItem>().unwrap();
+                let page_number = list_item.item().and_downcast::<page::PageNumber>().unwrap();
+                let child = list_item.child().unwrap();
+                let page = child.downcast_ref::<page::Page>().unwrap();
+
+                if let Some(doc) = state.doc() {
+                    if let Some(poppler_page) = doc.page(page_number.page_number()) {
+                        page.bind(&page_number, &poppler_page);
+                    }
+                }
+            }
+        ));
     }
 
     pub(crate) fn scroll_view(&self, dx: f64) {
@@ -94,15 +139,6 @@ impl Window {
         selection.selected_item()?;
 
         Some(selection)
-    }
-
-    fn setup_model(&self) {
-        let state: &State = self.imp().state.as_ref();
-        self.imp()
-            .selection
-            .property_expression("selected-item")
-            .chain_property::<page::PageNumber>("page_number")
-            .bind(state, "page", gtk::Widget::NONE);
     }
 
     #[template_callback]
@@ -174,50 +210,6 @@ impl Window {
             }
             glib::ControlFlow::Break
         });
-    }
-
-    fn setup_factory(&self) {
-        let state: &State = self.imp().state.as_ref();
-        let factory = gtk::SignalListItemFactory::new();
-        self.imp().listview.set_factory(Some(&factory));
-
-        factory.connect_setup(clone!(
-            #[weak(rename_to = state)]
-            state,
-            move |_, list_item| {
-                let list_item = list_item.downcast_ref::<gtk::ListItem>().unwrap();
-                let page = page::Page::new();
-
-                state
-                    .bind_property("crop", &page, "crop")
-                    .flags(glib::BindingFlags::DEFAULT | glib::BindingFlags::SYNC_CREATE)
-                    .build();
-
-                state
-                    .bind_property("zoom", &page, "zoom")
-                    .flags(glib::BindingFlags::DEFAULT | glib::BindingFlags::SYNC_CREATE)
-                    .build();
-
-                list_item.set_child(Some(&page));
-            }
-        ));
-
-        factory.connect_bind(clone!(
-            #[weak(rename_to = state)]
-            state,
-            move |_, list_item| {
-                let list_item = list_item.downcast_ref::<gtk::ListItem>().unwrap();
-                let page_number = list_item.item().and_downcast::<page::PageNumber>().unwrap();
-                let child = list_item.child().unwrap();
-                let page = child.downcast_ref::<page::Page>().unwrap();
-
-                if let Some(doc) = state.doc() {
-                    if let Some(poppler_page) = doc.page(page_number.page_number()) {
-                        page.bind(&page_number, &poppler_page);
-                    }
-                }
-            }
-        ));
     }
 
     pub(crate) fn show_error_dialog(&self, message: &str) {
