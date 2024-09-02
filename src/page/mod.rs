@@ -1,10 +1,22 @@
 mod imp;
 mod page_number_imp;
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
+use gtk::gdk::BUTTON_PRIMARY;
 use gtk::gio::prelude::*;
 use gtk::prelude::*;
 use gtk::subclass::prelude::ObjectSubclassIsExt;
 use gtk::{glib, glib::clone};
+
+#[derive(Default)]
+pub struct Highlighted {
+    pub x1: f64,
+    pub y1: f64,
+    pub x2: f64,
+    pub y2: f64,
+}
 
 glib::wrapper! {
     pub struct PageNumber(ObjectSubclass<page_number_imp::PageNumber>);
@@ -37,12 +49,66 @@ impl Page {
             p.queue_draw();
         });
 
+        let mouse_coords = Rc::new(RefCell::new(None));
+        let gc = gtk::GestureClick::builder().button(BUTTON_PRIMARY).build();
+        gc.connect_pressed(clone!(
+            #[strong]
+            mouse_coords,
+            move |_gc, _n_press, x, y| {
+                mouse_coords.replace(Some((x, y)));
+            }
+        ));
+
+        gc.connect_update(clone!(
+            #[strong]
+            mouse_coords,
+            #[strong]
+            page,
+            move |gc, seq| {
+                let Some((start_x, start_y)) = *mouse_coords.borrow() else {
+                    return;
+                };
+
+                let Some((end_x, end_y)) = gc.point(seq) else {
+                    return;
+                };
+
+                if let Some(poppler_page) = page.imp().popplerpage.borrow().as_ref() {
+                    let mut rect = poppler::Rectangle::default();
+                    // TODO: handle crop
+                    rect.set_x1(start_x / page.zoom());
+                    rect.set_y1(start_y / page.zoom());
+                    rect.set_x2(end_x / page.zoom());
+                    rect.set_y2(end_y / page.zoom());
+                    let selected =
+                        &poppler_page.selected_text(poppler::SelectionStyle::Glyph, &mut rect);
+
+                    page.imp().highlighted.replace(Highlighted {
+                        x1: rect.x1(),
+                        y1: rect.y1(),
+                        x2: rect.x2(),
+                        y2: rect.y2(),
+                    });
+
+                    if let Some(selected) = selected {
+                        page.clipboard().set_text(selected);
+                    }
+
+                    page.queue_draw();
+                };
+            }
+        ));
+
+        page.add_controller(gc);
+
         page.set_size_request(600, 800);
 
         page
     }
 
     pub fn bind(&self, pn: &PageNumber, poppler_page: &poppler::Page) {
+        self.imp().popplerpage.replace(Some(poppler_page.clone()));
+
         if let Some(prev_binding) = self.imp().binding.borrow_mut().take() {
             prev_binding.unbind();
         }
@@ -84,6 +150,19 @@ impl Page {
                 cr.set_source_rgba(1.0, 1.0, 1.0, 1.0);
                 cr.fill().expect("Failed to fill");
                 poppler_page.render(cr);
+
+                let highlighted = &page.imp().highlighted.borrow();
+
+                if highlighted.x2 - highlighted.x1 > 0.0 && highlighted.y2 - highlighted.y1 > 0.0 {
+                    cr.set_source_rgba(1.0, 1.0, 0.0, 0.5);
+                    cr.rectangle(
+                        highlighted.x1,
+                        highlighted.y1,
+                        highlighted.x2 - highlighted.x1,
+                        highlighted.y2 - highlighted.y1,
+                    );
+                    cr.fill().expect("Failed to fill");
+                }
             }
         ));
 

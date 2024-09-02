@@ -4,6 +4,8 @@ use gtk::glib::subclass::prelude::*;
 use gtk::subclass::prelude::*;
 use gtk::DrawingArea;
 use std::cell::{Cell, RefCell};
+use super::Highlighted;
+
 
 #[derive(Default, glib::Properties)]
 #[properties(wrapper_type = super::Page)]
@@ -16,6 +18,15 @@ pub struct Page {
 
     #[property(get, set)]
     pub binding: RefCell<Option<glib::Binding>>,
+
+    #[property(get, set)]
+    pub popplerpage: RefCell<Option<poppler::Page>>,
+
+    #[property(name = "x1", get, set, type = f64, member = x1)]
+    #[property(name = "y1", get, set, type = f64, member = y1)]
+    #[property(name = "x2", get, set, type = f64, member = x2)]
+    #[property(name = "y2", get, set, type = f64, member = y2)]
+    pub highlighted: RefCell<Highlighted>,
 }
 
 #[glib::object_subclass]
