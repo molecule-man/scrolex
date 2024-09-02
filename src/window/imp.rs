@@ -95,18 +95,6 @@ impl Window {
     }
 
     #[template_callback]
-    fn handle_zoom_out(&self, _: &Button) {
-        let zoom = self.state.zoom();
-        self.state.set_zoom(zoom / 1.1);
-    }
-
-    #[template_callback]
-    fn handle_zoom_in(&self, _: &Button) {
-        let zoom = self.state.zoom();
-        self.state.set_zoom(zoom * 1.1);
-    }
-
-    #[template_callback]
     fn handle_key_press(
         &self,
         keyval: Key,
@@ -124,10 +112,10 @@ impl Window {
                 self.obj().prev_page();
             }
             Key::bracketleft => {
-                self.state.set_zoom(self.state.zoom() / 1.1);
+                self.obj().zoom_out();
             }
             Key::bracketright => {
-                self.state.set_zoom(self.state.zoom() * 1.1);
+                self.obj().zoom_in();
             }
             _ => return glib::Propagation::Proceed,
         }

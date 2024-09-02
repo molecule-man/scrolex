@@ -27,7 +27,7 @@
 				</child>
 				<child type="start">
 					<object class="GtkButton" id="btn_zoom_out">
-						<signal name="clicked" handler="handle_zoom_out" swapped="true"/>
+						<signal name="clicked" handler="zoom_out" swapped="true"/>
 						<property name="icon-name">zoom-out</property>
 						<property name="tooltip-text">Zoom Out</property>
 						<property name="cursor">
@@ -39,7 +39,7 @@
 				</child>
 				<child type="start">
 					<object class="GtkButton" id="btn_zoom_in">
-						<signal name="clicked" handler="handle_zoom_in" swapped="true"/>
+						<signal name="clicked" handler="zoom_in" swapped="true"/>
 						<property name="icon-name">zoom-in</property>
 						<property name="tooltip-text">Zoom in</property>
 						<property name="cursor">

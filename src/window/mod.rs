@@ -80,6 +80,16 @@ impl Window {
         hadjustment.set_value(hadjustment.value() - dx);
     }
 
+    #[template_callback]
+    pub(crate) fn zoom_out(&self) {
+        self.imp().state.set_zoom(self.imp().state.zoom() / 1.1);
+    }
+
+    #[template_callback]
+    pub(crate) fn zoom_in(&self) {
+        self.imp().state.set_zoom(self.imp().state.zoom() * 1.1);
+    }
+
     pub(crate) fn prev_page(&self) {
         let Some(selection) = self.ensure_ready_selection() else {
             return;
