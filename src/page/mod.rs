@@ -75,11 +75,21 @@ impl Page {
 
                 if let Some(poppler_page) = page.imp().popplerpage.borrow().as_ref() {
                     let mut rect = poppler::Rectangle::default();
-                    // TODO: handle crop
-                    rect.set_x1(start_x / page.zoom());
-                    rect.set_y1(start_y / page.zoom());
-                    rect.set_x2(end_x / page.zoom());
-                    rect.set_y2(end_y / page.zoom());
+
+                    let mut crop_x1 = 0.0;
+                    let mut crop_y1 = 0.0;
+
+                    if page.crop() {
+                        let crop_bbox = page.imp().crop_bbox.borrow();
+                        crop_x1 = crop_bbox.x1();
+                        crop_y1 = crop_bbox.y1();
+                    }
+
+                    rect.set_x1(crop_x1 + start_x / page.zoom());
+                    rect.set_y1(crop_y1 + start_y / page.zoom());
+                    rect.set_x2(crop_x1 + end_x / page.zoom());
+                    rect.set_y2(crop_y1 + end_y / page.zoom());
+
                     let selected =
                         &poppler_page.selected_text(poppler::SelectionStyle::Glyph, &mut rect);
 
@@ -129,6 +139,21 @@ impl Page {
         let mut bbox = poppler::Rectangle::default();
         poppler_page.get_bounding_box(&mut bbox);
 
+        let mut crop_bbox = poppler::Rectangle::new();
+        crop_bbox.set_x1((bbox.x1() - 5.0).max(0.0));
+        crop_bbox.set_y1((bbox.y1() - 5.0).max(0.0));
+        crop_bbox.set_x2((bbox.x2() + 5.0).min(width));
+        crop_bbox.set_y2((bbox.y2() + 5.0).min(height));
+
+        if crop_bbox.x2() - crop_bbox.x1() < width / 2.0 {
+            crop_bbox.set_x2(crop_bbox.x1() + width / 2.0);
+        }
+        if crop_bbox.y2() - crop_bbox.y1() < height / 2.0 {
+            crop_bbox.set_y2(crop_bbox.y1() + height / 2.0);
+        }
+
+        self.imp().crop_bbox.replace(crop_bbox);
+
         self.set_draw_func(clone!(
             #[strong(rename_to = page)]
             self,
@@ -140,10 +165,10 @@ impl Page {
                 let zoom = page.zoom();
 
                 if page.crop() {
-                    cr.translate((-bbox.x1() + 5.0) * zoom, (-bbox.y1() + 5.0) * zoom);
+                    cr.translate(-crop_bbox.x1() * zoom, -crop_bbox.y1() * zoom);
                 }
 
-                resize_page(&page, zoom, page.crop(), width, height, bbox);
+                page.resize(width, height, crop_bbox);
 
                 cr.rectangle(0.0, 0.0, width * zoom, height * zoom);
                 cr.scale(zoom, zoom);
@@ -166,7 +191,18 @@ impl Page {
             }
         ));
 
-        resize_page(self, self.zoom(), self.crop(), width, height, bbox);
+        self.resize(width, height, crop_bbox);
+    }
+
+    fn resize(&self, orig_width: f64, orig_height: f64, bbox: poppler::Rectangle) {
+        let mut width = orig_width;
+        let mut height = orig_height;
+        if self.crop() {
+            width = bbox.x2() - bbox.x1();
+            height = bbox.y2() - bbox.y1();
+        }
+
+        self.set_size_request((width * self.zoom()) as i32, (height * self.zoom()) as i32);
     }
 }
 
@@ -174,30 +210,4 @@ impl Default for Page {
     fn default() -> Self {
         Self::new()
     }
-}
-
-fn resize_page(
-    page_widget: &impl IsA<gtk::Widget>,
-    zoom: f64,
-    crop_margins: bool,
-    orig_width: f64,
-    orig_height: f64,
-    bbox: poppler::Rectangle,
-) {
-    let mut width = orig_width;
-    let mut height = orig_height;
-    if crop_margins {
-        width = bbox.x2() - bbox.x1() + 10.0;
-        height = bbox.y2() - bbox.y1() + 10.0;
-    }
-
-    if width < orig_width / 2.0 {
-        width = orig_width / 2.0;
-    }
-
-    if height < orig_height / 2.0 {
-        height = orig_height / 2.0;
-    }
-
-    page_widget.set_size_request((width * zoom) as i32, (height * zoom) as i32);
 }
