@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+futures = "0.3.30"
 gtk = { version = "0.9.0", package = "gtk4", features = ["v4_14"] }
 poppler-rs = "0.24.1"
 

@@ -1,5 +1,7 @@
 mod imp;
 
+use std::sync::mpsc;
+
 use glib::{clone, Object};
 use gtk::glib::subclass::types::ObjectSubclassIsExt;
 use gtk::prelude::*;
@@ -26,6 +28,10 @@ impl Window {
     }
 
     pub(crate) fn setup(&self) {
+        let (render_req_send, render_req_recv) = mpsc::channel();
+
+        page::spawn_pdf_renderer(render_req_recv);
+
         let state: &State = self.imp().state.as_ref();
         let factory = gtk::SignalListItemFactory::new();
 
@@ -53,6 +59,11 @@ impl Window {
                     .flags(glib::BindingFlags::DEFAULT | glib::BindingFlags::SYNC_CREATE)
                     .build();
 
+                state
+                    .bind_property("uri", &page, "uri")
+                    .flags(glib::BindingFlags::DEFAULT | glib::BindingFlags::SYNC_CREATE)
+                    .build();
+
                 list_item.set_child(Some(&page));
             }
         ));
@@ -68,7 +79,7 @@ impl Window {
 
                 if let Some(doc) = state.doc() {
                     if let Some(poppler_page) = doc.page(page_number.page_number()) {
-                        page.bind(&page_number, &poppler_page);
+                        page.bind(&page_number, &poppler_page, render_req_send.clone());
                     }
                 }
             }

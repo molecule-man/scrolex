@@ -3,12 +3,17 @@ mod page_number_imp;
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::mpsc::{Receiver, Sender};
+use std::{sync, thread};
 
+use futures::channel::oneshot;
+use gtk::cairo::{Context, ImageSurface};
 use gtk::gdk::BUTTON_PRIMARY;
 use gtk::gio::prelude::*;
 use gtk::prelude::*;
 use gtk::subclass::prelude::ObjectSubclassIsExt;
 use gtk::{glib, glib::clone};
+use poppler::Document;
 
 #[derive(Default)]
 pub struct Highlighted {
@@ -116,7 +121,12 @@ impl Page {
         page
     }
 
-    pub fn bind(&self, pn: &PageNumber, poppler_page: &poppler::Page) {
+    pub(crate) fn bind(
+        &self,
+        pn: &PageNumber,
+        poppler_page: &poppler::Page,
+        render_req_sender: Sender<RenderMsg>,
+    ) {
         self.imp().popplerpage.replace(Some(poppler_page.clone()));
 
         if let Some(prev_binding) = self.imp().binding.borrow_mut().take() {
@@ -130,68 +140,122 @@ impl Page {
 
         self.imp().binding.replace(Some(new_binding));
 
-        self.bind_draw(poppler_page);
+        self.bind_draw(poppler_page, render_req_sender);
     }
 
-    fn bind_draw(&self, poppler_page: &poppler::Page) {
+    fn bind_draw(&self, poppler_page: &poppler::Page, render_req_sender: Sender<RenderMsg>) {
         let (width, height) = poppler_page.size();
 
-        let mut bbox = poppler::Rectangle::default();
-        poppler_page.get_bounding_box(&mut bbox);
+        let (render_resp_sender, render_resp_receiver) = oneshot::channel();
 
-        let mut crop_bbox = poppler::Rectangle::new();
-        crop_bbox.set_x1((bbox.x1() - 5.0).max(0.0));
-        crop_bbox.set_y1((bbox.y1() - 5.0).max(0.0));
-        crop_bbox.set_x2((bbox.x2() + 5.0).min(width));
-        crop_bbox.set_y2((bbox.y2() + 5.0).min(height));
+        render_req_sender
+            .send(RenderMsg {
+                uri: self.uri(),
+                page_num: poppler_page.index(),
+                width: width as i32,
+                height: height as i32,
+                resp_sender: render_resp_sender,
+            })
+            .expect("Failed to send render request");
 
-        if crop_bbox.x2() - crop_bbox.x1() < width / 2.0 {
-            crop_bbox.set_x2(crop_bbox.x1() + width / 2.0);
-        }
-        if crop_bbox.y2() - crop_bbox.y1() < height / 2.0 {
-            crop_bbox.set_y2(crop_bbox.y1() + height / 2.0);
-        }
-
-        self.imp().crop_bbox.replace(crop_bbox);
-
-        self.set_draw_func(clone!(
+        glib::spawn_future_local(clone!(
             #[strong(rename_to = page)]
             self,
-            #[strong]
-            poppler_page,
-            #[strong]
-            page,
-            move |_, cr, _width, _height| {
-                let zoom = page.zoom();
+            async move {
+                let rendered_data = render_resp_receiver
+                    .await
+                    .expect("Failed to receive rendered data");
 
-                if page.crop() {
-                    cr.translate(-crop_bbox.x1() * zoom, -crop_bbox.y1() * zoom);
-                }
+                let stride = 4 * width as i32;
 
-                page.resize(width, height, crop_bbox);
+                // Create an ImageSurface from the received pixel buffer
+                let surface = ImageSurface::create_for_data(
+                    rendered_data,
+                    gtk::cairo::Format::ARgb32,
+                    width as i32,
+                    height as i32,
+                    stride,
+                )
+                .expect("Failed to create image surface");
 
-                cr.rectangle(0.0, 0.0, width * zoom, height * zoom);
-                cr.scale(zoom, zoom);
-                cr.set_source_rgba(1.0, 1.0, 1.0, 1.0);
-                cr.fill().expect("Failed to fill");
-                poppler_page.render(cr);
+                //let surface =
+                //    ImageSurface::create(gtk::cairo::Format::ARgb32, width as i32, height as i32)
+                //        .expect("Couldn't create a surface!");
+                //surface
+                //    .with_data(|data| {
+                //        data.copy_from_slice(&rendered_data);
+                //    })
+                //    .expect("Failed to copy rendered data");
 
-                let highlighted = &page.imp().highlighted.borrow();
-
-                if highlighted.x2 - highlighted.x1 > 0.0 && highlighted.y2 - highlighted.y1 > 0.0 {
-                    cr.set_source_rgba(1.0, 1.0, 0.0, 0.5);
-                    cr.rectangle(
-                        highlighted.x1,
-                        highlighted.y1,
-                        highlighted.x2 - highlighted.x1,
-                        highlighted.y2 - highlighted.y1,
-                    );
-                    cr.fill().expect("Failed to fill");
-                }
+                page.set_draw_func(clone!(
+                    #[strong]
+                    page,
+                    move |_, cr, _width, _height| {
+                        cr.set_source_surface(&surface, 0.0, 0.0).unwrap();
+                        cr.paint().unwrap();
+                        page.set_size_request(width as i32, height as i32);
+                    }
+                ));
+                page.set_size_request(width as i32, height as i32);
             }
         ));
 
-        self.resize(width, height, crop_bbox);
+        //let mut bbox = poppler::Rectangle::default();
+        //poppler_page.get_bounding_box(&mut bbox);
+        //
+        //let mut crop_bbox = poppler::Rectangle::new();
+        //crop_bbox.set_x1((bbox.x1() - 5.0).max(0.0));
+        //crop_bbox.set_y1((bbox.y1() - 5.0).max(0.0));
+        //crop_bbox.set_x2((bbox.x2() + 5.0).min(width));
+        //crop_bbox.set_y2((bbox.y2() + 5.0).min(height));
+        //
+        //if crop_bbox.x2() - crop_bbox.x1() < width / 2.0 {
+        //    crop_bbox.set_x2(crop_bbox.x1() + width / 2.0);
+        //}
+        //if crop_bbox.y2() - crop_bbox.y1() < height / 2.0 {
+        //    crop_bbox.set_y2(crop_bbox.y1() + height / 2.0);
+        //}
+        //
+        //self.imp().crop_bbox.replace(crop_bbox);
+        //
+        //self.set_draw_func(clone!(
+        //    #[strong(rename_to = page)]
+        //    self,
+        //    #[strong]
+        //    poppler_page,
+        //    #[strong]
+        //    page,
+        //    move |_, cr, _width, _height| {
+        //        let zoom = page.zoom();
+        //
+        //        if page.crop() {
+        //            cr.translate(-crop_bbox.x1() * zoom, -crop_bbox.y1() * zoom);
+        //        }
+        //
+        //        page.resize(width, height, crop_bbox);
+        //
+        //        cr.rectangle(0.0, 0.0, width * zoom, height * zoom);
+        //        cr.scale(zoom, zoom);
+        //        cr.set_source_rgba(1.0, 1.0, 1.0, 1.0);
+        //        cr.fill().expect("Failed to fill");
+        //        poppler_page.render(cr);
+        //
+        //        let highlighted = &page.imp().highlighted.borrow();
+        //
+        //        if highlighted.x2 - highlighted.x1 > 0.0 && highlighted.y2 - highlighted.y1 > 0.0 {
+        //            cr.set_source_rgba(1.0, 1.0, 0.0, 0.5);
+        //            cr.rectangle(
+        //                highlighted.x1,
+        //                highlighted.y1,
+        //                highlighted.x2 - highlighted.x1,
+        //                highlighted.y2 - highlighted.y1,
+        //            );
+        //            cr.fill().expect("Failed to fill");
+        //        }
+        //    }
+        //));
+        //
+        //self.resize(width, height, crop_bbox);
     }
 
     fn resize(&self, orig_width: f64, orig_height: f64, bbox: poppler::Rectangle) {
@@ -210,4 +274,55 @@ impl Default for Page {
     fn default() -> Self {
         Self::new()
     }
+}
+
+pub(crate) struct RenderMsg {
+    pub uri: String,
+    pub page_num: i32,
+    pub width: i32,
+    pub height: i32,
+    pub resp_sender: oneshot::Sender<Vec<u8>>,
+}
+
+pub(crate) fn spawn_pdf_renderer(render_req_reciever: Receiver<RenderMsg>) {
+    thread::spawn(move || {
+        let mut doc = None;
+        let mut doc_uri = String::new();
+
+        for req in render_req_reciever {
+            if doc.is_none() || doc_uri != req.uri {
+                doc = Some(Document::from_file(&req.uri, None).expect("Couldn't open the file!"));
+                doc_uri = req.uri.clone();
+            }
+            let doc = doc.as_ref().unwrap();
+
+            if let Some(page) = doc.page(req.page_num) {
+                // Create a pixel buffer for rendering
+                let stride = 4 * req.width; // ARGB32 has 4 bytes per pixel
+                                            // Create a temporary Cairo ImageSurface to render the page
+                let surface =
+                    ImageSurface::create(gtk::cairo::Format::ARgb32, req.width, req.height)
+                        .expect("Couldn't create a surface!");
+                let cairo_context = Context::new(&surface).expect("Couldn't create a context!");
+
+                // Render the Poppler page into the Cairo surface
+                page.render(&cairo_context);
+
+                // Now extract the pixel data from the surface
+                let mut buffer = vec![0u8; (stride * req.height) as usize];
+                surface
+                    .with_data(|data| {
+                        // Copy the rendered pixel data into the buffer
+                        buffer.copy_from_slice(data);
+                    })
+                    .expect("Failed to extract surface data");
+
+                // Send the rendered buffer back to the main thread
+                req.resp_sender
+                    .send(buffer)
+                    .expect("Failed to send rendered data");
+            }
+            // TODO else
+        }
+    });
 }
