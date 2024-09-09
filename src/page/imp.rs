@@ -34,8 +34,8 @@ pub struct Page {
     pub highlighted: RefCell<Highlighted>,
 
     pub crop_bbox: RefCell<poppler::Rectangle>,
-    //#[property(get, set)]
-    //pub render_req_sender: RefCell<Option<Sender<super::RenderMsg>>>,
+
+    pub render_req_sender: RefCell<Option<Sender<super::RenderRequest>>>,
 }
 
 #[glib::object_subclass]

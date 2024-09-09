@@ -47,10 +47,12 @@ impl Page {
         let page: Page = glib::Object::builder().build();
 
         page.connect_crop_notify(|p| {
+            p.rebind_draw();
             p.queue_draw();
         });
 
         page.connect_zoom_notify(|p| {
+            p.rebind_draw();
             p.queue_draw();
         });
 
@@ -128,6 +130,9 @@ impl Page {
         render_req_sender: Sender<RenderRequest>,
     ) {
         self.imp().popplerpage.replace(Some(poppler_page.clone()));
+        self.imp()
+            .render_req_sender
+            .replace(Some(render_req_sender.clone()));
 
         if let Some(prev_binding) = self.imp().binding.borrow_mut().take() {
             prev_binding.unbind();
@@ -140,18 +145,30 @@ impl Page {
 
         self.imp().binding.replace(Some(new_binding));
 
-        self.bind_draw(poppler_page, render_req_sender);
+        self.bind_draw(poppler_page, &render_req_sender);
     }
 
-    fn bind_draw(&self, poppler_page: &poppler::Page, render_req_sender: Sender<RenderRequest>) {
+    fn rebind_draw(&self) {
+        let render_req_sender = self.imp().render_req_sender.borrow();
+        let Some(render_req_sender) = render_req_sender.as_ref() else {
+            return;
+        };
+
+        if let Some(poppler_page) = self.imp().popplerpage.borrow().as_ref() {
+            self.bind_draw(poppler_page, render_req_sender);
+        }
+    }
+
+    fn bind_draw(&self, poppler_page: &poppler::Page, render_req_sender: &Sender<RenderRequest>) {
         let (width, height) = poppler_page.size();
+        let page_num = poppler_page.index();
 
         let (render_resp_sender, render_resp_receiver) = oneshot::channel();
 
         render_req_sender
             .send(RenderRequest {
                 uri: self.uri(),
-                page_num: poppler_page.index(),
+                page_num,
                 resp_sender: render_resp_sender,
                 zoom: self.zoom(),
                 crop: self.crop(),
@@ -164,9 +181,11 @@ impl Page {
             async move {
                 let (canvas_width, canvas_height) = (width * page.zoom(), height * page.zoom());
 
+                println!("Waiting for render response... page number {}", page_num);
                 let render_response = render_resp_receiver
                     .await
                     .expect("Failed to receive rendered data");
+                println!("Received render response! Page number {}", page_num);
 
                 let rendered_data = render_response.data;
 
@@ -182,92 +201,29 @@ impl Page {
                 )
                 .expect("Failed to create image surface");
 
-                //let surface =
-                //    ImageSurface::create(gtk::cairo::Format::ARgb32, width as i32, height as i32)
-                //        .expect("Couldn't create a surface!");
-                //surface
-                //    .with_data(|data| {
-                //        data.copy_from_slice(&rendered_data);
-                //    })
-                //    .expect("Failed to copy rendered data");
-
                 page.set_draw_func(clone!(
                     #[strong]
                     page,
                     move |_, cr, _width, _height| {
                         cr.set_source_surface(&surface, 0.0, 0.0).unwrap();
                         cr.paint().unwrap();
-                        page.resize(width, height, render_response.crop_bbox);
+                        page.resize(width, height, Some(render_response.crop_bbox));
                     }
                 ));
-                page.resize(width, height, render_response.crop_bbox);
             }
         ));
 
-        //let mut bbox = poppler::Rectangle::default();
-        //poppler_page.get_bounding_box(&mut bbox);
-        //
-        //let mut crop_bbox = poppler::Rectangle::new();
-        //crop_bbox.set_x1((bbox.x1() - 5.0).max(0.0));
-        //crop_bbox.set_y1((bbox.y1() - 5.0).max(0.0));
-        //crop_bbox.set_x2((bbox.x2() + 5.0).min(width));
-        //crop_bbox.set_y2((bbox.y2() + 5.0).min(height));
-        //
-        //if crop_bbox.x2() - crop_bbox.x1() < width / 2.0 {
-        //    crop_bbox.set_x2(crop_bbox.x1() + width / 2.0);
-        //}
-        //if crop_bbox.y2() - crop_bbox.y1() < height / 2.0 {
-        //    crop_bbox.set_y2(crop_bbox.y1() + height / 2.0);
-        //}
-        //
-        //self.imp().crop_bbox.replace(crop_bbox);
-        //
-        //self.set_draw_func(clone!(
-        //    #[strong(rename_to = page)]
-        //    self,
-        //    #[strong]
-        //    poppler_page,
-        //    #[strong]
-        //    page,
-        //    move |_, cr, _width, _height| {
-        //        let zoom = page.zoom();
-        //
-        //        if page.crop() {
-        //            cr.translate(-crop_bbox.x1() * zoom, -crop_bbox.y1() * zoom);
-        //        }
-        //
-        //        page.resize(width, height, crop_bbox);
-        //
-        //        cr.rectangle(0.0, 0.0, width * zoom, height * zoom);
-        //        cr.scale(zoom, zoom);
-        //        cr.set_source_rgba(1.0, 1.0, 1.0, 1.0);
-        //        cr.fill().expect("Failed to fill");
-        //        poppler_page.render(cr);
-        //
-        //        let highlighted = &page.imp().highlighted.borrow();
-        //
-        //        if highlighted.x2 - highlighted.x1 > 0.0 && highlighted.y2 - highlighted.y1 > 0.0 {
-        //            cr.set_source_rgba(1.0, 1.0, 0.0, 0.5);
-        //            cr.rectangle(
-        //                highlighted.x1,
-        //                highlighted.y1,
-        //                highlighted.x2 - highlighted.x1,
-        //                highlighted.y2 - highlighted.y1,
-        //            );
-        //            cr.fill().expect("Failed to fill");
-        //        }
-        //    }
-        //));
-        //
-        //self.resize(width, height, crop_bbox);
+        self.resize(width, height, None);
     }
 
-    fn resize(&self, orig_width: f64, orig_height: f64, bbox: poppler::Rectangle) {
+    fn resize(&self, orig_width: f64, orig_height: f64, bbox: Option<poppler::Rectangle>) {
         let mut width = orig_width;
         let mut height = orig_height;
         if self.crop() {
-            width = bbox.x2() - bbox.x1();
-            height = bbox.y2() - bbox.y1();
+            if let Some(bbox) = bbox {
+                width = bbox.x2() - bbox.x1();
+                height = bbox.y2() - bbox.y1();
+            }
         }
 
         self.set_size_request((width * self.zoom()) as i32, (height * self.zoom()) as i32);
