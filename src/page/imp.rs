@@ -22,10 +22,13 @@ pub struct Page {
     uri: RefCell<String>,
 
     #[property(get, set)]
-    pub binding: RefCell<Option<glib::Binding>>,
+    pub(crate) binding: RefCell<Option<glib::Binding>>,
 
     #[property(get, set)]
-    pub popplerpage: RefCell<Option<poppler::Page>>,
+    popplerpage: RefCell<Option<poppler::Page>>,
+
+    #[property(get, set)]
+    rebind_needed: Cell<bool>,
 
     #[property(name = "x1", get, set, type = f64, member = x1)]
     #[property(name = "y1", get, set, type = f64, member = y1)]
@@ -33,9 +36,10 @@ pub struct Page {
     #[property(name = "y2", get, set, type = f64, member = y2)]
     pub highlighted: RefCell<Highlighted>,
 
-    pub crop_bbox: RefCell<poppler::Rectangle>,
+    #[property(get, set)]
+    crop_bbox: RefCell<poppler::Rectangle>,
 
-    pub render_req_sender: RefCell<Option<Sender<super::RenderRequest>>>,
+    pub(crate) render_req_sender: RefCell<Option<Sender<super::RenderRequest>>>,
 }
 
 #[glib::object_subclass]

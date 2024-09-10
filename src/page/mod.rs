@@ -4,7 +4,7 @@ mod page_number_imp;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::mpsc::{Receiver, Sender};
-use std::{sync, thread};
+use std::thread;
 
 use futures::channel::oneshot;
 use gtk::cairo::{Context, ImageSurface};
@@ -15,7 +15,7 @@ use gtk::subclass::prelude::ObjectSubclassIsExt;
 use gtk::{glib, glib::clone};
 use poppler::Document;
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct Highlighted {
     pub x1: f64,
     pub y1: f64,
@@ -48,12 +48,10 @@ impl Page {
 
         page.connect_crop_notify(|p| {
             p.rebind_draw();
-            p.queue_draw();
         });
 
         page.connect_zoom_notify(|p| {
             p.rebind_draw();
-            p.queue_draw();
         });
 
         let mouse_coords = Rc::new(RefCell::new(None));
@@ -80,14 +78,14 @@ impl Page {
                     return;
                 };
 
-                if let Some(poppler_page) = page.imp().popplerpage.borrow().as_ref() {
+                if let Some(poppler_page) = page.popplerpage().as_ref() {
                     let mut rect = poppler::Rectangle::default();
 
                     let mut crop_x1 = 0.0;
                     let mut crop_y1 = 0.0;
 
                     if page.crop() {
-                        let crop_bbox = page.imp().crop_bbox.borrow();
+                        let crop_bbox = page.crop_bbox();
                         crop_x1 = crop_bbox.x1();
                         crop_y1 = crop_bbox.y1();
                     }
@@ -100,12 +98,10 @@ impl Page {
                     let selected =
                         &poppler_page.selected_text(poppler::SelectionStyle::Glyph, &mut rect);
 
-                    page.imp().highlighted.replace(Highlighted {
-                        x1: rect.x1(),
-                        y1: rect.y1(),
-                        x2: rect.x2(),
-                        y2: rect.y2(),
-                    });
+                    page.set_x1(crop_x1 + start_x);
+                    page.set_y1(crop_y1 + start_y);
+                    page.set_x2(crop_x1 + end_x);
+                    page.set_y2(crop_y1 + end_y);
 
                     if let Some(selected) = selected {
                         page.clipboard().set_text(selected);
@@ -129,7 +125,6 @@ impl Page {
         poppler_page: &poppler::Page,
         render_req_sender: Sender<RenderRequest>,
     ) {
-        self.imp().popplerpage.replace(Some(poppler_page.clone()));
         self.imp()
             .render_req_sender
             .replace(Some(render_req_sender.clone()));
@@ -149,19 +144,39 @@ impl Page {
     }
 
     fn rebind_draw(&self) {
+        self.set_rebind_needed(true);
+
         let render_req_sender = self.imp().render_req_sender.borrow();
         let Some(render_req_sender) = render_req_sender.as_ref() else {
             return;
         };
 
-        if let Some(poppler_page) = self.imp().popplerpage.borrow().as_ref() {
+        if let Some(poppler_page) = self.popplerpage().as_ref() {
             self.bind_draw(poppler_page, render_req_sender);
+        }
+
+        if self.is_visible() {
+            self.queue_draw();
         }
     }
 
     fn bind_draw(&self, poppler_page: &poppler::Page, render_req_sender: &Sender<RenderRequest>) {
-        let (width, height) = poppler_page.size();
         let page_num = poppler_page.index();
+        let (width, height) = poppler_page.size();
+
+        if !self.is_mapped() {
+            self.resize(width, height, None);
+        }
+
+        if !self.rebind_needed() {
+            if let Some(saved_poppler_page) = self.popplerpage().as_ref() {
+                if saved_poppler_page.index() == page_num {
+                    return;
+                }
+            }
+        }
+
+        self.set_popplerpage(poppler_page.clone());
 
         let (render_resp_sender, render_resp_receiver) = oneshot::channel();
 
@@ -172,6 +187,7 @@ impl Page {
                 resp_sender: render_resp_sender,
                 zoom: self.zoom(),
                 crop: self.crop(),
+                scale_factor: self.scale_factor(),
             })
             .expect("Failed to send render request");
 
@@ -179,15 +195,16 @@ impl Page {
             #[strong(rename_to = page)]
             self,
             async move {
-                let (canvas_width, canvas_height) = (width * page.zoom(), height * page.zoom());
-
-                println!("Waiting for render response... page number {}", page_num);
                 let render_response = render_resp_receiver
                     .await
                     .expect("Failed to receive rendered data");
-                println!("Received render response! Page number {}", page_num);
 
                 let rendered_data = render_response.data;
+                let (canvas_width, canvas_height) =
+                    (render_response.canvas_width, render_response.canvas_height);
+                let scale_factor = render_response.scale_factor;
+
+                page.set_crop_bbox(render_response.crop_bbox);
 
                 let stride = 4 * canvas_width as i32;
 
@@ -205,15 +222,37 @@ impl Page {
                     #[strong]
                     page,
                     move |_, cr, _width, _height| {
+                        cr.save().unwrap();
+                        cr.scale(1.0 / scale_factor as f64, 1.0 / scale_factor as f64);
                         cr.set_source_surface(&surface, 0.0, 0.0).unwrap();
                         cr.paint().unwrap();
                         page.resize(width, height, Some(render_response.crop_bbox));
+
+                        cr.restore().unwrap();
+
+                        let highlighted = &page.imp().highlighted.borrow();
+
+                        if highlighted.x2 - highlighted.x1 > 0.0
+                            && highlighted.y2 - highlighted.y1 > 0.0
+                        {
+                            cr.set_source_rgba(1.0, 1.0, 0.0, 0.5);
+                            cr.rectangle(
+                                highlighted.x1,
+                                highlighted.y1,
+                                highlighted.x2 - highlighted.x1,
+                                highlighted.y2 - highlighted.y1,
+                            );
+                            cr.fill().expect("Failed to fill");
+                        }
                     }
                 ));
+
+                page.resize(width, height, Some(render_response.crop_bbox));
             }
         ));
 
         self.resize(width, height, None);
+        self.set_rebind_needed(false);
     }
 
     fn resize(&self, orig_width: f64, orig_height: f64, bbox: Option<poppler::Rectangle>) {
@@ -241,6 +280,7 @@ pub(crate) struct RenderRequest {
     pub page_num: i32,
     pub crop: bool,
     pub zoom: f64,
+    pub scale_factor: i32,
     pub resp_sender: oneshot::Sender<RenderResponse>,
 }
 
@@ -248,6 +288,9 @@ pub(crate) struct RenderRequest {
 pub(crate) struct RenderResponse {
     pub data: Vec<u8>,
     pub crop_bbox: poppler::Rectangle,
+    pub canvas_width: f64,
+    pub canvas_height: f64,
+    pub scale_factor: i32,
 }
 
 pub(crate) fn spawn_pdf_renderer(render_req_reciever: Receiver<RenderRequest>) {
@@ -264,12 +307,13 @@ pub(crate) fn spawn_pdf_renderer(render_req_reciever: Receiver<RenderRequest>) {
 
             if let Some(page) = doc.page(req.page_num) {
                 let (width, height) = page.size();
-                let (canvas_width, canvas_height) = (width * req.zoom, height * req.zoom);
-                let zoom = req.zoom;
+                let zoom = req.zoom * req.scale_factor as f64;
+                let (canvas_width, canvas_height) = (width * zoom, height * zoom);
 
                 // Create a pixel buffer for rendering
                 let stride = 4 * canvas_width as i32; // ARGB32 has 4 bytes per pixel
-                                                      // Create a temporary Cairo ImageSurface to render the page
+
+                // Create a temporary Cairo ImageSurface to render the page
                 let surface = ImageSurface::create(
                     gtk::cairo::Format::ARgb32,
                     canvas_width as i32,
@@ -288,7 +332,6 @@ pub(crate) fn spawn_pdf_renderer(render_req_reciever: Receiver<RenderRequest>) {
                     let mut bbox = poppler::Rectangle::default();
                     page.get_bounding_box(&mut bbox);
 
-                    let mut crop_bbox = poppler::Rectangle::new();
                     crop_bbox.set_x1((bbox.x1() - 5.0).max(0.0));
                     crop_bbox.set_y1((bbox.y1() - 5.0).max(0.0));
                     crop_bbox.set_x2((bbox.x2() + 5.0).min(width));
@@ -300,7 +343,7 @@ pub(crate) fn spawn_pdf_renderer(render_req_reciever: Receiver<RenderRequest>) {
                         crop_bbox.set_y2(crop_bbox.y1() + height / 2.0);
                     }
 
-                    cairo_context.translate(-crop_bbox.x1() * req.zoom, -crop_bbox.y1() * req.zoom);
+                    cairo_context.translate(-crop_bbox.x1() * zoom, -crop_bbox.y1() * zoom);
                 }
 
                 cairo_context.rectangle(0.0, 0.0, canvas_width, canvas_height);
@@ -325,6 +368,9 @@ pub(crate) fn spawn_pdf_renderer(render_req_reciever: Receiver<RenderRequest>) {
                     .send(RenderResponse {
                         data: buffer,
                         crop_bbox,
+                        canvas_width,
+                        canvas_height,
+                        scale_factor: req.scale_factor,
                     })
                     .expect("Failed to send rendered data");
             }
