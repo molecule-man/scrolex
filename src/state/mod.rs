@@ -52,6 +52,7 @@ impl State {
                     Some(("page", value)) => {
                         let page = value.parse().unwrap_or(0);
                         self.set_page(page);
+                        self.set_last_drawn_page(page as i32);
                     }
                     Some(("crop", value)) => {
                         let crop = value.parse().unwrap_or(false);

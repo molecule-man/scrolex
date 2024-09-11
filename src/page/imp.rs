@@ -6,7 +6,7 @@ use gtk::subclass::prelude::*;
 use gtk::DrawingArea;
 use std::{
     cell::{Cell, RefCell},
-    sync::mpsc::{self, Sender},
+    sync::mpsc::Sender,
 };
 
 #[derive(Default, glib::Properties)]
@@ -40,6 +40,9 @@ pub struct Page {
     crop_bbox: RefCell<poppler::Rectangle>,
 
     pub(crate) render_req_sender: RefCell<Option<Sender<super::RenderRequest>>>,
+
+    #[property(get, set)]
+    last_drawn_page: Cell<i32>,
 }
 
 #[glib::object_subclass]

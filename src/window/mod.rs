@@ -64,6 +64,15 @@ impl Window {
                     .flags(glib::BindingFlags::DEFAULT | glib::BindingFlags::SYNC_CREATE)
                     .build();
 
+                state
+                    .bind_property("last_drawn_page", &page, "last_drawn_page")
+                    .flags(
+                        glib::BindingFlags::BIDIRECTIONAL
+                            | glib::BindingFlags::DEFAULT
+                            | glib::BindingFlags::SYNC_CREATE,
+                    )
+                    .build();
+
                 list_item.set_child(Some(&page));
             }
         ));

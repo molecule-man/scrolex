@@ -162,19 +162,44 @@ impl Page {
 
     fn bind_draw(&self, poppler_page: &poppler::Page, render_req_sender: &Sender<RenderRequest>) {
         let page_num = poppler_page.index();
+        let last_drawn_page = self.last_drawn_page();
+
         let (width, height) = poppler_page.size();
 
-        if !self.is_mapped() {
+        // TODO
+        // Rewrite it so that rendering called from draw_func but in separate thread. The thread
+        // also renders couple of next and prev pages and stores them in a cache. Thread sends
+        // response BEFORE rendering adjacent pages. Main thread should block-wait for the
+        // response.
+
+        // Only render pages within 10 indices of the current view
+        let preload_limit = 10;
+
+        if (page_num >= last_drawn_page + preload_limit)
+            || (page_num <= last_drawn_page - preload_limit)
+        {
+            println!(
+                "Skipping page {}. Last drawn page {}",
+                page_num, last_drawn_page
+            );
             self.resize(width, height, None);
+            return;
         }
 
-        if !self.rebind_needed() {
-            if let Some(saved_poppler_page) = self.popplerpage().as_ref() {
-                if saved_poppler_page.index() == page_num {
-                    return;
-                }
-            }
-        }
+        //println!("Binding page {}", page_num);
+        //
+        //if !self.rebind_needed() {
+        //    if let Some(saved_poppler_page) = self.popplerpage().as_ref() {
+        //        if saved_poppler_page.index() == page_num {
+        //            return;
+        //        }
+        //    }
+        //}
+
+        println!(
+            "Rendering page {}. Last drawn page {}",
+            page_num, last_drawn_page
+        );
 
         self.set_popplerpage(poppler_page.clone());
 
@@ -244,6 +269,8 @@ impl Page {
                             );
                             cr.fill().expect("Failed to fill");
                         }
+
+                        page.set_last_drawn_page(page_num);
                     }
                 ));
 
