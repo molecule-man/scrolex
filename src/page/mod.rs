@@ -3,17 +3,14 @@ mod page_number_imp;
 
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::mpsc::{Receiver, Sender};
-use std::thread;
 
-use futures::channel::oneshot;
-use gtk::cairo::{Context, ImageSurface};
 use gtk::gdk::BUTTON_PRIMARY;
 use gtk::gio::prelude::*;
 use gtk::prelude::*;
 use gtk::subclass::prelude::ObjectSubclassIsExt;
 use gtk::{glib, glib::clone};
-use poppler::Document;
+
+use crate::render::{self, Renderer};
 
 #[derive(Default, Debug)]
 pub struct Highlighted {
@@ -47,11 +44,11 @@ impl Page {
         let page: Page = glib::Object::builder().build();
 
         page.connect_crop_notify(|p| {
-            p.rebind_draw();
+            p.queue_draw();
         });
 
         page.connect_zoom_notify(|p| {
-            p.rebind_draw();
+            p.queue_draw();
         });
 
         let mouse_coords = Rc::new(RefCell::new(None));
@@ -123,11 +120,9 @@ impl Page {
         &self,
         pn: &PageNumber,
         poppler_page: &poppler::Page,
-        render_req_sender: Sender<RenderRequest>,
+        renderer: Rc<RefCell<Renderer>>,
     ) {
-        self.imp()
-            .render_req_sender
-            .replace(Some(render_req_sender.clone()));
+        self.set_popplerpage(poppler_page.clone());
 
         if let Some(prev_binding) = self.imp().binding.borrow_mut().take() {
             prev_binding.unbind();
@@ -140,146 +135,53 @@ impl Page {
 
         self.imp().binding.replace(Some(new_binding));
 
-        self.bind_draw(poppler_page, &render_req_sender);
+        self.bind_draw(poppler_page, renderer);
     }
 
-    fn rebind_draw(&self) {
-        self.set_rebind_needed(true);
-
-        let render_req_sender = self.imp().render_req_sender.borrow();
-        let Some(render_req_sender) = render_req_sender.as_ref() else {
-            return;
-        };
-
-        if let Some(poppler_page) = self.popplerpage().as_ref() {
-            self.bind_draw(poppler_page, render_req_sender);
-        }
-
-        if self.is_visible() {
-            self.queue_draw();
-        }
-    }
-
-    fn bind_draw(&self, poppler_page: &poppler::Page, render_req_sender: &Sender<RenderRequest>) {
-        let page_num = poppler_page.index();
-        let last_drawn_page = self.last_drawn_page();
-
+    fn bind_draw(&self, poppler_page: &poppler::Page, renderer: Rc<RefCell<Renderer>>) {
         let (width, height) = poppler_page.size();
+        let crop_bbox = render::get_bbox(poppler_page, true);
+        self.set_crop_bbox(crop_bbox);
 
-        // TODO
-        // Rewrite it so that rendering called from draw_func but in separate thread. The thread
-        // also renders couple of next and prev pages and stores them in a cache. Thread sends
-        // response BEFORE rendering adjacent pages. Main thread should block-wait for the
-        // response.
-
-        // Only render pages within 10 indices of the current view
-        let preload_limit = 10;
-
-        if (page_num >= last_drawn_page + preload_limit)
-            || (page_num <= last_drawn_page - preload_limit)
-        {
-            println!(
-                "Skipping page {}. Last drawn page {}",
-                page_num, last_drawn_page
-            );
-            self.resize(width, height, None);
-            return;
-        }
-
-        //println!("Binding page {}", page_num);
-        //
-        //if !self.rebind_needed() {
-        //    if let Some(saved_poppler_page) = self.popplerpage().as_ref() {
-        //        if saved_poppler_page.index() == page_num {
-        //            return;
-        //        }
-        //    }
-        //}
-
-        println!(
-            "Rendering page {}. Last drawn page {}",
-            page_num, last_drawn_page
-        );
-
-        self.set_popplerpage(poppler_page.clone());
-
-        let (render_resp_sender, render_resp_receiver) = oneshot::channel();
-
-        render_req_sender
-            .send(RenderRequest {
-                uri: self.uri(),
-                page_num,
-                resp_sender: render_resp_sender,
-                zoom: self.zoom(),
-                crop: self.crop(),
-                scale_factor: self.scale_factor(),
-            })
-            .expect("Failed to send render request");
-
-        glib::spawn_future_local(clone!(
+        self.set_draw_func(clone!(
             #[strong(rename_to = page)]
             self,
-            async move {
-                let render_response = render_resp_receiver
-                    .await
-                    .expect("Failed to receive rendered data");
+            #[strong]
+            renderer,
+            #[strong]
+            poppler_page,
+            move |_, cr, _width, _height| {
+                page.resize(width, height, Some(crop_bbox));
 
-                let rendered_data = render_response.data;
-                let (canvas_width, canvas_height) =
-                    (render_response.canvas_width, render_response.canvas_height);
-                let scale_factor = render_response.scale_factor;
+                cr.save().expect("Failed to save");
+                renderer.borrow().render(
+                    cr,
+                    &poppler_page,
+                    &render::PageRenderInfo {
+                        uri: page.uri(),
+                        zoom: page.zoom(),
+                        crop: page.crop(),
+                        scale_factor: page.scale_factor(),
+                    },
+                );
+                cr.restore().expect("Failed to restore");
 
-                page.set_crop_bbox(render_response.crop_bbox);
+                let highlighted = &page.imp().highlighted.borrow();
 
-                let stride = 4 * canvas_width as i32;
-
-                // Create an ImageSurface from the received pixel buffer
-                let surface = ImageSurface::create_for_data(
-                    rendered_data,
-                    gtk::cairo::Format::ARgb32,
-                    canvas_width as i32,
-                    canvas_height as i32,
-                    stride,
-                )
-                .expect("Failed to create image surface");
-
-                page.set_draw_func(clone!(
-                    #[strong]
-                    page,
-                    move |_, cr, _width, _height| {
-                        cr.save().unwrap();
-                        cr.scale(1.0 / scale_factor as f64, 1.0 / scale_factor as f64);
-                        cr.set_source_surface(&surface, 0.0, 0.0).unwrap();
-                        cr.paint().unwrap();
-                        page.resize(width, height, Some(render_response.crop_bbox));
-
-                        cr.restore().unwrap();
-
-                        let highlighted = &page.imp().highlighted.borrow();
-
-                        if highlighted.x2 - highlighted.x1 > 0.0
-                            && highlighted.y2 - highlighted.y1 > 0.0
-                        {
-                            cr.set_source_rgba(1.0, 1.0, 0.0, 0.5);
-                            cr.rectangle(
-                                highlighted.x1,
-                                highlighted.y1,
-                                highlighted.x2 - highlighted.x1,
-                                highlighted.y2 - highlighted.y1,
-                            );
-                            cr.fill().expect("Failed to fill");
-                        }
-
-                        page.set_last_drawn_page(page_num);
-                    }
-                ));
-
-                page.resize(width, height, Some(render_response.crop_bbox));
+                if highlighted.x2 - highlighted.x1 > 0.0 && highlighted.y2 - highlighted.y1 > 0.0 {
+                    cr.set_source_rgba(1.0, 1.0, 0.0, 0.5);
+                    cr.rectangle(
+                        highlighted.x1,
+                        highlighted.y1,
+                        highlighted.x2 - highlighted.x1,
+                        highlighted.y2 - highlighted.y1,
+                    );
+                    cr.fill().expect("Failed to fill");
+                }
             }
         ));
 
-        self.resize(width, height, None);
-        self.set_rebind_needed(false);
+        self.resize(width, height, Some(crop_bbox));
     }
 
     fn resize(&self, orig_width: f64, orig_height: f64, bbox: Option<poppler::Rectangle>) {
@@ -300,108 +202,4 @@ impl Default for Page {
     fn default() -> Self {
         Self::new()
     }
-}
-
-pub(crate) struct RenderRequest {
-    pub uri: String,
-    pub page_num: i32,
-    pub crop: bool,
-    pub zoom: f64,
-    pub scale_factor: i32,
-    pub resp_sender: oneshot::Sender<RenderResponse>,
-}
-
-#[derive(Debug)]
-pub(crate) struct RenderResponse {
-    pub data: Vec<u8>,
-    pub crop_bbox: poppler::Rectangle,
-    pub canvas_width: f64,
-    pub canvas_height: f64,
-    pub scale_factor: i32,
-}
-
-pub(crate) fn spawn_pdf_renderer(render_req_reciever: Receiver<RenderRequest>) {
-    thread::spawn(move || {
-        let mut doc = None;
-        let mut doc_uri = String::new();
-
-        for req in render_req_reciever {
-            if doc.is_none() || doc_uri != req.uri {
-                doc = Some(Document::from_file(&req.uri, None).expect("Couldn't open the file!"));
-                doc_uri.clone_from(&req.uri);
-            }
-            let doc = doc.as_ref().unwrap();
-
-            if let Some(page) = doc.page(req.page_num) {
-                let (width, height) = page.size();
-                let zoom = req.zoom * req.scale_factor as f64;
-                let (canvas_width, canvas_height) = (width * zoom, height * zoom);
-
-                // Create a pixel buffer for rendering
-                let stride = 4 * canvas_width as i32; // ARGB32 has 4 bytes per pixel
-
-                // Create a temporary Cairo ImageSurface to render the page
-                let surface = ImageSurface::create(
-                    gtk::cairo::Format::ARgb32,
-                    canvas_width as i32,
-                    canvas_height as i32,
-                )
-                .expect("Couldn't create a surface!");
-                let cairo_context = Context::new(&surface).expect("Couldn't create a context!");
-
-                let mut crop_bbox = poppler::Rectangle::default();
-                crop_bbox.set_x1(0.0);
-                crop_bbox.set_y1(0.0);
-                crop_bbox.set_x2(width);
-                crop_bbox.set_y2(height);
-
-                if req.crop {
-                    let mut bbox = poppler::Rectangle::default();
-                    page.get_bounding_box(&mut bbox);
-
-                    crop_bbox.set_x1((bbox.x1() - 5.0).max(0.0));
-                    crop_bbox.set_y1((bbox.y1() - 5.0).max(0.0));
-                    crop_bbox.set_x2((bbox.x2() + 5.0).min(width));
-                    crop_bbox.set_y2((bbox.y2() + 5.0).min(height));
-                    if crop_bbox.x2() - crop_bbox.x1() < width / 2.0 {
-                        crop_bbox.set_x2(crop_bbox.x1() + width / 2.0);
-                    }
-                    if crop_bbox.y2() - crop_bbox.y1() < height / 2.0 {
-                        crop_bbox.set_y2(crop_bbox.y1() + height / 2.0);
-                    }
-
-                    cairo_context.translate(-crop_bbox.x1() * zoom, -crop_bbox.y1() * zoom);
-                }
-
-                cairo_context.rectangle(0.0, 0.0, canvas_width, canvas_height);
-                cairo_context.scale(zoom, zoom);
-                cairo_context.set_source_rgba(1.0, 1.0, 1.0, 1.0);
-                cairo_context.fill().expect("Failed to fill");
-
-                // Render the Poppler page into the Cairo surface
-                page.render(&cairo_context);
-
-                // Now extract the pixel data from the surface
-                let mut buffer = vec![0u8; (stride * canvas_height as i32) as usize];
-                surface
-                    .with_data(|data| {
-                        // Copy the rendered pixel data into the buffer
-                        buffer.copy_from_slice(data);
-                    })
-                    .expect("Failed to extract surface data");
-
-                // Send the rendered buffer back to the main thread
-                req.resp_sender
-                    .send(RenderResponse {
-                        data: buffer,
-                        crop_bbox,
-                        canvas_width,
-                        canvas_height,
-                        scale_factor: req.scale_factor,
-                    })
-                    .expect("Failed to send rendered data");
-            }
-            // TODO else
-        }
-    });
 }

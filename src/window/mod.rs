@@ -1,6 +1,7 @@
 mod imp;
 
-use std::sync::mpsc;
+use std::cell::RefCell;
+use std::rc::Rc;
 
 use glib::{clone, Object};
 use gtk::glib::subclass::types::ObjectSubclassIsExt;
@@ -8,6 +9,7 @@ use gtk::prelude::*;
 use gtk::{gio, glib, Application};
 
 use crate::page;
+use crate::render::Renderer;
 use crate::state::State;
 
 glib::wrapper! {
@@ -28,12 +30,9 @@ impl Window {
     }
 
     pub(crate) fn setup(&self) {
-        let (render_req_send, render_req_recv) = mpsc::channel();
-
-        page::spawn_pdf_renderer(render_req_recv);
-
         let state: &State = self.imp().state.as_ref();
         let factory = gtk::SignalListItemFactory::new();
+        let renderer = Rc::new(RefCell::new(Renderer::new()));
 
         self.imp().listview.set_factory(Some(&factory));
         self.imp()
@@ -64,15 +63,6 @@ impl Window {
                     .flags(glib::BindingFlags::DEFAULT | glib::BindingFlags::SYNC_CREATE)
                     .build();
 
-                state
-                    .bind_property("last_drawn_page", &page, "last_drawn_page")
-                    .flags(
-                        glib::BindingFlags::BIDIRECTIONAL
-                            | glib::BindingFlags::DEFAULT
-                            | glib::BindingFlags::SYNC_CREATE,
-                    )
-                    .build();
-
                 list_item.set_child(Some(&page));
             }
         ));
@@ -80,6 +70,8 @@ impl Window {
         factory.connect_bind(clone!(
             #[weak]
             state,
+            #[strong]
+            renderer,
             move |_, list_item| {
                 let list_item = list_item.downcast_ref::<gtk::ListItem>().unwrap();
                 let page_number = list_item.item().and_downcast::<page::PageNumber>().unwrap();
@@ -88,7 +80,7 @@ impl Window {
 
                 if let Some(doc) = state.doc() {
                     if let Some(poppler_page) = doc.page(page_number.page_number()) {
-                        page.bind(&page_number, &poppler_page, render_req_send.clone());
+                        page.bind(&page_number, &poppler_page, renderer.clone());
                     }
                 }
             }

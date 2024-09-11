@@ -7,6 +7,7 @@ use gtk::{gio::ApplicationFlags, glib, glib::clone, Application};
 use gtk::{prelude::*, CssProvider};
 
 mod page;
+mod render;
 mod state;
 mod window;
 

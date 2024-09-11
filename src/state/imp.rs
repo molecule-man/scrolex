@@ -21,9 +21,6 @@ pub struct State {
 
     #[property(get, set)]
     page: Cell<u32>,
-
-    #[property(get, set)]
-    last_drawn_page: Cell<i32>,
 }
 
 #[glib::object_subclass]
