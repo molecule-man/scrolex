@@ -5,7 +5,6 @@ use std::sync::mpsc::Receiver;
 use std::thread;
 
 use futures::channel::oneshot;
-use futures::stream::select;
 use gtk::cairo::{Context, ImageSurface};
 use gtk::glib;
 use poppler::Document;
@@ -18,10 +17,22 @@ pub(crate) struct PageRenderInfo {
     pub(crate) scale_factor: i32,
 }
 
-struct RenderRequest {
+struct Request {
     page_num: i32,
-    resp_sender: oneshot::Sender<RenderResponse>,
     page_info: PageRenderInfo,
+    req_type: RequestType,
+}
+
+enum RequestType {
+    Render(RenderRequest),
+    Bbox(BboxRequest),
+}
+
+struct RenderRequest {
+    resp_sender: oneshot::Sender<RenderResponse>,
+}
+struct BboxRequest {
+    resp_sender: oneshot::Sender<poppler::Rectangle>,
 }
 
 #[derive(Debug)]
@@ -34,7 +45,7 @@ struct RenderResponse {
 }
 
 pub(crate) struct Renderer {
-    send: std::sync::mpsc::Sender<RenderRequest>,
+    send: std::sync::mpsc::Sender<Request>,
     prerendered: Rc<RefCell<HashMap<i32, RenderResponse>>>,
 }
 
@@ -49,19 +60,41 @@ impl Renderer {
         renderer
     }
 
+    pub(crate) async fn get_bbox(&self, page_num: i32, uri: &str) -> poppler::Rectangle {
+        let (resp_sender, resp_receiver) = oneshot::channel();
+        self.send
+            .send(Request {
+                page_num,
+                req_type: RequestType::Bbox(BboxRequest { resp_sender }),
+                page_info: PageRenderInfo {
+                    uri: uri.to_string(),
+                    crop: true,
+                    zoom: 1.0,
+                    scale_factor: 1,
+                },
+            })
+            .expect("Failed to send bbox request");
+
+        resp_receiver.await.expect("Failed to receive bbox")
+    }
+
     pub(crate) fn render(
         &self,
         cr: &gtk::cairo::Context,
         page: &poppler::Page,
         page_info: &PageRenderInfo,
-    ) {
+    ) -> poppler::Rectangle {
         let now = std::time::Instant::now();
+        let mut bbox = poppler::Rectangle::default();
+
         if let Some(resp) = self.prerendered.borrow().get(&page.index()) {
             println!("Rendering from buffer {}", page.index());
             self.render_from_buffer(cr, resp);
+            bbox = resp.crop_bbox;
         } else {
+            bbox = get_bbox(page, page_info.crop);
             println!("Rendering from main loop {}", page.index());
-            render(cr, page, page_info.zoom, &get_bbox(page, page_info.crop));
+            render(cr, page, page_info.zoom, &bbox);
         }
         println!("Elapsed: {:.2?}", now.elapsed());
 
@@ -76,9 +109,9 @@ impl Renderer {
 
             let (resp_sender, resp_receiver) = oneshot::channel();
             self.send
-                .send(RenderRequest {
+                .send(Request {
                     page_num,
-                    resp_sender,
+                    req_type: RequestType::Render(RenderRequest { resp_sender }),
                     page_info: page_info.clone(),
                 })
                 .expect("Failed to send render request");
@@ -101,6 +134,8 @@ impl Renderer {
         ] {
             self.prerendered.borrow_mut().remove(&i);
         }
+
+        bbox
     }
 
     fn render_from_buffer(&self, cr: &gtk::cairo::Context, resp: &RenderResponse) {
@@ -125,7 +160,7 @@ impl Renderer {
         cr.paint().unwrap();
     }
 
-    fn spawn_bg_render_thread(&self, render_req_reciever: Receiver<RenderRequest>) {
+    fn spawn_bg_render_thread(&self, render_req_reciever: Receiver<Request>) {
         thread::spawn(move || {
             let mut doc = None;
             let mut doc_uri = String::new();
@@ -141,47 +176,57 @@ impl Renderer {
                 let doc = doc.as_ref().unwrap();
 
                 if let Some(page) = doc.page(req.page_num) {
-                    let (width, height) = page.size();
-                    let scale = req.page_info.zoom * req.page_info.scale_factor as f64;
-                    let (canvas_width, canvas_height) = (width * scale, height * scale);
+                    match req.req_type {
+                        RequestType::Render(t) => {
+                            let (width, height) = page.size();
+                            let scale = req.page_info.zoom * req.page_info.scale_factor as f64;
+                            let (canvas_width, canvas_height) = (width * scale, height * scale);
 
-                    // Create a pixel buffer for rendering
-                    let stride = 4 * canvas_width as i32; // ARGB32 has 4 bytes per pixel
+                            // Create a pixel buffer for rendering
+                            let stride = 4 * canvas_width as i32; // ARGB32 has 4 bytes per pixel
 
-                    // Create a temporary Cairo ImageSurface to render the page
-                    let surface = ImageSurface::create(
-                        gtk::cairo::Format::ARgb32,
-                        canvas_width as i32,
-                        canvas_height as i32,
-                    )
-                    .expect("Couldn't create a surface!");
-                    let cairo_context = Context::new(&surface).expect("Couldn't create a context!");
+                            // Create a temporary Cairo ImageSurface to render the page
+                            let surface = ImageSurface::create(
+                                gtk::cairo::Format::ARgb32,
+                                canvas_width as i32,
+                                canvas_height as i32,
+                            )
+                            .expect("Couldn't create a surface!");
+                            let cairo_context =
+                                Context::new(&surface).expect("Couldn't create a context!");
 
-                    let crop_bbox = get_bbox(&page, req.page_info.crop);
+                            let crop_bbox = get_bbox(&page, req.page_info.crop);
 
-                    render(&cairo_context, &page, scale, &crop_bbox);
+                            render(&cairo_context, &page, scale, &crop_bbox);
 
-                    // Now extract the pixel data from the surface
-                    let mut buffer = vec![0u8; (stride * canvas_height as i32) as usize];
-                    surface
-                        .with_data(|data| {
-                            // Copy the rendered pixel data into the buffer
-                            buffer.copy_from_slice(data);
-                        })
-                        .expect("Failed to extract surface data");
+                            // Now extract the pixel data from the surface
+                            let mut buffer = vec![0u8; (stride * canvas_height as i32) as usize];
+                            surface
+                                .with_data(|data| {
+                                    // Copy the rendered pixel data into the buffer
+                                    buffer.copy_from_slice(data);
+                                })
+                                .expect("Failed to extract surface data");
 
-                    // Send the rendered buffer back to the main thread
-                    req.resp_sender
-                        .send(RenderResponse {
-                            data: buffer,
-                            crop_bbox,
-                            canvas_width,
-                            canvas_height,
-                            scale_factor: req.page_info.scale_factor,
-                        })
-                        .expect("Failed to send rendered data");
+                            // Send the rendered buffer back to the main thread
+                            t.resp_sender
+                                .send(RenderResponse {
+                                    data: buffer,
+                                    crop_bbox,
+                                    canvas_width,
+                                    canvas_height,
+                                    scale_factor: req.page_info.scale_factor,
+                                })
+                                .expect("Failed to send rendered data");
+                        }
+                        RequestType::Bbox(t) => {
+                            t.resp_sender
+                                .send(get_bbox(&page, true))
+                                .expect("Failed to send bbox");
+                        }
+                    }
+                    // TODO else
                 }
-                // TODO else
             }
         });
     }
