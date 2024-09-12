@@ -4,6 +4,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use glib::{clone, Object};
+use gtk::glib::closure_local;
 use gtk::glib::subclass::types::ObjectSubclassIsExt;
 use gtk::prelude::*;
 use gtk::{gio, glib, Application};
@@ -40,6 +41,34 @@ impl Window {
             .property_expression("selected-item")
             .chain_property::<page::PageNumber>("page_number")
             .bind(state, "page", gtk::Widget::NONE);
+
+        state.connect_closure(
+            "before-load",
+            false,
+            closure_local!(
+                #[strong]
+                renderer,
+                move |_: &State| {
+                    renderer.borrow().clear_cache();
+                }
+            ),
+        );
+
+        state.connect_zoom_notify(clone!(
+            #[strong]
+            renderer,
+            move |_| {
+                renderer.borrow().clear_cache();
+            },
+        ));
+
+        state.connect_crop_notify(clone!(
+            #[strong]
+            renderer,
+            move |_| {
+                renderer.borrow().clear_cache();
+            },
+        ));
 
         factory.connect_setup(clone!(
             #[weak]

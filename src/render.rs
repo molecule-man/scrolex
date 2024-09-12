@@ -60,6 +60,10 @@ impl Renderer {
         renderer
     }
 
+    pub(crate) fn clear_cache(&self) {
+        self.prerendered.borrow_mut().clear();
+    }
+
     pub(crate) async fn get_bbox(&self, page_num: i32, uri: &str) -> poppler::Rectangle {
         let (resp_sender, resp_receiver) = oneshot::channel();
         self.send

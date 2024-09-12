@@ -95,10 +95,10 @@ impl Page {
                     let selected =
                         &poppler_page.selected_text(poppler::SelectionStyle::Glyph, &mut rect);
 
-                    page.set_x1(crop_x1 + start_x);
-                    page.set_y1(crop_y1 + start_y);
-                    page.set_x2(crop_x1 + end_x);
-                    page.set_y2(crop_y1 + end_y);
+                    page.set_x1(start_x);
+                    page.set_y1(start_y);
+                    page.set_x2(end_x);
+                    page.set_y2(end_y);
 
                     if let Some(selected) = selected {
                         page.clipboard().set_text(selected);
