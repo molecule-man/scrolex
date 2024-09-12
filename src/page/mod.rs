@@ -168,7 +168,7 @@ impl Page {
                 let highlighted = &page.imp().highlighted.borrow();
 
                 if highlighted.x2 - highlighted.x1 > 0.0 && highlighted.y2 - highlighted.y1 > 0.0 {
-                    cr.set_source_rgba(1.0, 1.0, 0.0, 0.5);
+                    cr.set_source_rgba(0.5, 0.8, 0.9, 0.3);
                     cr.rectangle(
                         highlighted.x1,
                         highlighted.y1,
