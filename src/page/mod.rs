@@ -139,9 +139,6 @@ impl Page {
     }
 
     fn bind_draw(&self, poppler_page: &poppler::Page, renderer: Rc<RefCell<Renderer>>) {
-        let (width, height) = poppler_page.size();
-        let page_num = poppler_page.index();
-
         self.set_draw_func(clone!(
             #[strong(rename_to = page)]
             self,
@@ -151,7 +148,7 @@ impl Page {
             poppler_page,
             move |_, cr, _width, _height| {
                 cr.save().expect("Failed to save");
-                let crop_bbox = renderer.borrow().render(
+                renderer.borrow().render(
                     cr,
                     &poppler_page,
                     &render::PageRenderInfo {
@@ -163,7 +160,7 @@ impl Page {
                 );
                 cr.restore().expect("Failed to restore");
 
-                page.resize(width, height, Some(crop_bbox));
+                renderer.borrow().resize(&page, &poppler_page);
 
                 let highlighted = &page.imp().highlighted.borrow();
 
@@ -180,21 +177,15 @@ impl Page {
             }
         ));
 
-        glib::spawn_future_local(clone!(
-            #[strong(rename_to = page)]
-            self,
-            #[strong]
-            renderer,
-            async move {
-                let renderer = renderer.borrow();
-                let crop_bbox = renderer.get_bbox(page_num, &page.uri()).await;
-                page.set_crop_bbox(crop_bbox);
-                page.resize(width, height, Some(crop_bbox));
-            }
-        ));
+        renderer.borrow().resize(self, poppler_page);
     }
 
-    fn resize(&self, orig_width: f64, orig_height: f64, bbox: Option<poppler::Rectangle>) {
+    pub(crate) fn resize(
+        &self,
+        orig_width: f64,
+        orig_height: f64,
+        bbox: Option<poppler::Rectangle>,
+    ) {
         let mut width = orig_width;
         let mut height = orig_height;
         if self.crop() {

@@ -46,7 +46,8 @@ struct RenderResponse {
 
 pub(crate) struct Renderer {
     send: std::sync::mpsc::Sender<Request>,
-    prerendered: Rc<RefCell<HashMap<i32, RenderResponse>>>,
+    prerendered_cache: Rc<RefCell<HashMap<i32, RenderResponse>>>,
+    bbox_cache: Rc<RefCell<HashMap<i32, poppler::Rectangle>>>,
 }
 
 impl Renderer {
@@ -54,24 +55,61 @@ impl Renderer {
         let (send, recv) = std::sync::mpsc::channel();
         let renderer = Renderer {
             send,
-            prerendered: Rc::new(RefCell::new(HashMap::new())),
+            prerendered_cache: Rc::new(RefCell::new(HashMap::new())),
+            bbox_cache: Rc::new(RefCell::new(HashMap::new())),
         };
         renderer.spawn_bg_render_thread(recv);
         renderer
     }
 
     pub(crate) fn clear_cache(&self) {
-        self.prerendered.borrow_mut().clear();
+        self.prerendered_cache.borrow_mut().clear();
     }
 
-    pub(crate) async fn get_bbox(&self, page_num: i32, uri: &str) -> poppler::Rectangle {
+    pub(crate) fn clear_bbox_cache(&self) {
+        self.bbox_cache.borrow_mut().clear();
+    }
+
+    fn get_bbox(&self, page: &poppler::Page, crop: bool) -> poppler::Rectangle {
+        if !crop {
+            let mut bbox = poppler::Rectangle::default();
+            bbox.set_x1(0.0);
+            bbox.set_y1(0.0);
+            let (w, h) = page.size();
+            bbox.set_x2(w);
+            bbox.set_y2(h);
+            return bbox;
+        }
+        if let Some(bbox) = self.bbox_cache.borrow().get(&page.index()) {
+            return *bbox;
+        }
+
+        let bbox = get_bbox(page, true);
+        self.bbox_cache.borrow_mut().insert(page.index(), bbox);
+        bbox
+    }
+
+    pub(crate) fn resize(&self, page: &crate::page::Page, poppler_page: &poppler::Page) {
+        let (w, h) = poppler_page.size();
+        let page_num = poppler_page.index();
+
+        if !page.crop() {
+            page.resize(w, h, None);
+            return;
+        }
+
+        if let Some(bbox) = self.bbox_cache.borrow().get(&poppler_page.index()) {
+            page.resize(w, h, Some(*bbox));
+            return;
+        }
+
         let (resp_sender, resp_receiver) = oneshot::channel();
         self.send
             .send(Request {
                 page_num,
                 req_type: RequestType::Bbox(BboxRequest { resp_sender }),
                 page_info: PageRenderInfo {
-                    uri: uri.to_string(),
+                    uri: page.uri().to_string(),
                     crop: true,
                     zoom: 1.0,
                     scale_factor: 1,
@@ -79,7 +117,17 @@ impl Renderer {
             })
             .expect("Failed to send bbox request");
 
-        resp_receiver.await.expect("Failed to receive bbox")
+        glib::spawn_future_local(glib::clone!(
+            #[strong(rename_to = bbox_cache)]
+            self.bbox_cache,
+            #[strong]
+            page,
+            async move {
+                let bbox = resp_receiver.await.expect("Failed to receive bbox");
+                bbox_cache.borrow_mut().insert(page_num, bbox);
+                page.resize(w, h, Some(bbox));
+            }
+        ));
     }
 
     pub(crate) fn render(
@@ -89,25 +137,32 @@ impl Renderer {
         page_info: &PageRenderInfo,
     ) -> poppler::Rectangle {
         let now = std::time::Instant::now();
-        let mut bbox = poppler::Rectangle::default();
 
-        if let Some(resp) = self.prerendered.borrow().get(&page.index()) {
-            println!("Rendering from buffer {}", page.index());
+        let bbox = if let Some(resp) = self.prerendered_cache.borrow().get(&page.index()) {
+            println!(
+                "Rendering from buffer {}. elapsed: {:.2?}",
+                page.index(),
+                now.elapsed()
+            );
             self.render_from_buffer(cr, resp);
-            bbox = resp.crop_bbox;
+            resp.crop_bbox
         } else {
-            bbox = get_bbox(page, page_info.crop);
-            println!("Rendering from main loop {}", page.index());
+            let bbox = self.get_bbox(page, page_info.crop);
             render(cr, page, page_info.zoom, &bbox);
-        }
-        println!("Elapsed: {:.2?}", now.elapsed());
+            println!(
+                "Rendering from main loop {}. elapsed: {:.2?}",
+                page.index(),
+                now.elapsed()
+            );
+            bbox
+        };
 
         let prerender_num = 3;
         let max_prerendered = 5;
 
         for i in -prerender_num..=prerender_num {
             let page_num = page.index() + i;
-            if self.prerendered.borrow().contains_key(&page_num) {
+            if self.prerendered_cache.borrow().contains_key(&page_num) {
                 continue;
             }
 
@@ -122,7 +177,7 @@ impl Renderer {
 
             glib::spawn_future_local(glib::clone!(
                 #[strong(rename_to = prerendered)]
-                self.prerendered,
+                self.prerendered_cache,
                 async move {
                     let resp = resp_receiver
                         .await
@@ -136,7 +191,7 @@ impl Renderer {
             page.index() - max_prerendered,
             page.index() + max_prerendered,
         ] {
-            self.prerendered.borrow_mut().remove(&i);
+            self.prerendered_cache.borrow_mut().remove(&i);
         }
 
         bbox

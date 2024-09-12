@@ -50,6 +50,7 @@ impl Window {
                 renderer,
                 move |_: &State| {
                     renderer.borrow().clear_cache();
+                    renderer.borrow().clear_bbox_cache();
                 }
             ),
         );
