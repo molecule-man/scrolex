@@ -35,6 +35,7 @@ pub struct Window {
     pub listview: TemplateChild<ListView>,
 
     drag_coords: RefCell<Option<(f64, f64)>>,
+    drag_cursor: RefCell<Option<gtk::gdk::Cursor>>,
 }
 
 // The central trait for subclassing a GObject
@@ -82,6 +83,11 @@ impl Window {
     #[template_callback]
     fn handle_drag_start(&self, _n_press: i32, x: f64, y: f64) {
         *self.drag_coords.borrow_mut() = Some((x, y));
+
+        if let Some(surface) = self.obj().surface() {
+            *self.drag_cursor.borrow_mut() = surface.cursor();
+            surface.set_cursor(gtk::gdk::Cursor::from_name("grabbing", None).as_ref());
+        }
     }
 
     #[template_callback]
@@ -92,6 +98,13 @@ impl Window {
             }
         }
         *self.drag_coords.borrow_mut() = gc.point(seq);
+    }
+
+    #[template_callback]
+    fn handle_drag_end(&self) {
+        if let Some(surface) = self.obj().surface() {
+            surface.set_cursor(self.drag_cursor.borrow().as_ref());
+        }
     }
 
     #[template_callback]

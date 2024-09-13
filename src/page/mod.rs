@@ -52,12 +52,20 @@ impl Page {
         });
 
         let mouse_coords = Rc::new(RefCell::new(None));
+        let cursor = Rc::new(RefCell::new(None));
         let gc = gtk::GestureClick::builder().button(BUTTON_PRIMARY).build();
+
         gc.connect_pressed(clone!(
             #[strong]
             mouse_coords,
+            #[strong]
+            page,
+            #[strong]
+            cursor,
             move |_gc, _n_press, x, y| {
                 mouse_coords.replace(Some((x, y)));
+                cursor.replace(page.cursor());
+                page.set_cursor_from_name(Some("crosshair"));
             }
         ));
 
@@ -106,6 +114,14 @@ impl Page {
 
                     page.queue_draw();
                 };
+            }
+        ));
+
+        gc.connect_end(clone!(
+            #[strong]
+            page,
+            move |_, _| {
+                page.set_cursor(cursor.borrow().as_ref());
             }
         ));
 

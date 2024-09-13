@@ -92,6 +92,7 @@
 						<property name="button">2</property>
 						<signal name="pressed" handler="handle_drag_start" swapped="true" />
 						<signal name="update" handler="handle_drag_move" swapped="true" />
+						<signal name="end" handler="handle_drag_end" swapped="true" />
 					</object>
 				</child>
 				<child>
