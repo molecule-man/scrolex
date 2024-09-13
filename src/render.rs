@@ -9,6 +9,10 @@ use gtk::cairo::{Context, ImageSurface};
 use gtk::glib;
 use poppler::Document;
 
+const USE_PRE_RENDER: bool = false;
+const PRE_RENDER_PAGES: i32 = 3;
+const PRE_RENDER_CACHE_SIZE: i32 = 5;
+
 #[derive(Clone)]
 pub(crate) struct PageRenderInfo {
     pub(crate) uri: String,
@@ -38,7 +42,6 @@ struct BboxRequest {
 #[derive(Debug)]
 struct RenderResponse {
     data: Vec<u8>,
-    crop_bbox: poppler::Rectangle,
     canvas_width: f64,
     canvas_height: f64,
     scale_factor: i32,
@@ -135,17 +138,16 @@ impl Renderer {
         cr: &gtk::cairo::Context,
         page: &poppler::Page,
         page_info: &PageRenderInfo,
-    ) -> poppler::Rectangle {
+    ) {
         let now = std::time::Instant::now();
 
-        let bbox = if let Some(resp) = self.prerendered_cache.borrow().get(&page.index()) {
+        if let Some(resp) = self.prerendered_cache.borrow().get(&page.index()) {
             println!(
                 "Rendering from buffer {}. elapsed: {:.2?}",
                 page.index(),
                 now.elapsed()
             );
             self.render_from_buffer(cr, resp);
-            resp.crop_bbox
         } else {
             let bbox = self.get_bbox(page, page_info.crop);
             render(cr, page, page_info.zoom, &bbox);
@@ -154,47 +156,63 @@ impl Renderer {
                 page.index(),
                 now.elapsed()
             );
-            bbox
         };
 
-        let prerender_num = 3;
-        let max_prerendered = 5;
-
-        for i in -prerender_num..=prerender_num {
-            let page_num = page.index() + i;
-            if self.prerendered_cache.borrow().contains_key(&page_num) {
-                continue;
+        if USE_PRE_RENDER {
+            for i in [
+                page.index() - PRE_RENDER_CACHE_SIZE,
+                page.index() + PRE_RENDER_CACHE_SIZE,
+            ] {
+                self.prerendered_cache.borrow_mut().remove(&i);
             }
 
-            let (resp_sender, resp_receiver) = oneshot::channel();
-            self.send
-                .send(Request {
-                    page_num,
-                    req_type: RequestType::Render(RenderRequest { resp_sender }),
-                    page_info: page_info.clone(),
-                })
-                .expect("Failed to send render request");
-
-            glib::spawn_future_local(glib::clone!(
-                #[strong(rename_to = prerendered)]
-                self.prerendered_cache,
-                async move {
-                    let resp = resp_receiver
-                        .await
-                        .expect("Failed to receive rendered data");
-                    prerendered.borrow_mut().insert(page_num, resp);
+            for i in -PRE_RENDER_PAGES..=PRE_RENDER_PAGES {
+                let page_num = page.index() + i;
+                if self.prerendered_cache.borrow().contains_key(&page_num) {
+                    continue;
                 }
-            ));
-        }
 
-        for i in [
-            page.index() - max_prerendered,
-            page.index() + max_prerendered,
-        ] {
-            self.prerendered_cache.borrow_mut().remove(&i);
-        }
+                let (resp_sender, resp_receiver) = oneshot::channel();
+                self.send
+                    .send(Request {
+                        page_num,
+                        req_type: RequestType::Render(RenderRequest { resp_sender }),
+                        page_info: page_info.clone(),
+                    })
+                    .expect("Failed to send render request");
 
-        bbox
+                glib::spawn_future_local(glib::clone!(
+                    #[strong(rename_to = prerendered)]
+                    self.prerendered_cache,
+                    async move {
+                        let resp = resp_receiver
+                            .await
+                            .expect("Failed to receive rendered data");
+                        prerendered.borrow_mut().insert(page_num, resp);
+                    }
+                ));
+            }
+
+            let max_cache_size = 2 * PRE_RENDER_PAGES - 1;
+            let cache_size = self.prerendered_cache.borrow().len();
+            println!("Cache size: {}", cache_size);
+            if cache_size > max_cache_size as usize {
+                let keys = self
+                    .prerendered_cache
+                    .borrow()
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>();
+
+                for key in keys {
+                    if key < page.index() - PRE_RENDER_PAGES
+                        || key > page.index() + PRE_RENDER_PAGES
+                    {
+                        self.prerendered_cache.borrow_mut().remove(&key);
+                    }
+                }
+            }
+        }
     }
 
     fn render_from_buffer(&self, cr: &gtk::cairo::Context, resp: &RenderResponse) {
@@ -271,7 +289,6 @@ impl Renderer {
                             t.resp_sender
                                 .send(RenderResponse {
                                     data: buffer,
-                                    crop_bbox,
                                     canvas_width,
                                     canvas_height,
                                     scale_factor: req.page_info.scale_factor,
