@@ -10,7 +10,7 @@ use gtk::prelude::*;
 use gtk::subclass::prelude::ObjectSubclassIsExt;
 use gtk::{glib, glib::clone};
 
-use crate::render::{self, Renderer};
+use crate::render::Renderer;
 
 #[derive(Default, Debug)]
 pub struct Highlighted {
@@ -148,16 +148,7 @@ impl Page {
             poppler_page,
             move |_, cr, _width, _height| {
                 cr.save().expect("Failed to save");
-                renderer.borrow().render(
-                    cr,
-                    &poppler_page,
-                    &render::PageRenderInfo {
-                        uri: page.uri(),
-                        zoom: page.zoom(),
-                        crop: page.crop(),
-                        scale_factor: page.scale_factor(),
-                    },
-                );
+                renderer.borrow().render(cr, &page, &poppler_page);
                 cr.restore().expect("Failed to restore");
 
                 renderer.borrow().resize(&page, &poppler_page);

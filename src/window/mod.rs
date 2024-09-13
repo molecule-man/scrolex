@@ -50,26 +50,9 @@ impl Window {
                 renderer,
                 move |_: &State| {
                     renderer.borrow().clear_cache();
-                    renderer.borrow().clear_bbox_cache();
                 }
             ),
         );
-
-        state.connect_zoom_notify(clone!(
-            #[strong]
-            renderer,
-            move |_| {
-                renderer.borrow().clear_cache();
-            },
-        ));
-
-        state.connect_crop_notify(clone!(
-            #[strong]
-            renderer,
-            move |_| {
-                renderer.borrow().clear_cache();
-            },
-        ));
 
         factory.connect_setup(clone!(
             #[weak]
