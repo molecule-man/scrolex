@@ -31,7 +31,7 @@ pub struct Page {
     pub highlighted: RefCell<Highlighted>,
 
     #[property(get, set)]
-    crop_bbox: RefCell<poppler::Rectangle>,
+    bbox: RefCell<poppler::Rectangle>,
 }
 
 #[glib::object_subclass]

@@ -2,18 +2,15 @@ mod imp;
 mod page_number_imp;
 
 use std::cell::RefCell;
-use std::ffi::CStr;
 use std::rc::Rc;
 
 use gtk::gdk::BUTTON_PRIMARY;
 use gtk::gio::prelude::*;
-use gtk::glib::closure;
-use gtk::glib::translate::FromGlib;
 use gtk::prelude::*;
 use gtk::subclass::prelude::ObjectSubclassIsExt;
 use gtk::{glib, glib::clone};
 
-use crate::poppler::LinkMappingExt;
+use crate::poppler::*;
 use crate::render::Renderer;
 
 #[derive(Default, Debug)]
@@ -94,7 +91,7 @@ impl Page {
                     let mut crop_y1 = 0.0;
 
                     if page.crop() {
-                        let crop_bbox = page.crop_bbox();
+                        let crop_bbox = page.bbox();
                         crop_x1 = crop_bbox.x1();
                         crop_y1 = crop_bbox.y1();
                     }
@@ -142,6 +139,8 @@ impl Page {
         poppler_page: &poppler::Page,
         renderer: Rc<RefCell<Renderer>>,
         overlay: &gtk::Overlay,
+        state: &crate::state::State,
+        listview: &gtk::ListView,
     ) {
         self.set_popplerpage(poppler_page.clone());
 
@@ -168,8 +167,6 @@ impl Page {
             //child = overlay.first_child();
         }
 
-        let (_, height) = poppler_page.size();
-
         for link in poppler_page.link_mapping() {
             let link = link.from_raw();
             match link {
@@ -177,35 +174,53 @@ impl Page {
                     let btn = gtk::Button::builder()
                         .valign(gtk::Align::Start)
                         .halign(gtk::Align::Start)
-                        .opacity(0.5)
+                        .opacity(0.0)
                         .css_classes(vec!["link-overlay"])
+                        .cursor(&gtk::gdk::Cursor::from_name("pointer", None).unwrap())
                         .build();
 
-                    self.property_expression("zoom")
-                        .chain_closure::<i32>(closure!(move |page: Self, zoom: f64| {
-                            (zoom * area.x1()) as i32
-                        }))
-                        .bind(&btn, "margin-start", Some(self));
+                    self.connect_zoom_notify(clone!(
+                        #[strong]
+                        btn,
+                        move |page| {
+                            update_link_location(page, &btn, &area);
+                        }
+                    ));
 
-                    self.property_expression("zoom")
-                        .chain_closure::<i32>(closure!(move |page: Self, zoom: f64| {
-                            (zoom * (height - area.y2())) as i32 // poppler uses bottom-left origin
-                        }))
-                        .bind(&btn, "margin-top", Some(self));
+                    self.connect_bbox_notify(clone!(
+                        #[strong]
+                        btn,
+                        move |page| {
+                            update_link_location(page, &btn, &area);
+                        }
+                    ));
 
-                    self.property_expression("zoom")
-                        .chain_closure::<i32>(closure!(
-                            move |_: Option<glib::Object>, zoom: f64| {
-                                (zoom * (area.x2() - area.x1())) as i32
-                            }
-                        ))
-                        .bind(&btn, "width-request", gtk::Widget::NONE);
+                    update_link_location(self, &btn, &area);
 
                     btn.connect_clicked(clone!(
-                        //#[strong]
-                        //page,
+                        #[strong]
+                        listview,
+                        #[strong]
+                        state,
                         move |_| {
-                            println!("Link: {:?}, area: {:?}", name, area);
+                            let Some(doc) = state.doc() else {
+                                return;
+                            };
+
+                            let Some(dest) = doc.find_dest(&name) else {
+                                return;
+                            };
+
+                            let Dest::Xyz(page_num) = dest.from_raw() else {
+                                return;
+                            };
+
+                            dbg!(page_num);
+                            listview.scroll_to(
+                                (page_num as u32).saturating_sub(1),
+                                gtk::ListScrollFlags::SELECT | gtk::ListScrollFlags::FOCUS,
+                                None,
+                            );
                         }
                     ));
 
@@ -259,10 +274,20 @@ impl Page {
     ) {
         let mut width = orig_width;
         let mut height = orig_height;
-        if self.crop() {
-            if let Some(bbox) = bbox {
+
+        match (bbox, self.crop()) {
+            (Some(bbox), true) => {
                 width = bbox.x2() - bbox.x1();
                 height = bbox.y2() - bbox.y1();
+                self.set_bbox(bbox);
+            }
+            _ => {
+                let mut bbox = poppler::Rectangle::default();
+                bbox.set_x1(0.0);
+                bbox.set_y1(0.0);
+                bbox.set_x2(width);
+                bbox.set_y2(height);
+                self.set_bbox(bbox);
             }
         }
 
@@ -274,4 +299,12 @@ impl Default for Page {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn update_link_location(page: &Page, btn: &gtk::Button, area: &poppler::Rectangle) {
+    let (_, height) = page.popplerpage().as_ref().unwrap().size();
+    btn.set_margin_start((page.zoom() * (area.x1() - page.bbox().x1())) as i32);
+    btn.set_margin_top((page.zoom() * (height - area.y2() - page.bbox().y1())) as i32);
+    btn.set_width_request((page.zoom() * (area.x2() - area.x1())) as i32);
+    btn.set_height_request((page.zoom() * (area.y2() - area.y1())) as i32);
 }

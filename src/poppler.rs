@@ -77,3 +77,39 @@ impl LinkMappingExt for LinkMapping {
         Link::Unknown
     }
 }
+
+#[derive(Debug)]
+pub(crate) enum Dest {
+    Unknown(poppler::DestType),
+    Invalid,
+    Named(String),
+    Xyz(i32),
+}
+
+pub(crate) trait DestExt {
+    fn from_raw(&self) -> Dest;
+}
+
+impl DestExt for poppler::Dest {
+    fn from_raw(&self) -> Dest {
+        let raw_dest = self.as_ptr();
+        unsafe {
+            let dest: &poppler_sys::PopplerDest = &*raw_dest;
+
+            match poppler::DestType::from_glib(dest.type_) {
+                poppler::DestType::Named => {
+                    let named_dest_ptr = dest.named_dest;
+                    if named_dest_ptr.is_null() {
+                        return Dest::Invalid;
+                    }
+
+                    let c_str = CStr::from_ptr(named_dest_ptr);
+                    let rust_string = c_str.to_string_lossy().into_owned();
+                    Dest::Named(rust_string)
+                }
+                poppler::DestType::Xyz => Dest::Xyz(dest.page_num),
+                t => Dest::Unknown(t),
+            }
+        }
+    }
+}

@@ -15,7 +15,8 @@
 }
 
 .link-overlay {
-	color: #00f;
 	padding: 0;
 	border: none;
+	min-width: 1px;
+	min-height: 1px;
 }

@@ -87,6 +87,8 @@ impl Window {
             state,
             #[strong]
             renderer,
+            #[strong(rename_to = listview)]
+            self.imp().listview,
             move |_, list_item| {
                 let list_item = list_item.downcast_ref::<gtk::ListItem>().unwrap();
                 let page_number = list_item.item().and_downcast::<page::PageNumber>().unwrap();
@@ -96,7 +98,14 @@ impl Window {
 
                 if let Some(doc) = state.doc() {
                     if let Some(poppler_page) = doc.page(page_number.page_number()) {
-                        page.bind(&page_number, &poppler_page, renderer.clone(), &overlay);
+                        page.bind(
+                            &page_number,
+                            &poppler_page,
+                            renderer.clone(),
+                            &overlay,
+                            &state,
+                            &listview,
+                        );
                     }
                 }
             }
