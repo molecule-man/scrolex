@@ -13,3 +13,9 @@
 #main row:selected:hover {
 	background-color: #222;
 }
+
+.link-overlay {
+	color: #00f;
+	padding: 0;
+	border: none;
+}

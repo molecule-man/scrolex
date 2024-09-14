@@ -2,14 +2,18 @@ mod imp;
 mod page_number_imp;
 
 use std::cell::RefCell;
+use std::ffi::CStr;
 use std::rc::Rc;
 
 use gtk::gdk::BUTTON_PRIMARY;
 use gtk::gio::prelude::*;
+use gtk::glib::closure;
+use gtk::glib::translate::FromGlib;
 use gtk::prelude::*;
 use gtk::subclass::prelude::ObjectSubclassIsExt;
 use gtk::{glib, glib::clone};
 
+use crate::poppler::LinkMappingExt;
 use crate::render::Renderer;
 
 #[derive(Default, Debug)]
@@ -137,6 +141,7 @@ impl Page {
         pn: &PageNumber,
         poppler_page: &poppler::Page,
         renderer: Rc<RefCell<Renderer>>,
+        overlay: &gtk::Overlay,
     ) {
         self.set_popplerpage(poppler_page.clone());
 
@@ -152,6 +157,65 @@ impl Page {
         self.imp().binding.replace(Some(new_binding));
 
         self.bind_draw(poppler_page, renderer);
+
+        let mut child = overlay.first_child();
+        while let Some(c) = child {
+            child = c.next_sibling();
+            if c.type_() == gtk::Button::static_type() {
+                overlay.remove_overlay(&c);
+            }
+            //overlay.remove(&c);
+            //child = overlay.first_child();
+        }
+
+        let (_, height) = poppler_page.size();
+
+        for link in poppler_page.link_mapping() {
+            let link = link.from_raw();
+            match link {
+                crate::poppler::Link::GotoNamedDest(name, area) => {
+                    let btn = gtk::Button::builder()
+                        .valign(gtk::Align::Start)
+                        .halign(gtk::Align::Start)
+                        .opacity(0.5)
+                        .css_classes(vec!["link-overlay"])
+                        .build();
+
+                    self.property_expression("zoom")
+                        .chain_closure::<i32>(closure!(move |page: Self, zoom: f64| {
+                            (zoom * area.x1()) as i32
+                        }))
+                        .bind(&btn, "margin-start", Some(self));
+
+                    self.property_expression("zoom")
+                        .chain_closure::<i32>(closure!(move |page: Self, zoom: f64| {
+                            (zoom * (height - area.y2())) as i32 // poppler uses bottom-left origin
+                        }))
+                        .bind(&btn, "margin-top", Some(self));
+
+                    self.property_expression("zoom")
+                        .chain_closure::<i32>(closure!(
+                            move |_: Option<glib::Object>, zoom: f64| {
+                                (zoom * (area.x2() - area.x1())) as i32
+                            }
+                        ))
+                        .bind(&btn, "width-request", gtk::Widget::NONE);
+
+                    btn.connect_clicked(clone!(
+                        //#[strong]
+                        //page,
+                        move |_| {
+                            println!("Link: {:?}, area: {:?}", name, area);
+                        }
+                    ));
+
+                    overlay.add_overlay(&btn);
+                }
+                _ => {
+                    println!("unhandled link: {:?}", link);
+                }
+            }
+        }
     }
 
     fn bind_draw(&self, poppler_page: &poppler::Page, renderer: Rc<RefCell<Renderer>>) {

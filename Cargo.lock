@@ -487,6 +487,7 @@ dependencies = [
  "glib-build-tools",
  "gtk4",
  "poppler-rs",
+ "poppler-sys-rs",
 ]
 
 [[package]]
