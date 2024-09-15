@@ -42,13 +42,15 @@ glib::wrapper! {
 
 impl Page {
     pub fn new() -> Self {
-        let page: Page = glib::Object::builder().build();
+        glib::Object::builder().build()
+    }
 
-        page.connect_crop_notify(|p| {
+    pub(crate) fn setup(&self) {
+        self.connect_crop_notify(|p| {
             p.queue_draw();
         });
 
-        page.connect_zoom_notify(|p| {
+        self.connect_zoom_notify(|p| {
             p.queue_draw();
         });
 
@@ -59,8 +61,8 @@ impl Page {
         gc.connect_pressed(clone!(
             #[strong]
             mouse_coords,
-            #[strong]
-            page,
+            #[strong(rename_to = page)]
+            self,
             #[strong]
             cursor,
             move |_gc, _n_press, x, y| {
@@ -73,8 +75,8 @@ impl Page {
         gc.connect_update(clone!(
             #[strong]
             mouse_coords,
-            #[strong]
-            page,
+            #[strong(rename_to = page)]
+            self,
             move |gc, seq| {
                 let Some((start_x, start_y)) = *mouse_coords.borrow() else {
                     return;
@@ -119,18 +121,16 @@ impl Page {
         ));
 
         gc.connect_end(clone!(
-            #[strong]
-            page,
+            #[strong(rename_to = page)]
+            self,
             move |_, _| {
                 page.set_cursor(cursor.borrow().as_ref());
             }
         ));
 
-        page.add_controller(gc);
+        self.add_controller(gc);
 
-        page.set_size_request(600, 800);
-
-        page
+        self.set_size_request(600, 800);
     }
 
     pub(crate) fn bind(

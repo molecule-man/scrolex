@@ -36,12 +36,18 @@ pub struct Page {
 
 #[glib::object_subclass]
 impl ObjectSubclass for Page {
-    const NAME: &'static str = "HallyviewPage";
+    const NAME: &'static str = "Page";
     type Type = super::Page;
     type ParentType = DrawingArea;
 }
 
 #[glib::derived_properties]
-impl ObjectImpl for Page {}
+impl ObjectImpl for Page {
+    fn constructed(&self) {
+        self.parent_constructed();
+        self.obj().setup();
+    }
+}
+
 impl WidgetImpl for Page {}
 impl DrawingAreaImpl for Page {}

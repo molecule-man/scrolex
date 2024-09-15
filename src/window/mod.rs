@@ -59,25 +59,24 @@ impl Window {
             state,
             move |_, list_item| {
                 let list_item = list_item.downcast_ref::<gtk::ListItem>().unwrap();
-                let overlay = gtk::Overlay::new();
-                let page = page::Page::new();
+                let overlay = crate::page_overlay::PageOverlay::new();
+                let page: &crate::page::Page = overlay.imp().page.as_ref();
 
                 state
-                    .bind_property("crop", &page, "crop")
+                    .bind_property("crop", page, "crop")
                     .flags(glib::BindingFlags::DEFAULT | glib::BindingFlags::SYNC_CREATE)
                     .build();
 
                 state
-                    .bind_property("zoom", &page, "zoom")
+                    .bind_property("zoom", page, "zoom")
                     .flags(glib::BindingFlags::DEFAULT | glib::BindingFlags::SYNC_CREATE)
                     .build();
 
                 state
-                    .bind_property("uri", &page, "uri")
+                    .bind_property("uri", page, "uri")
                     .flags(glib::BindingFlags::DEFAULT | glib::BindingFlags::SYNC_CREATE)
                     .build();
 
-                overlay.set_child(Some(&page));
                 list_item.set_child(Some(&overlay));
             }
         ));
@@ -92,9 +91,12 @@ impl Window {
             move |_, list_item| {
                 let list_item = list_item.downcast_ref::<gtk::ListItem>().unwrap();
                 let page_number = list_item.item().and_downcast::<page::PageNumber>().unwrap();
-                let overlay = list_item.child().and_downcast::<gtk::Overlay>().unwrap();
-                let child = overlay.child().unwrap();
-                let page = child.downcast_ref::<page::Page>().unwrap();
+                let overlay = list_item
+                    .child()
+                    .and_downcast::<crate::page_overlay::PageOverlay>()
+                    .unwrap();
+                let page: &crate::page::Page = overlay.imp().page.as_ref();
+                let overlay: &gtk::Overlay = overlay.imp().overlay.as_ref();
 
                 if let Some(doc) = state.doc() {
                     if let Some(poppler_page) = doc.page(page_number.page_number()) {
@@ -102,7 +104,7 @@ impl Window {
                             &page_number,
                             &poppler_page,
                             renderer.clone(),
-                            &overlay,
+                            overlay,
                             &state,
                             &listview,
                         );
