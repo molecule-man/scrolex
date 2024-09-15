@@ -163,46 +163,45 @@ impl Page {
             if c.type_() == gtk::Button::static_type() {
                 overlay.remove_overlay(&c);
             }
-            //overlay.remove(&c);
-            //child = overlay.first_child();
         }
 
         for link in poppler_page.link_mapping() {
-            let link = link.from_raw();
-            match link {
-                crate::poppler::Link::GotoNamedDest(name, area) => {
-                    let btn = gtk::Button::builder()
-                        .valign(gtk::Align::Start)
-                        .halign(gtk::Align::Start)
-                        .opacity(0.0)
-                        .css_classes(vec!["link-overlay"])
-                        .cursor(&gtk::gdk::Cursor::from_name("pointer", None).unwrap())
-                        .build();
+            let crate::poppler::Link(link_type, area) = link.from_raw();
 
-                    self.connect_zoom_notify(clone!(
-                        #[strong]
-                        btn,
-                        move |page| {
-                            update_link_location(page, &btn, &area);
-                        }
-                    ));
+            let btn = gtk::Button::builder()
+                .valign(gtk::Align::Start)
+                .halign(gtk::Align::Start)
+                .opacity(0.0)
+                .css_classes(vec!["link-overlay"])
+                .cursor(&gtk::gdk::Cursor::from_name("pointer", None).unwrap())
+                .build();
 
-                    self.connect_bbox_notify(clone!(
-                        #[strong]
-                        btn,
-                        move |page| {
-                            update_link_location(page, &btn, &area);
-                        }
-                    ));
+            self.connect_zoom_notify(clone!(
+                #[strong]
+                btn,
+                move |page| {
+                    update_link_location(page, &btn, &area);
+                }
+            ));
 
-                    update_link_location(self, &btn, &area);
+            self.connect_bbox_notify(clone!(
+                #[strong]
+                btn,
+                move |page| {
+                    update_link_location(page, &btn, &area);
+                }
+            ));
 
-                    btn.connect_clicked(clone!(
-                        #[strong]
-                        listview,
-                        #[strong]
-                        state,
-                        move |_| {
+            update_link_location(self, &btn, &area);
+
+            btn.connect_clicked(clone!(
+                #[strong]
+                listview,
+                #[strong]
+                state,
+                move |_| {
+                    match link_type.clone() {
+                        LinkType::GotoNamedDest(name) => {
                             let Some(doc) = state.doc() else {
                                 return;
                             };
@@ -222,14 +221,20 @@ impl Page {
                                 None,
                             );
                         }
-                    ));
+                        LinkType::Uri(uri) => {
+                            let _ = gtk::gio::AppInfo::launch_default_for_uri(
+                                &uri,
+                                gtk::gio::AppLaunchContext::NONE,
+                            );
+                        }
+                        _ => {
+                            println!("unhandled link: {:?}", link_type);
+                        }
+                    }
+                }
+            ));
 
-                    overlay.add_overlay(&btn);
-                }
-                _ => {
-                    println!("unhandled link: {:?}", link);
-                }
-            }
+            overlay.add_overlay(&btn);
         }
     }
 

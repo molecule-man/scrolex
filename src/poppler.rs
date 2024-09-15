@@ -2,15 +2,17 @@ use gtk::glib::translate::FromGlib;
 use poppler::LinkMapping;
 use std::ffi::CStr;
 
-#[derive(Debug)]
-pub(crate) enum Link {
+#[derive(Debug, Clone)]
+pub(crate) enum LinkType {
     Unknown,
     Invalid,
     //GotoPage(i32),
-    GotoNamedDest(String, poppler::Rectangle),
+    GotoNamedDest(String),
     //Launch(String),
     Uri(String),
 }
+
+pub(crate) struct Link(pub(crate) LinkType, pub(crate) poppler::Rectangle);
 
 pub(crate) trait LinkMappingExt {
     fn from_raw(&self) -> Link;
@@ -30,7 +32,7 @@ impl LinkMappingExt for LinkMapping {
 
             let action_ptr = link_mapping.action;
             if action_ptr.is_null() {
-                return Link::Invalid;
+                return Link(LinkType::Invalid, area);
             }
 
             let action = &*action_ptr;
@@ -40,41 +42,32 @@ impl LinkMappingExt for LinkMapping {
                     let destination_ptr = goto_action.dest;
 
                     if destination_ptr.is_null() {
-                        return Link::Invalid;
+                        return Link(LinkType::Invalid, area);
                     }
-                    let destination = &*destination_ptr;
+                    let destination = (*destination_ptr).from_raw();
 
-                    if poppler::DestType::from_glib(destination.type_) != poppler::DestType::Named {
-                        return Link::Unknown;
-                    }
+                    let Dest::Named(name) = destination else {
+                        return Link(LinkType::Unknown, area);
+                    };
 
-                    let named_dest_ptr = destination.named_dest;
-                    if named_dest_ptr.is_null() {
-                        return Link::Invalid;
-                    }
-
-                    let c_str = CStr::from_ptr(named_dest_ptr);
-                    let rust_string = c_str.to_string_lossy().into_owned();
-                    return Link::GotoNamedDest(rust_string, area);
+                    Link(LinkType::GotoNamedDest(name), area)
                 }
                 poppler::ActionType::Uri => {
                     let uri_action = action.uri;
                     let uri_ptr = uri_action.uri;
 
                     if uri_ptr.is_null() {
-                        return Link::Invalid;
+                        return Link(LinkType::Invalid, area);
                     }
 
                     let c_str = CStr::from_ptr(uri_ptr);
                     let rust_string = c_str.to_string_lossy().into_owned();
-                    return Link::Uri(rust_string);
+                    Link(LinkType::Uri(rust_string), area)
                 }
 
-                _ => {}
+                _ => Link(LinkType::Unknown, area),
             }
         }
-
-        Link::Unknown
     }
 }
 
@@ -94,11 +87,18 @@ impl DestExt for poppler::Dest {
     fn from_raw(&self) -> Dest {
         let raw_dest = self.as_ptr();
         unsafe {
-            let dest: &poppler_sys::PopplerDest = &*raw_dest;
+            let dest = &*raw_dest;
+            dest.from_raw()
+        }
+    }
+}
 
-            match poppler::DestType::from_glib(dest.type_) {
+impl DestExt for poppler_sys::PopplerDest {
+    fn from_raw(&self) -> Dest {
+        unsafe {
+            match poppler::DestType::from_glib(self.type_) {
                 poppler::DestType::Named => {
-                    let named_dest_ptr = dest.named_dest;
+                    let named_dest_ptr = self.named_dest;
                     if named_dest_ptr.is_null() {
                         return Dest::Invalid;
                     }
@@ -107,7 +107,7 @@ impl DestExt for poppler::Dest {
                     let rust_string = c_str.to_string_lossy().into_owned();
                     Dest::Named(rust_string)
                 }
-                poppler::DestType::Xyz => Dest::Xyz(dest.page_num),
+                poppler::DestType::Xyz => Dest::Xyz(self.page_num),
                 t => Dest::Unknown(t),
             }
         }
