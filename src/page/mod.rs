@@ -10,7 +10,6 @@ use gtk::prelude::*;
 use gtk::subclass::prelude::ObjectSubclassIsExt;
 use gtk::{glib, glib::clone};
 
-use crate::poppler::*;
 use crate::render::Renderer;
 
 #[derive(Default, Debug)]
@@ -138,9 +137,6 @@ impl Page {
         pn: &PageNumber,
         poppler_page: &poppler::Page,
         renderer: Rc<RefCell<Renderer>>,
-        overlay: &gtk::Overlay,
-        state: &crate::state::State,
-        listview: &gtk::ListView,
     ) {
         self.set_popplerpage(poppler_page.clone());
 
@@ -156,86 +152,6 @@ impl Page {
         self.imp().binding.replace(Some(new_binding));
 
         self.bind_draw(poppler_page, renderer);
-
-        let mut child = overlay.first_child();
-        while let Some(c) = child {
-            child = c.next_sibling();
-            if c.type_() == gtk::Button::static_type() {
-                overlay.remove_overlay(&c);
-            }
-        }
-
-        for link in poppler_page.link_mapping() {
-            let crate::poppler::Link(link_type, area) = link.from_raw();
-
-            let btn = gtk::Button::builder()
-                .valign(gtk::Align::Start)
-                .halign(gtk::Align::Start)
-                .opacity(0.0)
-                .css_classes(vec!["link-overlay"])
-                .cursor(&gtk::gdk::Cursor::from_name("pointer", None).unwrap())
-                .build();
-
-            self.connect_zoom_notify(clone!(
-                #[strong]
-                btn,
-                move |page| {
-                    update_link_location(page, &btn, &area);
-                }
-            ));
-
-            self.connect_bbox_notify(clone!(
-                #[strong]
-                btn,
-                move |page| {
-                    update_link_location(page, &btn, &area);
-                }
-            ));
-
-            update_link_location(self, &btn, &area);
-
-            btn.connect_clicked(clone!(
-                #[strong]
-                listview,
-                #[strong]
-                state,
-                move |_| {
-                    match link_type.clone() {
-                        LinkType::GotoNamedDest(name) => {
-                            let Some(doc) = state.doc() else {
-                                return;
-                            };
-
-                            let Some(dest) = doc.find_dest(&name) else {
-                                return;
-                            };
-
-                            let Dest::Xyz(page_num) = dest.from_raw() else {
-                                return;
-                            };
-
-                            dbg!(page_num);
-                            listview.scroll_to(
-                                (page_num as u32).saturating_sub(1),
-                                gtk::ListScrollFlags::SELECT | gtk::ListScrollFlags::FOCUS,
-                                None,
-                            );
-                        }
-                        LinkType::Uri(uri) => {
-                            let _ = gtk::gio::AppInfo::launch_default_for_uri(
-                                &uri,
-                                gtk::gio::AppLaunchContext::NONE,
-                            );
-                        }
-                        _ => {
-                            println!("unhandled link: {:?}", link_type);
-                        }
-                    }
-                }
-            ));
-
-            overlay.add_overlay(&btn);
-        }
     }
 
     fn bind_draw(&self, poppler_page: &poppler::Page, renderer: Rc<RefCell<Renderer>>) {
@@ -304,12 +220,4 @@ impl Default for Page {
     fn default() -> Self {
         Self::new()
     }
-}
-
-fn update_link_location(page: &Page, btn: &gtk::Button, area: &poppler::Rectangle) {
-    let (_, height) = page.popplerpage().as_ref().unwrap().size();
-    btn.set_margin_start((page.zoom() * (area.x1() - page.bbox().x1())) as i32);
-    btn.set_margin_top((page.zoom() * (height - area.y2() - page.bbox().y1())) as i32);
-    btn.set_width_request((page.zoom() * (area.x2() - area.x1())) as i32);
-    btn.set_height_request((page.zoom() * (area.y2() - area.y1())) as i32);
 }

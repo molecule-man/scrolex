@@ -1,5 +1,8 @@
+use std::sync::OnceLock;
+
 use gtk::glib;
-use gtk::glib::subclass::prelude::*;
+use gtk::glib::subclass::{prelude::*, Signal};
+use gtk::prelude::*;
 use gtk::subclass::prelude::*;
 
 use crate::page::Page;
@@ -29,6 +32,14 @@ impl ObjectSubclass for PageOverlay {
 }
 
 impl ObjectImpl for PageOverlay {
+    fn signals() -> &'static [Signal] {
+        static SIGNALS: OnceLock<Vec<Signal>> = OnceLock::new();
+        SIGNALS.get_or_init(|| {
+            vec![Signal::builder("page-link-clicked")
+                .param_types([i32::static_type()])
+                .build()]
+        })
+    }
     //fn constructed(&self) {
     //    self.parent_constructed();
     //

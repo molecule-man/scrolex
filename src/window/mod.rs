@@ -10,6 +10,7 @@ use gtk::prelude::*;
 use gtk::{gio, glib, Application};
 
 use crate::page;
+use crate::page_overlay::PageOverlay;
 use crate::render::Renderer;
 use crate::state::State;
 
@@ -57,6 +58,8 @@ impl Window {
         factory.connect_setup(clone!(
             #[weak]
             state,
+            #[weak(rename_to = listview)]
+            self.imp().listview,
             move |_, list_item| {
                 let list_item = list_item.downcast_ref::<gtk::ListItem>().unwrap();
                 let overlay = crate::page_overlay::PageOverlay::new();
@@ -77,6 +80,18 @@ impl Window {
                     .flags(glib::BindingFlags::DEFAULT | glib::BindingFlags::SYNC_CREATE)
                     .build();
 
+                overlay.connect_closure(
+                    "page-link-clicked",
+                    false,
+                    closure_local!(move |_: &PageOverlay, page_num: i32| {
+                        listview.scroll_to(
+                            (page_num as u32).saturating_sub(1),
+                            gtk::ListScrollFlags::SELECT | gtk::ListScrollFlags::FOCUS,
+                            None,
+                        );
+                    }),
+                );
+
                 list_item.set_child(Some(&overlay));
             }
         ));
@@ -86,8 +101,6 @@ impl Window {
             state,
             #[strong]
             renderer,
-            #[strong(rename_to = listview)]
-            self.imp().listview,
             move |_, list_item| {
                 let list_item = list_item.downcast_ref::<gtk::ListItem>().unwrap();
                 let page_number = list_item.item().and_downcast::<page::PageNumber>().unwrap();
@@ -96,18 +109,11 @@ impl Window {
                     .and_downcast::<crate::page_overlay::PageOverlay>()
                     .unwrap();
                 let page: &crate::page::Page = overlay.imp().page.as_ref();
-                let overlay: &gtk::Overlay = overlay.imp().overlay.as_ref();
 
                 if let Some(doc) = state.doc() {
                     if let Some(poppler_page) = doc.page(page_number.page_number()) {
-                        page.bind(
-                            &page_number,
-                            &poppler_page,
-                            renderer.clone(),
-                            overlay,
-                            &state,
-                            &listview,
-                        );
+                        page.bind(&page_number, &poppler_page, renderer.clone());
+                        overlay.bind(&poppler_page, &doc);
                     }
                 }
             }
