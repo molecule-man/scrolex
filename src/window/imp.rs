@@ -33,6 +33,8 @@ pub struct Window {
     pub scrolledwindow: TemplateChild<ScrolledWindow>,
     #[template_child]
     pub listview: TemplateChild<ListView>,
+    #[template_child]
+    pub entry_page_num: TemplateChild<gtk::Entry>,
 
     drag_coords: RefCell<Option<(f64, f64)>>,
     drag_cursor: RefCell<Option<gtk::gdk::Cursor>>,
@@ -65,6 +67,16 @@ impl ObjectImpl for Window {
 
         let obj = self.obj();
         obj.setup();
+
+        if let Some(editable) = self.entry_page_num.delegate() {
+            editable.connect_insert_text(|entry, s, _| {
+                for c in s.chars() {
+                    if !c.is_numeric() {
+                        entry.stop_signal_emission_by_name("insert-text");
+                    }
+                }
+            });
+        }
     }
 }
 
@@ -134,6 +146,24 @@ impl Window {
         }
 
         glib::Propagation::Stop
+    }
+
+    #[template_callback]
+    fn handle_page_number_entered(&self, entry: &gtk::Entry) {
+        let Ok(page_num) = entry.text().parse::<u32>() else {
+            return;
+        };
+
+        self.obj().goto_page(page_num);
+    }
+
+    #[template_callback]
+    fn handle_page_number_icon_pressed(&self, _: gtk::EntryIconPosition, entry: &gtk::Entry) {
+        let Ok(page_num) = entry.text().parse::<u32>() else {
+            return;
+        };
+
+        self.obj().goto_page(page_num);
     }
 }
 

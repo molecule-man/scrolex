@@ -9,9 +9,29 @@
 		<child type="titlebar">
 			<object class="GtkHeaderBar" id="headerbar">
 				<child type="title">
-					<object class="GtkLabel" id="title">
-						<property name="label">HallyViewed</property>
+					<object class="GtkBox">
+						<property name="orientation">horizontal</property>
+						<child>
+							<object class="GtkLabel">
+								<property name="label">Page: </property>
+							</object>
+						</child>
+						<child>
+							<object class="GtkEntry" id="entry_page_num">
+								<signal name="activate" handler="handle_page_number_entered" swapped="true"/>
+								<signal name="icon-press" handler="handle_page_number_icon_pressed" swapped="true"/>
+								<property name="secondary-icon-name">view-paged</property>
+								<property name="halign">end</property>
+								<property name="valign">baseline-center</property>
+								<property name="width-chars">4</property>
+								<property name="max-width-chars">4</property>
+								<property name="input-purpose">digits</property>
+							</object>
+						</child>
 					</object>
+					<!--<object class="GtkLabel" id="title">-->
+					<!--	<property name="label">HallyViewed</property>-->
+					<!--</object>-->
 				</child>
 				<child type="start">
 					<object class="GtkButton" id="btn_open">

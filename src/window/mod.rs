@@ -4,8 +4,8 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use glib::{clone, Object};
-use gtk::glib::closure_local;
 use gtk::glib::subclass::types::ObjectSubclassIsExt;
+use gtk::glib::{closure, closure_local};
 use gtk::prelude::*;
 use gtk::{gio, glib, Application};
 
@@ -37,11 +37,20 @@ impl Window {
         let renderer = Rc::new(RefCell::new(Renderer::new()));
 
         self.imp().listview.set_factory(Some(&factory));
-        self.imp()
+        let pn_expr = self
+            .imp()
             .selection
             .property_expression("selected-item")
-            .chain_property::<page::PageNumber>("page_number")
-            .bind(state, "page", gtk::Widget::NONE);
+            .chain_property::<page::PageNumber>("page_number");
+
+        pn_expr.bind(state, "page", gtk::Widget::NONE);
+
+        let entry_page_num: &gtk::Entry = self.imp().entry_page_num.as_ref();
+        pn_expr
+            .chain_closure::<String>(closure!(move |_: Option<glib::Object>, page_num: i32| {
+                format!("{}", page_num + 1)
+            }))
+            .bind(entry_page_num, "text", gtk::Widget::NONE);
 
         state.connect_closure(
             "before-load",
@@ -58,8 +67,8 @@ impl Window {
         factory.connect_setup(clone!(
             #[weak]
             state,
-            #[weak(rename_to = listview)]
-            self.imp().listview,
+            #[strong(rename_to = win)]
+            self,
             move |_, list_item| {
                 let list_item = list_item.downcast_ref::<gtk::ListItem>().unwrap();
                 let overlay = crate::page_overlay::PageOverlay::new();
@@ -83,13 +92,13 @@ impl Window {
                 overlay.connect_closure(
                     "page-link-clicked",
                     false,
-                    closure_local!(move |_: &PageOverlay, page_num: i32| {
-                        listview.scroll_to(
-                            (page_num as u32).saturating_sub(1),
-                            gtk::ListScrollFlags::SELECT | gtk::ListScrollFlags::FOCUS,
-                            None,
-                        );
-                    }),
+                    closure_local!(
+                        #[strong]
+                        win,
+                        move |_: &PageOverlay, page_num: i32| {
+                            win.goto_page(page_num as u32);
+                        }
+                    ),
                 );
 
                 list_item.set_child(Some(&overlay));
@@ -133,6 +142,20 @@ impl Window {
     #[template_callback]
     pub(crate) fn zoom_in(&self) {
         self.imp().state.set_zoom(self.imp().state.zoom() * 1.1);
+    }
+
+    pub(crate) fn goto_page(&self, page_num: u32) {
+        let Some(selection) = self.ensure_ready_selection() else {
+            return;
+        };
+
+        let page_num = page_num.min(selection.n_items());
+
+        self.imp().listview.scroll_to(
+            page_num.saturating_sub(1),
+            gtk::ListScrollFlags::SELECT | gtk::ListScrollFlags::FOCUS,
+            None,
+        );
     }
 
     pub(crate) fn prev_page(&self) {
