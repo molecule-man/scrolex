@@ -1,16 +1,11 @@
 mod imp;
 
-use std::cell::RefCell;
-use std::rc::Rc;
-
 use gtk::gio::prelude::*;
 use gtk::prelude::*;
 use gtk::subclass::prelude::ObjectSubclassIsExt;
-use gtk::subclass::prelude::*;
 use gtk::{glib, glib::clone};
 
 use crate::poppler::*;
-use crate::render::Renderer;
 
 glib::wrapper! {
     pub struct PageOverlay(ObjectSubclass<imp::PageOverlay>)
@@ -63,8 +58,6 @@ impl PageOverlay {
             update_link_location(&self.imp().page, &btn, &area);
 
             btn.connect_clicked(clone!(
-                //#[strong]
-                //listview,
                 #[strong]
                 doc,
                 #[strong(rename_to = overlay)]
@@ -80,11 +73,6 @@ impl PageOverlay {
                                 return;
                             };
 
-                            //listview.scroll_to(
-                            //    (page_num as u32).saturating_sub(1),
-                            //    gtk::ListScrollFlags::SELECT | gtk::ListScrollFlags::FOCUS,
-                            //    None,
-                            //);
                             overlay.emit_by_name::<()>("page-link-clicked", &[&page_num]);
                         }
                         LinkType::Uri(uri) => {
