@@ -28,8 +28,8 @@ impl PageOverlay {
             }
         }
 
-        for link in poppler_page.link_mapping() {
-            let crate::poppler::Link(link_type, area) = link.from_raw();
+        for raw_link in poppler_page.link_mapping() {
+            let crate::poppler::Link(link_type, area) = raw_link.to_link();
 
             let btn = gtk::Button::builder()
                 .valign(gtk::Align::Start)
@@ -69,7 +69,7 @@ impl PageOverlay {
                                 return;
                             };
 
-                            let Dest::Xyz(page_num) = dest.from_raw() else {
+                            let Dest::Xyz(page_num) = dest.to_dest() else {
                                 return;
                             };
 
@@ -80,6 +80,9 @@ impl PageOverlay {
                                 &uri,
                                 gtk::gio::AppLaunchContext::NONE,
                             );
+                        }
+                        LinkType::Unknown(msg) => {
+                            println!("unhandled link: {:?}", msg);
                         }
                         _ => {
                             println!("unhandled link: {:?}", link_type);

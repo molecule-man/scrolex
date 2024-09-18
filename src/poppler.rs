@@ -4,22 +4,20 @@ use std::ffi::CStr;
 
 #[derive(Debug, Clone)]
 pub(crate) enum LinkType {
-    Unknown,
+    Unknown(String),
     Invalid,
-    //GotoPage(i32),
     GotoNamedDest(String),
-    //Launch(String),
     Uri(String),
 }
 
 pub(crate) struct Link(pub(crate) LinkType, pub(crate) poppler::Rectangle);
 
 pub(crate) trait LinkMappingExt {
-    fn from_raw(&self) -> Link;
+    fn to_link(&self) -> Link;
 }
 
 impl LinkMappingExt for LinkMapping {
-    fn from_raw(&self) -> Link {
+    fn to_link(&self) -> Link {
         let raw_link = self.as_ptr();
         unsafe {
             let link_mapping: &poppler_sys::PopplerLinkMapping = &*raw_link;
@@ -44,10 +42,22 @@ impl LinkMappingExt for LinkMapping {
                     if destination_ptr.is_null() {
                         return Link(LinkType::Invalid, area);
                     }
-                    let destination = (*destination_ptr).from_raw();
+                    let destination = (*destination_ptr).to_dest();
 
-                    let Dest::Named(name) = destination else {
-                        return Link(LinkType::Unknown, area);
+                    let name = match destination {
+                        Dest::Named(name) => name,
+                        Dest::Unknown(dest_type) => {
+                            return Link(
+                                LinkType::Unknown(format!("link dest is unknown: {:?}", dest_type)),
+                                area,
+                            )
+                        }
+                        t => {
+                            return Link(
+                                LinkType::Unknown(format!("link dest is unhandled {:?}", t)),
+                                area,
+                            )
+                        }
                     };
 
                     Link(LinkType::GotoNamedDest(name), area)
@@ -65,7 +75,10 @@ impl LinkMappingExt for LinkMapping {
                     Link(LinkType::Uri(rust_string), area)
                 }
 
-                _ => Link(LinkType::Unknown, area),
+                t => Link(
+                    LinkType::Unknown(format!("link action is unhandled: {:?}", t)),
+                    area,
+                ),
             }
         }
     }
@@ -80,21 +93,21 @@ pub(crate) enum Dest {
 }
 
 pub(crate) trait DestExt {
-    fn from_raw(&self) -> Dest;
+    fn to_dest(&self) -> Dest;
 }
 
 impl DestExt for poppler::Dest {
-    fn from_raw(&self) -> Dest {
+    fn to_dest(&self) -> Dest {
         let raw_dest = self.as_ptr();
         unsafe {
             let dest = &*raw_dest;
-            dest.from_raw()
+            dest.to_dest()
         }
     }
 }
 
 impl DestExt for poppler_sys::PopplerDest {
-    fn from_raw(&self) -> Dest {
+    fn to_dest(&self) -> Dest {
         unsafe {
             match poppler::DestType::from_glib(self.type_) {
                 poppler::DestType::Named => {
