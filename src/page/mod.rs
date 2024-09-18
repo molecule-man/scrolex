@@ -1,14 +1,12 @@
 mod imp;
 mod page_number_imp;
 
-use std::cell::RefCell;
-use std::rc::Rc;
-
-use gtk::gdk::BUTTON_PRIMARY;
 use gtk::gio::prelude::*;
 use gtk::prelude::*;
 use gtk::subclass::prelude::ObjectSubclassIsExt;
 use gtk::{glib, glib::clone};
+use std::cell::RefCell;
+use std::rc::Rc;
 
 use crate::render::Renderer;
 
@@ -44,94 +42,6 @@ impl Page {
         glib::Object::builder().build()
     }
 
-    pub(crate) fn setup(&self) {
-        self.connect_crop_notify(|p| {
-            p.queue_draw();
-        });
-
-        self.connect_zoom_notify(|p| {
-            p.queue_draw();
-        });
-
-        let mouse_coords = Rc::new(RefCell::new(None));
-        let cursor = Rc::new(RefCell::new(None));
-        let gc = gtk::GestureClick::builder().button(BUTTON_PRIMARY).build();
-
-        gc.connect_pressed(clone!(
-            #[strong]
-            mouse_coords,
-            #[strong(rename_to = page)]
-            self,
-            #[strong]
-            cursor,
-            move |_gc, _n_press, x, y| {
-                mouse_coords.replace(Some((x, y)));
-                cursor.replace(page.cursor());
-                page.set_cursor_from_name(Some("crosshair"));
-            }
-        ));
-
-        gc.connect_update(clone!(
-            #[strong]
-            mouse_coords,
-            #[strong(rename_to = page)]
-            self,
-            move |gc, seq| {
-                let Some((start_x, start_y)) = *mouse_coords.borrow() else {
-                    return;
-                };
-
-                let Some((end_x, end_y)) = gc.point(seq) else {
-                    return;
-                };
-
-                if let Some(poppler_page) = page.popplerpage().as_ref() {
-                    let mut rect = poppler::Rectangle::default();
-
-                    let mut crop_x1 = 0.0;
-                    let mut crop_y1 = 0.0;
-
-                    if page.crop() {
-                        let crop_bbox = page.bbox();
-                        crop_x1 = crop_bbox.x1();
-                        crop_y1 = crop_bbox.y1();
-                    }
-
-                    rect.set_x1(crop_x1 + start_x / page.zoom());
-                    rect.set_y1(crop_y1 + start_y / page.zoom());
-                    rect.set_x2(crop_x1 + end_x / page.zoom());
-                    rect.set_y2(crop_y1 + end_y / page.zoom());
-
-                    let selected =
-                        &poppler_page.selected_text(poppler::SelectionStyle::Glyph, &mut rect);
-
-                    page.set_x1(start_x);
-                    page.set_y1(start_y);
-                    page.set_x2(end_x);
-                    page.set_y2(end_y);
-
-                    if let Some(selected) = selected {
-                        page.clipboard().set_text(selected);
-                    }
-
-                    page.queue_draw();
-                };
-            }
-        ));
-
-        gc.connect_end(clone!(
-            #[strong(rename_to = page)]
-            self,
-            move |_, _| {
-                page.set_cursor(cursor.borrow().as_ref());
-            }
-        ));
-
-        self.add_controller(gc);
-
-        self.set_size_request(600, 800);
-    }
-
     pub(crate) fn bind(
         &self,
         pn: &PageNumber,
@@ -151,10 +61,6 @@ impl Page {
 
         self.imp().binding.replace(Some(new_binding));
 
-        self.bind_draw(poppler_page, renderer);
-    }
-
-    fn bind_draw(&self, poppler_page: &poppler::Page, renderer: Rc<RefCell<Renderer>>) {
         self.set_draw_func(clone!(
             #[strong(rename_to = page)]
             self,

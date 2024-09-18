@@ -1,13 +1,21 @@
+use std::cell::RefCell;
+use std::rc::Rc;
+
+use glib::clone;
 use glib::subclass::InitializingObject;
 use gtk::gdk::{EventSequence, Key, ModifierType};
 use gtk::glib::subclass::prelude::*;
+use gtk::glib::subclass::types::ObjectSubclassIsExt;
+use gtk::glib::{closure, closure_local};
 use gtk::subclass::prelude::*;
 use gtk::{
     glib, Button, CompositeTemplate, ListView, ScrolledWindow, SingleSelection, ToggleButton,
 };
 use gtk::{prelude::*, GestureClick};
-use std::cell::RefCell;
 
+use crate::page;
+use crate::page_overlay::PageOverlay;
+use crate::render::Renderer;
 use crate::state::State;
 
 // Object holding the state
@@ -62,11 +70,102 @@ impl ObjectSubclass for Window {
 // Trait shared by all GObjects
 impl ObjectImpl for Window {
     fn constructed(&self) {
-        // Call "constructed" on parent
         self.parent_constructed();
 
-        let obj = self.obj();
-        obj.setup();
+        let state: &State = self.state.as_ref();
+        let factory = gtk::SignalListItemFactory::new();
+        let renderer = Rc::new(RefCell::new(Renderer::new()));
+
+        self.listview.set_factory(Some(&factory));
+        let pn_expr = self
+            .selection
+            .property_expression("selected-item")
+            .chain_property::<page::PageNumber>("page_number");
+
+        pn_expr.bind(state, "page", gtk::Widget::NONE);
+
+        let entry_page_num: &gtk::Entry = self.entry_page_num.as_ref();
+        pn_expr
+            .chain_closure::<String>(closure!(move |_: Option<glib::Object>, page_num: i32| {
+                format!("{}", page_num + 1)
+            }))
+            .bind(entry_page_num, "text", gtk::Widget::NONE);
+
+        state.connect_closure(
+            "before-load",
+            false,
+            closure_local!(
+                #[strong]
+                renderer,
+                move |_: &State| {
+                    renderer.borrow().clear_cache();
+                }
+            ),
+        );
+
+        factory.connect_setup(clone!(
+            #[weak]
+            state,
+            #[strong(rename_to = obj)]
+            self.obj(),
+            move |_, list_item| {
+                let list_item = list_item.downcast_ref::<gtk::ListItem>().unwrap();
+                let overlay = crate::page_overlay::PageOverlay::new();
+                let page: &crate::page::Page = overlay.imp().page.as_ref();
+
+                state
+                    .bind_property("crop", page, "crop")
+                    .flags(glib::BindingFlags::DEFAULT | glib::BindingFlags::SYNC_CREATE)
+                    .build();
+
+                state
+                    .bind_property("zoom", page, "zoom")
+                    .flags(glib::BindingFlags::DEFAULT | glib::BindingFlags::SYNC_CREATE)
+                    .build();
+
+                state
+                    .bind_property("uri", page, "uri")
+                    .flags(glib::BindingFlags::DEFAULT | glib::BindingFlags::SYNC_CREATE)
+                    .build();
+
+                overlay.connect_closure(
+                    "page-link-clicked",
+                    false,
+                    closure_local!(
+                        #[strong]
+                        obj,
+                        move |_: &PageOverlay, page_num: i32| {
+                            obj.imp().goto_page(page_num as u32);
+                        }
+                    ),
+                );
+
+                list_item.set_child(Some(&overlay));
+            }
+        ));
+
+        factory.connect_bind(clone!(
+            #[weak]
+            state,
+            #[strong]
+            renderer,
+            move |_, list_item| {
+                let list_item = list_item.downcast_ref::<gtk::ListItem>().unwrap();
+                let page_number = list_item.item().and_downcast::<page::PageNumber>().unwrap();
+                let overlay = list_item
+                    .child()
+                    .and_downcast::<crate::page_overlay::PageOverlay>()
+                    .unwrap();
+                let page: &crate::page::Page = overlay.imp().page.as_ref();
+
+                if let Some(doc) = state.doc() {
+                    if let Some(poppler_page) = doc.page(page_number.page_number()) {
+                        page.bind(&page_number, &poppler_page, renderer.clone());
+                        overlay.bind(&poppler_page, &doc);
+                    }
+                }
+            }
+        ));
 
         if let Some(editable) = self.entry_page_num.delegate() {
             editable.connect_insert_text(|entry, s, _| {
@@ -85,9 +184,9 @@ impl Window {
     #[template_callback]
     fn handle_scroll(&self, _dx: f64, dy: f64) -> glib::Propagation {
         if dy < 0.0 {
-            self.obj().prev_page();
+            self.prev_page();
         } else {
-            self.obj().next_page();
+            self.next_page();
         }
         glib::Propagation::Stop
     }
@@ -106,7 +205,9 @@ impl Window {
     fn handle_drag_move(&self, seq: Option<&EventSequence>, gc: &GestureClick) {
         if let Some((prev_x, _)) = *self.drag_coords.borrow() {
             if let Some((x, _)) = gc.point(seq) {
-                self.obj().scroll_view(x - prev_x);
+                let dx = x - prev_x;
+                let hadjustment = self.scrolledwindow.hadjustment();
+                hadjustment.set_value(hadjustment.value() - dx);
             }
         }
         *self.drag_coords.borrow_mut() = gc.point(seq);
@@ -120,6 +221,16 @@ impl Window {
     }
 
     #[template_callback]
+    fn zoom_out(&self) {
+        self.state.set_zoom(self.state.zoom() / 1.1);
+    }
+
+    #[template_callback]
+    fn zoom_in(&self) {
+        self.state.set_zoom(self.state.zoom() * 1.1);
+    }
+
+    #[template_callback]
     fn handle_key_press(
         &self,
         keyval: Key,
@@ -128,19 +239,19 @@ impl Window {
     ) -> glib::Propagation {
         match keyval {
             Key::o => {
-                self.obj().open_document();
+                self.open_document();
             }
             Key::l => {
-                self.obj().next_page();
+                self.next_page();
             }
             Key::h => {
-                self.obj().prev_page();
+                self.prev_page();
             }
             Key::bracketleft => {
-                self.obj().zoom_out();
+                self.zoom_out();
             }
             Key::bracketright => {
-                self.obj().zoom_in();
+                self.zoom_in();
             }
             _ => return glib::Propagation::Proceed,
         }
@@ -154,7 +265,7 @@ impl Window {
             return;
         };
 
-        self.obj().goto_page(page_num);
+        self.goto_page(page_num);
     }
 
     #[template_callback]
@@ -163,7 +274,152 @@ impl Window {
             return;
         };
 
-        self.obj().goto_page(page_num);
+        self.goto_page(page_num);
+    }
+
+    fn goto_page(&self, page_num: u32) {
+        let Some(selection) = self.ensure_ready_selection() else {
+            return;
+        };
+
+        let page_num = page_num.min(selection.n_items());
+
+        self.listview.scroll_to(
+            page_num.saturating_sub(1),
+            gtk::ListScrollFlags::SELECT | gtk::ListScrollFlags::FOCUS,
+            None,
+        );
+    }
+
+    fn prev_page(&self) {
+        let Some(selection) = self.ensure_ready_selection() else {
+            return;
+        };
+
+        let current_pos = self.scrolledwindow.hadjustment().value();
+
+        // normally I'd use list_view.scroll_to() here, but it doesn't scroll if the item
+        // is already visible :(
+        selection.select_item(selection.selected().saturating_sub(1), true);
+        let width = selection
+            .selected_item()
+            .and_downcast::<page::PageNumber>()
+            .unwrap()
+            .width() as f64
+            + 4.0; // 4px is padding of list item widget. TODO: figure out how to un-hardcode this
+
+        self.scrolledwindow
+            .hadjustment()
+            .set_value(current_pos - width);
+    }
+
+    fn next_page(&self) {
+        let Some(selection) = self.ensure_ready_selection() else {
+            return;
+        };
+
+        let current_pos = self.scrolledwindow.hadjustment().value();
+
+        // normally I'd use list_view.scroll_to() here, but it doesn't scroll if the item
+        // is already visible :(
+        let width = selection
+            .selected_item()
+            .and_downcast::<page::PageNumber>()
+            .unwrap()
+            .width() as f64
+            + 4.0; // 4px is padding of list item widget. TODO: figure out how to un-hardcode this
+
+        selection.select_item(
+            (selection.selected() + 1).min(selection.n_items() - 1),
+            true,
+        );
+        self.scrolledwindow
+            .hadjustment()
+            .set_value(current_pos + width);
+    }
+
+    fn ensure_ready_selection(&self) -> Option<&gtk::SingleSelection> {
+        let selection: &gtk::SingleSelection = self.selection.as_ref();
+
+        if selection.n_items() == 0 {
+            return None;
+        }
+
+        selection.selected_item()?;
+
+        Some(selection)
+    }
+
+    #[template_callback]
+    fn clear_model(&self) {
+        self.model.remove_all();
+    }
+
+    #[template_callback]
+    fn open_document(&self) {
+        let dialog = gtk::FileDialog::builder()
+            .title("Open PDF File")
+            .modal(true)
+            .build();
+
+        let obj = self.obj();
+        dialog.open(
+            Some(obj.as_ref()),
+            gtk::gio::Cancellable::NONE,
+            clone!(
+                #[strong(rename_to = state)]
+                self.state,
+                #[strong]
+                obj,
+                move |file| match file {
+                    Ok(file) => {
+                        state.load(&file).unwrap_or_else(|err| {
+                            obj.show_error_dialog(&format!("Error loading file: {}", err));
+                        });
+                    }
+                    Err(err) => {
+                        obj.show_error_dialog(&format!("Error opening file: {}", err));
+                    }
+                },
+            ),
+        );
+    }
+
+    #[template_callback]
+    fn handle_document_load(&self, state: &State) {
+        let Some(doc) = state.doc() else {
+            return;
+        };
+
+        let model = self.model.clone();
+        let selection = self.selection.clone();
+
+        let n_pages = doc.n_pages() as u32;
+        let scroll_to = state.page().min(n_pages - 1);
+        let init_load_from = scroll_to.saturating_sub(1);
+        let init_load_till = (scroll_to + 10).min(n_pages - 1);
+
+        let vector: Vec<page::PageNumber> = (init_load_from as i32..init_load_till as i32)
+            .map(page::PageNumber::new)
+            .collect();
+        model.extend_from_slice(&vector);
+        selection.select_item(scroll_to - init_load_from, true);
+
+        glib::idle_add_local(move || {
+            if init_load_from > 0 {
+                let vector: Vec<page::PageNumber> = (0..init_load_from as i32)
+                    .map(page::PageNumber::new)
+                    .collect();
+                model.splice(0, 0, &vector);
+            }
+            if init_load_till < n_pages {
+                let vector: Vec<page::PageNumber> = (init_load_till as i32..n_pages as i32)
+                    .map(page::PageNumber::new)
+                    .collect();
+                model.extend_from_slice(&vector);
+            }
+            glib::ControlFlow::Break
+        });
     }
 }
 
