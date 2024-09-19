@@ -145,8 +145,6 @@ impl ObjectImpl for Window {
                                     return;
                                 };
 
-                                println!("goto page {}", page_num);
-
                                 obj.imp().goto_page(page_num as u32);
                             }
                         }
@@ -295,7 +293,6 @@ impl Window {
 
         let page_num = page_num.min(selection.n_items());
 
-        println!("scrolling to page {}", page_num);
         self.listview.scroll_to(
             page_num.saturating_sub(1),
             gtk::ListScrollFlags::SELECT | gtk::ListScrollFlags::FOCUS,
@@ -369,9 +366,15 @@ impl Window {
 
     #[template_callback]
     fn open_document(&self) {
+        let filter = gtk::FileFilter::new();
+        filter.add_mime_type("application/pdf");
+        let filters = gtk::gio::ListStore::new::<gtk::FileFilter>();
+        filters.append(&filter);
+
         let dialog = gtk::FileDialog::builder()
             .title("Open PDF File")
             .modal(true)
+            .filters(&filters)
             .build();
 
         let obj = self.obj();

@@ -96,15 +96,8 @@ impl Renderer {
         page: &crate::page::Page,
         poppler_page: &poppler::Page,
     ) {
-        let now = std::time::Instant::now();
-
         let bbox = self.get_bbox(poppler_page, page.crop());
         render(cr, poppler_page, page.zoom(), &bbox);
-        println!(
-            "Rendering from main loop {}. elapsed: {:.2?}",
-            poppler_page.index(),
-            now.elapsed()
-        );
     }
 
     fn spawn_bg_thread(&self, recv: Receiver<Request>) {
