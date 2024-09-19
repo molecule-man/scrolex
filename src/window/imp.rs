@@ -14,7 +14,7 @@ use gtk::{
 use gtk::{prelude::*, GestureClick};
 
 use crate::page;
-use crate::page_overlay::PageOverlay;
+use crate::poppler::*;
 use crate::render::Renderer;
 use crate::state::State;
 
@@ -110,8 +110,7 @@ impl ObjectImpl for Window {
             self.obj(),
             move |_, list_item| {
                 let list_item = list_item.downcast_ref::<gtk::ListItem>().unwrap();
-                let overlay = crate::page_overlay::PageOverlay::new();
-                let page: &crate::page::Page = overlay.imp().page.as_ref();
+                let page = &page::Page::new();
 
                 state
                     .bind_property("crop", page, "crop")
@@ -128,19 +127,33 @@ impl ObjectImpl for Window {
                     .flags(glib::BindingFlags::DEFAULT | glib::BindingFlags::SYNC_CREATE)
                     .build();
 
-                overlay.connect_closure(
-                    "page-link-clicked",
+                page.connect_closure(
+                    "named-link-clicked",
                     false,
                     closure_local!(
                         #[strong]
                         obj,
-                        move |_: &PageOverlay, page_num: i32| {
-                            obj.imp().goto_page(page_num as u32);
+                        #[weak]
+                        state,
+                        move |_: &crate::page::Page, dest_name: &str| {
+                            if let Some(doc) = state.doc() {
+                                let Some(dest) = doc.find_dest(dest_name) else {
+                                    return;
+                                };
+
+                                let Dest::Xyz(page_num) = dest.to_dest() else {
+                                    return;
+                                };
+
+                                println!("goto page {}", page_num);
+
+                                obj.imp().goto_page(page_num as u32);
+                            }
                         }
                     ),
                 );
 
-                list_item.set_child(Some(&overlay));
+                list_item.set_child(Some(page));
             }
         ));
 
@@ -152,16 +165,14 @@ impl ObjectImpl for Window {
             move |_, list_item| {
                 let list_item = list_item.downcast_ref::<gtk::ListItem>().unwrap();
                 let page_number = list_item.item().and_downcast::<page::PageNumber>().unwrap();
-                let overlay = list_item
+                let page = list_item
                     .child()
-                    .and_downcast::<crate::page_overlay::PageOverlay>()
+                    .and_downcast::<crate::page::Page>()
                     .unwrap();
-                let page: &crate::page::Page = overlay.imp().page.as_ref();
 
                 if let Some(doc) = state.doc() {
                     if let Some(poppler_page) = doc.page(page_number.page_number()) {
                         page.bind(&page_number, &poppler_page, renderer.clone());
-                        overlay.bind(&poppler_page, &doc);
                     }
                 }
             }
@@ -284,6 +295,7 @@ impl Window {
 
         let page_num = page_num.min(selection.n_items());
 
+        println!("scrolling to page {}", page_num);
         self.listview.scroll_to(
             page_num.saturating_sub(1),
             gtk::ListScrollFlags::SELECT | gtk::ListScrollFlags::FOCUS,
