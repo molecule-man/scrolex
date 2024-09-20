@@ -4,9 +4,9 @@ use std::rc::Rc;
 use glib::clone;
 use glib::subclass::InitializingObject;
 use gtk::gdk::{EventSequence, Key, ModifierType};
+use gtk::glib::closure_local;
 use gtk::glib::subclass::prelude::*;
 use gtk::glib::subclass::types::ObjectSubclassIsExt;
-use gtk::glib::{closure, closure_local};
 use gtk::subclass::prelude::*;
 use gtk::{
     glib, Button, CompositeTemplate, ListView, ScrolledWindow, SingleSelection, ToggleButton,
@@ -173,43 +173,11 @@ impl ObjectImpl for Window {
                 }
             });
         }
-
-        self.setup_bindings();
     }
 }
 
 #[gtk::template_callbacks]
 impl Window {
-    fn setup_bindings(&self) {
-        let state: &State = self.state.as_ref();
-        let pn_expr = self
-            .selection
-            .property_expression("selected-item")
-            .chain_property::<page::PageNumber>("page_number");
-
-        pn_expr.bind(state, "page", gtk::Widget::NONE);
-
-        let entry_page_num: &gtk::Entry = self.entry_page_num.as_ref();
-        pn_expr
-            .chain_closure::<String>(closure!(move |_: Option<glib::Object>, page_num: i32| {
-                format!("{}", page_num + 1)
-            }))
-            .bind(entry_page_num, "text", gtk::Widget::NONE);
-
-        let btn_jump_back: &gtk::Button = self.btn_jump_back.as_ref();
-        let prev_page_expr = state.property_expression("prev_page");
-        prev_page_expr
-            .chain_closure::<String>(closure!(move |_: Option<glib::Object>, page_num: u32| {
-                format!("Jump back to page {page_num}")
-            }))
-            .bind(btn_jump_back, "tooltip-text", gtk::Widget::NONE);
-        prev_page_expr
-            .chain_closure::<bool>(closure!(move |_: Option<glib::Object>, page_num: u32| {
-                page_num > 0
-            }))
-            .bind(btn_jump_back, "sensitive", gtk::Widget::NONE);
-    }
-
     #[template_callback]
     fn handle_scroll(&self, _dx: f64, dy: f64) -> glib::Propagation {
         if dy < 0.0 {
@@ -470,6 +438,21 @@ impl Window {
         if let Some(page) = self.state.jump_list_pop() {
             self.navigate_to_page(page);
         }
+    }
+
+    #[template_callback]
+    fn can_jump_back(&self, prev_page: u32) -> bool {
+        prev_page > 0
+    }
+
+    #[template_callback]
+    fn back_btn_text(&self, prev_page: u32) -> String {
+        format!("Jump back to page {prev_page}")
+    }
+
+    #[template_callback]
+    fn page_entry_text(&self, page: i32) -> String {
+        format!("{}", page + 1)
     }
 }
 

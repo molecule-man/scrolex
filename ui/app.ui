@@ -3,6 +3,11 @@
 	<object class="DocState" id="state">
 		<signal name="before-load" handler="clear_model" swapped="true"/>
 		<signal name="loaded" handler="handle_document_load" swapped="true"/>
+		<binding name="page">
+			<lookup name="page_number" type="PageNumber">
+				<lookup name="selected-item">selection</lookup>
+			</lookup>
+		</binding>
 	</object>
 	<template class="MyApp" parent="GtkApplicationWindow">
 		<property name="title">HallyViewed</property>
@@ -15,12 +20,21 @@
 							<object class="GtkButton" id="btn_jump_back">
 								<signal name="clicked" handler="jump_back" swapped="true"/>
 								<property name="icon-name">go-previous</property>
-								<!--<property name="sensitive">false</property>-->
 								<property name="cursor">
 									<object class="GdkCursor">
 										<property name="name">pointer</property>
 									</object>
 								</property>
+								<binding name="sensitive">
+									<closure type="gboolean" function="can_jump_back">
+										<lookup name="prev_page">state</lookup>
+									</closure>
+								</binding>
+								<binding name="tooltip-text">
+									<closure type="gchararray" function="back_btn_text">
+										<lookup name="prev_page">state</lookup>
+									</closure>
+								</binding>
 							</object>
 						</child>
 						<child>
@@ -38,6 +52,13 @@
 								<property name="width-chars">4</property>
 								<property name="max-width-chars">4</property>
 								<property name="input-purpose">digits</property>
+								<binding name="text">
+									<closure type="gchararray" function="page_entry_text">
+										<lookup name="page_number" type="PageNumber">
+											<lookup name="selected-item">selection</lookup>
+										</lookup>
+									</closure>
+								</binding>
 							</object>
 						</child>
 					</object>
