@@ -53,7 +53,6 @@ impl ObjectSubclass for Page {
 
 #[glib::derived_properties]
 impl ObjectImpl for Page {
-    #[expect(clippy::too_many_lines)]
     fn constructed(&self) {
         self.parent_constructed();
         let obj = self.obj();
@@ -66,8 +65,29 @@ impl ObjectImpl for Page {
             p.queue_draw();
         });
 
+        self.setup_text_selection();
+        self.setup_link_handling();
+
+        obj.set_size_request(600, 800);
+    }
+
+    fn signals() -> &'static [Signal] {
+        static SIGNALS: OnceLock<Vec<Signal>> = OnceLock::new();
+        SIGNALS.get_or_init(|| {
+            vec![Signal::builder("named-link-clicked")
+                .param_types([String::static_type()])
+                .build()]
+        })
+    }
+}
+
+impl WidgetImpl for Page {}
+impl DrawingAreaImpl for Page {}
+
+impl Page {
+    fn setup_text_selection(&self) {
+        let obj = self.obj();
         let mouse_coords = Rc::new(RefCell::new(None));
-        let cursor = Rc::new(RefCell::new(None));
         let gc = gtk::GestureClick::builder().button(BUTTON_PRIMARY).build();
 
         gc.connect_pressed(clone!(
@@ -75,11 +95,8 @@ impl ObjectImpl for Page {
             mouse_coords,
             #[strong(rename_to = page)]
             obj,
-            #[strong]
-            cursor,
             move |_gc, _n_press, x, y| {
                 mouse_coords.replace(Some((x, y)));
-                cursor.replace(page.cursor());
                 page.set_cursor_from_name(Some("crosshair"));
             }
         ));
@@ -101,17 +118,12 @@ impl ObjectImpl for Page {
                 if let Some(poppler_page) = page.popplerpage().as_ref() {
                     let mut rect = poppler::Rectangle::default();
 
-                    let mut offset = (0.0, 0.0);
-
-                    if page.crop() {
-                        let crop_bbox = page.bbox();
-                        offset = (crop_bbox.x1(), crop_bbox.y1());
-                    }
-
-                    rect.set_x1(offset.0 + start_x / page.zoom());
-                    rect.set_y1(offset.1 + start_y / page.zoom());
-                    rect.set_x2(offset.0 + end_x / page.zoom());
-                    rect.set_y2(offset.1 + end_y / page.zoom());
+                    let Point { x: x1, y: y1 } = to_poppler_coords(&page, start_x, start_y, None);
+                    let Point { x: x2, y: y2 } = to_poppler_coords(&page, end_x, end_y, None);
+                    rect.set_x1(x1);
+                    rect.set_y1(y1);
+                    rect.set_x2(x2);
+                    rect.set_y2(y2);
 
                     let selected =
                         &poppler_page.selected_text(poppler::SelectionStyle::Glyph, &mut rect);
@@ -134,12 +146,15 @@ impl ObjectImpl for Page {
             #[strong(rename_to = page)]
             obj,
             move |_, _| {
-                page.set_cursor(cursor.borrow().as_ref());
+                page.set_cursor(None);
             }
         ));
 
         obj.add_controller(gc);
+    }
 
+    fn setup_link_handling(&self) {
+        let obj = self.obj();
         let motion_controller = gtk::EventControllerMotion::new();
         motion_controller.connect_motion(clone!(
             #[strong]
@@ -153,16 +168,7 @@ impl ObjectImpl for Page {
                         return;
                     }
 
-                    let mut x = x / obj.zoom();
-                    let mut y = y / obj.zoom();
-
-                    if obj.crop() {
-                        let crop_bbox = obj.bbox();
-                        x += crop_bbox.x1();
-                        y += crop_bbox.y1();
-                    }
-
-                    y = height - y; // poppler uses a different coordinate system
+                    let Point { x, y } = to_poppler_coords(&obj, x, y, Some(height));
 
                     for raw_link in raw_links {
                         let crate::poppler::Link(_, area) = raw_link.to_link();
@@ -193,16 +199,7 @@ impl ObjectImpl for Page {
                         return;
                     }
 
-                    let mut x = x / obj.zoom();
-                    let mut y = y / obj.zoom();
-
-                    if obj.crop() {
-                        let crop_bbox = obj.bbox();
-                        x += crop_bbox.x1();
-                        y += crop_bbox.y1();
-                    }
-
-                    y = height - y; // poppler uses a different coordinate system
+                    let Point { x, y } = to_poppler_coords(&obj, x, y, Some(height));
 
                     for raw_link in raw_links {
                         let crate::poppler::Link(link_type, area) = raw_link.to_link();
@@ -235,19 +232,27 @@ impl ObjectImpl for Page {
             }
         ));
         obj.add_controller(gc);
-
-        obj.set_size_request(600, 800);
-    }
-
-    fn signals() -> &'static [Signal] {
-        static SIGNALS: OnceLock<Vec<Signal>> = OnceLock::new();
-        SIGNALS.get_or_init(|| {
-            vec![Signal::builder("named-link-clicked")
-                .param_types([String::static_type()])
-                .build()]
-        })
     }
 }
 
-impl WidgetImpl for Page {}
-impl DrawingAreaImpl for Page {}
+struct Point {
+    x: f64,
+    y: f64,
+}
+
+fn to_poppler_coords(page: &super::Page, x: f64, y: f64, page_height: Option<f64>) -> Point {
+    let mut x = x / page.zoom();
+    let mut y = y / page.zoom();
+
+    if page.crop() {
+        x += page.bbox().x1();
+        y += page.bbox().y1();
+    }
+
+    // Adjust y for Poppler's coordinate system if page height is provided
+    if let Some(height) = page_height {
+        y = height - y;
+    }
+
+    Point { x, y }
+}
