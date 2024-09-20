@@ -46,7 +46,7 @@ impl Page {
         &self,
         pn: &PageNumber,
         poppler_page: &poppler::Page,
-        renderer: Rc<RefCell<Renderer>>,
+        renderer: &Rc<RefCell<Renderer>>,
     ) {
         self.set_popplerpage(poppler_page.clone());
 
@@ -102,20 +102,17 @@ impl Page {
         let mut width = orig_width;
         let mut height = orig_height;
 
-        match (bbox, self.crop()) {
-            (Some(bbox), true) => {
-                width = bbox.x2() - bbox.x1();
-                height = bbox.y2() - bbox.y1();
-                self.set_bbox(bbox);
-            }
-            _ => {
-                let mut bbox = poppler::Rectangle::default();
-                bbox.set_x1(0.0);
-                bbox.set_y1(0.0);
-                bbox.set_x2(width);
-                bbox.set_y2(height);
-                self.set_bbox(bbox);
-            }
+        if let (Some(bbox), true) = (bbox, self.crop()) {
+            width = bbox.x2() - bbox.x1();
+            height = bbox.y2() - bbox.y1();
+            self.set_bbox(bbox);
+        } else {
+            let mut bbox = poppler::Rectangle::default();
+            bbox.set_x1(0.0);
+            bbox.set_y1(0.0);
+            bbox.set_x2(width);
+            bbox.set_y2(height);
+            self.set_bbox(bbox);
         }
 
         self.set_size_request((width * self.zoom()) as i32, (height * self.zoom()) as i32);

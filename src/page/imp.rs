@@ -1,3 +1,5 @@
+#![expect(unused_lifetimes)]
+
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -12,7 +14,7 @@ use gtk::subclass::prelude::*;
 use gtk::DrawingArea;
 
 use super::Highlighted;
-use crate::poppler::*;
+use crate::poppler::{LinkMappingExt, LinkType};
 
 #[derive(Default, glib::Properties)]
 #[properties(wrapper_type = super::Page)]
@@ -51,6 +53,7 @@ impl ObjectSubclass for Page {
 
 #[glib::derived_properties]
 impl ObjectImpl for Page {
+    #[expect(clippy::too_many_lines)]
     fn constructed(&self) {
         self.parent_constructed();
         let obj = self.obj();
@@ -98,19 +101,17 @@ impl ObjectImpl for Page {
                 if let Some(poppler_page) = page.popplerpage().as_ref() {
                     let mut rect = poppler::Rectangle::default();
 
-                    let mut crop_x1 = 0.0;
-                    let mut crop_y1 = 0.0;
+                    let mut offset = (0.0, 0.0);
 
                     if page.crop() {
                         let crop_bbox = page.bbox();
-                        crop_x1 = crop_bbox.x1();
-                        crop_y1 = crop_bbox.y1();
+                        offset = (crop_bbox.x1(), crop_bbox.y1());
                     }
 
-                    rect.set_x1(crop_x1 + start_x / page.zoom());
-                    rect.set_y1(crop_y1 + start_y / page.zoom());
-                    rect.set_x2(crop_x1 + end_x / page.zoom());
-                    rect.set_y2(crop_y1 + end_y / page.zoom());
+                    rect.set_x1(offset.0 + start_x / page.zoom());
+                    rect.set_y1(offset.1 + start_y / page.zoom());
+                    rect.set_x2(offset.0 + end_x / page.zoom());
+                    rect.set_y2(offset.1 + end_y / page.zoom());
 
                     let selected =
                         &poppler_page.selected_text(poppler::SelectionStyle::Glyph, &mut rect);
@@ -219,10 +220,10 @@ impl ObjectImpl for Page {
                                     );
                                 }
                                 LinkType::Unknown(msg) => {
-                                    println!("unhandled link: {:?}", msg);
+                                    println!("unhandled link: {msg:?}");
                                 }
-                                _ => {
-                                    println!("unhandled link: {:?}", link_type);
+                                LinkType::Invalid => {
+                                    println!("invalid link: {link_type:?}");
                                 }
                             }
                             return;

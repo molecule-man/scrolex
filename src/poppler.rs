@@ -48,13 +48,13 @@ impl LinkMappingExt for LinkMapping {
                         Dest::Named(name) => name,
                         Dest::Unknown(dest_type) => {
                             return Link(
-                                LinkType::Unknown(format!("link dest is unknown: {:?}", dest_type)),
+                                LinkType::Unknown(format!("link dest is unknown: {dest_type:?}")),
                                 area,
                             )
                         }
                         t => {
                             return Link(
-                                LinkType::Unknown(format!("link dest is unhandled {:?}", t)),
+                                LinkType::Unknown(format!("link dest is unhandled {t:?}")),
                                 area,
                             )
                         }
@@ -76,7 +76,7 @@ impl LinkMappingExt for LinkMapping {
                 }
 
                 t => Link(
-                    LinkType::Unknown(format!("link action is unhandled: {:?}", t)),
+                    LinkType::Unknown(format!("link action is unhandled: {t:?}")),
                     area,
                 ),
             }

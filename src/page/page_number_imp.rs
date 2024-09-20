@@ -1,3 +1,4 @@
+#![expect(unused_lifetimes)]
 use gtk::gio::prelude::*;
 use gtk::glib;
 use gtk::glib::subclass::prelude::*;

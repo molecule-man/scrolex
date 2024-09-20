@@ -27,7 +27,7 @@ impl Renderer {
             send,
             bbox_cache: Rc::new(RefCell::new(HashMap::new())),
         };
-        renderer.spawn_bg_thread(recv);
+        Self::spawn_bg_thread(recv);
         renderer
     }
 
@@ -100,7 +100,7 @@ impl Renderer {
         render(cr, poppler_page, page.zoom(), &bbox);
     }
 
-    fn spawn_bg_thread(&self, recv: Receiver<Request>) {
+    fn spawn_bg_thread(recv: Receiver<Request>) {
         thread::spawn(move || {
             let mut doc = None;
             let mut doc_uri = String::new();

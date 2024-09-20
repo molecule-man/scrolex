@@ -111,7 +111,7 @@ impl Default for State {
 
 fn get_state_file_path(uri: &str) -> Result<PathBuf, env::VarError> {
     let mut state_path = env::var("XDG_STATE_HOME")
-        .or_else(|_| env::var("HOME").map(|home| format!("{}/.local/state", home)))
+        .or_else(|_| env::var("HOME").map(|home| format!("{home}/.local/state")))
         .map(PathBuf::from)?;
 
     state_path.push("pdf-viewer");

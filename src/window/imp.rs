@@ -69,7 +69,7 @@ impl ObjectSubclass for Window {
     }
 }
 
-// Trait shared by all GObjects
+#[expect(clippy::too_many_lines)]
 impl ObjectImpl for Window {
     fn constructed(&self) {
         self.parent_constructed();
@@ -97,7 +97,7 @@ impl ObjectImpl for Window {
         let prev_page_expr = state.property_expression("prev_page");
         prev_page_expr
             .chain_closure::<String>(closure!(move |_: Option<glib::Object>, page_num: u32| {
-                format!("Jump back to page {}", page_num)
+                format!("Jump back to page {page_num}")
             }))
             .bind(btn_jump_back, "tooltip-text", gtk::Widget::NONE);
         prev_page_expr
@@ -185,7 +185,7 @@ impl ObjectImpl for Window {
 
                 if let Some(doc) = state.doc() {
                     if let Some(poppler_page) = doc.page(page_number.page_number()) {
-                        page.bind(&page_number, &poppler_page, renderer.clone());
+                        page.bind(&page_number, &poppler_page, &renderer.clone());
                     }
                 }
             }
@@ -331,12 +331,13 @@ impl Window {
         // normally I'd use list_view.scroll_to() here, but it doesn't scroll if the item
         // is already visible :(
         selection.select_item(selection.selected().saturating_sub(1), true);
-        let width = selection
-            .selected_item()
-            .and_downcast::<page::PageNumber>()
-            .unwrap()
-            .width() as f64
-            + 4.0; // 4px is padding of list item widget. TODO: figure out how to un-hardcode this
+        let width = f64::from(
+            selection
+                .selected_item()
+                .and_downcast::<page::PageNumber>()
+                .unwrap()
+                .width(),
+        ) + 4.0; // 4px is padding of list item widget. TODO: figure out how to un-hardcode this
 
         self.scrolledwindow
             .hadjustment()
@@ -352,12 +353,13 @@ impl Window {
 
         // normally I'd use list_view.scroll_to() here, but it doesn't scroll if the item
         // is already visible :(
-        let width = selection
-            .selected_item()
-            .and_downcast::<page::PageNumber>()
-            .unwrap()
-            .width() as f64
-            + 4.0; // 4px is padding of list item widget. TODO: figure out how to un-hardcode this
+        let width = f64::from(
+            selection
+                .selected_item()
+                .and_downcast::<page::PageNumber>()
+                .unwrap()
+                .width(),
+        ) + 4.0; // 4px is padding of list item widget. TODO: figure out how to un-hardcode this
 
         selection.select_item(
             (selection.selected() + 1).min(selection.n_items() - 1),
@@ -410,11 +412,11 @@ impl Window {
                 move |file| match file {
                     Ok(file) => {
                         state.load(&file).unwrap_or_else(|err| {
-                            obj.show_error_dialog(&format!("Error loading file: {}", err));
+                            obj.show_error_dialog(&format!("Error loading file: {err}"));
                         });
                     }
                     Err(err) => {
-                        obj.show_error_dialog(&format!("Error opening file: {}", err));
+                        obj.show_error_dialog(&format!("Error opening file: {err}"));
                     }
                 },
             ),
