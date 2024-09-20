@@ -12,6 +12,18 @@
 					<object class="GtkBox">
 						<property name="orientation">horizontal</property>
 						<child>
+							<object class="GtkButton" id="btn_jump_back">
+								<signal name="clicked" handler="jump_back" swapped="true"/>
+								<property name="icon-name">go-previous</property>
+								<!--<property name="sensitive">false</property>-->
+								<property name="cursor">
+									<object class="GdkCursor">
+										<property name="name">pointer</property>
+									</object>
+								</property>
+							</object>
+						</child>
+						<child>
 							<object class="GtkLabel">
 								<property name="label">Page: </property>
 							</object>

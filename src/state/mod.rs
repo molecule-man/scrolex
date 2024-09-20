@@ -2,6 +2,7 @@ mod imp;
 use gtk::gio::prelude::*;
 use gtk::glib;
 use gtk::prelude::ObjectExt;
+use gtk::subclass::prelude::*;
 use poppler::Document;
 
 use std::io::{self, Write};
@@ -21,6 +22,17 @@ impl State {
             .build()
     }
 
+    pub(crate) fn jump_list_add(&self, page: u32) {
+        self.set_prev_page(page);
+        self.imp().jump_stack.borrow_mut().push(page);
+    }
+
+    pub(crate) fn jump_list_pop(&self) -> Option<u32> {
+        let page = self.imp().jump_stack.borrow_mut().pop();
+        self.set_prev_page(self.imp().jump_stack.borrow().peek().unwrap_or_default());
+        page
+    }
+
     pub(crate) fn load(&self, f: &gtk::gio::File) -> io::Result<()> {
         if self.doc().is_some() {
             self.save()?;
@@ -34,6 +46,8 @@ impl State {
         let uri = f.uri();
         let state_path = get_state_file_path(&uri).unwrap();
 
+        self.imp().jump_stack.borrow_mut().reset();
+        self.set_prev_page(0);
         self.set_uri(uri);
         self.set_doc(doc);
         self.set_zoom(1.0);

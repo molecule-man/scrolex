@@ -1,3 +1,12 @@
+#![warn(
+    rust_2018_idioms,
+    future_incompatible,
+    nonstandard_style,
+    unused_lifetimes,
+    clippy::pedantic
+)]
+#![deny(clippy::all, clippy::if_not_else, clippy::enum_glob_use)]
+
 use std::ffi::OsString;
 use std::path::PathBuf;
 
@@ -6,6 +15,7 @@ use gtk::glib::Uri;
 use gtk::{gio::ApplicationFlags, glib, glib::clone, Application};
 use gtk::{prelude::*, CssProvider};
 
+mod jump_stack;
 mod page;
 mod poppler;
 mod render;

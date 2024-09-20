@@ -14,7 +14,7 @@ use gtk::{
 use gtk::{prelude::*, GestureClick};
 
 use crate::page;
-use crate::poppler::*;
+use crate::poppler::{Dest, DestExt};
 use crate::render::Renderer;
 use crate::state::State;
 
@@ -37,6 +37,8 @@ pub struct Window {
     pub btn_zoom_out: TemplateChild<Button>,
     #[template_child]
     pub btn_crop: TemplateChild<ToggleButton>,
+    #[template_child]
+    pub btn_jump_back: TemplateChild<Button>,
     #[template_child]
     pub scrolledwindow: TemplateChild<ScrolledWindow>,
     #[template_child]
@@ -90,6 +92,19 @@ impl ObjectImpl for Window {
                 format!("{}", page_num + 1)
             }))
             .bind(entry_page_num, "text", gtk::Widget::NONE);
+
+        let btn_jump_back: &gtk::Button = self.btn_jump_back.as_ref();
+        let prev_page_expr = state.property_expression("prev_page");
+        prev_page_expr
+            .chain_closure::<String>(closure!(move |_: Option<glib::Object>, page_num: u32| {
+                format!("Jump back to page {}", page_num)
+            }))
+            .bind(btn_jump_back, "tooltip-text", gtk::Widget::NONE);
+        prev_page_expr
+            .chain_closure::<bool>(closure!(move |_: Option<glib::Object>, page_num: u32| {
+                page_num > 0
+            }))
+            .bind(btn_jump_back, "sensitive", gtk::Widget::NONE);
 
         state.connect_closure(
             "before-load",
@@ -287,6 +302,12 @@ impl Window {
     }
 
     fn goto_page(&self, page_num: u32) {
+        self.state.jump_list_add(self.state.page() + 1);
+        self.navigate_to_page(page_num);
+    }
+
+    // same as goto_page, but doesn't add to jump list
+    fn navigate_to_page(&self, page_num: u32) {
         let Some(selection) = self.ensure_ready_selection() else {
             return;
         };
@@ -435,6 +456,13 @@ impl Window {
             }
             glib::ControlFlow::Break
         });
+    }
+
+    #[template_callback]
+    fn jump_back(&self) {
+        if let Some(page) = self.state.jump_list_pop() {
+            self.navigate_to_page(page);
+        }
     }
 }
 
