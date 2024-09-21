@@ -14,7 +14,6 @@ use gtk::{
 use gtk::{prelude::*, GestureClick};
 
 use crate::page;
-use crate::poppler::{Dest, DestExt};
 use crate::render::Renderer;
 use crate::state::State;
 
@@ -98,22 +97,7 @@ impl ObjectImpl for Window {
             self.obj(),
             move |_, list_item| {
                 let list_item = list_item.downcast_ref::<gtk::ListItem>().unwrap();
-                let page = &page::Page::new();
-
-                state
-                    .bind_property("crop", page, "crop")
-                    .flags(glib::BindingFlags::DEFAULT | glib::BindingFlags::SYNC_CREATE)
-                    .build();
-
-                state
-                    .bind_property("zoom", page, "zoom")
-                    .flags(glib::BindingFlags::DEFAULT | glib::BindingFlags::SYNC_CREATE)
-                    .build();
-
-                state
-                    .bind_property("uri", page, "uri")
-                    .flags(glib::BindingFlags::DEFAULT | glib::BindingFlags::SYNC_CREATE)
-                    .build();
+                let page = &page::Page::new(&state);
 
                 page.connect_closure(
                     "named-link-clicked",
@@ -121,20 +105,8 @@ impl ObjectImpl for Window {
                     closure_local!(
                         #[strong]
                         obj,
-                        #[weak]
-                        state,
-                        move |_: &crate::page::Page, dest_name: &str| {
-                            if let Some(doc) = state.doc() {
-                                let Some(dest) = doc.find_dest(dest_name) else {
-                                    return;
-                                };
-
-                                let Dest::Xyz(page_num) = dest.to_dest() else {
-                                    return;
-                                };
-
-                                obj.imp().goto_page(page_num as u32);
-                            }
+                        move |_: &crate::page::Page, page_num: i32| {
+                            obj.imp().goto_page(page_num as u32);
                         }
                     ),
                 );
@@ -440,16 +412,19 @@ impl Window {
         }
     }
 
+    #[allow(clippy::unused_self)]
     #[template_callback]
     fn can_jump_back(&self, prev_page: u32) -> bool {
         prev_page > 0
     }
 
+    #[allow(clippy::unused_self)]
     #[template_callback]
     fn back_btn_text(&self, prev_page: u32) -> String {
         format!("Jump back to page {prev_page}")
     }
 
+    #[allow(clippy::unused_self)]
     #[template_callback]
     fn page_entry_text(&self, page: i32) -> String {
         format!("{}", page + 1)

@@ -38,8 +38,26 @@ glib::wrapper! {
 }
 
 impl Page {
-    pub fn new() -> Self {
-        glib::Object::builder().build()
+    pub fn new(state: &crate::state::State) -> Self {
+        let obj: Self = glib::Object::builder().property("state", state).build();
+
+        state.connect_crop_notify(clone!(
+            #[strong]
+            obj,
+            move |_| {
+                obj.queue_draw();
+            }
+        ));
+
+        state.connect_zoom_notify(clone!(
+            #[strong]
+            obj,
+            move |_| {
+                obj.queue_draw();
+            }
+        ));
+
+        obj
     }
 
     pub(crate) fn bind(
@@ -117,10 +135,16 @@ impl Page {
 
         self.set_size_request((width * self.zoom()) as i32, (height * self.zoom()) as i32);
     }
-}
 
-impl Default for Page {
-    fn default() -> Self {
-        Self::new()
+    pub(crate) fn crop(&self) -> bool {
+        self.state().crop()
+    }
+
+    pub(crate) fn zoom(&self) -> f64 {
+        self.state().zoom()
+    }
+
+    pub(crate) fn uri(&self) -> String {
+        self.state().uri()
     }
 }

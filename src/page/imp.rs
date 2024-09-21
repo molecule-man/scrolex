@@ -1,6 +1,5 @@
 #![expect(unused_lifetimes)]
 
-use std::cell::Cell;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::OnceLock;
@@ -14,19 +13,13 @@ use gtk::subclass::prelude::*;
 use gtk::DrawingArea;
 
 use super::Highlighted;
-use crate::poppler::{LinkMappingExt, LinkType};
+use crate::poppler::{Dest, DestExt, LinkMappingExt, LinkType};
 
 #[derive(Default, glib::Properties)]
 #[properties(wrapper_type = super::Page)]
 pub struct Page {
     #[property(get, set)]
-    zoom: Cell<f64>,
-
-    #[property(get, set)]
-    crop: Cell<bool>,
-
-    #[property(get, set)]
-    uri: RefCell<String>,
+    state: RefCell<crate::state::State>,
 
     #[property(get, set)]
     pub(crate) binding: RefCell<Option<glib::Binding>>,
@@ -55,27 +48,18 @@ impl ObjectSubclass for Page {
 impl ObjectImpl for Page {
     fn constructed(&self) {
         self.parent_constructed();
-        let obj = self.obj();
-
-        obj.connect_crop_notify(|p| {
-            p.queue_draw();
-        });
-
-        obj.connect_zoom_notify(|p| {
-            p.queue_draw();
-        });
 
         self.setup_text_selection();
         self.setup_link_handling();
 
-        obj.set_size_request(600, 800);
+        self.obj().set_size_request(600, 800);
     }
 
     fn signals() -> &'static [Signal] {
         static SIGNALS: OnceLock<Vec<Signal>> = OnceLock::new();
         SIGNALS.get_or_init(|| {
             vec![Signal::builder("named-link-clicked")
-                .param_types([String::static_type()])
+                .param_types([i32::static_type()])
                 .build()]
         })
     }
@@ -207,8 +191,18 @@ impl Page {
                         if area.x1() <= x && x <= area.x2() && area.y1() <= y && y <= area.y2() {
                             match link_type {
                                 LinkType::GotoNamedDest(name) => {
-                                    gc.set_state(gtk::EventSequenceState::Claimed); // stop the event from propagating
-                                    obj.emit_by_name::<()>("named-link-clicked", &[&name]);
+                                    if let Some(doc) = obj.state().doc() {
+                                        let Some(dest) = doc.find_dest(&name) else {
+                                            return;
+                                        };
+
+                                        let Dest::Xyz(page_num) = dest.to_dest() else {
+                                            return;
+                                        };
+
+                                        gc.set_state(gtk::EventSequenceState::Claimed); // stop the event from propagating
+                                        obj.emit_by_name::<()>("named-link-clicked", &[&page_num]);
+                                    }
                                 }
                                 LinkType::Uri(uri) => {
                                     let _ = gtk::gio::AppInfo::launch_default_for_uri(
