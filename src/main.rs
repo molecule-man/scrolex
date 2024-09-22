@@ -30,6 +30,7 @@ const APP_ID: &str = "com.andr2i.hallyview";
 fn main() -> glib::ExitCode {
     // register types for usage in templates
     page::PageNumber::static_type();
+    page::Page::static_type();
 
     gtk::gio::resources_register_include!("hallyview-ui.gresource")
         .expect("Failed to register resources");

@@ -456,6 +456,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "once_cell"
+version = "1.19.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3fdb12b2476b595f9358c5161aa467c2438859caa136dec86c26fdd2efe17b92"
+
+[[package]]
 name = "pango"
 version = "0.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -486,6 +492,7 @@ dependencies = [
  "futures",
  "glib-build-tools",
  "gtk4",
+ "once_cell",
  "poppler-rs",
  "poppler-sys-rs",
 ]

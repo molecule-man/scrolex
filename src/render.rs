@@ -7,7 +7,12 @@ use std::thread;
 use futures::channel::oneshot;
 use gtk::cairo::Context;
 use gtk::glib;
+use once_cell::sync::Lazy;
 use poppler::Document;
+
+thread_local!(
+    pub(crate) static RENDERER: Lazy<Renderer> = Lazy::new(Renderer::new);
+);
 
 struct Request {
     page_num: i32,
@@ -21,7 +26,7 @@ pub(crate) struct Renderer {
 }
 
 impl Renderer {
-    pub(crate) fn new() -> Self {
+    fn new() -> Self {
         let (send, recv) = std::sync::mpsc::channel();
         let renderer = Renderer {
             send,

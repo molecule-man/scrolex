@@ -126,12 +126,37 @@
 						<property name="hexpand">true</property>
 						<property name="orientation">horizontal</property>
 						<property name="model">
-                                                        <object class="GtkSingleSelection" id="selection">
-                                                                <property name="model">
-                                                                        <object class="GListStore" id="model"/>
-                                                                </property>
-                                                        </object>
+							<object class="GtkSingleSelection" id="selection">
+								<property name="model">
+									<object class="GListStore" id="model"/>
+								</property>
+							</object>
 						</property>
+						<!--<property name="factory">-->
+						<!--	<object class="GtkBuilderListItemFactory">-->
+						<!--		<property name="bytes"><![CDATA[-->
+						<!--		<?xml version="1.0" encoding="UTF-8"?>-->
+						<!--		<interface>-->
+						<!--			<template class="GtkListItem">-->
+						<!--				<property name="child">-->
+						<!--					<object class="Page">-->
+						<!--						<binding name="state">-->
+						<!--							<lookup name="state" type="PageNumber">-->
+						<!--								<lookup name="item">GtkListItem</lookup>-->
+						<!--							</lookup>-->
+						<!--						</binding>-->
+						<!--						<binding name="index">-->
+						<!--							<lookup name="page_number" type="PageNumber">-->
+						<!--								<lookup name="item">GtkListItem</lookup>-->
+						<!--							</lookup>-->
+						<!--						</binding>-->
+						<!--					</object>-->
+						<!--				</property>-->
+						<!--			</template>-->
+						<!--		</interface>-->
+						<!--			]]></property>-->
+						<!--	</object>-->
+						<!--</property>-->
 					</object>
 				</child>
 				<child>

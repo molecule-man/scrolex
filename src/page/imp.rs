@@ -1,6 +1,6 @@
 #![expect(unused_lifetimes)]
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::OnceLock;
 
@@ -25,7 +25,7 @@ pub struct Page {
     pub(crate) binding: RefCell<Option<glib::Binding>>,
 
     #[property(get, set)]
-    popplerpage: RefCell<Option<poppler::Page>>,
+    index: Cell<i32>,
 
     #[property(name = "x1", get, set, type = f64, member = x1)]
     #[property(name = "y1", get, set, type = f64, member = y1)]
@@ -49,6 +49,8 @@ impl ObjectImpl for Page {
     fn constructed(&self) {
         self.parent_constructed();
 
+        self.setup_draw_function();
+        self.setup_state_listeners();
         self.setup_text_selection();
         self.setup_link_handling();
 
@@ -69,6 +71,69 @@ impl WidgetImpl for Page {}
 impl DrawingAreaImpl for Page {}
 
 impl Page {
+    fn setup_draw_function(&self) {
+        let obj = self.obj();
+        obj.set_draw_func(clone!(
+            #[strong]
+            obj,
+            move |_, cr, _width, _height| {
+                let Some(poppler_page) = obj.state().doc().and_then(|doc| doc.page(obj.index()))
+                else {
+                    return;
+                };
+
+                cr.save().expect("Failed to save");
+                crate::render::RENDERER.with(|r| {
+                    r.render(cr, &obj, &poppler_page);
+                    r.resize(&obj, &poppler_page);
+                });
+                cr.restore().expect("Failed to restore");
+
+                let highlighted = &obj.imp().highlighted.borrow();
+
+                if highlighted.x2 - highlighted.x1 > 0.0 && highlighted.y2 - highlighted.y1 > 0.0 {
+                    cr.set_source_rgba(0.5, 0.8, 0.9, 0.3);
+                    cr.rectangle(
+                        highlighted.x1,
+                        highlighted.y1,
+                        highlighted.x2 - highlighted.x1,
+                        highlighted.y2 - highlighted.y1,
+                    );
+                    cr.fill().expect("Failed to fill");
+                }
+            }
+        ));
+    }
+
+    fn setup_state_listeners(&self) {
+        let obj = self.obj().clone();
+        obj.property_expression("state")
+            .chain_property::<crate::state::State>("crop")
+            .watch(gtk::Widget::NONE, move || obj.imp().trigger_resize());
+
+        let obj = self.obj().clone();
+        obj.property_expression("state")
+            .chain_property::<crate::state::State>("zoom")
+            .watch(gtk::Widget::NONE, move || obj.imp().trigger_resize());
+    }
+
+    pub(super) fn trigger_resize(&self) {
+        let obj = self.obj();
+        if let Some(page) = self.poppler_page() {
+            crate::render::RENDERER.with(|r| {
+                r.resize(&obj, &page);
+            });
+        }
+    }
+
+    fn poppler_page(&self) -> Option<poppler::Page> {
+        let obj = self.obj();
+        self.obj()
+            .state()
+            .doc()
+            .and_then(|doc| doc.page(obj.index()))
+    }
+
     fn setup_text_selection(&self) {
         let obj = self.obj();
         let mouse_coords = Rc::new(RefCell::new(None));
@@ -85,11 +150,10 @@ impl Page {
             }
         ));
 
+        let obj = self.obj().clone();
         gc.connect_update(clone!(
             #[strong]
             mouse_coords,
-            #[strong(rename_to = page)]
-            obj,
             move |gc, seq| {
                 let Some((start_x, start_y)) = *mouse_coords.borrow() else {
                     return;
@@ -99,11 +163,11 @@ impl Page {
                     return;
                 };
 
-                if let Some(poppler_page) = page.popplerpage().as_ref() {
+                if let Some(poppler_page) = obj.imp().poppler_page() {
                     let mut rect = poppler::Rectangle::default();
 
-                    let Point { x: x1, y: y1 } = to_poppler_coords(&page, start_x, start_y, None);
-                    let Point { x: x2, y: y2 } = to_poppler_coords(&page, end_x, end_y, None);
+                    let Point { x: x1, y: y1 } = to_poppler_coords(&obj, start_x, start_y, None);
+                    let Point { x: x2, y: y2 } = to_poppler_coords(&obj, end_x, end_y, None);
                     rect.set_x1(x1);
                     rect.set_y1(y1);
                     rect.set_x2(x2);
@@ -112,29 +176,26 @@ impl Page {
                     let selected =
                         &poppler_page.selected_text(poppler::SelectionStyle::Glyph, &mut rect);
 
-                    page.set_x1(start_x);
-                    page.set_y1(start_y);
-                    page.set_x2(end_x);
-                    page.set_y2(end_y);
+                    obj.set_x1(start_x);
+                    obj.set_y1(start_y);
+                    obj.set_x2(end_x);
+                    obj.set_y2(end_y);
 
                     if let Some(selected) = selected {
-                        page.clipboard().set_text(selected);
+                        obj.clipboard().set_text(selected);
                     }
 
-                    page.queue_draw();
+                    obj.queue_draw();
                 };
             }
         ));
 
-        gc.connect_end(clone!(
-            #[strong(rename_to = page)]
-            obj,
-            move |_, _| {
-                page.set_cursor(None);
-            }
-        ));
+        let obj = self.obj().clone();
+        gc.connect_end(move |_, _| {
+            obj.set_cursor(None);
+        });
 
-        obj.add_controller(gc);
+        self.obj().add_controller(gc);
     }
 
     fn setup_link_handling(&self) {
@@ -144,7 +205,7 @@ impl Page {
             #[strong]
             obj,
             move |_, x, y| {
-                if let Some(poppler_page) = obj.popplerpage().as_ref() {
+                if let Some(poppler_page) = obj.imp().poppler_page() {
                     let (_, height) = poppler_page.size();
                     let raw_links = poppler_page.link_mapping();
 
@@ -175,7 +236,7 @@ impl Page {
             #[strong]
             obj,
             move |gc, _n_press, x, y| {
-                if let Some(poppler_page) = obj.popplerpage().as_ref() {
+                if let Some(poppler_page) = obj.imp().poppler_page() {
                     let (_, height) = poppler_page.size();
                     let raw_links = poppler_page.link_mapping();
 

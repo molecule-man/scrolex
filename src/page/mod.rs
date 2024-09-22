@@ -2,13 +2,9 @@ mod imp;
 mod page_number_imp;
 
 use gtk::gio::prelude::*;
+use gtk::glib;
 use gtk::prelude::*;
 use gtk::subclass::prelude::ObjectSubclassIsExt;
-use gtk::{glib, glib::clone};
-use std::cell::RefCell;
-use std::rc::Rc;
-
-use crate::render::Renderer;
 
 #[derive(Default, Debug)]
 pub struct Highlighted {
@@ -39,34 +35,11 @@ glib::wrapper! {
 
 impl Page {
     pub fn new(state: &crate::state::State) -> Self {
-        let obj: Self = glib::Object::builder().property("state", state).build();
-
-        state.connect_crop_notify(clone!(
-            #[strong]
-            obj,
-            move |_| {
-                obj.queue_draw();
-            }
-        ));
-
-        state.connect_zoom_notify(clone!(
-            #[strong]
-            obj,
-            move |_| {
-                obj.queue_draw();
-            }
-        ));
-
-        obj
+        glib::Object::builder().property("state", state).build()
     }
 
-    pub(crate) fn bind(
-        &self,
-        pn: &PageNumber,
-        poppler_page: &poppler::Page,
-        renderer: &Rc<RefCell<Renderer>>,
-    ) {
-        self.set_popplerpage(poppler_page.clone());
+    pub(crate) fn bind(&self, pn: &PageNumber) {
+        self.set_index(pn.page_number());
 
         if let Some(prev_binding) = self.imp().binding.borrow_mut().take() {
             prev_binding.unbind();
@@ -78,37 +51,7 @@ impl Page {
             .build();
 
         self.imp().binding.replace(Some(new_binding));
-
-        self.set_draw_func(clone!(
-            #[strong(rename_to = page)]
-            self,
-            #[strong]
-            renderer,
-            #[strong]
-            poppler_page,
-            move |_, cr, _width, _height| {
-                cr.save().expect("Failed to save");
-                renderer.borrow().render(cr, &page, &poppler_page);
-                cr.restore().expect("Failed to restore");
-
-                renderer.borrow().resize(&page, &poppler_page);
-
-                let highlighted = &page.imp().highlighted.borrow();
-
-                if highlighted.x2 - highlighted.x1 > 0.0 && highlighted.y2 - highlighted.y1 > 0.0 {
-                    cr.set_source_rgba(0.5, 0.8, 0.9, 0.3);
-                    cr.rectangle(
-                        highlighted.x1,
-                        highlighted.y1,
-                        highlighted.x2 - highlighted.x1,
-                        highlighted.y2 - highlighted.y1,
-                    );
-                    cr.fill().expect("Failed to fill");
-                }
-            }
-        ));
-
-        renderer.borrow().resize(self, poppler_page);
+        self.imp().trigger_resize();
     }
 
     pub(crate) fn resize(

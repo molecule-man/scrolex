@@ -1,5 +1,4 @@
 use std::cell::RefCell;
-use std::rc::Rc;
 
 use glib::clone;
 use glib::subclass::InitializingObject;
@@ -14,7 +13,6 @@ use gtk::{
 use gtk::{prelude::*, GestureClick};
 
 use crate::page;
-use crate::render::Renderer;
 use crate::state::State;
 
 // Object holding the state
@@ -73,23 +71,19 @@ impl ObjectImpl for Window {
         self.parent_constructed();
 
         let state: &State = self.state.as_ref();
-        let factory = gtk::SignalListItemFactory::new();
-        let renderer = Rc::new(RefCell::new(Renderer::new()));
-
-        self.listview.set_factory(Some(&factory));
 
         state.connect_closure(
             "before-load",
             false,
-            closure_local!(
-                #[strong]
-                renderer,
-                move |_: &State| {
-                    renderer.borrow().clear_cache();
-                }
-            ),
+            closure_local!(move |_: &State| {
+                crate::render::RENDERER.with(|r| {
+                    r.clear_cache();
+                });
+            }),
         );
 
+        let factory = gtk::SignalListItemFactory::new();
+        self.listview.set_factory(Some(&factory));
         factory.connect_setup(clone!(
             #[weak]
             state,
@@ -115,26 +109,16 @@ impl ObjectImpl for Window {
             }
         ));
 
-        factory.connect_bind(clone!(
-            #[weak]
-            state,
-            #[strong]
-            renderer,
-            move |_, list_item| {
-                let list_item = list_item.downcast_ref::<gtk::ListItem>().unwrap();
-                let page_number = list_item.item().and_downcast::<page::PageNumber>().unwrap();
-                let page = list_item
-                    .child()
-                    .and_downcast::<crate::page::Page>()
-                    .unwrap();
+        factory.connect_bind(move |_, list_item| {
+            let list_item = list_item.downcast_ref::<gtk::ListItem>().unwrap();
+            let page_number = list_item.item().and_downcast::<page::PageNumber>().unwrap();
+            let page = list_item
+                .child()
+                .and_downcast::<crate::page::Page>()
+                .unwrap();
 
-                if let Some(doc) = state.doc() {
-                    if let Some(poppler_page) = doc.page(page_number.page_number()) {
-                        page.bind(&page_number, &poppler_page, &renderer.clone());
-                    }
-                }
-            }
-        ));
+            page.bind(&page_number);
+        });
 
         if let Some(editable) = self.entry_page_num.delegate() {
             editable.connect_insert_text(|entry, s, _| {
