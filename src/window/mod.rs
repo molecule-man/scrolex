@@ -23,10 +23,21 @@ impl Window {
         self.imp().state.as_ref()
     }
 
+    pub(crate) fn goto_page(&self, page_number: u32) {
+        self.imp().goto_page(page_number);
+    }
+
     pub(crate) fn show_error_dialog(&self, message: &str) {
         gtk::AlertDialog::builder()
             .message(message)
             .build()
             .show(Some(self));
+    }
+}
+
+// not used. Only needed for other objects to be able to use window as property
+impl Default for Window {
+    fn default() -> Self {
+        Object::builder().build()
     }
 }

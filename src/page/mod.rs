@@ -19,11 +19,18 @@ glib::wrapper! {
 }
 
 impl PageNumber {
-    pub fn new(number: i32) -> Self {
+    pub fn new(number: i32, main_window: &crate::window::Window) -> Self {
         glib::Object::builder()
             .property("page_number", number)
-            .property("width", 100)
+            .property("main_window", main_window)
+            .property("state", main_window.state())
             .build()
+    }
+}
+
+impl Default for PageNumber {
+    fn default() -> Self {
+        glib::Object::builder().build()
     }
 }
 
@@ -39,8 +46,6 @@ impl Page {
     }
 
     pub(crate) fn bind(&self, pn: &PageNumber) {
-        self.set_index(pn.page_number());
-
         if let Some(prev_binding) = self.imp().binding.borrow_mut().take() {
             prev_binding.unbind();
         }

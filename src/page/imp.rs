@@ -19,7 +19,13 @@ use crate::poppler::{Dest, DestExt, LinkMappingExt, LinkType};
 #[properties(wrapper_type = super::Page)]
 pub struct Page {
     #[property(get, set)]
+    model: RefCell<Option<super::PageNumber>>,
+
+    #[property(get, set)]
     state: RefCell<crate::state::State>,
+
+    #[property(get, set)]
+    main_window: RefCell<crate::window::Window>,
 
     #[property(get, set)]
     pub(crate) binding: RefCell<Option<glib::Binding>>,
@@ -49,21 +55,18 @@ impl ObjectImpl for Page {
     fn constructed(&self) {
         self.parent_constructed();
 
+        self.obj().connect_model_notify(|p| {
+            if let Some(model) = p.model() {
+                p.bind(&model);
+            }
+        });
+
         self.setup_draw_function();
         self.setup_state_listeners();
         self.setup_text_selection();
         self.setup_link_handling();
 
         self.obj().set_size_request(600, 800);
-    }
-
-    fn signals() -> &'static [Signal] {
-        static SIGNALS: OnceLock<Vec<Signal>> = OnceLock::new();
-        SIGNALS.get_or_init(|| {
-            vec![Signal::builder("named-link-clicked")
-                .param_types([i32::static_type()])
-                .build()]
-        })
     }
 }
 
@@ -262,7 +265,7 @@ impl Page {
                                         };
 
                                         gc.set_state(gtk::EventSequenceState::Claimed); // stop the event from propagating
-                                        obj.emit_by_name::<()>("named-link-clicked", &[&page_num]);
+                                        obj.main_window().goto_page(page_num as u32);
                                     }
                                 }
                                 LinkType::Uri(uri) => {

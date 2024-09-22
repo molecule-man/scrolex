@@ -82,44 +82,6 @@ impl ObjectImpl for Window {
             }),
         );
 
-        let factory = gtk::SignalListItemFactory::new();
-        self.listview.set_factory(Some(&factory));
-        factory.connect_setup(clone!(
-            #[weak]
-            state,
-            #[strong(rename_to = obj)]
-            self.obj(),
-            move |_, list_item| {
-                let list_item = list_item.downcast_ref::<gtk::ListItem>().unwrap();
-                let page = &page::Page::new(&state);
-
-                page.connect_closure(
-                    "named-link-clicked",
-                    false,
-                    closure_local!(
-                        #[strong]
-                        obj,
-                        move |_: &crate::page::Page, page_num: i32| {
-                            obj.imp().goto_page(page_num as u32);
-                        }
-                    ),
-                );
-
-                list_item.set_child(Some(page));
-            }
-        ));
-
-        factory.connect_bind(move |_, list_item| {
-            let list_item = list_item.downcast_ref::<gtk::ListItem>().unwrap();
-            let page_number = list_item.item().and_downcast::<page::PageNumber>().unwrap();
-            let page = list_item
-                .child()
-                .and_downcast::<crate::page::Page>()
-                .unwrap();
-
-            page.bind(&page_number);
-        });
-
         if let Some(editable) = self.entry_page_num.delegate() {
             editable.connect_insert_text(|entry, s, _| {
                 for c in s.chars() {
@@ -230,7 +192,7 @@ impl Window {
         self.goto_page(page_num);
     }
 
-    fn goto_page(&self, page_num: u32) {
+    pub(super) fn goto_page(&self, page_num: u32) {
         self.state.jump_list_add(self.state.page() + 1);
         self.navigate_to_page(page_num);
     }
@@ -367,21 +329,22 @@ impl Window {
         let init_load_till = (scroll_to + 10).min(n_pages - 1);
 
         let vector: Vec<page::PageNumber> = (init_load_from as i32..init_load_till as i32)
-            .map(page::PageNumber::new)
+            .map(|i| page::PageNumber::new(i, &self.obj()))
             .collect();
         model.extend_from_slice(&vector);
         selection.select_item(scroll_to - init_load_from, true);
 
+        let obj = self.obj().clone();
         glib::idle_add_local(move || {
             if init_load_from > 0 {
                 let vector: Vec<page::PageNumber> = (0..init_load_from as i32)
-                    .map(page::PageNumber::new)
+                    .map(|i| page::PageNumber::new(i, &obj))
                     .collect();
                 model.splice(0, 0, &vector);
             }
             if init_load_till < n_pages {
                 let vector: Vec<page::PageNumber> = (init_load_till as i32..n_pages as i32)
-                    .map(page::PageNumber::new)
+                    .map(|i| page::PageNumber::new(i, &obj))
                     .collect();
                 model.extend_from_slice(&vector);
             }
