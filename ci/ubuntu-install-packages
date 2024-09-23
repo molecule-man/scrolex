@@ -1,4 +1,4 @@
 #!/bin/sh
 
-apt-get update
-apt-get install -y gtk4 poppler cairo
+sudo apt-get update
+sudo apt-get install -y gtk4 poppler cairo
