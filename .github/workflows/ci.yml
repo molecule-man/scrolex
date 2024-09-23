@@ -12,7 +12,6 @@ jobs:
     name: test
     env:
       RUST_BACKTRACE: 1
-      # PKG_CONFIG_PATH: /usr/lib/x86_64-linux-gnu/pkgconfig
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -35,9 +34,6 @@ jobs:
       if: matrix.os == 'ubuntu-24.04'
       run: |
         ci/ubuntu-install-packages
-
-    - name: Check apt-cache
-      run: apt-cache policy libgtk-4-dev
 
     - name: Install Rust
       uses: dtolnay/rust-toolchain@master
