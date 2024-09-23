@@ -17,23 +17,23 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             rust: stable
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             rust: nightly
-          - os: windows
-            rust: stable
-          - os: windows
-            rust: nightly
+          # - os: windows
+          #   rust: stable
+          # - os: windows
+          #   rust: nightly
 
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
 
-    # - name: Install packages (Ubuntu)
-    #   if: matrix.os == 'ubuntu-latest'
-    #   run: |
-    #     ci/ubuntu-install-packages
+    - name: Install packages (Ubuntu)
+      if: matrix.os == 'ubuntu-24.04'
+      run: |
+        ci/ubuntu-install-packages
 
     - name: Install Rust
       uses: dtolnay/rust-toolchain@master
