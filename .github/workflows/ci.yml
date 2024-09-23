@@ -35,6 +35,9 @@ jobs:
       run: |
         ci/ubuntu-install-packages
 
+    - name: Where the f is gtk4.pc?
+      run: sudo find /usr -name "gtk4.pc"
+
     - name: Install Rust
       uses: dtolnay/rust-toolchain@master
       with:
