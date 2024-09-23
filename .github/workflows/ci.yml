@@ -36,6 +36,9 @@ jobs:
       run: |
         ci/ubuntu-install-packages
 
+    - name: Check apt-cache
+      run: apt-cache policy libgtk-4-dev
+
     - name: Install Rust
       uses: dtolnay/rust-toolchain@master
       with:
