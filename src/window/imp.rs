@@ -82,44 +82,6 @@ impl ObjectImpl for Window {
             }),
         );
 
-        let factory = gtk::SignalListItemFactory::new();
-        self.listview.set_factory(Some(&factory));
-        factory.connect_setup(clone!(
-            #[weak]
-            state,
-            #[strong(rename_to = obj)]
-            self.obj(),
-            move |_, list_item| {
-                let list_item = list_item.downcast_ref::<gtk::ListItem>().unwrap();
-                let page = &page::Page::new(&state);
-
-                page.connect_closure(
-                    "named-link-clicked",
-                    false,
-                    closure_local!(
-                        #[strong]
-                        obj,
-                        move |_: &crate::page::Page, page_num: i32| {
-                            obj.imp().goto_page(page_num as u32);
-                        }
-                    ),
-                );
-
-                list_item.set_child(Some(page));
-            }
-        ));
-
-        factory.connect_bind(move |_, list_item| {
-            let list_item = list_item.downcast_ref::<gtk::ListItem>().unwrap();
-            let page_number = list_item.item().and_downcast::<page::PageNumber>().unwrap();
-            let page = list_item
-                .child()
-                .and_downcast::<crate::page::Page>()
-                .unwrap();
-
-            page.bind(&page_number);
-        });
-
         if let Some(editable) = self.entry_page_num.delegate() {
             editable.connect_insert_text(|entry, s, _| {
                 for c in s.chars() {
@@ -134,6 +96,33 @@ impl ObjectImpl for Window {
 
 #[gtk::template_callbacks]
 impl Window {
+    #[template_callback]
+    fn on_factory_setup(&self, list_item: &gtk::ListItem) {
+        let page = &page::Page::new(&self.state);
+
+        let obj = self.obj().clone();
+        page.connect_closure(
+            "named-link-clicked",
+            false,
+            closure_local!(move |_: &crate::page::Page, page_num: i32| {
+                obj.imp().goto_page(page_num as u32);
+            }),
+        );
+
+        list_item.set_child(Some(page));
+    }
+
+    #[template_callback]
+    fn on_factory_bind(_: &gtk::SignalListItemFactory, list_item: &gtk::ListItem) {
+        let page_number = list_item.item().and_downcast::<page::PageNumber>().unwrap();
+        let page = list_item
+            .child()
+            .and_downcast::<crate::page::Page>()
+            .unwrap();
+
+        page.bind(&page_number);
+    }
+
     #[template_callback]
     fn handle_scroll(&self, _dx: f64, dy: f64) -> glib::Propagation {
         if dy < 0.0 {
