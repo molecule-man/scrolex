@@ -12,6 +12,7 @@ jobs:
     name: test
     env:
       RUST_BACKTRACE: 1
+      PKG_CONFIG_PATH: /usr/lib/x86_64-linux-gnu/pkgconfig
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -34,9 +35,6 @@ jobs:
       if: matrix.os == 'ubuntu-latest'
       run: |
         ci/ubuntu-install-packages
-
-    - name: Where the f is gtk4.pc?
-      run: sudo find /usr -name "gtk4.pc"
 
     - name: Install Rust
       uses: dtolnay/rust-toolchain@master
