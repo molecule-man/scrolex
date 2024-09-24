@@ -39,6 +39,7 @@ jobs:
     needs: ['create-release']
     runs-on: ${{ matrix.os }}
     env:
+      CARGO: cargo
       # When CARGO is set to CROSS, this is set to `--target matrix.target`.
       TARGET_FLAGS:
       # When CARGO is set to CROSS, TARGET_DIR includes matrix.target.
