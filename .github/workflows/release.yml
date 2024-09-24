@@ -49,16 +49,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
-        - build: linux
-          os: ubuntu-24.04
-          rust: nightly
-          target: x86_64-unknown-linux-musl
-          strip: x86_64-linux-musl-strip
-        # - build: stable-x86
+        # - build: linux
         #   os: ubuntu-24.04
-        #   rust: stable
-        #   target: i686-unknown-linux-gnu
-        #   strip: x86_64-linux-gnu-strip
+        #   rust: nightly
+        #   target: x86_64-unknown-linux-musl
+        #   strip: x86_64-linux-musl-strip
+        - build: stable-x86
+          os: ubuntu-24.04
+          rust: stable
+          target: i686-unknown-linux-gnu
+          strip: x86_64-linux-gnu-strip
         # - build: stable-aarch64
         #   os: ubuntu-24.04
         #   rust: stable
