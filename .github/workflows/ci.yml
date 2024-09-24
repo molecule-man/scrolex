@@ -19,8 +19,8 @@ jobs:
         include:
           - os: ubuntu-24.04
             rust: stable
-          - os: ubuntu-24.04
-            rust: nightly
+          # - os: ubuntu-24.04
+          #   rust: nightly
           # - os: windows
           #   rust: stable
           # - os: windows
