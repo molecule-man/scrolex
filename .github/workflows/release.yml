@@ -49,16 +49,20 @@ jobs:
       fail-fast: false
       matrix:
         include:
+        - build: linux-arm64
+          os: ubuntu-24.04
+          rust: stable
+          target: aarch64-unknown-linux-gnu
         # - build: linux
         #   os: ubuntu-24.04
         #   rust: nightly
         #   target: x86_64-unknown-linux-musl
         #   strip: x86_64-linux-musl-strip
-        - build: stable-x86
-          os: ubuntu-24.04
-          rust: stable
-          target: i686-unknown-linux-gnu
-          strip: x86_64-linux-gnu-strip
+        # - build: stable-x86
+        #   os: ubuntu-24.04
+        #   rust: stable
+        #   target: i686-unknown-linux-gnu
+        #   strip: x86_64-linux-gnu-strip
         # - build: stable-aarch64
         #   os: ubuntu-24.04
         #   rust: stable
@@ -132,6 +136,14 @@ jobs:
         cd "$dir"
         curl -LO "https://github.com/cross-rs/cross/releases/download/$CROSS_VERSION/cross-x86_64-unknown-linux-musl.tar.gz"
         tar xf cross-x86_64-unknown-linux-musl.tar.gz
+        cat <<EOF > Cross.toml
+        [target.${{ matrix.target }}]
+        pre-build = [
+            "dpkg --add-architecture \$CROSS_DEB_ARCH",
+            "apt-get update && apt-get install --assume-yes libgtk-4-dev:\$CROSS_DEB_ARCH libpoppler-glib-dev:\$CROSS_DEB_ARCH"
+        ]
+        EOF
+        cat Cross.toml
         echo "CARGO=cross" >> $GITHUB_ENV
 
     - name: Set target variables
