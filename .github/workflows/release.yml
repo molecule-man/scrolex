@@ -39,6 +39,7 @@ jobs:
     needs: ['create-release']
     runs-on: ${{ matrix.os }}
     env:
+      CARGO: cargo
       # When CARGO is set to CROSS, this is set to `--target matrix.target`.
       TARGET_FLAGS:
       # When CARGO is set to CROSS, TARGET_DIR includes matrix.target.
@@ -51,9 +52,17 @@ jobs:
         include:
         - build: linux
           os: ubuntu-24.04
-          rust: nightly
-          target: x86_64-unknown-linux-musl
-          strip: x86_64-linux-musl-strip
+          rust: stable
+          target: x86_64-unknown-linux-gnu
+        # - build: linux-arm64
+        #   os: ubuntu-24.04
+        #   rust: stable
+        #   target: aarch64-unknown-linux-gnu
+        # - build: linux
+        #   os: ubuntu-24.04
+        #   rust: nightly
+        #   target: x86_64-unknown-linux-musl
+        #   strip: x86_64-linux-musl-strip
         # - build: stable-x86
         #   os: ubuntu-24.04
         #   rust: stable
@@ -123,9 +132,17 @@ jobs:
         target: ${{ matrix.target }}
 
     - name: Use Cross
-      if: matrix.os == 'ubuntu-24.04'
+      if: matrix.os == 'ubuntu-24.04' && matrix.use_cross
       shell: bash
       run: |
+        cat <<EOF > Cross.toml
+        [target.${{ matrix.target }}]
+        pre-build = [
+            "dpkg --add-architecture \$CROSS_DEB_ARCH",
+            "apt-get update && apt-get install --assume-yes libgtk-4-dev:\$CROSS_DEB_ARCH libpoppler-glib-dev:\$CROSS_DEB_ARCH"
+        ]
+        EOF
+        cat Cross.toml
         dir="$RUNNER_TEMP/cross-download"
         mkdir "$dir"
         echo "$dir" >> $GITHUB_PATH
@@ -150,7 +167,7 @@ jobs:
     - name: Build release binary
       shell: bash
       run: |
-        ${{ env.CARGO }} build --verbose --release --features pcre2 ${{ env.TARGET_FLAGS }}
+        ${{ env.CARGO }} build --verbose --release ${{ env.TARGET_FLAGS }}
         if [ "${{ matrix.os }}" = "windows-latest" ]; then
           bin="target/${{ matrix.target }}/release/scrolex.exe"
         else
