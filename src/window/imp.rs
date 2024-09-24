@@ -17,7 +17,7 @@ use crate::state::State;
 
 // Object holding the state
 #[derive(CompositeTemplate, Default)]
-#[template(resource = "/com/andr2i/hallyview/app.ui")]
+#[template(resource = "/com/andr2i/scrolex/app.ui")]
 pub struct Window {
     #[template_child]
     pub state: TemplateChild<State>,

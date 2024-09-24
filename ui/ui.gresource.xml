@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <gresources>
-	<gresource prefix="/com/andr2i/hallyview">
+	<gresource prefix="/com/andr2i/scrolex">
 		<file preprocess="xml-stripblanks">app.ui</file>
 	</gresource>
 </gresources>

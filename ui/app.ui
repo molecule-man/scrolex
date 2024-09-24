@@ -10,7 +10,7 @@
 		</binding>
 	</object>
 	<template class="MyApp" parent="GtkApplicationWindow">
-		<property name="title">HallyViewed</property>
+		<property name="title">Scrolex PDF Viewer</property>
 		<child type="titlebar">
 			<object class="GtkHeaderBar" id="headerbar">
 				<child type="title">
@@ -63,7 +63,7 @@
 						</child>
 					</object>
 					<!--<object class="GtkLabel" id="title">-->
-					<!--	<property name="label">HallyViewed</property>-->
+					<!--	<property name="label">Scrolex</property>-->
 					<!--</object>-->
 				</child>
 				<child type="start">

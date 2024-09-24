@@ -25,14 +25,14 @@ mod render;
 mod state;
 mod window;
 
-const APP_ID: &str = "com.andr2i.hallyview";
+const APP_ID: &str = "com.andr2i.scrolex";
 
 fn main() -> glib::ExitCode {
     // register types for usage in templates
     page::PageNumber::static_type();
     page::Page::static_type();
 
-    gtk::gio::resources_register_include!("hallyview-ui.gresource")
+    gtk::gio::resources_register_include!("scrolex-ui.gresource")
         .expect("Failed to register resources");
 
     let app = Application::builder()
