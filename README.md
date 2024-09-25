@@ -5,6 +5,14 @@
 > \- Scroll the x  
 > \- **Scrolex**
 
+🚧 **Under Heavy Development** 🚧
+
+This project is currently in an early stage of development and is **NOT ready
+for production use**. Features may change rapidly, and bugs are likely. Please
+check back later for a stable release.
+
+---
+
 Scrolex is a high-performance PDF viewer specifically optimized for HiDPI
 displays and designed for distraction-free, efficient reading. With its
 horizontal scrolling layout, Scrolex lets you see more pages at once, making it

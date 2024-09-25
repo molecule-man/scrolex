@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Scrolex
+Comment=A Horizontally Scrolled PDF Viewer
+Exec=scrolex %f
+Icon=scrolex
+Terminal=false
+MimeType=application/pdf;
+Categories=Viewer;Graphics;
