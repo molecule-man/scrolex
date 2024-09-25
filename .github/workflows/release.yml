@@ -201,7 +201,7 @@ jobs:
       run: |
         mkdir -p "$ARCHIVE"
         cp "$BIN" "$ARCHIVE"/
-        cp README.md "$ARCHIVE"/
+        cp -r ./resources/ "$ARCHIVE"/
 
     - name: Build archive (Windows)
       shell: bash
