@@ -7,9 +7,10 @@
 
 🚧 **Under Heavy Development** 🚧
 
-This project is currently in an early stage of development and is **NOT ready
-for production use**. Features may change rapidly, and bugs are likely. Please
-check back later for a stable release.
+This project is still under active development and may contain bugs or
+incomplete features. While it is functional and can be used, please be aware
+that certain aspects might change rapidly, and stability is not guaranteed. Use
+at your own discretion, and check back for updates as the app evolves.
 
 ---
 
@@ -46,3 +47,48 @@ ideal for large monitors and wide screens.
     Scrolex offers full Wayland support, ensuring compatibility with modern
     Linux systems. Whether you're using X11 or Wayland, Scrolex will run
     smoothly.
+
+## Installation
+
+### 0. Dependencies
+
+If you are not installing the app via a package manager (currently only
+available on AUR), you will need to manually install the `gtk4` and `poppler`
+dependencies.
+
+On arch, you can install these dependencies with:
+
+```bash
+sudo pacman -S gtk4 poppler
+```
+
+### 1. Download from GitHub Releases
+
+You can download the latest pre-built binary directly from the [GitHub releases
+page][1].
+
+### 2. Install from AUR (Arch Linux)
+
+If you're using Arch Linux or any Arch-based distribution, you can install
+Scrolex from the Arch User Repository (AUR).
+
+```bash
+yay -S scrolex-bin
+```
+
+### 3. Build from source
+
+```bash
+# clone the repository
+git clone https://github.com/molecule-man/scrolex.git
+cd scrolex
+# build the project using Cargo:
+cargo build --release
+```
+
+After building, you will find the binary at the location
+`target/release/scrolex`. You can move the binary to a directory in your
+`$PATH`.
+
+
+[1]: https://github.com/molecule-man/scrolex/releases/latest
