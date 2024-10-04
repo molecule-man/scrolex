@@ -70,18 +70,6 @@ impl ObjectImpl for Window {
     fn constructed(&self) {
         self.parent_constructed();
 
-        let state: &State = self.state.as_ref();
-
-        state.connect_closure(
-            "before-load",
-            false,
-            closure_local!(move |_: &State| {
-                crate::render::RENDERER.with(|r| {
-                    r.clear_cache();
-                });
-            }),
-        );
-
         if let Some(editable) = self.entry_page_num.delegate() {
             editable.connect_insert_text(|entry, s, _| {
                 for c in s.chars() {

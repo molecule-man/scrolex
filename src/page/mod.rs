@@ -51,7 +51,7 @@ impl Page {
             .build();
 
         self.imp().binding.replace(Some(new_binding));
-        self.imp().trigger_resize();
+        self.imp().resize();
     }
 
     pub(crate) fn resize(

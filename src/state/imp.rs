@@ -4,6 +4,7 @@ use gtk::glib;
 use gtk::glib::subclass::prelude::*;
 use gtk::{gio::prelude::*, glib::subclass::Signal};
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::OnceLock;
 
@@ -31,6 +32,7 @@ pub struct State {
     prev_page: RefCell<u32>,
 
     pub(super) jump_stack: Rc<RefCell<jump_stack::JumpStack>>,
+    pub(crate) bbox_cache: Rc<RefCell<HashMap<i32, poppler::Rectangle>>>,
 }
 
 #[glib::object_subclass]

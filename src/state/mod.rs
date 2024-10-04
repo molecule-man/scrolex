@@ -40,6 +40,7 @@ impl State {
 
         let doc = Document::from_gfile(f, None, gtk::gio::Cancellable::NONE)
             .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
+        self.imp().bbox_cache.borrow_mut().clear();
 
         self.emit_by_name::<()>("before-load", &[]);
 

@@ -4,6 +4,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::OnceLock;
 
+use futures::channel::oneshot;
 use gtk::gdk::BUTTON_PRIMARY;
 use gtk::glib;
 use gtk::glib::clone;
@@ -83,10 +84,22 @@ impl Page {
                 };
 
                 cr.save().expect("Failed to save");
-                crate::render::RENDERER.with(|r| {
-                    r.render(cr, &obj, &poppler_page);
-                    r.resize(&obj, &poppler_page);
-                });
+
+                let bbox = obj.imp().get_bbox(&poppler_page, obj.crop());
+                let (width, height) = poppler_page.size();
+                let scale = obj.zoom();
+
+                if bbox.x1() != 0.0 || bbox.y1() != 0.0 {
+                    cr.translate(-bbox.x1() * scale, -bbox.y1() * scale);
+                }
+
+                cr.rectangle(0.0, 0.0, width * scale, height * scale);
+                cr.scale(scale, scale);
+                cr.set_source_rgba(1.0, 1.0, 1.0, 1.0);
+                cr.fill().expect("Failed to fill");
+                poppler_page.render(cr);
+                obj.imp().resize();
+
                 cr.restore().expect("Failed to restore");
 
                 let highlighted = &obj.imp().highlighted.borrow();
@@ -109,21 +122,56 @@ impl Page {
         let obj = self.obj().clone();
         obj.property_expression("state")
             .chain_property::<crate::state::State>("crop")
-            .watch(gtk::Widget::NONE, move || obj.imp().trigger_resize());
+            .watch(gtk::Widget::NONE, move || obj.imp().resize());
 
         let obj = self.obj().clone();
         obj.property_expression("state")
             .chain_property::<crate::state::State>("zoom")
-            .watch(gtk::Widget::NONE, move || obj.imp().trigger_resize());
+            .watch(gtk::Widget::NONE, move || obj.imp().resize());
     }
 
-    pub(super) fn trigger_resize(&self) {
-        let obj = self.obj();
-        if let Some(page) = self.poppler_page() {
-            crate::render::RENDERER.with(|r| {
-                r.resize(&obj, &page);
-            });
+    pub(super) fn resize(&self) {
+        let Some(poppler_page) = self.poppler_page() else {
+            return;
+        };
+        let page = self.obj();
+        let (w, h) = poppler_page.size();
+        let page_num = poppler_page.index();
+        let bbox_cache = self.state.borrow().imp().bbox_cache.clone();
+
+        if !page.crop() {
+            page.resize(w, h, None);
+            return;
         }
+
+        if let Some(bbox) = bbox_cache.borrow().get(&poppler_page.index()) {
+            page.resize(w, h, Some(*bbox));
+            return;
+        }
+
+        let (resp_sender, resp_receiver) = oneshot::channel();
+
+        crate::render::JOB_MANAGER.with(|r| {
+            r.execute(
+                &page.uri(),
+                Box::new(move |doc| {
+                    if let Some(page) = doc.page(page_num) {
+                        let bbox = get_bbox(&page, true);
+                        resp_sender.send(bbox).expect("Failed to send bbox");
+                    }
+                }),
+            );
+        });
+
+        glib::spawn_future_local(glib::clone!(
+            #[strong]
+            page,
+            async move {
+                let bbox = resp_receiver.await.expect("Failed to receive bbox");
+                bbox_cache.borrow_mut().insert(page_num, bbox);
+                page.resize(w, h, Some(bbox));
+            }
+        ));
     }
 
     fn poppler_page(&self) -> Option<poppler::Page> {
@@ -288,6 +336,26 @@ impl Page {
         ));
         obj.add_controller(gc);
     }
+
+    fn get_bbox(&self, page: &poppler::Page, crop: bool) -> poppler::Rectangle {
+        if !crop {
+            let mut bbox = poppler::Rectangle::default();
+            bbox.set_x1(0.0);
+            bbox.set_y1(0.0);
+            let (w, h) = page.size();
+            bbox.set_x2(w);
+            bbox.set_y2(h);
+            return bbox;
+        }
+        let bbox_cache = self.state.borrow().imp().bbox_cache.clone();
+        if let Some(bbox) = bbox_cache.borrow().get(&page.index()) {
+            return *bbox;
+        }
+
+        let bbox = get_bbox(page, true);
+        bbox_cache.borrow_mut().insert(page.index(), bbox);
+        bbox
+    }
 }
 
 struct Point {
@@ -310,4 +378,31 @@ fn to_poppler_coords(page: &super::Page, x: f64, y: f64, page_height: Option<f64
     }
 
     Point { x, y }
+}
+
+pub(crate) fn get_bbox(page: &poppler::Page, crop: bool) -> poppler::Rectangle {
+    let (width, height) = page.size();
+    let mut crop_bbox = poppler::Rectangle::default();
+    crop_bbox.set_x1(0.0);
+    crop_bbox.set_y1(0.0);
+    crop_bbox.set_x2(width);
+    crop_bbox.set_y2(height);
+
+    if crop {
+        let mut bbox = poppler::Rectangle::default();
+        page.get_bounding_box(&mut bbox);
+
+        crop_bbox.set_x1((bbox.x1() - 5.0).max(0.0));
+        crop_bbox.set_y1((bbox.y1() - 5.0).max(0.0));
+        crop_bbox.set_x2((bbox.x2() + 5.0).min(width));
+        crop_bbox.set_y2((bbox.y2() + 5.0).min(height));
+        if crop_bbox.x2() - crop_bbox.x1() < width / 2.0 {
+            crop_bbox.set_x2(crop_bbox.x1() + width / 2.0);
+        }
+        if crop_bbox.y2() - crop_bbox.y1() < height / 2.0 {
+            crop_bbox.set_y2(crop_bbox.y1() + height / 2.0);
+        }
+    }
+
+    crop_bbox
 }
