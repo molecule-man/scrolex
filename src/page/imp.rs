@@ -151,7 +151,7 @@ impl Page {
 
         let (resp_sender, resp_receiver) = oneshot::channel();
 
-        crate::render::JOB_MANAGER.with(|r| {
+        crate::bg_job::JOB_MANAGER.with(|r| {
             r.execute(
                 &page.uri(),
                 Box::new(move |doc| {

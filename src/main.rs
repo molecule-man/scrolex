@@ -18,10 +18,10 @@ use gtk::glib::Uri;
 use gtk::{gio::ApplicationFlags, glib, glib::clone, Application};
 use gtk::{prelude::*, CssProvider};
 
+mod bg_job;
 mod jump_stack;
 mod page;
 mod poppler;
-mod render;
 mod state;
 mod window;
 
