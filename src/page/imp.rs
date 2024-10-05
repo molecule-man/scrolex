@@ -136,44 +136,12 @@ impl Page {
         let Some(poppler_page) = self.poppler_page() else {
             return;
         };
-        let page = self.obj();
+        let page = self.obj().clone();
         let (w, h) = poppler_page.size();
-        let page_num = poppler_page.index();
-        let bbox_cache = self.state.borrow().imp().bbox_cache.clone();
 
-        if !page.crop() {
-            page.resize(w, h, None);
-            return;
-        }
-
-        if let Some(bbox) = bbox_cache.borrow().get(&poppler_page.index()) {
+        self.get_bbox_async(&poppler_page, page.crop(), move |bbox| {
             page.resize(w, h, Some(*bbox));
-            return;
-        }
-
-        let (resp_sender, resp_receiver) = oneshot::channel();
-
-        crate::bg_job::JOB_MANAGER.with(|r| {
-            r.execute(
-                &page.uri(),
-                Box::new(move |doc| {
-                    if let Some(page) = doc.page(page_num) {
-                        let bbox = get_bbox(&page, true);
-                        resp_sender.send(bbox).expect("Failed to send bbox");
-                    }
-                }),
-            );
         });
-
-        glib::spawn_future_local(glib::clone!(
-            #[strong]
-            page,
-            async move {
-                let bbox = resp_receiver.await.expect("Failed to receive bbox");
-                bbox_cache.borrow_mut().insert(page_num, bbox);
-                page.resize(w, h, Some(bbox));
-            }
-        ));
     }
 
     fn poppler_page(&self) -> Option<poppler::Page> {
@@ -351,6 +319,53 @@ impl Page {
     }
 
     fn get_bbox(&self, page: &poppler::Page, crop: bool) -> poppler::Rectangle {
+        if let Some(bbox) = self.lookup_bbox(page, crop) {
+            return bbox;
+        }
+
+        let bbox = get_bbox(page, true);
+        self.state
+            .borrow()
+            .imp()
+            .bbox_cache
+            .borrow_mut()
+            .insert(page.index(), bbox);
+        bbox
+    }
+
+    fn get_bbox_async<F>(&self, page: &poppler::Page, crop: bool, cb: F)
+    where
+        F: FnOnce(&poppler::Rectangle) + 'static,
+    {
+        if let Some(bbox) = self.lookup_bbox(page, crop) {
+            cb(&bbox);
+            return;
+        }
+        let bbox_cache = self.state.borrow().imp().bbox_cache.clone();
+
+        let uri = self.obj().uri();
+        let page_num = page.index();
+        let (resp_sender, resp_receiver) = oneshot::channel();
+        crate::bg_job::JOB_MANAGER.with(|r| {
+            r.execute(
+                &uri,
+                Box::new(move |doc| {
+                    if let Some(page) = doc.page(page_num) {
+                        let bbox = get_bbox(&page, true);
+                        resp_sender.send(bbox).expect("Failed to send bbox");
+                    }
+                }),
+            );
+        });
+
+        glib::spawn_future_local(async move {
+            let bbox = resp_receiver.await.expect("Failed to receive bbox");
+            bbox_cache.borrow_mut().insert(page_num, bbox);
+            cb(&bbox);
+        });
+    }
+
+    fn lookup_bbox(&self, page: &poppler::Page, crop: bool) -> Option<poppler::Rectangle> {
         if !crop {
             let mut bbox = poppler::Rectangle::default();
             bbox.set_x1(0.0);
@@ -358,16 +373,15 @@ impl Page {
             let (w, h) = page.size();
             bbox.set_x2(w);
             bbox.set_y2(h);
-            return bbox;
+            return Some(bbox);
         }
-        let bbox_cache = self.state.borrow().imp().bbox_cache.clone();
-        if let Some(bbox) = bbox_cache.borrow().get(&page.index()) {
-            return *bbox;
-        }
-
-        let bbox = get_bbox(page, true);
-        bbox_cache.borrow_mut().insert(page.index(), bbox);
-        bbox
+        self.state
+            .borrow()
+            .imp()
+            .bbox_cache
+            .borrow()
+            .get(&page.index())
+            .copied()
     }
 }
 
