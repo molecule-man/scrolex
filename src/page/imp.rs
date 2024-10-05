@@ -427,6 +427,7 @@ fn get_bbox(page: &poppler::Page, crop: bool) -> poppler::Rectangle {
 mod tests {
     use super::*;
 
+    const EPSILON: f64 = 0.0001;
     const SMALL_PDF: &[u8] = b"%PDF-1.2 \n\
 9 0 obj\n<<\n>>\nstream\nBT/ 32 Tf(  YOUR TEXT HERE   )' ET\nendstream\nendobj\n\
 10 0 obj\n<<\n/Subtype /Link\n/Rect [ {BBOX} ]\n/Contents (Your Annotation Text)\n\
@@ -443,10 +444,10 @@ trailer\n<<\n/Root 3 0 R\n>>\n\
         let doc = poppler::Document::from_data(content.as_bytes(), None).unwrap();
         let page = doc.page(0).unwrap();
         let bbox = get_bbox(&page, false);
-        assert_eq!(bbox.x1(), 0.0);
-        assert_eq!(bbox.y1(), 0.0);
-        assert_eq!(bbox.x2(), 250.0);
-        assert_eq!(bbox.y2(), 50.0);
+        assert!((bbox.x1() - 0.0).abs() < EPSILON);
+        assert!((bbox.y1() - 0.0).abs() < EPSILON);
+        assert!((bbox.x2() - 250.0).abs() < EPSILON);
+        assert!((bbox.y2() - 50.0).abs() < EPSILON);
     }
 
     #[test]
@@ -462,10 +463,10 @@ trailer\n<<\n/Root 3 0 R\n>>\n\
         // notice strange y2 and y1. Poppler uses left-bottom as origin.
         // 0.5 pixels for the border I guess.
 
-        assert_eq!(bbox.x1(), 4.5); // 10.0 - 0.5 - 5
-        assert_eq!(bbox.y1(), 1.0); // 6.5 - 0.5 - 5
-        assert_eq!(bbox.x2(), 243.5); // 238.0 + 0.5 + 5
-        assert_eq!(bbox.y2(), 47.0); // 41.5 + 0.5 + 5
+        assert!((bbox.x1() - 4.5).abs() < EPSILON); // 10.0 - 0.5 - 5
+        assert!((bbox.y1() - 1.0).abs() < EPSILON); // 6.5 - 0.5 - 5
+        assert!((bbox.x2() - 243.5).abs() < EPSILON); // 238.0 + 0.5 + 5
+        assert!((bbox.y2() - 47.0).abs() < EPSILON); // 41.5 + 0.5 + 5
     }
 
     #[test]
@@ -475,9 +476,9 @@ trailer\n<<\n/Root 3 0 R\n>>\n\
         let page = doc.page(0).unwrap();
         let bbox = get_bbox(&page, true);
 
-        assert_eq!(bbox.x1(), 4.5); // 10.0 - 0.5 - 5
-        assert_eq!(bbox.y1(), 1.0); // 6.5 - 0.5 - 5
-        assert_eq!(bbox.x2(), 129.5); // 4.5 + 250 / 2
-        assert_eq!(bbox.y2(), 26.0); // 1.0 + 50 / 2
+        assert!((bbox.x1() - 4.5).abs() < EPSILON); // 10.0 - 0.5 - 5
+        assert!((bbox.y1() - 1.0).abs() < EPSILON); // 6.5 - 0.5 - 5
+        assert!((bbox.x2() - 129.5).abs() < EPSILON); // 4.5 + 250 / 2
+        assert!((bbox.y2() - 26.0).abs() < EPSILON); // 1.0 + 50 / 2
     }
 }
