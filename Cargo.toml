@@ -6,6 +6,7 @@ authors = ["Andrii Berezhynskyi <microsolutions_harebrain@aleeas.com>"]
 license = "MIT"
 homepage = "https://github.com/molecule-man/scrolex"
 repository = "https://github.com/molecule-man/scrolex"
+description = "A Horizontally Scrolled PDF Viewer"
 
 [dependencies]
 futures = "0.3.30"
@@ -16,3 +17,14 @@ poppler-sys-rs = "0.24.0"
 
 [build-dependencies]
 glib-build-tools = "0.20.0"
+
+[profile.deb]
+inherits = "release"
+debug = false
+
+[package.metadata.deb]
+assets = [
+	["target/release/scrolex", "usr/bin/", "755"],
+	["resources/scrolex.desktop", "usr/share/applications/", "644"],
+	["resources/icon.png", "usr/share/icons/scrolex.png", "644"]
+]
