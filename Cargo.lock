@@ -568,7 +568,7 @@ dependencies = [
 
 [[package]]
 name = "scrolex"
-version = "0.1.0-alpha+2"
+version = "0.1.0-deb+5"
 dependencies = [
  "futures",
  "glib-build-tools",
