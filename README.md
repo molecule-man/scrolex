@@ -76,7 +76,17 @@ Scrolex from the Arch User Repository (AUR).
 yay -S scrolex-bin
 ```
 
-### 3. Build from source
+### 3. Download and install .deb package from GitHub Releases
+
+If you are Debian (or Ubuntu) user, then you can download a `.deb` file directly from the [GitHub releases
+page][1] and install it.
+
+```bash
+curl -LO 'https://github.com/molecule-man/scrolex/releases/download/0.1.0-alpha+3/scrolex_0.1.0-alpha+3.deb'
+sudo dpkg -i scrolex_0.1.0-alpha+3.deb
+```
+
+### 4. Build from source
 
 ```bash
 # clone the repository
