@@ -1,6 +1,6 @@
 [package]
 name = "scrolex"
-version = "0.1.0-alpha+2"
+version = "0.1.0-deb+4"
 edition = "2021"
 authors = ["Andrii Berezhynskyi <microsolutions_harebrain@aleeas.com>"]
 license = "MIT"
