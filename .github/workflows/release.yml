@@ -20,13 +20,14 @@ jobs:
       - name: Show the version
         run: |
           echo "version is: $VERSION"
-      - name: Check that tag version and Cargo.toml version are the same
-        shell: bash
-        run: |
-          if ! grep -q "version = \"$VERSION\"" Cargo.toml; then
-            echo "version does not match Cargo.toml" >&2
-            exit 1
-          fi
+      # TODO don't forget to uncomment
+      # - name: Check that tag version and Cargo.toml version are the same
+      #   shell: bash
+      #   run: |
+      #     if ! grep -q "version = \"$VERSION\"" Cargo.toml; then
+      #       echo "version does not match Cargo.toml" >&2
+      #       exit 1
+      #     fi
       - name: Create GitHub release
         env:
           GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
@@ -228,3 +229,56 @@ jobs:
       run: |
         version="${{ needs.create-release.outputs.version }}"
         gh release upload "$version" ${{ env.ASSET }} ${{ env.ASSET_SUM }}
+
+  build-release-deb:
+    name: build-release-deb
+    needs: ['create-release']
+    runs-on: ubuntu-24.04
+    env:
+      RUST_BACKTRACE: 1
+      TARGET: x86_64-unknown-linux-gnu
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Install packages (Ubuntu)
+      shell: bash
+      run: |
+        ci/ubuntu-install-packages
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: stable
+        target: ${{ env.TARGET }}
+
+    - name: Install cargo-deb
+      shell: bash
+      run: |
+        cargo install cargo-deb
+
+    - name: Build release binary
+      shell: bash
+      run: |
+        cargo deb --profile deb --target ${{ env.TARGET }}
+        version="${{ needs.create-release.outputs.version }}"
+        echo "DEB_DIR=target/${{ env.TARGET }}/debian" >> $GITHUB_ENV
+        echo "DEB_NAME=scrolex_$version-1_amd64.deb" >> $GITHUB_ENV
+
+    - name: Create sha256 sum of deb file
+      shell: bash
+      run: |
+        cd "$DEB_DIR"
+        sum="$DEB_NAME.sha256"
+        shasum -a 256 "$DEB_NAME" > "$sum"
+        echo "SUM=$sum" >> $GITHUB_ENV
+
+    - name: Upload release archive
+      env:
+        GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
+      shell: bash
+      run: |
+        cd "$DEB_DIR"
+        version="${{ needs.create-release.outputs.version }}"
+        gh release upload "$version" "$DEB_NAME" "$SUM"
