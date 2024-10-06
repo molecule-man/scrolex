@@ -2,6 +2,10 @@
 name = "scrolex"
 version = "0.1.0-alpha+2"
 edition = "2021"
+authors = ["Andrii Berezhynskyi <microsolutions_harebrain@aleeas.com>"]
+license = "MIT"
+homepage = "https://github.com/molecule-man/scrolex"
+repository = "https://github.com/molecule-man/scrolex"
 
 [dependencies]
 futures = "0.3.30"
