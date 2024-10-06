@@ -261,9 +261,10 @@ jobs:
     - name: Build release binary
       shell: bash
       run: |
-        echo "DEB_NAME=scrolex_$version.deb" >> $GITHUB_ENV
-        cargo deb --profile deb --target ${{ env.TARGET }} -o ${{ env.DEB_DIR }}/$DEB_NAME
         version="${{ needs.create-release.outputs.version }}"
+        DEB_NAME=scrolex_$version.deb
+        echo "DEB_NAME=$DEB_NAME" >> $GITHUB_ENV
+        cargo deb --profile deb --target ${{ env.TARGET }} -o ${{ env.DEB_DIR }}/$DEB_NAME
 
     - name: Create sha256 sum of deb file
       shell: bash
