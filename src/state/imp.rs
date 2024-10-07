@@ -32,7 +32,7 @@ pub struct State {
     prev_page: RefCell<u32>,
 
     pub(super) jump_stack: Rc<RefCell<jump_stack::JumpStack>>,
-    pub(crate) bbox_cache: Rc<RefCell<HashMap<i32, poppler::Rectangle>>>,
+    pub(crate) bbox_cache: Rc<RefCell<HashMap<i32, crate::page::Rectangle>>>,
 }
 
 #[glib::object_subclass]

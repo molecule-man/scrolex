@@ -13,7 +13,7 @@ use gtk::prelude::*;
 use gtk::subclass::prelude::*;
 use gtk::DrawingArea;
 
-use super::Highlighted;
+use super::Rectangle;
 use crate::poppler::{Dest, DestExt, LinkMappingExt, LinkType};
 
 #[derive(Default, glib::Properties)]
@@ -28,14 +28,8 @@ pub struct Page {
     #[property(get, set)]
     index: Cell<i32>,
 
-    #[property(name = "x1", get, set, type = f64, member = x1)]
-    #[property(name = "y1", get, set, type = f64, member = y1)]
-    #[property(name = "x2", get, set, type = f64, member = x2)]
-    #[property(name = "y2", get, set, type = f64, member = y2)]
-    pub highlighted: RefCell<Highlighted>,
-
-    #[property(get, set)]
-    bbox: RefCell<poppler::Rectangle>,
+    highlighted: RefCell<Rectangle>,
+    bbox: RefCell<Rectangle>,
 }
 
 #[glib::object_subclass]
@@ -91,8 +85,8 @@ impl Page {
                 let (width, height) = poppler_page.size();
                 let scale = obj.zoom();
 
-                if bbox.x1() != 0.0 || bbox.y1() != 0.0 {
-                    cr.translate(-bbox.x1() * scale, -bbox.y1() * scale);
+                if bbox.x1 != 0.0 || bbox.y1 != 0.0 {
+                    cr.translate(-bbox.x1 * scale, -bbox.y1 * scale);
                 }
 
                 cr.rectangle(0.0, 0.0, width * scale, height * scale);
@@ -139,9 +133,25 @@ impl Page {
         let page = self.obj().clone();
         let (w, h) = poppler_page.size();
 
-        self.get_bbox_async(&poppler_page, page.crop(), move |bbox| {
-            page.resize(w, h, Some(*bbox));
-        });
+        self.get_bbox_async(
+            &poppler_page,
+            page.crop(),
+            clone!(
+                #[weak(rename_to = imp)]
+                self,
+                move |bbox| {
+                    let bbox = if page.crop() {
+                        *bbox
+                    } else {
+                        Rectangle::new(0.0, 0.0, w, h)
+                    };
+
+                    imp.bbox.replace(bbox);
+                    let (w, h) = bbox.size();
+                    page.set_size_request((w * page.zoom()) as i32, (h * page.zoom()) as i32);
+                }
+            ),
+        );
     }
 
     fn poppler_page(&self) -> Option<poppler::Page> {
@@ -185,22 +195,20 @@ impl Page {
                     return;
                 };
 
-                let mut rect = poppler::Rectangle::default();
+                let highlighted = Rectangle::new(start_x, start_y, end_x, end_y);
 
+                let mut poppler_rect = poppler::Rectangle::default();
                 let Point { x: x1, y: y1 } = to_poppler_coords(&obj, start_x, start_y, None);
                 let Point { x: x2, y: y2 } = to_poppler_coords(&obj, end_x, end_y, None);
-                rect.set_x1(x1);
-                rect.set_y1(y1);
-                rect.set_x2(x2);
-                rect.set_y2(y2);
+                poppler_rect.set_x1(x1);
+                poppler_rect.set_y1(y1);
+                poppler_rect.set_x2(x2);
+                poppler_rect.set_y2(y2);
 
                 let selected =
-                    &poppler_page.selected_text(poppler::SelectionStyle::Glyph, &mut rect);
+                    &poppler_page.selected_text(poppler::SelectionStyle::Glyph, &mut poppler_rect);
 
-                obj.set_x1(start_x);
-                obj.set_y1(start_y);
-                obj.set_x2(end_x);
-                obj.set_y2(end_y);
+                imp.highlighted.replace(highlighted);
 
                 if let Some(selected) = selected {
                     obj.clipboard().set_text(selected);
@@ -318,7 +326,7 @@ impl Page {
         obj.add_controller(gc);
     }
 
-    fn get_bbox(&self, page: &poppler::Page, crop: bool) -> poppler::Rectangle {
+    fn get_bbox(&self, page: &poppler::Page, crop: bool) -> Rectangle {
         if let Some(bbox) = self.lookup_bbox(page, crop) {
             return bbox;
         }
@@ -335,7 +343,7 @@ impl Page {
 
     fn get_bbox_async<F>(&self, page: &poppler::Page, crop: bool, cb: F)
     where
-        F: FnOnce(&poppler::Rectangle) + 'static,
+        F: FnOnce(&Rectangle) + 'static,
     {
         if let Some(bbox) = self.lookup_bbox(page, crop) {
             cb(&bbox);
@@ -365,15 +373,10 @@ impl Page {
         });
     }
 
-    fn lookup_bbox(&self, page: &poppler::Page, crop: bool) -> Option<poppler::Rectangle> {
+    fn lookup_bbox(&self, page: &poppler::Page, crop: bool) -> Option<Rectangle> {
         if !crop {
-            let mut bbox = poppler::Rectangle::default();
-            bbox.set_x1(0.0);
-            bbox.set_y1(0.0);
             let (w, h) = page.size();
-            bbox.set_x2(w);
-            bbox.set_y2(h);
-            return Some(bbox);
+            return Some(Rectangle::new(0.0, 0.0, w, h));
         }
         self.state
             .borrow()
@@ -395,8 +398,8 @@ fn to_poppler_coords(page: &super::Page, x: f64, y: f64, page_height: Option<f64
     let mut y = y / page.zoom();
 
     if page.crop() {
-        x += page.bbox().x1();
-        y += page.bbox().y1();
+        x += page.imp().bbox.borrow().x1;
+        y += page.imp().bbox.borrow().y1;
     }
 
     // Adjust y for Poppler's coordinate system if page height is provided
@@ -407,7 +410,7 @@ fn to_poppler_coords(page: &super::Page, x: f64, y: f64, page_height: Option<f64
     Point { x, y }
 }
 
-fn get_bbox(page: &poppler::Page, crop: bool) -> poppler::Rectangle {
+fn get_bbox(page: &poppler::Page, crop: bool) -> Rectangle {
     let (width, height) = page.size();
     let mut bbox = poppler::Rectangle::default();
     bbox.set_x1(0.0);
@@ -419,12 +422,11 @@ fn get_bbox(page: &poppler::Page, crop: bool) -> poppler::Rectangle {
         let mut poppler_bbox = poppler::Rectangle::default();
         page.get_bounding_box(&mut poppler_bbox);
 
-        bbox.set_x1((poppler_bbox.x1() - 5.0).max(0.0));
-        bbox.set_x2((poppler_bbox.x2() + 5.0).min(width));
+        bbox.set_x1(poppler_bbox.x1() - 5.0);
+        bbox.set_x2(poppler_bbox.x2() + 5.0);
 
-        // Poppler uses left-bottom as origin. We need to flip the y-axis.
-        bbox.set_y1((height - poppler_bbox.y2() - 5.0).max(0.0));
-        bbox.set_y2((height - poppler_bbox.y1() + 5.0).min(height));
+        bbox.set_y1(poppler_bbox.y1() - 5.0);
+        bbox.set_y2(poppler_bbox.y2() + 5.0);
 
         if bbox.x2() - bbox.x1() < width / 2.0 {
             bbox.set_x2(bbox.x1() + width / 2.0);
@@ -432,9 +434,14 @@ fn get_bbox(page: &poppler::Page, crop: bool) -> poppler::Rectangle {
         if bbox.y2() - bbox.y1() < height / 2.0 {
             bbox.set_y2(bbox.y1() + height / 2.0);
         }
+
+        bbox.set_x1(bbox.x1().max(0.0));
+        bbox.set_y1(bbox.y1().max(0.0));
+        bbox.set_x2(bbox.x2().min(width));
+        bbox.set_y2(bbox.y2().min(height));
     }
 
-    bbox
+    Rectangle::from_poppler(&bbox, height)
 }
 
 #[cfg(test)]
@@ -458,10 +465,10 @@ trailer\n<<\n/Root 3 0 R\n>>\n\
         let doc = poppler::Document::from_data(content.as_bytes(), None).unwrap();
         let page = doc.page(0).unwrap();
         let bbox = get_bbox(&page, false);
-        assert!((bbox.x1() - 0.0).abs() < EPSILON);
-        assert!((bbox.y1() - 0.0).abs() < EPSILON);
-        assert!((bbox.x2() - 250.0).abs() < EPSILON);
-        assert!((bbox.y2() - 50.0).abs() < EPSILON);
+        assert!((bbox.x1 - 0.0).abs() < EPSILON);
+        assert!((bbox.y1 - 0.0).abs() < EPSILON);
+        assert!((bbox.x2 - 250.0).abs() < EPSILON);
+        assert!((bbox.y2 - 50.0).abs() < EPSILON);
     }
 
     #[test]
@@ -477,22 +484,22 @@ trailer\n<<\n/Root 3 0 R\n>>\n\
         // notice strange y2 and y1. Poppler uses left-bottom as origin.
         // 0.5 pixels for the border I guess.
 
-        assert!((bbox.x1() - 4.5).abs() < EPSILON); // 10.0 - 0.5 - 5
-        assert!((bbox.y1() - 1.0).abs() < EPSILON); // 6.5 - 0.5 - 5
-        assert!((bbox.x2() - 243.5).abs() < EPSILON); // 238.0 + 0.5 + 5
-        assert!((bbox.y2() - 47.0).abs() < EPSILON); // 41.5 + 0.5 + 5
+        assert!((bbox.x1 - 4.5).abs() < EPSILON); // 10.0 - 0.5 - 5
+        assert!((bbox.y1 - 1.0).abs() < EPSILON); // 6.5 - 0.5 - 5
+        assert!((bbox.x2 - 243.5).abs() < EPSILON); // 238.0 + 0.5 + 5
+        assert!((bbox.y2 - 47.0).abs() < EPSILON); // 41.5 + 0.5 + 5
     }
 
     #[test]
     fn test_get_bbox_with_big_margins() {
-        let content = String::from_utf8_lossy(SMALL_PDF).replace("{BBOX}", "10 6.5 20 16");
+        let content = String::from_utf8_lossy(SMALL_PDF).replace("{BBOX}", "10 34 20 43.5");
         let doc = poppler::Document::from_data(content.as_bytes(), None).unwrap();
         let page = doc.page(0).unwrap();
         let bbox = get_bbox(&page, true);
 
-        assert!((bbox.x1() - 4.5).abs() < EPSILON); // 10.0 - 0.5 - 5
-        assert!((bbox.y1() - 1.0).abs() < EPSILON); // 6.5 - 0.5 - 5
-        assert!((bbox.x2() - 129.5).abs() < EPSILON); // 4.5 + 250 / 2
-        assert!((bbox.y2() - 26.0).abs() < EPSILON); // 1.0 + 50 / 2
+        assert!((bbox.x1 - 4.5).abs() < EPSILON); // 10.0 - 0.5 - 5
+        assert!((bbox.y1 - 24.0).abs() < EPSILON);
+        assert!((bbox.x2 - 129.5).abs() < EPSILON); // 4.5 + 250 / 2
+        assert!((bbox.y2 - 49.0).abs() < EPSILON);
     }
 }
