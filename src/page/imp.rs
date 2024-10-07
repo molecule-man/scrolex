@@ -14,7 +14,7 @@ use gtk::subclass::prelude::*;
 use gtk::DrawingArea;
 
 use super::Rectangle;
-use crate::poppler::{Dest, DestExt, LinkMappingExt, LinkType};
+use crate::poppler::{Dest, DestExt, LinkType};
 
 #[derive(Default, glib::Properties)]
 #[properties(wrapper_type = super::Page)]
@@ -198,8 +198,8 @@ impl Page {
                 let highlighted = Rectangle::new(start_x, start_y, end_x, end_y);
 
                 let mut poppler_rect = poppler::Rectangle::default();
-                let Point { x: x1, y: y1 } = to_poppler_coords(&obj, start_x, start_y, None);
-                let Point { x: x2, y: y2 } = to_poppler_coords(&obj, end_x, end_y, None);
+                let Point { x: x1, y: y1 } = undo_zoom_and_crop(&obj, start_x, start_y);
+                let Point { x: x2, y: y2 } = undo_zoom_and_crop(&obj, end_x, end_y);
                 poppler_rect.set_x1(x1);
                 poppler_rect.set_y1(y1);
                 poppler_rect.set_x2(x2);
@@ -229,6 +229,7 @@ impl Page {
     fn setup_link_handling(&self) {
         let obj = self.obj();
         let motion_controller = gtk::EventControllerMotion::new();
+
         motion_controller.connect_motion(clone!(
             #[strong]
             obj,
@@ -239,22 +240,18 @@ impl Page {
                     return;
                 };
 
-                let (_, height) = poppler_page.size();
-                let raw_links = poppler_page.link_mapping();
-
-                if raw_links.is_empty() {
+                let Point { x, y } = undo_zoom_and_crop(&obj, x, y);
+                if imp
+                    .state
+                    .borrow()
+                    .imp()
+                    .links
+                    .borrow_mut()
+                    .get_link(&poppler_page, x, y)
+                    .is_some()
+                {
+                    obj.set_cursor_from_name(Some("pointer"));
                     return;
-                }
-
-                let Point { x, y } = to_poppler_coords(&obj, x, y, Some(height));
-
-                for raw_link in raw_links {
-                    let crate::poppler::Link(_, area) = raw_link.to_link();
-
-                    if area.x1() <= x && x <= area.x2() && area.y1() <= y && y <= area.y2() {
-                        obj.set_cursor_from_name(Some("pointer"));
-                        return;
-                    }
                 }
 
                 obj.set_cursor(None);
@@ -273,26 +270,21 @@ impl Page {
                 let Some(poppler_page) = imp.poppler_page() else {
                     return;
                 };
-                let (_, height) = poppler_page.size();
-                let raw_links = poppler_page.link_mapping();
 
-                if raw_links.is_empty() {
-                    return;
-                }
+                let Point { x, y } = undo_zoom_and_crop(&obj, x, y);
 
-                let Point { x, y } = to_poppler_coords(&obj, x, y, Some(height));
-
-                for raw_link in raw_links {
-                    let crate::poppler::Link(link_type, area) = raw_link.to_link();
-
-                    if !(area.x1() <= x && x <= area.x2() && area.y1() <= y && y <= area.y2()) {
-                        continue;
-                    }
-
+                if let Some(link_type) =
+                    imp.state
+                        .borrow()
+                        .imp()
+                        .links
+                        .borrow_mut()
+                        .get_link(&poppler_page, x, y)
+                {
                     match link_type {
                         LinkType::GotoNamedDest(name) => {
                             if let Some(doc) = obj.state().doc() {
-                                let Some(dest) = doc.find_dest(&name) else {
+                                let Some(dest) = doc.find_dest(name) else {
                                     return;
                                 };
 
@@ -306,7 +298,7 @@ impl Page {
                         }
                         LinkType::Uri(uri) => {
                             let _ = gtk::gio::AppInfo::launch_default_for_uri(
-                                &uri,
+                                uri,
                                 gtk::gio::AppLaunchContext::NONE,
                             );
                         }
@@ -317,10 +309,7 @@ impl Page {
                             println!("invalid link: {link_type:?}");
                         }
                     }
-                    return;
-                }
-
-                obj.set_cursor(None);
+                };
             }
         ));
         obj.add_controller(gc);
@@ -393,18 +382,13 @@ struct Point {
     y: f64,
 }
 
-fn to_poppler_coords(page: &super::Page, x: f64, y: f64, page_height: Option<f64>) -> Point {
+fn undo_zoom_and_crop(page: &super::Page, x: f64, y: f64) -> Point {
     let mut x = x / page.zoom();
     let mut y = y / page.zoom();
 
     if page.crop() {
         x += page.imp().bbox.borrow().x1;
         y += page.imp().bbox.borrow().y1;
-    }
-
-    // Adjust y for Poppler's coordinate system if page height is provided
-    if let Some(height) = page_height {
-        y = height - y;
     }
 
     Point { x, y }

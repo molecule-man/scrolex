@@ -19,11 +19,11 @@ impl Window {
         Object::builder().property("application", app).build()
     }
 
-    pub(crate) fn state(&self) -> &State {
+    pub fn state(&self) -> &State {
         self.imp().state.as_ref()
     }
 
-    pub(crate) fn show_error_dialog(&self, message: &str) {
+    pub fn show_error_dialog(&self, message: &str) {
         gtk::AlertDialog::builder()
             .message(message)
             .build()

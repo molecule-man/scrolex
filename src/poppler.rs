@@ -3,16 +3,16 @@ use poppler::LinkMapping;
 use std::ffi::CStr;
 
 #[derive(Debug, Clone)]
-pub(crate) enum LinkType {
+pub enum LinkType {
     Unknown(String),
     Invalid,
     GotoNamedDest(String),
     Uri(String),
 }
 
-pub(crate) struct Link(pub(crate) LinkType, pub(crate) poppler::Rectangle);
+pub struct Link(pub LinkType, pub poppler::Rectangle);
 
-pub(crate) trait LinkMappingExt {
+pub trait LinkMappingExt {
     fn to_link(&self) -> Link;
 }
 

@@ -7,10 +7,10 @@ use gtk::subclass::prelude::ObjectSubclassIsExt;
 
 #[derive(Default, Debug, Copy, Clone)]
 pub struct Rectangle {
-    x1: f64,
-    y1: f64,
-    x2: f64,
-    y2: f64,
+    pub x1: f64,
+    pub y1: f64,
+    pub x2: f64,
+    pub y2: f64,
 }
 
 impl Rectangle {
@@ -18,7 +18,7 @@ impl Rectangle {
         Self { x1, y1, x2, y2 }
     }
 
-    fn from_poppler(rect: &poppler::Rectangle, height: f64) -> Self {
+    pub(crate) fn from_poppler(rect: &poppler::Rectangle, height: f64) -> Self {
         Self {
             x1: rect.x1(),
             y1: height - rect.y2(),
