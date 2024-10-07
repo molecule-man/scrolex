@@ -18,12 +18,15 @@ use gtk::glib::Uri;
 use gtk::{gio::ApplicationFlags, glib, glib::clone, Application};
 use gtk::{prelude::*, CssProvider};
 
-mod bg_job;
-mod jump_stack;
-mod page;
-mod poppler;
-mod state;
-mod window;
+//mod bg_job;
+//mod jump_stack;
+//mod links;
+//mod page;
+//mod poppler;
+//mod state;
+//mod window;
+use scrolex::page;
+use scrolex::window;
 
 const APP_ID: &str = "com.andr2i.scrolex";
 

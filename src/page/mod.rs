@@ -3,15 +3,33 @@ mod page_number_imp;
 
 use gtk::gio::prelude::*;
 use gtk::glib;
-use gtk::prelude::*;
 use gtk::subclass::prelude::ObjectSubclassIsExt;
 
-#[derive(Default, Debug)]
-pub struct Highlighted {
+#[derive(Default, Debug, Copy, Clone)]
+pub struct Rectangle {
     pub x1: f64,
     pub y1: f64,
     pub x2: f64,
     pub y2: f64,
+}
+
+impl Rectangle {
+    pub fn new(x1: f64, y1: f64, x2: f64, y2: f64) -> Self {
+        Self { x1, y1, x2, y2 }
+    }
+
+    pub(crate) fn from_poppler(rect: &poppler::Rectangle, height: f64) -> Self {
+        Self {
+            x1: rect.x1(),
+            y1: height - rect.y2(),
+            x2: rect.x2(),
+            y2: height - rect.y1(),
+        }
+    }
+
+    fn size(&self) -> (f64, f64) {
+        (self.x2 - self.x1, self.y2 - self.y1)
+    }
 }
 
 glib::wrapper! {
@@ -52,31 +70,6 @@ impl Page {
 
         self.imp().binding.replace(Some(new_binding));
         self.imp().resize();
-    }
-
-    pub(crate) fn resize(
-        &self,
-        orig_width: f64,
-        orig_height: f64,
-        bbox: Option<poppler::Rectangle>,
-    ) {
-        let mut width = orig_width;
-        let mut height = orig_height;
-
-        if let (Some(bbox), true) = (bbox, self.crop()) {
-            width = bbox.x2() - bbox.x1();
-            height = bbox.y2() - bbox.y1();
-            self.set_bbox(bbox);
-        } else {
-            let mut bbox = poppler::Rectangle::default();
-            bbox.set_x1(0.0);
-            bbox.set_y1(0.0);
-            bbox.set_x2(width);
-            bbox.set_y2(height);
-            self.set_bbox(bbox);
-        }
-
-        self.set_size_request((width * self.zoom()) as i32, (height * self.zoom()) as i32);
     }
 
     pub(crate) fn crop(&self) -> bool {

@@ -33,7 +33,7 @@ impl State {
         page
     }
 
-    pub(crate) fn load(&self, f: &gtk::gio::File) -> io::Result<()> {
+    pub fn load(&self, f: &gtk::gio::File) -> io::Result<()> {
         if self.doc().is_some() {
             self.save()?;
         }
@@ -41,6 +41,7 @@ impl State {
         let doc = Document::from_gfile(f, None, gtk::gio::Cancellable::NONE)
             .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
         self.imp().bbox_cache.borrow_mut().clear();
+        self.imp().links.borrow_mut().clear();
 
         self.emit_by_name::<()>("before-load", &[]);
 
@@ -82,7 +83,7 @@ impl State {
         Ok(())
     }
 
-    pub(crate) fn save(&self) -> io::Result<()> {
+    pub fn save(&self) -> io::Result<()> {
         let state_path = get_state_file_path(&self.uri()).unwrap();
         let state_dir = state_path.parent().unwrap();
 
