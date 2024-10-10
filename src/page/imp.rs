@@ -323,8 +323,7 @@ impl Page {
         let bbox = get_bbox(page, true);
         self.state
             .borrow()
-            .imp()
-            .bbox_cache
+            .bbox_cache()
             .borrow_mut()
             .insert(page.index(), bbox);
         bbox
@@ -338,7 +337,7 @@ impl Page {
             cb(&bbox);
             return;
         }
-        let bbox_cache = self.state.borrow().imp().bbox_cache.clone();
+        let bbox_cache = self.state.borrow().bbox_cache().clone();
 
         let uri = self.obj().uri();
         let page_num = page.index();
@@ -369,8 +368,7 @@ impl Page {
         }
         self.state
             .borrow()
-            .imp()
-            .bbox_cache
+            .bbox_cache()
             .borrow()
             .get(&page.index())
             .copied()
