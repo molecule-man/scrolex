@@ -17,6 +17,8 @@ poppler-sys-rs = "0.24.0"
 
 [build-dependencies]
 glib-build-tools = "0.20.0"
+cc = "1.0"
+pkg-config = "0.3"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

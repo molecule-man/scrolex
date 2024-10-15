@@ -463,10 +463,11 @@ fn draw_page(obj: &super::Page, cr: &Context, imp: &Page, buf: &Rc<RefCell<Optio
         });
         RENDER_QUEUE.with(move |queue| {
             queue.execute(
-                &uri,
+                &uri.clone(),
                 Box::new(move |doc| {
                     if let Ok(doc) = doc {
                         request_render(
+                            &uri,
                             doc,
                             scale,
                             scale_factor,
@@ -540,6 +541,7 @@ pub fn draw_surface(
 }
 
 fn request_render(
+    uri: &str,
     doc: &poppler::Document,
     scale: f64,
     scale_factor: f64,
@@ -554,7 +556,7 @@ fn request_render(
     };
 
     let scale = scale * scale_factor;
-    let surface = render(&page, scale);
+    let surface = render(uri, &page, scale);
 
     let mut buffer = vec![0u8; (stride * canvas_height as i32) as usize];
     surface
@@ -569,7 +571,7 @@ fn request_render(
         .expect("Failed to send buffer");
 }
 
-pub fn render(page: &poppler::Page, scale: f64) -> ImageSurface {
+pub fn render(uri: &str, page: &poppler::Page, scale: f64) -> ImageSurface {
     let (width, height) = page.size();
     let (canvas_width, canvas_height) = (width * scale, height * scale);
 
@@ -584,7 +586,14 @@ pub fn render(page: &poppler::Page, scale: f64) -> ImageSurface {
     cr.scale(scale, scale);
     cr.set_source_rgba(1.0, 1.0, 1.0, 1.0);
     cr.fill().expect("Failed to fill");
-    page.render(&cr);
+
+    if page.index() == 15 {
+        //crate::cpp_render_page(page, &cr);
+        let uri_without_scheme = uri.split_once(':').map(|(_, rest)| rest).unwrap_or(uri);
+        crate::cpp_render_doc_page(uri_without_scheme, page.index(), &cr);
+    } else {
+        page.render(&cr);
+    };
 
     //let mut old_rect = poppler::Rectangle::new();
     //let mut rect = poppler::Rectangle::new();
