@@ -704,6 +704,13 @@ fn get_bbox(page: &poppler::Page, crop: bool) -> Rectangle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flate2::read::GzDecoder;
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use std::env;
+    use std::fs;
+    use std::io::{Read, Write};
+    use std::path::Path;
 
     const EPSILON: f64 = 0.0001;
     const SMALL_PDF: &[u8] = b"%PDF-1.2 \n\
@@ -714,6 +721,65 @@ mod tests {
 5 0 obj\n<<\n/Kids [4 0 R ]\n/Count 1\n/Type /Pages\n/MediaBox [ 0 0 250 50 ]\n>>\nendobj\n\
 3 0 obj\n<<\n/Pages 5 0 R\n/Type /Catalog\n>>\nendobj\n\
 trailer\n<<\n/Root 3 0 R\n>>\n\
+%%EOF";
+
+    const SMALL_RENDERABLE_PDF: &[u8] = b"%PDF-1.1
+%\xc2\xa5\xc2\xb1\xc3\xab
+
+1 0 obj
+  << /Type /Catalog
+     /Pages 2 0 R
+  >>
+endobj
+
+2 0 obj
+  << /Type /Pages
+     /Kids [3 0 R]
+     /Count 1
+     /MediaBox [0 0 80 12]
+  >>
+endobj
+
+3 0 obj
+  <<  /Type /Page
+      /Parent 2 0 R
+      /Resources
+       << /Font
+           << /F1
+               << /Type /Font
+                  /Subtype /Type1
+                  /BaseFont /Times-Roman
+               >>
+           >>
+       >>
+      /Contents 4 0 R
+  >>
+endobj
+
+4 0 obj
+  << /Length 55 >>
+stream
+  BT
+    /F1 18 Tf
+    0 0 Td
+    (Hello World) Tj
+  ET
+endstream
+endobj
+
+xref
+0 5
+0000000000 65535 f
+0000000018 00000 n
+0000000077 00000 n
+0000000178 00000 n
+0000000457 00000 n
+trailer
+  <<  /Root 1 0 R
+      /Size 5
+  >>
+startxref
+565
 %%EOF";
 
     #[test]
@@ -758,5 +824,80 @@ trailer\n<<\n/Root 3 0 R\n>>\n\
         assert!((bbox.y1 - 1.0).abs() < EPSILON);
         assert!((bbox.x2 - 129.5).abs() < EPSILON); // 4.5 + 250 / 2
         assert!((bbox.y2 - 26.0).abs() < EPSILON);
+    }
+
+    #[gtk::test]
+    fn test_render() {
+        let doc = poppler::Document::from_data(SMALL_RENDERABLE_PDF, None).unwrap();
+
+        let state = crate::state::State::new();
+        let page = crate::page::Page::new(&state);
+        page.state().set_doc(&doc);
+        page.bind(&crate::page::PageNumber::new(0));
+
+        let surface = gtk::cairo::ImageSurface::create(gtk::cairo::Format::ARgb32, 80, 12).unwrap();
+        let cr = gtk::cairo::Context::new(&surface).unwrap();
+
+        page.imp().render_to_cairo(&cr, &doc.page(0).unwrap());
+        let mut buffer = vec![0u8; (surface.stride() * surface.height()) as usize];
+        surface
+            .with_data(|data| {
+                buffer.copy_from_slice(data);
+            })
+            .expect("Failed to extract surface data");
+        surface.finish();
+
+        assert_snapshot("test_render", &buffer);
+    }
+
+    #[test]
+    fn test_render_surface() {
+        let doc = poppler::Document::from_data(SMALL_RENDERABLE_PDF, None).unwrap();
+        let surface = render_surface(&doc.page(0).unwrap(), 1.0);
+
+        let mut buffer = vec![0u8; (surface.stride() * surface.height()) as usize];
+        surface
+            .with_data(|data| {
+                buffer.copy_from_slice(data);
+            })
+            .expect("Failed to extract surface data");
+        surface.finish();
+
+        assert_snapshot("test_render_surface", &buffer);
+    }
+
+    fn assert_snapshot(snapshot_name: &str, data: &[u8]) {
+        let snapshot_dir = Path::new(".snapshots");
+        let snapshot_file_path = snapshot_dir.join(format!("{snapshot_name}.snap"));
+
+        if env::var("UPDATE_SNAP").is_ok() {
+            let compressed_data = compress_data(data);
+
+            fs::create_dir_all(snapshot_dir).expect("Failed to create snapshot directory");
+            fs::write(&snapshot_file_path, compressed_data).expect("Failed to write snapshot file");
+
+            println!("Snapshot updated.");
+        } else {
+            let compressed_snapshot =
+                fs::read(&snapshot_file_path).expect("Failed to read snapshot file");
+
+            let decompressed_snapshot =
+                decompress_data(&compressed_snapshot).expect("Failed to decompress snapshot");
+
+            assert_eq!(decompressed_snapshot, data, "Snapshot does not match!");
+        }
+    }
+
+    fn compress_data(data: &[u8]) -> Vec<u8> {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::new(9));
+        encoder.write_all(data).expect("Failed to compress data");
+        encoder.finish().expect("Failed to finish compression")
+    }
+
+    fn decompress_data(compressed_data: &[u8]) -> Result<Vec<u8>, std::io::Error> {
+        let mut decoder = GzDecoder::new(compressed_data);
+        let mut decompressed_data = Vec::new();
+        decoder.read_to_end(&mut decompressed_data)?;
+        Ok(decompressed_data)
     }
 }
