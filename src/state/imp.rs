@@ -31,6 +31,9 @@ pub struct State {
     #[property(get, set)]
     prev_page: RefCell<u32>,
 
+    #[property(get, set)]
+    multithread_rendering: Cell<bool>,
+
     pub(super) jump_stack: Rc<RefCell<jump_stack::JumpStack>>,
     pub(crate) bbox_cache: Rc<RefCell<HashMap<i32, crate::page::Rectangle>>>,
     pub(crate) links: Rc<RefCell<crate::links::Links>>,

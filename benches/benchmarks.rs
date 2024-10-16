@@ -102,19 +102,19 @@ pub fn bench_render_surface(c: &mut Criterion) {
 
     group.bench_function(
         format!("full ({width}x{height}) {pdf_path} page {page_number}"),
-        |b| b.iter(|| scrolex::page::render(&page, 1.0)),
+        |b| b.iter(|| scrolex::page::render_surface(&page, 1.0)),
     );
 
     group.bench_function(
         format!("downscaled 1/4 {pdf_path} page {page_number}"),
-        |b| b.iter(|| scrolex::page::render(&page, 0.25)),
+        |b| b.iter(|| scrolex::page::render_surface(&page, 0.25)),
     );
 
     group.bench_function(format!("upscaled x4 {pdf_path} page {page_number}"), |b| {
-        b.iter(|| scrolex::page::render(&page, 4.0))
+        b.iter(|| scrolex::page::render_surface(&page, 4.0))
     });
 
-    let surface = scrolex::page::render(&page, 1.0);
+    let surface = scrolex::page::render_surface(&page, 1.0);
     let cr = gtk::cairo::Context::new(&surface).unwrap();
     let bbox = scrolex::page::Rectangle::from(cr.clip_extents().unwrap());
     cr.set_source_rgb(1.0, 1.0, 1.0);

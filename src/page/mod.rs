@@ -2,7 +2,7 @@ mod imp;
 mod page_number_imp;
 
 pub use imp::draw_surface;
-pub use imp::render;
+pub use imp::render_surface;
 
 use gtk::gio::prelude::*;
 use gtk::glib;

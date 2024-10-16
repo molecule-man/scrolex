@@ -60,6 +60,7 @@ impl State {
         self.set_zoom(1.0);
         self.set_crop(false);
         self.set_page(0);
+        self.set_multithread_rendering(false);
 
         if state_path.exists() {
             for line in fs::read_to_string(&state_path).unwrap().lines() {

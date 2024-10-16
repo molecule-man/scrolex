@@ -93,7 +93,33 @@ impl Page {
             #[weak(rename_to = imp)]
             self,
             move |_, cr, _width, _height| {
-                draw_page(&obj, cr, &imp, &buf);
+                let Some(poppler_page) = obj.state().doc().and_then(|doc| doc.page(obj.index()))
+                else {
+                    return;
+                };
+
+                cr.save().expect("Failed to save");
+
+                if obj.state().multithread_rendering() {
+                    imp.multithread_render_to_cairo(cr, &poppler_page, &buf);
+                } else {
+                    imp.render_to_cairo(cr, &poppler_page);
+                }
+
+                cr.restore().expect("Failed to restore");
+
+                let highlighted = &imp.highlighted.borrow();
+
+                if highlighted.x2 - highlighted.x1 > 0.0 && highlighted.y2 - highlighted.y1 > 0.0 {
+                    cr.set_source_rgba(0.5, 0.8, 0.9, 0.3);
+                    cr.rectangle(
+                        highlighted.x1,
+                        highlighted.y1,
+                        highlighted.x2 - highlighted.x1,
+                        highlighted.y2 - highlighted.y1,
+                    );
+                    cr.fill().expect("Failed to fill");
+                }
             }
         ));
     }
@@ -287,10 +313,10 @@ impl Page {
                             );
                         }
                         LinkType::Unknown(msg) => {
-                            println!("unhandled link: {msg:?}");
+                            log::warn!("unhandled link: {msg:?}");
                         }
                         LinkType::Invalid => {
-                            println!("invalid link: {link_type:?}");
+                            log::warn!("invalid link: {link_type:?}");
                         }
                     }
                 };
@@ -364,154 +390,149 @@ impl Page {
             .get(&page.index())
             .copied()
     }
-}
 
-fn draw_page(obj: &super::Page, cr: &Context, imp: &Page, buf: &Rc<RefCell<Option<Box<[u8]>>>>) {
-    let Some(poppler_page) = obj.state().doc().and_then(|doc| doc.page(obj.index())) else {
-        return;
-    };
+    fn render_to_cairo(&self, cr: &Context, poppler_page: &poppler::Page) {
+        let start = std::time::Instant::now();
 
-    let uri = obj.uri();
-    let page_num = poppler_page.index();
+        let obj = self.obj();
 
-    cr.save().expect("Failed to save");
+        let bbox = self.get_bbox(poppler_page, obj.crop());
+        let (width, height) = poppler_page.size();
+        let scale = obj.zoom();
 
-    //let bbox = imp.get_bbox(&poppler_page, obj.crop());
-    //let (width, height) = poppler_page.size();
-    //let scale = obj.zoom();
-    //
-    //if bbox.x1 != 0.0 || bbox.y1 != 0.0 {
-    //    cr.translate(-bbox.x1 * scale, -bbox.y1 * scale);
-    //}
-    //
-    //cr.rectangle(0.0, 0.0, width * scale, height * scale);
-    //cr.scale(scale, scale);
-    //cr.set_source_rgba(1.0, 1.0, 1.0, 1.0);
-    //cr.fill().expect("Failed to fill");
-    //poppler_page.render(cr);
-    //imp.resize();
+        if bbox.x1 != 0.0 || bbox.y1 != 0.0 {
+            cr.translate(-bbox.x1 * scale, -bbox.y1 * scale);
+        }
 
-    let (width, height) = poppler_page.size();
-    let scale = obj.zoom();
+        cr.rectangle(0.0, 0.0, width * scale, height * scale);
+        cr.scale(scale, scale);
+        cr.set_source_rgba(1.0, 1.0, 1.0, 1.0);
+        cr.fill().expect("Failed to fill");
+        poppler_page.render(cr);
+        let elapsed = start.elapsed();
+        log::trace!(
+            "Rendered page {} with multithreading disabled in {elapsed:?}",
+            poppler_page.index()
+        );
 
-    let scale_factor = obj.scale_factor() as f64;
-    let (canvas_width, canvas_height) =
-        (width * scale * scale_factor, height * scale * scale_factor);
-    let stride = 4 * canvas_width as i32; // ARGB32 has 4 bytes per pixel
-
-    if let Some(buffer) = buf.take() {
-        if buffer.len() != (stride * canvas_height as i32) as usize {
-            println!("Buffer size mismatch. Requesting new rendering.");
-            buf.replace(None);
-        } else {
-            buf.replace(Some(buffer));
+        if elapsed > std::time::Duration::from_millis(100) {
+            log::warn!("Rendering took too long: {elapsed:?}. Switching to multithreading mode.");
+            obj.state().set_multithread_rendering(true);
         }
     }
 
-    if let Some(buffer) = buf.take() {
-        let return_location = Rc::new(RefCell::new(None));
-        {
-            let holder = DataHolder {
-                data: Some(buffer),
-                return_location: Rc::clone(&return_location),
-            };
-            // Create an ImageSurface from the received pixel buffer
-            let surface = ImageSurface::create_for_data(
-                holder,
-                gtk::cairo::Format::ARgb32,
-                canvas_width as i32,
-                canvas_height as i32,
-                stride,
-            )
-            .expect("Failed to create image surface");
-            let bbox = imp.get_bbox(&poppler_page, obj.crop());
-            draw_surface(cr, &surface, &bbox, scale, scale_factor);
+    fn multithread_render_to_cairo(
+        &self,
+        cr: &Context,
+        poppler_page: &poppler::Page,
+        buf: &Rc<RefCell<Option<Box<[u8]>>>>,
+    ) {
+        let obj = self.obj();
+        let page_num = poppler_page.index();
+        log::trace!("Rendering page {page_num} with multithreading enabled");
+
+        let (width, height) = poppler_page.size();
+        let scale = obj.zoom();
+        let scale_factor = obj.scale_factor() as f64;
+        let (canvas_width, canvas_height) =
+            (width * scale * scale_factor, height * scale * scale_factor);
+        let stride = 4 * canvas_width as i32; // ARGB32 has 4 bytes per pixel
+
+        if let Some(buffer) = buf.take() {
+            if buffer.len() != (stride * canvas_height as i32) as usize {
+                log::info!("Buffer size mismatch. Requesting new rendering.");
+                buf.replace(None);
+            } else {
+                buf.replace(Some(buffer));
+            }
         }
 
-        assert!(return_location.borrow().is_some());
-        buf.replace(return_location.take());
-    } else {
-        let (resp_sender, resp_receiver) = oneshot::channel();
-        let buf = Rc::clone(buf);
-        let obj_clone = obj.clone();
-        glib::spawn_future_local(async move {
-            let buffer = resp_receiver.await.expect("Failed to receive buffer");
-            if !obj_clone.is_drawable() {
-                println!("Page {page_num} not drawable anymore. Aborting.");
-                //buf.replace(None);
-                return;
+        if let Some(buffer) = buf.take() {
+            let return_location = Rc::new(RefCell::new(None));
+            {
+                let holder = DataHolder {
+                    data: Some(buffer),
+                    return_location: Rc::clone(&return_location),
+                };
+                // Create an ImageSurface from the received pixel buffer
+                let surface = ImageSurface::create_for_data(
+                    holder,
+                    gtk::cairo::Format::ARgb32,
+                    canvas_width as i32,
+                    canvas_height as i32,
+                    stride,
+                )
+                .expect("Failed to create image surface");
+                let bbox = self.get_bbox(poppler_page, obj.crop());
+                self.render_surface(cr, &surface, &bbox);
             }
 
-            let Ok(buffer) = buffer else {
-                if obj_clone.is_drawable() {
-                    println!("Page {page_num} is still drawable. Rescheduling.");
+            assert!(return_location.borrow().is_some());
+            buf.replace(return_location.take());
+        } else {
+            let (resp_sender, resp_receiver) = oneshot::channel();
+            let buf = Rc::clone(buf);
+            let obj_clone = obj.clone();
+            glib::spawn_future_local(async move {
+                let buffer = resp_receiver.await.expect("Failed to receive buffer");
+                if !obj_clone.is_drawable() {
+                    log::debug!("Page {page_num} not drawable anymore. Aborting.");
+                    //buf.replace(None);
+                    return;
+                }
+
+                let Ok(buffer) = buffer else {
+                    if obj_clone.is_drawable() {
+                        log::debug!("Page {page_num} is still drawable. Rescheduling.");
+                        glib::idle_add_local_full(Priority::HIGH, move || {
+                            obj_clone.queue_draw();
+                            glib::ControlFlow::Break
+                        });
+                    }
+                    return;
+                };
+
+                let prev = buf.replace(Some(buffer));
+                if prev.is_none() {
                     glib::idle_add_local_full(Priority::HIGH, move || {
                         obj_clone.queue_draw();
                         glib::ControlFlow::Break
                     });
                 }
-                return;
-            };
+            });
+            let uri = obj.uri();
+            RENDER_QUEUE.with(move |queue| {
+                queue.execute(
+                    &uri,
+                    Box::new(move |doc| {
+                        if let Ok(doc) = doc {
+                            request_render(doc, scale * scale_factor, page_num, resp_sender);
+                        } else {
+                            resp_sender.send(Err(())).expect("Failed to send buffer");
+                        }
+                    }),
+                );
+            });
 
-            let prev = buf.replace(Some(buffer));
-            if prev.is_none() {
-                glib::idle_add_local_full(Priority::HIGH, move || {
-                    obj_clone.queue_draw();
-                    glib::ControlFlow::Break
-                });
-            }
-        });
-        RENDER_QUEUE.with(move |queue| {
-            queue.execute(
-                &uri,
-                Box::new(move |doc| {
-                    if let Ok(doc) = doc {
-                        request_render(
-                            doc,
-                            scale,
-                            scale_factor,
-                            page_num,
-                            canvas_width,
-                            canvas_height,
-                            stride,
-                            resp_sender,
-                        );
-                    } else {
-                        resp_sender.send(Err(())).expect("Failed to send buffer");
-                        //handle.abort();
-                        //println!("Aborted rendering of page {page_num}");
-                    }
-                }),
-            );
-        });
+            let bbox = self.get_cached_bbox(poppler_page, obj.crop());
+            let (w, h) = bbox.size();
+            cr.rectangle(0.0, 0.0, w * scale, h * scale);
+            //cr.scale(scale, scale);
+            cr.set_source_rgba(1.0, 1.0, 1.0, 1.0);
+            cr.fill().expect("Failed to fill");
 
-        let bbox = imp.get_cached_bbox(&poppler_page, obj.crop());
-        let (w, h) = bbox.size();
-        cr.rectangle(0.0, 0.0, w * scale, h * scale);
-        //cr.scale(scale, scale);
-        cr.set_source_rgba(1.0, 1.0, 1.0, 1.0);
-        cr.fill().expect("Failed to fill");
-
-        //let downscale = 1.0 / 32.0;
-        //let surface = render(&poppler_page, scale * downscale);
-        //draw_surface(cr, &surface, &bbox, scale, downscale);
+            //let downscale = 1.0 / 32.0;
+            //let surface = render(&poppler_page, scale * downscale);
+            //draw_surface(cr, &surface, &bbox, scale, downscale);
+        }
     }
 
-    //imp.resize();
+    pub fn render_surface(&self, cr: &Context, surface: &ImageSurface, bbox: &Rectangle) {
+        let obj = self.obj();
+        let scale = obj.zoom();
+        let scale_factor = obj.scale_factor() as f64;
 
-    cr.restore().expect("Failed to restore");
-
-    let highlighted = &imp.highlighted.borrow();
-
-    if highlighted.x2 - highlighted.x1 > 0.0 && highlighted.y2 - highlighted.y1 > 0.0 {
-        cr.set_source_rgba(0.5, 0.8, 0.9, 0.3);
-        cr.rectangle(
-            highlighted.x1,
-            highlighted.y1,
-            highlighted.x2 - highlighted.x1,
-            highlighted.y2 - highlighted.y1,
-        );
-        cr.fill().expect("Failed to fill");
+        draw_surface(cr, surface, bbox, scale, scale_factor);
     }
 }
 
@@ -542,19 +563,18 @@ pub fn draw_surface(
 fn request_render(
     doc: &poppler::Document,
     scale: f64,
-    scale_factor: f64,
     page_num: i32,
-    canvas_width: f64,
-    canvas_height: f64,
-    stride: i32,
     resp_sender: oneshot::Sender<Result<Box<[u8]>, ()>>,
 ) {
     let Some(page) = doc.page(page_num) else {
         todo!("Page not found");
     };
 
-    let scale = scale * scale_factor;
-    let surface = render(&page, scale);
+    let (width, height) = page.size();
+    let surface = render_surface(&page, scale);
+
+    let (canvas_width, canvas_height) = (width * scale, height * scale);
+    let stride = 4 * canvas_width as i32; // ARGB32 has 4 bytes per pixel
 
     let mut buffer = vec![0u8; (stride * canvas_height as i32) as usize];
     surface
@@ -563,13 +583,12 @@ fn request_render(
         })
         .expect("Failed to extract surface data");
     surface.finish();
-    drop(surface);
     resp_sender
         .send(Ok(buffer.into_boxed_slice()))
         .expect("Failed to send buffer");
 }
 
-pub fn render(page: &poppler::Page, scale: f64) -> ImageSurface {
+pub fn render_surface(page: &poppler::Page, scale: f64) -> ImageSurface {
     let (width, height) = page.size();
     let (canvas_width, canvas_height) = (width * scale, height * scale);
 
@@ -723,9 +742,9 @@ trailer\n<<\n/Root 3 0 R\n>>\n\
         // 0.5 pixels for the border I guess.
 
         assert!((bbox.x1 - 4.5).abs() < EPSILON); // 10.0 - 0.5 - 5
-        assert!((bbox.y1 - 1.0).abs() < EPSILON); // 6.5 - 0.5 - 5
+        assert!((bbox.y1 - 3.0).abs() < EPSILON); // 50 - (41.5 + 0.5 + 5)
         assert!((bbox.x2 - 243.5).abs() < EPSILON); // 238.0 + 0.5 + 5
-        assert!((bbox.y2 - 47.0).abs() < EPSILON); // 41.5 + 0.5 + 5
+        assert!((bbox.y2 - 49.0).abs() < EPSILON); // 50 - (6.5 - 0.5 - 5)
     }
 
     #[test]
@@ -736,8 +755,8 @@ trailer\n<<\n/Root 3 0 R\n>>\n\
         let bbox = get_bbox(&page, true);
 
         assert!((bbox.x1 - 4.5).abs() < EPSILON); // 10.0 - 0.5 - 5
-        assert!((bbox.y1 - 24.0).abs() < EPSILON);
+        assert!((bbox.y1 - 1.0).abs() < EPSILON);
         assert!((bbox.x2 - 129.5).abs() < EPSILON); // 4.5 + 250 / 2
-        assert!((bbox.y2 - 49.0).abs() < EPSILON);
+        assert!((bbox.y2 - 26.0).abs() < EPSILON);
     }
 }

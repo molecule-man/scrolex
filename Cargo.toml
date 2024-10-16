@@ -9,11 +9,18 @@ repository = "https://github.com/molecule-man/scrolex"
 description = "A Horizontally Scrolled PDF Viewer"
 
 [dependencies]
+env_logger = { version = "0.11.5", optional = true }
 futures = "0.3.30"
+glib = { version = "0.20.4", optional = true, features = ["log"] }
 gtk = { version = "0.9.1", package = "gtk4", features = ["v4_14"] }
+log = "0.4"
 once_cell = "1.19.0"
 poppler-rs = "0.24.1"
 poppler-sys-rs = "0.24.0"
+
+[features]
+default = []
+logging = ["glib", "env_logger"]
 
 [build-dependencies]
 glib-build-tools = "0.20.0"
