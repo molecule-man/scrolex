@@ -108,6 +108,26 @@ pub fn render_surface(
     surface
 }
 
+pub fn render_surface_for_printing(page: &poppler::Page, scale: f64) -> gtk::cairo::ImageSurface {
+    let (width, height) = page.size();
+    let (canvas_width, canvas_height) = (width * scale, height * scale);
+
+    let surface = gtk::cairo::ImageSurface::create(
+        gtk::cairo::Format::ARgb32,
+        canvas_width as i32,
+        canvas_height as i32,
+    )
+    .expect("Couldn't create a surface!");
+    let cr = gtk::cairo::Context::new(&surface).expect("Couldn't create a context!");
+    cr.rectangle(0.0, 0.0, canvas_width, canvas_height);
+    cr.scale(scale, scale);
+    cr.set_source_rgba(1.0, 1.0, 1.0, 1.0);
+    cr.fill().expect("Failed to fill");
+    page.render_for_printing(&cr);
+
+    surface
+}
+
 pub fn bench_render_surface(c: &mut Criterion) {
     let pdf_path = std::env::var("PDF_PATH").expect("Environment variable PDF_PATH is not set");
 
@@ -183,9 +203,10 @@ pub fn bench_render_surface(c: &mut Criterion) {
     //    }
     //}
 
-    group.bench_function(format!(" {pdf_path} page {page_number}"), |b| {
-        b.iter(|| scrolex::page::render_surface(&page, 4.0))
-    });
+    group.bench_function(
+        format!("render for printing {pdf_path} page {page_number}"),
+        |b| b.iter(|| render_surface_for_printing(&page, 1.0)),
+    );
 
     group.finish();
 }
