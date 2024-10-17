@@ -31,6 +31,12 @@ use scrolex::window;
 const APP_ID: &str = "com.andr2i.scrolex";
 
 fn main() -> glib::ExitCode {
+    #[cfg(feature = "logging")]
+    {
+        env_logger::init();
+        gtk::glib::log_set_default_handler(gtk::glib::rust_log_handler);
+    }
+
     // register types for usage in templates
     page::PageNumber::static_type();
     page::Page::static_type();

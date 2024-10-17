@@ -1,6 +1,9 @@
 mod imp;
 mod page_number_imp;
 
+pub use imp::draw_surface;
+pub use imp::render_surface;
+
 use gtk::gio::prelude::*;
 use gtk::glib;
 use gtk::subclass::prelude::ObjectSubclassIsExt;
@@ -29,6 +32,12 @@ impl Rectangle {
 
     fn size(&self) -> (f64, f64) {
         (self.x2 - self.x1, self.y2 - self.y1)
+    }
+}
+
+impl From<(f64, f64, f64, f64)> for Rectangle {
+    fn from((x1, y1, x2, y2): (f64, f64, f64, f64)) -> Self {
+        Self { x1, y1, x2, y2 }
     }
 }
 

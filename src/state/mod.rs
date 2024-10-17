@@ -5,9 +5,14 @@ use gtk::prelude::ObjectExt;
 use gtk::subclass::prelude::*;
 use poppler::Document;
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::{env, fs};
+
+use crate::page;
 
 glib::wrapper! {
     pub struct State(ObjectSubclass<imp::State>);
@@ -55,6 +60,7 @@ impl State {
         self.set_zoom(1.0);
         self.set_crop(false);
         self.set_page(0);
+        self.set_multithread_rendering(false);
 
         if state_path.exists() {
             for line in fs::read_to_string(&state_path).unwrap().lines() {
@@ -102,6 +108,10 @@ impl State {
         writeln!(file, "crop={}", self.crop())?;
 
         file.flush()
+    }
+
+    pub(crate) fn bbox_cache(&self) -> Rc<RefCell<HashMap<i32, page::Rectangle>>> {
+        self.imp().bbox_cache.clone()
     }
 }
 
