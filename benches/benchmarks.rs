@@ -81,6 +81,33 @@ fn draw_half_page(page: &poppler::Page) -> gtk::cairo::ImageSurface {
     surface
 }
 
+pub fn render_surface(
+    page: &poppler::Page,
+    scale: f64,
+    antialias: gtk::cairo::Antialias,
+    font_options: &gtk::cairo::FontOptions,
+) -> gtk::cairo::ImageSurface {
+    let (width, height) = page.size();
+    let (canvas_width, canvas_height) = (width * scale, height * scale);
+
+    let surface = gtk::cairo::ImageSurface::create(
+        gtk::cairo::Format::ARgb32,
+        canvas_width as i32,
+        canvas_height as i32,
+    )
+    .expect("Couldn't create a surface!");
+    let cr = gtk::cairo::Context::new(&surface).expect("Couldn't create a context!");
+    cr.set_antialias(antialias);
+    cr.set_font_options(font_options);
+    cr.rectangle(0.0, 0.0, canvas_width, canvas_height);
+    cr.scale(scale, scale);
+    cr.set_source_rgba(1.0, 1.0, 1.0, 1.0);
+    cr.fill().expect("Failed to fill");
+    page.render(&cr);
+
+    surface
+}
+
 pub fn bench_render_surface(c: &mut Criterion) {
     let pdf_path = std::env::var("PDF_PATH").expect("Environment variable PDF_PATH is not set");
 
@@ -128,8 +155,40 @@ pub fn bench_render_surface(c: &mut Criterion) {
         },
     );
 
+    //for antialias in &[
+    //    gtk::cairo::Antialias::None,
+    //    //gtk::cairo::Antialias::Gray,
+    //    gtk::cairo::Antialias::Subpixel,
+    //] {
+    //    for hint_antialias in &[
+    //        gtk::cairo::Antialias::Fast,
+    //        //gtk::cairo::Antialias::Good,
+    //        gtk::cairo::Antialias::Best,
+    //    ] {
+    //        for hint_metrics in &[gtk::cairo::HintMetrics::On, gtk::cairo::HintMetrics::Off] {
+    //            for hint_style in &[gtk::cairo::HintStyle::None, gtk::cairo::HintStyle::Full] {
+    //                let mut font_options = gtk::cairo::FontOptions::new().unwrap();
+    //                font_options.set_antialias(*hint_antialias);
+    //                font_options.set_hint_metrics(*hint_metrics);
+    //                font_options.set_hint_style(*hint_style);
+    //
+    //                group.bench_function(
+    //                    format!(
+    //                        "antialias {antialias:?} ha {hint_antialias:?} hm {hint_metrics:?} hs {hint_style:?} {pdf_path} page {page_number}",
+    //                    ),
+    //                    |b| b.iter(|| render_surface(&page, 1.0, *antialias, &font_options)),
+    //                );
+    //            }
+    //        }
+    //    }
+    //}
+
+    group.bench_function(format!(" {pdf_path} page {page_number}"), |b| {
+        b.iter(|| scrolex::page::render_surface(&page, 4.0))
+    });
+
     group.finish();
 }
 
-criterion_group!(benches, bench_links_lookup, bench_render_surface);
+criterion_group!(benches, bench_links_lookup, bench_render_surface,);
 criterion_main!(benches);

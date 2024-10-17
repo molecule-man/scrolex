@@ -404,6 +404,7 @@ impl Page {
             cr.translate(-bbox.x1 * scale, -bbox.y1 * scale);
         }
 
+        // TODO try hint antialiasing (best)
         cr.rectangle(0.0, 0.0, width * scale, height * scale);
         cr.scale(scale, scale);
         cr.set_source_rgba(1.0, 1.0, 1.0, 1.0);
@@ -884,7 +885,12 @@ startxref
             let decompressed_snapshot =
                 decompress_data(&compressed_snapshot).expect("Failed to decompress snapshot");
 
-            assert_eq!(decompressed_snapshot, data, "Snapshot does not match!");
+            let diff = decompressed_snapshot
+                .iter()
+                .zip(data.iter())
+                .fold(0, |acc, (a, b)| acc + (*a as i32 - *b as i32).abs());
+
+            assert_eq!(diff, 0)
         }
     }
 
