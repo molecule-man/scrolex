@@ -42,6 +42,7 @@ pub struct Page {
 
     highlighted: RefCell<Rectangle>,
     bbox: RefCell<Rectangle>,
+    cursor_guard: Cell<bool>,
 }
 
 #[glib::object_subclass]
@@ -171,14 +172,25 @@ impl Page {
         let mouse_coords = Rc::new(RefCell::new(None));
         let gc = gtk::GestureClick::builder().button(BUTTON_PRIMARY).build();
 
+        // indicates that we have "borrowed" global page cursor
+        let cursor = Rc::new(Cell::new(false));
+
         gc.connect_pressed(clone!(
             #[strong]
             mouse_coords,
             #[strong(rename_to = page)]
             obj,
+            #[weak(rename_to = imp)]
+            self,
+            #[strong]
+            cursor,
             move |_gc, _n_press, x, y| {
                 mouse_coords.replace(Some((x, y)));
-                page.set_cursor_from_name(Some("text"));
+                if !imp.cursor_guard.get() {
+                    page.set_cursor_from_name(Some("text"));
+                    imp.cursor_guard.set(true);
+                    cursor.set(true);
+                }
             }
         ));
 
@@ -219,7 +231,11 @@ impl Page {
 
         let obj = self.obj().clone();
         gc.connect_end(move |_, _| {
-            obj.set_cursor(None);
+            if Cell::get(&cursor) {
+                cursor.set(false);
+                obj.set_cursor(None);
+                obj.imp().cursor_guard.set(false);
+            }
         });
 
         self.obj().add_controller(gc);
@@ -228,6 +244,9 @@ impl Page {
     fn setup_link_handling(&self) {
         let obj = self.obj();
         let motion_controller = gtk::EventControllerMotion::new();
+
+        // indicates that we have "borrowed" global page cursor
+        let cursor = Cell::new(false);
 
         motion_controller.connect_motion(clone!(
             #[strong]
@@ -249,11 +268,19 @@ impl Page {
                     .get_link(&poppler_page, x, y)
                     .is_some()
                 {
-                    obj.set_cursor_from_name(Some("pointer"));
+                    if !imp.cursor_guard.get() {
+                        obj.set_cursor_from_name(Some("pointer"));
+                        imp.cursor_guard.set(true);
+                        cursor.set(true);
+                    }
                     return;
                 }
 
-                obj.set_cursor(None);
+                if Cell::get(&cursor) {
+                    obj.set_cursor(None);
+                    imp.cursor_guard.set(false);
+                    cursor.set(false);
+                }
             }
         ));
         obj.add_controller(motion_controller);
