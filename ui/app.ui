@@ -105,8 +105,7 @@
 				<child type="end">
 					<object class="GtkToggleButton" id="btn_crop">
 						<property name="active" bind-source="state" bind-property="crop" bind-flags="bidirectional"/>
-						<property name="icon-name">object-flip-horizontal</property>
-						<property name="tooltip-text">Crop Margins</property>
+						<property name="label">Crop Margins</property>
 						<property name="cursor">
 							<object class="GdkCursor">
 								<property name="name">pointer</property>
