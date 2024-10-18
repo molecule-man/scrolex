@@ -42,6 +42,7 @@ pub struct Page {
 
     highlighted: RefCell<Rectangle>,
     bbox: RefCell<Rectangle>,
+    cursor_guard: Cell<bool>,
 }
 
 #[glib::object_subclass]
@@ -109,16 +110,10 @@ impl Page {
                 cr.restore().expect("Failed to restore");
 
                 let highlighted = &imp.highlighted.borrow();
+                let (w, h) = highlighted.size();
 
-                if highlighted.x2 - highlighted.x1 > 0.0 && highlighted.y2 - highlighted.y1 > 0.0 {
-                    cr.set_source_rgba(0.5, 0.8, 0.9, 0.3);
-                    cr.rectangle(
-                        highlighted.x1,
-                        highlighted.y1,
-                        highlighted.x2 - highlighted.x1,
-                        highlighted.y2 - highlighted.y1,
-                    );
-                    cr.fill().expect("Failed to fill");
+                if w * w > 0.0 && h * h > 0.0 {
+                    imp.render_selection_overlay(cr, &poppler_page, highlighted);
                 }
             }
         ));
@@ -177,14 +172,25 @@ impl Page {
         let mouse_coords = Rc::new(RefCell::new(None));
         let gc = gtk::GestureClick::builder().button(BUTTON_PRIMARY).build();
 
+        // indicates that we have "borrowed" global page cursor
+        let cursor = Rc::new(Cell::new(false));
+
         gc.connect_pressed(clone!(
             #[strong]
             mouse_coords,
             #[strong(rename_to = page)]
             obj,
+            #[weak(rename_to = imp)]
+            self,
+            #[strong]
+            cursor,
             move |_gc, _n_press, x, y| {
                 mouse_coords.replace(Some((x, y)));
-                page.set_cursor_from_name(Some("crosshair"));
+                if !imp.cursor_guard.get() {
+                    page.set_cursor_from_name(Some("text"));
+                    imp.cursor_guard.set(true);
+                    cursor.set(true);
+                }
             }
         ));
 
@@ -205,20 +211,15 @@ impl Page {
                     return;
                 };
 
-                let highlighted = Rectangle::new(start_x, start_y, end_x, end_y);
-
-                let mut poppler_rect = poppler::Rectangle::default();
                 let Point { x: x1, y: y1 } = undo_zoom_and_crop(&obj, start_x, start_y);
                 let Point { x: x2, y: y2 } = undo_zoom_and_crop(&obj, end_x, end_y);
-                poppler_rect.set_x1(x1);
-                poppler_rect.set_y1(y1);
-                poppler_rect.set_x2(x2);
-                poppler_rect.set_y2(y2);
-
-                let selected =
-                    &poppler_page.selected_text(poppler::SelectionStyle::Glyph, &mut poppler_rect);
-
+                let highlighted = Rectangle::new(x1, y1, x2, y2);
                 imp.highlighted.replace(highlighted);
+
+                let selected = &poppler_page.selected_text(
+                    poppler::SelectionStyle::Glyph,
+                    &mut highlighted.as_poppler(),
+                );
 
                 if let Some(selected) = selected {
                     obj.clipboard().set_text(selected);
@@ -230,7 +231,11 @@ impl Page {
 
         let obj = self.obj().clone();
         gc.connect_end(move |_, _| {
-            obj.set_cursor(None);
+            if Cell::get(&cursor) {
+                cursor.set(false);
+                obj.set_cursor(None);
+                obj.imp().cursor_guard.set(false);
+            }
         });
 
         self.obj().add_controller(gc);
@@ -239,6 +244,9 @@ impl Page {
     fn setup_link_handling(&self) {
         let obj = self.obj();
         let motion_controller = gtk::EventControllerMotion::new();
+
+        // indicates that we have "borrowed" global page cursor
+        let cursor = Cell::new(false);
 
         motion_controller.connect_motion(clone!(
             #[strong]
@@ -260,11 +268,19 @@ impl Page {
                     .get_link(&poppler_page, x, y)
                     .is_some()
                 {
-                    obj.set_cursor_from_name(Some("pointer"));
+                    if !imp.cursor_guard.get() {
+                        obj.set_cursor_from_name(Some("pointer"));
+                        imp.cursor_guard.set(true);
+                        cursor.set(true);
+                    }
                     return;
                 }
 
-                obj.set_cursor(None);
+                if Cell::get(&cursor) {
+                    obj.set_cursor(None);
+                    imp.cursor_guard.set(false);
+                    cursor.set(false);
+                }
             }
         ));
         obj.add_controller(motion_controller);
@@ -404,7 +420,6 @@ impl Page {
             cr.translate(-bbox.x1 * scale, -bbox.y1 * scale);
         }
 
-        // TODO try hint antialiasing (best)
         cr.rectangle(0.0, 0.0, width * scale, height * scale);
         cr.scale(scale, scale);
         cr.set_source_rgba(1.0, 1.0, 1.0, 1.0);
@@ -420,6 +435,42 @@ impl Page {
             log::warn!("Rendering took too long: {elapsed:?}. Switching to multithreading mode.");
             obj.state().set_multithread_rendering(true);
         }
+    }
+
+    fn render_selection_overlay(
+        &self,
+        cr: &Context,
+        poppler_page: &poppler::Page,
+        rect: &Rectangle,
+    ) {
+        let start = std::time::Instant::now();
+
+        let bbox = self.get_bbox(poppler_page, self.obj().crop());
+        let scale = self.obj().zoom();
+
+        let (w, h) = poppler_page.size();
+        let mask = ImageSurface::create(gtk::cairo::Format::ARgb32, w as i32, h as i32)
+            .expect("Failed to create mask surface");
+        let mask_cr = Context::new(&mask).expect("Failed to create mask context");
+        poppler_page.render_selection(
+            &mask_cr,
+            &mut rect.as_poppler(),
+            &mut poppler::Rectangle::new(),
+            poppler::SelectionStyle::Glyph,
+            &mut poppler::Color::new(),
+            &mut poppler::Color::new(),
+        );
+
+        if bbox.x1 != 0.0 || bbox.y1 != 0.0 {
+            cr.translate(-bbox.x1 * scale, -bbox.y1 * scale);
+        }
+        cr.scale(scale, scale);
+        cr.set_source_rgba(0.5, 0.8, 0.9, 0.7);
+        cr.mask_surface(&mask, 0.0, 0.0)
+            .expect("Failed to mask surface");
+
+        let elapsed = start.elapsed();
+        log::trace!("Rendered selection {} in {elapsed:?}", poppler_page.index());
     }
 
     fn multithread_render_to_cairo(

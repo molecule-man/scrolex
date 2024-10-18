@@ -35,10 +35,7 @@ impl Links {
             self.current_page = page.index();
         }
 
-        let pos = self
-            .rects
-            .iter()
-            .position(|rect| x >= rect.x1 && x <= rect.x2 && y >= rect.y1 && y <= rect.y2);
+        let pos = self.rects.iter().position(|rect| rect.contains(x, y));
 
         pos.map(|i| &self.link_types[i])
     }

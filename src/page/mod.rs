@@ -21,6 +21,15 @@ impl Rectangle {
         Self { x1, y1, x2, y2 }
     }
 
+    pub(crate) fn as_poppler(&self) -> poppler::Rectangle {
+        let mut rect = poppler::Rectangle::new();
+        rect.set_x1(self.x1);
+        rect.set_y1(self.y1);
+        rect.set_x2(self.x2);
+        rect.set_y2(self.y2);
+        rect
+    }
+
     pub(crate) fn from_poppler(rect: &poppler::Rectangle, height: f64) -> Self {
         Self {
             x1: rect.x1(),
@@ -32,6 +41,10 @@ impl Rectangle {
 
     fn size(&self) -> (f64, f64) {
         (self.x2 - self.x1, self.y2 - self.y1)
+    }
+
+    pub(crate) fn contains(&self, x: f64, y: f64) -> bool {
+        x >= self.x1 && x <= self.x2 && y >= self.y1 && y <= self.y2
     }
 }
 
