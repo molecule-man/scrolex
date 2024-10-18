@@ -82,8 +82,8 @@ If you are Debian (or Ubuntu) user, then you can download a `.deb` file directly
 page][1] and install it.
 
 ```bash
-curl -LO 'https://github.com/molecule-man/scrolex/releases/download/0.1.0-alpha+3/scrolex_0.1.0-alpha+3.deb'
-sudo dpkg -i scrolex_0.1.0-alpha+3.deb
+curl -LO 'https://github.com/molecule-man/scrolex/releases/download/0.1.0/scrolex_0.1.0.deb'
+sudo dpkg -i scrolex_0.1.0.deb
 ```
 
 ### 4. Build from source
