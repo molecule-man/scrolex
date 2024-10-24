@@ -409,22 +409,39 @@ impl Page {
 
     fn render_to_cairo(&self, cr: &Context, poppler_page: &poppler::Page) {
         let start = std::time::Instant::now();
-
         let obj = self.obj();
 
-        let bbox = self.get_bbox(poppler_page, obj.crop());
-        let (width, height) = poppler_page.size();
-        let scale = obj.zoom();
-
-        if bbox.x1 != 0.0 || bbox.y1 != 0.0 {
-            cr.translate(-bbox.x1 * scale, -bbox.y1 * scale);
+        let scale = self.obj().zoom();
+        let mut scale_factor = self.obj().scale_factor() as f64;
+        if poppler_page.index() == 494 {
+            scale_factor *= 3.0;
         }
 
-        cr.rectangle(0.0, 0.0, width * scale, height * scale);
-        cr.scale(scale, scale);
-        cr.set_source_rgba(1.0, 1.0, 1.0, 1.0);
-        cr.fill().expect("Failed to fill");
-        poppler_page.render(cr);
+        let surface = render_surface(poppler_page, scale * scale_factor);
+
+        let bbox = self.get_bbox(poppler_page, obj.crop());
+
+        draw_surface(cr, &surface, &bbox, scale, scale_factor);
+
+        //
+        //let bbox = self.get_bbox(poppler_page, obj.crop());
+        //let (width, height) = poppler_page.size();
+        //let scale = obj.zoom();
+        //
+        //if bbox.x1 != 0.0 || bbox.y1 != 0.0 {
+        //    cr.translate(-bbox.x1 * scale, -bbox.y1 * scale);
+        //}
+        //
+        //if poppler_page.index() == 496 {
+        //    cr.target().set_device_scale(0.5, 0.5);
+        //}
+        //cr.rectangle(0.0, 0.0, width * scale, height * scale);
+        //cr.scale(scale, scale);
+        ////cr.set_source_rgba(1.0, 1.0, 1.0, 1.0);
+        //cr.set_source_rgb(1.0, 1.0, 1.0);
+        //cr.fill().expect("Failed to fill");
+        //poppler_page.render(cr);
+
         let elapsed = start.elapsed();
         log::trace!(
             "Rendered page {} with multithreading disabled in {elapsed:?}",
