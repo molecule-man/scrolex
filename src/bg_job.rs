@@ -51,8 +51,11 @@ impl JobManager {
             loop {
                 let req = recv.lock().unwrap().recv().unwrap();
                 if doc.is_none() || doc_uri != req.uri {
-                    doc =
-                        Some(Document::from_file(&req.uri, None).expect("Couldn't open the file!"));
+                    let f = gtk::gio::File::for_uri(&req.uri);
+                    doc = Some(
+                        Document::from_gfile(&f, None, gtk::gio::Cancellable::NONE)
+                            .expect("Couldn't open the file!"),
+                    );
                     doc_uri.clone_from(&req.uri);
                 }
                 let doc = doc.as_ref().unwrap();
@@ -129,8 +132,11 @@ impl DebouncingJobQueue {
                 }
 
                 if doc.is_none() || doc_uri != req.uri {
-                    doc =
-                        Some(Document::from_file(&req.uri, None).expect("Couldn't open the file!"));
+                    let f = gtk::gio::File::for_uri(&req.uri);
+                    doc = Some(
+                        Document::from_gfile(&f, None, gtk::gio::Cancellable::NONE)
+                            .expect("Couldn't open the file!"),
+                    );
                     doc_uri.clone_from(&req.uri);
                 }
                 let doc = doc.as_ref().unwrap();
