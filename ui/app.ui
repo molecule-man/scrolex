@@ -91,6 +91,23 @@
 					</object>
 				</child>
 				<child type="start">
+					<object class="GtkEntry" id="entry_zoom">
+						<signal name="activate" handler="handle_zoom_entry" swapped="true"/>
+						<signal name="icon-press" handler="handle_zoom_entry_icon" swapped="true"/>
+						<property name="secondary-icon-name">view-refresh</property>
+						<property name="halign">end</property>
+						<property name="valign">baseline-center</property>
+						<property name="width-chars">6</property>
+						<property name="max-width-chars">6</property>
+						<property name="input-purpose">digits</property>
+						<binding name="text">
+							<closure type="gchararray" function="zoom_entry_text">
+								<lookup name="zoom">state</lookup>
+							</closure>
+						</binding>
+					</object>
+				</child>
+				<child type="start">
 					<object class="GtkButton" id="btn_zoom_in">
 						<signal name="clicked" handler="zoom_in" swapped="true"/>
 						<property name="icon-name">zoom-in</property>

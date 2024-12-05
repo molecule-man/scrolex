@@ -221,7 +221,7 @@ pub fn bench_render_surface(c: &mut Criterion) {
         );
     }
 
-    let surface = scrolex::page::render_surface(&page, 1.0);
+    let surface = scrolex::page::render_surface(&page, 1.0, 1.0);
     let cr = gtk::cairo::Context::new(&surface).unwrap();
     let bbox = scrolex::page::Rectangle::from(cr.clip_extents().unwrap());
     cr.set_source_rgb(1.0, 1.0, 1.0);
