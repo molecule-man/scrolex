@@ -411,46 +411,34 @@ impl Page {
     fn render_to_cairo(&self, cr: &Context, poppler_page: &poppler::Page) {
         let start = std::time::Instant::now();
         let obj = self.obj();
+        let (width, height) = poppler_page.size();
+        let scale_factor = obj.scale_factor() as f64;
 
-        //for i in 0..obj.display().monitors().n_items() {
-        //    let monitor = obj
-        //        .display()
-        //        .monitors()
-        //        .item(i)
-        //        .and_downcast::<gtk::gdk::Monitor>()
-        //        .unwrap();
-        //    dbg!(monitor.width_mm(), monitor.height_mm());
-        //    dbg!(monitor.geometry());
-        //}
-        let scale = self.obj().zoom();
-        //const PPI_SCALE: f64 = 148.6 / 72.0;
-        //let scale_factor = self.obj().scale_factor() as f64 * PPI_SCALE;
-        //let scale_factor = self.obj().scale_factor() as f64;
-        let scale_factor = self.obj().scale_factor() as f64;
-
-        let surface = render_surface(poppler_page, scale, scale_factor);
+        // surface has to be created anew because existing surface created with different scale
+        // factor has different size
+        let surface = ImageSurface::create(
+            gtk::cairo::Format::Rgb24,
+            (width * scale_factor) as i32,
+            (height * scale_factor) as i32,
+        )
+        .expect("Failed to create image surface");
+        cr.set_source_surface(surface, 0., 0.).unwrap();
 
         let bbox = self.get_bbox(poppler_page, obj.crop());
+        let scale = obj.zoom();
 
-        draw_surface(cr, &surface, &bbox, scale, scale_factor);
+        if bbox.x1 != 0.0 || bbox.y1 != 0.0 {
+            cr.translate(-bbox.x1 * scale, -bbox.y1 * scale);
+        }
 
-        //let bbox = self.get_bbox(poppler_page, obj.crop());
-        //let (width, height) = poppler_page.size();
-        //let scale = obj.zoom();
-        //
-        //if bbox.x1 != 0.0 || bbox.y1 != 0.0 {
-        //    cr.translate(-bbox.x1 * scale, -bbox.y1 * scale);
-        //}
-        //
-        //if poppler_page.index() == 496 {
-        //    cr.target().set_device_scale(0.5, 0.5);
-        //}
-        //cr.rectangle(0.0, 0.0, width * scale, height * scale);
-        //cr.scale(scale, scale);
-        ////cr.set_source_rgba(1.0, 1.0, 1.0, 1.0);
-        //cr.set_source_rgb(1.0, 1.0, 1.0);
-        //cr.fill().expect("Failed to fill");
-        //poppler_page.render(cr);
+        cr.rectangle(0.0, 0.0, width * scale, height * scale);
+        //cr.set_source_rgba(1.0, 1.0, 1.0, 1.0);
+        cr.set_source_rgb(1.0, 1.0, 1.0);
+        cr.fill().expect("Failed to fill");
+
+        cr.scale(scale, scale);
+
+        poppler_page.render(cr);
 
         let elapsed = start.elapsed();
         log::trace!(
