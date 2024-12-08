@@ -230,7 +230,7 @@ pub fn bench_render_surface(c: &mut Criterion) {
         format!("draw pre-rendered {pdf_path} page {page_number}"),
         |b| {
             b.iter(|| {
-                scrolex::page::draw_surface(&cr, &surface, &bbox, 1.0, 1.0);
+                scrolex::page::draw_surface(&cr, &surface, &bbox, 1.0);
             })
         },
     );

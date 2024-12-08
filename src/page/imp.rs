@@ -532,7 +532,7 @@ impl Page {
                 .expect("Failed to create image surface");
                 surface.set_device_scale(scale_factor, scale_factor);
                 let bbox = self.get_bbox(poppler_page, obj.crop());
-                self.render_surface(cr, &surface, &bbox);
+                draw_surface(cr, &surface, &bbox, scale);
             }
 
             assert!(return_location.borrow().is_some());
@@ -588,41 +588,16 @@ impl Page {
             //cr.scale(scale, scale);
             cr.set_source_rgba(1.0, 1.0, 1.0, 1.0);
             cr.fill().expect("Failed to fill");
-
-            //let downscale = 1.0 / 32.0;
-            //let surface = render(&poppler_page, scale * downscale);
-            //draw_surface(cr, &surface, &bbox, scale, downscale);
         }
     }
 
     pub fn render_surface(&self, cr: &Context, surface: &ImageSurface, bbox: &Rectangle) {
-        let obj = self.obj();
-        let scale = obj.zoom();
-        let scale_factor = obj.scale_factor() as f64;
-
-        draw_surface(cr, surface, bbox, scale, scale_factor);
+        draw_surface(cr, surface, bbox, self.obj().zoom());
     }
 }
 
-pub fn draw_surface(
-    cr: &Context,
-    surface: &ImageSurface,
-    bbox: &Rectangle,
-    scale: f64,
-    _scale_factor: f64,
-) {
-    //cr.scale(1.0 / scale_factor, 1.0 / scale_factor);
-    ////let bbox = imp.get_bbox(poppler_page, obj.crop());
-    //cr.set_source_surface(
-    //    surface,
-    //    -bbox.x1 * scale * scale_factor,
-    //    -bbox.y1 * scale * scale_factor,
-    //)
-    //.unwrap();
-    //let (w, h) = bbox.size();
-    //cr.rectangle(0.0, 0.0, w * scale * scale_factor, h * scale * scale_factor);
+pub fn draw_surface(cr: &Context, surface: &ImageSurface, bbox: &Rectangle, scale: f64) {
     cr.scale(1.0, 1.0);
-    //let bbox = imp.get_bbox(poppler_page, obj.crop());
     cr.set_source_surface(surface, -bbox.x1 * scale, -bbox.y1 * scale)
         .unwrap();
     let (w, h) = bbox.size();
