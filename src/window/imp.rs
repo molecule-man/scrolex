@@ -207,6 +207,24 @@ impl Window {
         self.goto_page(page_num);
     }
 
+    #[template_callback]
+    fn handle_zoom_entry_icon(&self, _: gtk::EntryIconPosition, entry: &gtk::Entry) {
+        self.handle_zoom_entry(entry);
+    }
+
+    #[template_callback]
+    fn handle_zoom_entry(&self, entry: &gtk::Entry) {
+        let Ok(zoom) = entry.text().parse::<f64>() else {
+            return;
+        };
+
+        if zoom < 5.0 {
+            return;
+        }
+
+        self.state.set_zoom(zoom / 100.0);
+    }
+
     fn goto_page(&self, page_num: u32) {
         self.state.jump_list_add(self.state.page() + 1);
         self.navigate_to_page(page_num);
@@ -389,6 +407,12 @@ impl Window {
     #[template_callback]
     fn page_entry_text(&self, page: i32) -> String {
         format!("{}", page + 1)
+    }
+
+    #[allow(clippy::unused_self)]
+    #[template_callback]
+    fn zoom_entry_text(&self, zoom_value: f64) -> String {
+        format!("{}", zoom_value * 100.0)
     }
 }
 

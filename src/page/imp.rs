@@ -6,6 +6,7 @@ use std::sync::OnceLock;
 
 use futures::channel::oneshot;
 use gtk::cairo::{Context, ImageSurface};
+use gtk::gdk::prelude::*;
 use gtk::gdk::BUTTON_PRIMARY;
 use gtk::glib::clone;
 use gtk::glib::subclass::{prelude::*, Signal};
@@ -409,11 +410,21 @@ impl Page {
 
     fn render_to_cairo(&self, cr: &Context, poppler_page: &poppler::Page) {
         let start = std::time::Instant::now();
-
         let obj = self.obj();
+        let (width, height) = poppler_page.size();
+        let scale_factor = obj.scale_factor() as f64;
+
+        // surface has to be created anew because existing surface created with different scale
+        // factor has different size
+        let surface = ImageSurface::create(
+            gtk::cairo::Format::Rgb24,
+            (width * scale_factor) as i32,
+            (height * scale_factor) as i32,
+        )
+        .expect("Failed to create image surface");
+        cr.set_source_surface(surface, 0., 0.).unwrap();
 
         let bbox = self.get_bbox(poppler_page, obj.crop());
-        let (width, height) = poppler_page.size();
         let scale = obj.zoom();
 
         if bbox.x1 != 0.0 || bbox.y1 != 0.0 {
@@ -421,10 +432,14 @@ impl Page {
         }
 
         cr.rectangle(0.0, 0.0, width * scale, height * scale);
-        cr.scale(scale, scale);
-        cr.set_source_rgba(1.0, 1.0, 1.0, 1.0);
+        //cr.set_source_rgba(1.0, 1.0, 1.0, 1.0);
+        cr.set_source_rgb(1.0, 1.0, 1.0);
         cr.fill().expect("Failed to fill");
+
+        cr.scale(scale, scale);
+
         poppler_page.render(cr);
+
         let elapsed = start.elapsed();
         log::trace!(
             "Rendered page {} with multithreading disabled in {elapsed:?}",
@@ -488,7 +503,7 @@ impl Page {
         let scale_factor = obj.scale_factor() as f64;
         let (canvas_width, canvas_height) =
             (width * scale * scale_factor, height * scale * scale_factor);
-        let stride = 4 * canvas_width as i32; // ARGB32 has 4 bytes per pixel
+        let stride = 4 * canvas_width as i32; // RGB24 has 3 bytes per pixel. But why 4? TODO
 
         if let Some(buffer) = buf.take() {
             if buffer.len() != (stride * canvas_height as i32) as usize {
@@ -509,14 +524,15 @@ impl Page {
                 // Create an ImageSurface from the received pixel buffer
                 let surface = ImageSurface::create_for_data(
                     holder,
-                    gtk::cairo::Format::ARgb32,
+                    gtk::cairo::Format::Rgb24,
                     canvas_width as i32,
                     canvas_height as i32,
                     stride,
                 )
                 .expect("Failed to create image surface");
+                surface.set_device_scale(scale_factor, scale_factor);
                 let bbox = self.get_bbox(poppler_page, obj.crop());
-                self.render_surface(cr, &surface, &bbox);
+                draw_surface(cr, &surface, &bbox, scale);
             }
 
             assert!(return_location.borrow().is_some());
@@ -558,7 +574,7 @@ impl Page {
                     &uri,
                     Box::new(move |doc| {
                         if let Ok(doc) = doc {
-                            request_render(doc, scale * scale_factor, page_num, resp_sender);
+                            request_render(doc, scale, scale_factor, page_num, resp_sender);
                         } else {
                             resp_sender.send(Err(())).expect("Failed to send buffer");
                         }
@@ -572,49 +588,31 @@ impl Page {
             //cr.scale(scale, scale);
             cr.set_source_rgba(1.0, 1.0, 1.0, 1.0);
             cr.fill().expect("Failed to fill");
-
-            //let downscale = 1.0 / 32.0;
-            //let surface = render(&poppler_page, scale * downscale);
-            //draw_surface(cr, &surface, &bbox, scale, downscale);
         }
     }
 
     pub fn render_surface(&self, cr: &Context, surface: &ImageSurface, bbox: &Rectangle) {
-        let obj = self.obj();
-        let scale = obj.zoom();
-        let scale_factor = obj.scale_factor() as f64;
-
-        draw_surface(cr, surface, bbox, scale, scale_factor);
+        draw_surface(cr, surface, bbox, self.obj().zoom());
     }
 }
 
-pub fn draw_surface(
-    cr: &Context,
-    surface: &ImageSurface,
-    bbox: &Rectangle,
-    scale: f64,
-    scale_factor: f64,
-) {
-    cr.scale(1.0 / scale_factor, 1.0 / scale_factor);
-    //let bbox = imp.get_bbox(poppler_page, obj.crop());
-    cr.set_source_surface(
-        surface,
-        -bbox.x1 * scale * scale_factor,
-        -bbox.y1 * scale * scale_factor,
-    )
-    .unwrap();
+pub fn draw_surface(cr: &Context, surface: &ImageSurface, bbox: &Rectangle, scale: f64) {
+    cr.scale(1.0, 1.0);
+    cr.set_source_surface(surface, -bbox.x1 * scale, -bbox.y1 * scale)
+        .unwrap();
     let (w, h) = bbox.size();
-    cr.rectangle(0.0, 0.0, w * scale * scale_factor, h * scale * scale_factor);
+    cr.rectangle(0.0, 0.0, w * scale, h * scale);
     cr.clip();
     cr.paint().unwrap();
 
     // Release the surface data
-    cr.set_source_rgba(0.0, 0.0, 0.0, 0.0);
+    cr.set_source_rgb(0.0, 0.0, 0.0);
 }
 
 fn request_render(
     doc: &poppler::Document,
     scale: f64,
+    device_scale_factor: f64,
     page_num: i32,
     resp_sender: oneshot::Sender<Result<Box<[u8]>, ()>>,
 ) {
@@ -622,13 +620,9 @@ fn request_render(
         todo!("Page not found");
     };
 
-    let (width, height) = page.size();
-    let surface = render_surface(&page, scale);
+    let surface = render_surface(&page, scale, device_scale_factor);
 
-    let (canvas_width, canvas_height) = (width * scale, height * scale);
-    let stride = 4 * canvas_width as i32; // ARGB32 has 4 bytes per pixel
-
-    let mut buffer = vec![0u8; (stride * canvas_height as i32) as usize];
+    let mut buffer = vec![0u8; (surface.stride() * surface.height()) as usize];
     surface
         .with_data(|data| {
             buffer.copy_from_slice(data);
@@ -640,20 +634,23 @@ fn request_render(
         .expect("Failed to send buffer");
 }
 
-pub fn render_surface(page: &poppler::Page, scale: f64) -> ImageSurface {
+pub fn render_surface(page: &poppler::Page, scale: f64, device_scale_factor: f64) -> ImageSurface {
     let (width, height) = page.size();
-    let (canvas_width, canvas_height) = (width * scale, height * scale);
+    let scale_factor = device_scale_factor * scale;
+    let (canvas_width, canvas_height) = (width * scale_factor, height * scale_factor);
 
     let surface = ImageSurface::create(
-        gtk::cairo::Format::ARgb32,
+        gtk::cairo::Format::Rgb24,
+        //gtk::cairo::Format::ARgb32,
         canvas_width as i32,
         canvas_height as i32,
     )
     .expect("Couldn't create a surface!");
+    surface.set_device_scale(device_scale_factor, device_scale_factor);
     let cr = Context::new(&surface).expect("Couldn't create a context!");
     cr.rectangle(0.0, 0.0, canvas_width, canvas_height);
     cr.scale(scale, scale);
-    cr.set_source_rgba(1.0, 1.0, 1.0, 1.0);
+    cr.set_source_rgb(1.0, 1.0, 1.0);
     cr.fill().expect("Failed to fill");
     page.render(&cr);
 
@@ -887,7 +884,7 @@ startxref
         page.state().set_doc(&doc);
         page.bind(&crate::page::PageNumber::new(0));
 
-        let surface = gtk::cairo::ImageSurface::create(gtk::cairo::Format::ARgb32, 80, 12).unwrap();
+        let surface = gtk::cairo::ImageSurface::create(gtk::cairo::Format::Rgb24, 80, 12).unwrap();
         let cr = gtk::cairo::Context::new(&surface).unwrap();
 
         page.imp().render_to_cairo(&cr, &doc.page(0).unwrap());
@@ -905,7 +902,7 @@ startxref
     #[test]
     fn test_render_surface() {
         let doc = poppler::Document::from_data(SMALL_RENDERABLE_PDF, None).unwrap();
-        let surface = render_surface(&doc.page(0).unwrap(), 1.0);
+        let surface = render_surface(&doc.page(0).unwrap(), 1.0, 1.0);
 
         let mut buffer = vec![0u8; (surface.stride() * surface.height()) as usize];
         surface

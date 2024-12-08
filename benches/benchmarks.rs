@@ -97,12 +97,12 @@ pub fn render_surface(
     )
     .expect("Couldn't create a surface!");
     let cr = gtk::cairo::Context::new(&surface).expect("Couldn't create a context!");
-    cr.set_antialias(antialias);
-    cr.set_font_options(font_options);
     cr.rectangle(0.0, 0.0, canvas_width, canvas_height);
     cr.scale(scale, scale);
-    cr.set_source_rgba(1.0, 1.0, 1.0, 1.0);
+    cr.set_source_rgb(1.0, 1.0, 1.0);
     cr.fill().expect("Failed to fill");
+    cr.set_antialias(antialias);
+    cr.set_font_options(font_options);
     page.render(&cr);
 
     surface
@@ -128,6 +128,34 @@ pub fn render_surface_for_printing(page: &poppler::Page, scale: f64) -> gtk::cai
     surface
 }
 
+pub fn render_surface_with_filter(
+    page: &poppler::Page,
+    scale: f64,
+    filter: gtk::cairo::Filter,
+) -> gtk::cairo::ImageSurface {
+    let (width, height) = page.size();
+    let (canvas_width, canvas_height) = (width * scale, height * scale);
+
+    let surface = gtk::cairo::ImageSurface::create(
+        gtk::cairo::Format::ARgb32,
+        canvas_width as i32,
+        canvas_height as i32,
+    )
+    .expect("Couldn't create a surface!");
+
+    let pattern = gtk::cairo::SurfacePattern::create(&surface);
+    pattern.set_filter(filter);
+
+    let cr = gtk::cairo::Context::new(&surface).expect("Couldn't create a context!");
+    cr.rectangle(0.0, 0.0, canvas_width, canvas_height);
+    cr.scale(scale, scale);
+    cr.set_source_rgba(1.0, 1.0, 1.0, 1.0);
+    cr.fill().expect("Failed to fill");
+    page.render(&cr);
+
+    surface
+}
+
 pub fn bench_render_surface(c: &mut Criterion) {
     let pdf_path = std::env::var("PDF_PATH").expect("Environment variable PDF_PATH is not set");
 
@@ -143,25 +171,57 @@ pub fn bench_render_surface(c: &mut Criterion) {
     let mut group = c.benchmark_group("render_surface");
     group.throughput(Throughput::Elements(1));
 
-    group.bench_function(format!("half-page {pdf_path} page {page_number}"), |b| {
-        b.iter(|| draw_half_page(&page))
-    });
+    //group.bench_function(format!("half-page {pdf_path} page {page_number}"), |b| {
+    //    b.iter(|| draw_half_page(&page))
+    //});
+    //
+    //group.bench_function(
+    //    format!("full ({width}x{height}) {pdf_path} page {page_number}"),
+    //    |b| b.iter(|| scrolex::page::render_surface(&page, 1.0)),
+    //);
 
-    group.bench_function(
-        format!("full ({width}x{height}) {pdf_path} page {page_number}"),
-        |b| b.iter(|| scrolex::page::render_surface(&page, 1.0)),
-    );
+    //group.bench_function(
+    //    format!("downscaled 1/4 {pdf_path} page {page_number}"),
+    //    |b| b.iter(|| scrolex::page::render_surface(&page, 0.25)),
+    //);
+    //
+    //group.bench_function(format!("upscaled x4 {pdf_path} page {page_number}"), |b| {
+    //    b.iter(|| scrolex::page::render_surface(&page, 4.0))
+    //});
 
-    group.bench_function(
-        format!("downscaled 1/4 {pdf_path} page {page_number}"),
-        |b| b.iter(|| scrolex::page::render_surface(&page, 0.25)),
-    );
+    //for filter in &[
+    //    gtk::cairo::Filter::Fast,
+    //    gtk::cairo::Filter::Good,
+    //    gtk::cairo::Filter::Best,
+    //    gtk::cairo::Filter::Nearest,
+    //    gtk::cairo::Filter::Bilinear,
+    //] {
+    //    group.bench_function(
+    //        format!(
+    //            "upscale 4x filter {filter:?} {pdf_path} page {page_number}",
+    //            filter = filter
+    //        ),
+    //        |b| b.iter(|| render_surface_with_filter(&page, 4.0, *filter)),
+    //    );
+    //}
 
-    group.bench_function(format!("upscaled x4 {pdf_path} page {page_number}"), |b| {
-        b.iter(|| scrolex::page::render_surface(&page, 4.0))
-    });
+    for filter in &[
+        gtk::cairo::Filter::Fast,
+        gtk::cairo::Filter::Good,
+        gtk::cairo::Filter::Best,
+        gtk::cairo::Filter::Nearest,
+        gtk::cairo::Filter::Bilinear,
+    ] {
+        group.bench_function(
+            format!(
+                "downscale 0.25x filter {filter:?} {pdf_path} page {page_number}",
+                filter = filter
+            ),
+            |b| b.iter(|| render_surface_with_filter(&page, 0.25, *filter)),
+        );
+    }
 
-    let surface = scrolex::page::render_surface(&page, 1.0);
+    let surface = scrolex::page::render_surface(&page, 1.0, 1.0);
     let cr = gtk::cairo::Context::new(&surface).unwrap();
     let bbox = scrolex::page::Rectangle::from(cr.clip_extents().unwrap());
     cr.set_source_rgb(1.0, 1.0, 1.0);
@@ -170,7 +230,7 @@ pub fn bench_render_surface(c: &mut Criterion) {
         format!("draw pre-rendered {pdf_path} page {page_number}"),
         |b| {
             b.iter(|| {
-                scrolex::page::draw_surface(&cr, &surface, &bbox, 1.0, 1.0);
+                scrolex::page::draw_surface(&cr, &surface, &bbox, 1.0);
             })
         },
     );
@@ -211,5 +271,9 @@ pub fn bench_render_surface(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_links_lookup, bench_render_surface,);
+criterion_group!(
+    benches,
+    //bench_links_lookup,
+    bench_render_surface,
+);
 criterion_main!(benches);
