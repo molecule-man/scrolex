@@ -519,6 +519,14 @@ impl Page {
             self.schedule_render(page_num, scale, scale_factor, RenderPriority::Visible);
         }
 
+        // remember that this widget is the one waiting for page_num, so the
+        // render repaints it when it lands (the request may have come from a
+        // different widget's prefetch)
+        obj.state()
+            .render_waiters()
+            .borrow_mut()
+            .insert(page_num, obj.downgrade());
+
         // nothing to draw yet: fill the area so stale pixels aren't shown
         let bbox = self.get_cached_bbox(poppler_page, obj.crop());
         let (w, h) = bbox.size();
@@ -599,10 +607,17 @@ impl Page {
             let surface = rendered.into_surface(scale_factor);
             state.render_cache().borrow_mut().insert(page_num, surface);
 
-            // only redraw if this widget is the one showing the rendered page;
-            // prefetched neighbours are picked up when their own widget draws
-            if obj_clone.index() == page_num {
-                obj_clone.queue_draw();
+            // repaint whichever widget is currently waiting to show this page
+            // (not necessarily the one that requested the render)
+            if let Some(widget) = state
+                .render_waiters()
+                .borrow_mut()
+                .remove(&page_num)
+                .and_then(|weak| weak.upgrade())
+            {
+                if widget.index() == page_num {
+                    widget.queue_draw();
+                }
             }
         });
 

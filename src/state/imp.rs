@@ -43,6 +43,9 @@ pub struct State {
     pub(crate) render_cache: Rc<RefCell<crate::render_cache::RenderCache>>,
     // page indices with a render currently queued, to avoid scheduling duplicates
     pub(crate) render_inflight: Rc<RefCell<HashSet<i32>>>,
+    // widget currently waiting to display each page, so a finished render
+    // repaints the right widget even if list recycling moved the requester
+    pub(crate) render_waiters: Rc<RefCell<HashMap<i32, glib::WeakRef<crate::page::Page>>>>,
 }
 
 #[glib::object_subclass]

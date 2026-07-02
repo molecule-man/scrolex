@@ -57,6 +57,7 @@ impl State {
         self.imp().links.borrow_mut().clear();
         self.imp().render_cache.borrow_mut().clear();
         self.imp().render_inflight.borrow_mut().clear();
+        self.imp().render_waiters.borrow_mut().clear();
 
         self.emit_by_name::<()>("before-load", &[]);
 
@@ -130,6 +131,10 @@ impl State {
 
     pub(crate) fn render_inflight(&self) -> Rc<RefCell<HashSet<i32>>> {
         self.imp().render_inflight.clone()
+    }
+
+    pub(crate) fn render_waiters(&self) -> Rc<RefCell<HashMap<i32, glib::WeakRef<page::Page>>>> {
+        self.imp().render_waiters.clone()
     }
 }
 
