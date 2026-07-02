@@ -171,23 +171,19 @@ pub fn bench_render_surface(c: &mut Criterion) {
     let mut group = c.benchmark_group("render_surface");
     group.throughput(Throughput::Elements(1));
 
-    //group.bench_function(format!("half-page {pdf_path} page {page_number}"), |b| {
-    //    b.iter(|| draw_half_page(&page))
-    //});
-    //
-    //group.bench_function(
-    //    format!("full ({width}x{height}) {pdf_path} page {page_number}"),
-    //    |b| b.iter(|| scrolex::page::render_surface(&page, 1.0)),
-    //);
+    group.bench_function(
+        format!("full ({width}x{height}) {pdf_path} page {page_number}"),
+        |b| b.iter(|| scrolex::page::render_surface(&page, 1.0, 1.0)),
+    );
 
-    //group.bench_function(
-    //    format!("downscaled 1/4 {pdf_path} page {page_number}"),
-    //    |b| b.iter(|| scrolex::page::render_surface(&page, 0.25)),
-    //);
-    //
-    //group.bench_function(format!("upscaled x4 {pdf_path} page {page_number}"), |b| {
-    //    b.iter(|| scrolex::page::render_surface(&page, 4.0))
-    //});
+    group.bench_function(
+        format!("downscaled 1/4 {pdf_path} page {page_number}"),
+        |b| b.iter(|| scrolex::page::render_surface(&page, 0.25, 1.0)),
+    );
+
+    group.bench_function(format!("upscaled x4 {pdf_path} page {page_number}"), |b| {
+        b.iter(|| scrolex::page::render_surface(&page, 4.0, 1.0))
+    });
 
     //for filter in &[
     //    gtk::cairo::Filter::Fast,

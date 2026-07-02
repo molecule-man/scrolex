@@ -899,6 +899,53 @@ startxref
         assert_snapshot("test_render", &buffer);
     }
 
+    // Throughput probe: measures how many pages/sec the renderer sustains at
+    // various thread counts. Ignored by default (needs a real PDF); run with:
+    //   PDF_PATH=/abs/file.pdf cargo test --release bench_render_throughput -- --ignored --nocapture
+    // Optional env: PAGE_NUMBER (start page), PAGES (how many to render).
+    #[test]
+    #[ignore]
+    fn bench_render_throughput() {
+        let path = env::var("PDF_PATH").expect("PDF_PATH not set");
+        let uri = format!("file://{path}");
+        let start: i32 = env::var("PAGE_NUMBER")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let count: i32 = env::var("PAGES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(40);
+        let pages: Vec<i32> = (start..start + count).collect();
+
+        for threads in [1usize, 2, 4, 8] {
+            let t0 = std::time::Instant::now();
+            std::thread::scope(|s| {
+                for t in 0..threads {
+                    let uri = uri.clone();
+                    let chunk: Vec<i32> = pages.iter().copied().skip(t).step_by(threads).collect();
+                    if chunk.is_empty() {
+                        continue;
+                    }
+                    s.spawn(move || {
+                        let doc = poppler::Document::from_file(&uri, None).unwrap();
+                        for p in chunk {
+                            if let Some(page) = doc.page(p) {
+                                std::hint::black_box(render_surface(&page, 1.0, 1.0));
+                            }
+                        }
+                    });
+                }
+            });
+            let dt = t0.elapsed();
+            println!(
+                "threads={threads:<2} pages={} time={dt:>8.2?} throughput={:.1} pages/s",
+                pages.len(),
+                pages.len() as f64 / dt.as_secs_f64()
+            );
+        }
+    }
+
     #[test]
     fn test_render_surface() {
         let doc = poppler::Document::from_data(SMALL_RENDERABLE_PDF, None).unwrap();
