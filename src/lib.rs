@@ -3,6 +3,7 @@ pub mod jump_stack;
 pub mod links;
 pub mod page;
 pub mod poppler;
+pub mod render_cache;
 pub mod state;
 pub mod window;
 //pub use crate::links::Links;

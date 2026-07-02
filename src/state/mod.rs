@@ -6,7 +6,7 @@ use gtk::subclass::prelude::*;
 use poppler::Document;
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -20,11 +20,19 @@ glib::wrapper! {
 
 impl State {
     pub(crate) fn new() -> Self {
-        glib::Object::builder()
+        let state: Self = glib::Object::builder()
             .property("zoom", 1.0)
             .property("crop", false)
             .property("page", 0_u32)
-            .build()
+            .build();
+
+        // A zoom change alters the rendered surface dimensions, so cached renders are no longer
+        // valid.
+        state.connect_notify_local(Some("zoom"), |state, _| {
+            state.imp().render_cache.borrow_mut().clear();
+        });
+
+        state
     }
 
     pub(crate) fn jump_list_add(&self, page: u32) {
@@ -47,6 +55,8 @@ impl State {
             .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
         self.imp().bbox_cache.borrow_mut().clear();
         self.imp().links.borrow_mut().clear();
+        self.imp().render_cache.borrow_mut().clear();
+        self.imp().render_inflight.borrow_mut().clear();
 
         self.emit_by_name::<()>("before-load", &[]);
 
@@ -112,6 +122,14 @@ impl State {
 
     pub(crate) fn bbox_cache(&self) -> Rc<RefCell<HashMap<i32, page::Rectangle>>> {
         self.imp().bbox_cache.clone()
+    }
+
+    pub(crate) fn render_cache(&self) -> Rc<RefCell<crate::render_cache::RenderCache>> {
+        self.imp().render_cache.clone()
+    }
+
+    pub(crate) fn render_inflight(&self) -> Rc<RefCell<HashSet<i32>>> {
+        self.imp().render_inflight.clone()
     }
 }
 

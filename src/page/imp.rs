@@ -82,12 +82,6 @@ impl DrawingAreaImpl for Page {}
 impl Page {
     fn setup_draw_function(&self) {
         let obj = self.obj();
-        let buf = Rc::new(RefCell::new(None::<Box<[u8]>>));
-
-        let buf_clone = Rc::clone(&buf);
-        obj.connect_unmap(move |_| {
-            buf_clone.replace(None);
-        });
 
         obj.set_draw_func(clone!(
             #[strong]
@@ -103,7 +97,7 @@ impl Page {
                 cr.save().expect("Failed to save");
 
                 if obj.state().multithread_rendering() {
-                    imp.multithread_render_to_cairo(cr, &poppler_page, &buf);
+                    imp.multithread_render_to_cairo(cr, &poppler_page);
                 } else {
                     imp.render_to_cairo(cr, &poppler_page);
                 }
@@ -488,107 +482,93 @@ impl Page {
         log::trace!("Rendered selection {} in {elapsed:?}", poppler_page.index());
     }
 
-    fn multithread_render_to_cairo(
-        &self,
-        cr: &Context,
-        poppler_page: &poppler::Page,
-        buf: &Rc<RefCell<Option<Box<[u8]>>>>,
-    ) {
+    fn multithread_render_to_cairo(&self, cr: &Context, poppler_page: &poppler::Page) {
         let obj = self.obj();
         let page_num = poppler_page.index();
-        log::trace!("Rendering page {page_num} with multithreading enabled");
 
         let (width, height) = poppler_page.size();
         let scale = obj.zoom();
         let scale_factor = obj.scale_factor() as f64;
         let (canvas_width, canvas_height) =
             (width * scale * scale_factor, height * scale * scale_factor);
-        let stride = 4 * canvas_width as i32; // RGB24 has 3 bytes per pixel. But why 4? TODO
+        let expected = (canvas_width as i32, canvas_height as i32);
 
-        if let Some(buffer) = buf.take() {
-            if buffer.len() != (stride * canvas_height as i32) as usize {
-                log::info!("Buffer size mismatch. Requesting new rendering.");
-                buf.replace(None);
-            } else {
-                buf.replace(Some(buffer));
-            }
-        }
-
-        if let Some(buffer) = buf.take() {
-            let return_location = Rc::new(RefCell::new(None));
-            {
-                let holder = DataHolder {
-                    data: Some(buffer),
-                    return_location: Rc::clone(&return_location),
-                };
-                // Create an ImageSurface from the received pixel buffer
-                let surface = ImageSurface::create_for_data(
-                    holder,
-                    gtk::cairo::Format::Rgb24,
-                    canvas_width as i32,
-                    canvas_height as i32,
-                    stride,
-                )
-                .expect("Failed to create image surface");
-                surface.set_device_scale(scale_factor, scale_factor);
+        let cache = obj.state().render_cache();
+        let cached = cache.borrow_mut().get(page_num);
+        if let Some(surface) = cached {
+            if (surface.width(), surface.height()) == expected {
                 let bbox = self.get_bbox(poppler_page, obj.crop());
                 draw_surface(cr, &surface, &bbox, scale);
+                return;
+            }
+            // dimensions changed (e.g. zoom), the cached surface is stale
+            cache.borrow_mut().remove(page_num);
+        }
+
+        // schedule a render unless one is already queued for this page
+        let is_new = obj
+            .state()
+            .render_inflight()
+            .borrow_mut()
+            .insert(page_num);
+        if is_new {
+            self.schedule_render(page_num, scale, scale_factor);
+        }
+
+        // nothing to draw yet: fill the area so stale pixels aren't shown
+        let bbox = self.get_cached_bbox(poppler_page, obj.crop());
+        let (w, h) = bbox.size();
+        cr.rectangle(0.0, 0.0, w * scale, h * scale);
+        cr.set_source_rgba(1.0, 1.0, 1.0, 1.0);
+        cr.fill().expect("Failed to fill");
+    }
+
+    fn schedule_render(&self, page_num: i32, scale: f64, scale_factor: f64) {
+        let obj = self.obj();
+        let uri = obj.uri();
+        log::trace!("Scheduling render of page {page_num}");
+
+        let (resp_sender, resp_receiver) = oneshot::channel::<Result<RenderedPage, ()>>();
+        let obj_clone = obj.clone();
+        let uri_check = uri.clone();
+        glib::spawn_future_local(async move {
+            let rendered = resp_receiver.await.expect("Failed to receive render");
+            let state = obj_clone.state();
+            state.render_inflight().borrow_mut().remove(&page_num);
+
+            // the document may have changed while the render was in flight
+            if obj_clone.uri() != uri_check {
+                return;
             }
 
-            assert!(return_location.borrow().is_some());
-            buf.replace(return_location.take());
-        } else {
-            let (resp_sender, resp_receiver) = oneshot::channel();
-            let buf = Rc::clone(buf);
-            let obj_clone = obj.clone();
-            glib::spawn_future_local(async move {
-                let buffer = resp_receiver.await.expect("Failed to receive buffer");
-                if !obj_clone.is_drawable() {
-                    log::debug!("Page {page_num} not drawable anymore. Aborting.");
-                    //buf.replace(None);
-                    return;
-                }
-
-                let Ok(buffer) = buffer else {
-                    if obj_clone.is_drawable() {
-                        log::debug!("Page {page_num} is still drawable. Rescheduling.");
-                        glib::idle_add_local_full(Priority::HIGH, move || {
-                            obj_clone.queue_draw();
-                            glib::ControlFlow::Break
-                        });
-                    }
-                    return;
-                };
-
-                let prev = buf.replace(Some(buffer));
-                if prev.is_none() {
+            let Ok(rendered) = rendered else {
+                // render was cancelled (debounced); redraw to reschedule if needed
+                if obj_clone.is_drawable() {
                     glib::idle_add_local_full(Priority::HIGH, move || {
                         obj_clone.queue_draw();
                         glib::ControlFlow::Break
                     });
                 }
-            });
-            let uri = obj.uri();
-            RENDER_QUEUE.with(move |queue| {
-                queue.execute(
-                    &uri,
-                    Box::new(move |doc| {
-                        if let Ok(doc) = doc {
-                            request_render(doc, scale, scale_factor, page_num, resp_sender);
-                        } else {
-                            resp_sender.send(Err(())).expect("Failed to send buffer");
-                        }
-                    }),
-                );
-            });
+                return;
+            };
 
-            let bbox = self.get_cached_bbox(poppler_page, obj.crop());
-            let (w, h) = bbox.size();
-            cr.rectangle(0.0, 0.0, w * scale, h * scale);
-            //cr.scale(scale, scale);
-            cr.set_source_rgba(1.0, 1.0, 1.0, 1.0);
-            cr.fill().expect("Failed to fill");
-        }
+            let surface = rendered.into_surface(scale_factor);
+            state.render_cache().borrow_mut().insert(page_num, surface);
+            obj_clone.queue_draw();
+        });
+
+        RENDER_QUEUE.with(move |queue| {
+            queue.execute(
+                &uri,
+                Box::new(move |doc| {
+                    if let Ok(doc) = doc {
+                        request_render(doc, scale, scale_factor, page_num, resp_sender);
+                    } else {
+                        resp_sender.send(Err(())).expect("Failed to send render");
+                    }
+                }),
+            );
+        });
     }
 
     pub fn render_surface(&self, cr: &Context, surface: &ImageSurface, bbox: &Rectangle) {
@@ -609,20 +589,47 @@ pub fn draw_surface(cr: &Context, surface: &ImageSurface, bbox: &Rectangle, scal
     cr.set_source_rgb(0.0, 0.0, 0.0);
 }
 
+// A rendered page as raw pixels. Rendering happens on a background thread, and
+// `ImageSurface` is not `Send`, so the pixels cross the thread boundary as a
+// plain buffer and the surface is rebuilt on the main thread.
+#[derive(Debug)]
+struct RenderedPage {
+    data: Box<[u8]>,
+    width: i32,
+    height: i32,
+    stride: i32,
+}
+
+impl RenderedPage {
+    fn into_surface(self, device_scale_factor: f64) -> ImageSurface {
+        let surface = ImageSurface::create_for_data(
+            self.data,
+            gtk::cairo::Format::Rgb24,
+            self.width,
+            self.height,
+            self.stride,
+        )
+        .expect("Failed to create image surface");
+        surface.set_device_scale(device_scale_factor, device_scale_factor);
+        surface
+    }
+}
+
 fn request_render(
     doc: &poppler::Document,
     scale: f64,
     device_scale_factor: f64,
     page_num: i32,
-    resp_sender: oneshot::Sender<Result<Box<[u8]>, ()>>,
+    resp_sender: oneshot::Sender<Result<RenderedPage, ()>>,
 ) {
     let Some(page) = doc.page(page_num) else {
         todo!("Page not found");
     };
 
     let surface = render_surface(&page, scale, device_scale_factor);
+    let (width, height, stride) = (surface.width(), surface.height(), surface.stride());
 
-    let mut buffer = vec![0u8; (surface.stride() * surface.height()) as usize];
+    let mut buffer = vec![0u8; (stride * height) as usize];
     surface
         .with_data(|data| {
             buffer.copy_from_slice(data);
@@ -630,8 +637,13 @@ fn request_render(
         .expect("Failed to extract surface data");
     surface.finish();
     resp_sender
-        .send(Ok(buffer.into_boxed_slice()))
-        .expect("Failed to send buffer");
+        .send(Ok(RenderedPage {
+            data: buffer.into_boxed_slice(),
+            width,
+            height,
+            stride,
+        }))
+        .expect("Failed to send render");
 }
 
 pub fn render_surface(page: &poppler::Page, scale: f64, device_scale_factor: f64) -> ImageSurface {
@@ -670,32 +682,6 @@ pub fn render_surface(page: &poppler::Page, scale: f64, device_scale_factor: f64
     //);
 
     surface
-}
-
-struct DataHolder {
-    data: Option<Box<[u8]>>,
-    return_location: Rc<RefCell<Option<Box<[u8]>>>>,
-}
-
-// This stores the pixels back into the return_location as now nothing
-// references the pixels anymore
-impl Drop for DataHolder {
-    fn drop(&mut self) {
-        *self.return_location.borrow_mut() = Some(self.data.take().expect("Holding no image"));
-    }
-}
-
-// Needed for DataSurface::create_for_data() to be able to access the pixels
-impl AsRef<[u8]> for DataHolder {
-    fn as_ref(&self) -> &[u8] {
-        self.data.as_ref().expect("Holding no image").as_ref()
-    }
-}
-
-impl AsMut<[u8]> for DataHolder {
-    fn as_mut(&mut self) -> &mut [u8] {
-        self.data.as_mut().expect("Holding no image").as_mut()
-    }
 }
 
 struct Point {
