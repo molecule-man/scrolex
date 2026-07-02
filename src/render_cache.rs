@@ -54,6 +54,12 @@ impl RenderCache {
         Some(surface)
     }
 
+    // Whether a page is cached, without affecting recency (used by prefetch to
+    // decide what still needs rendering).
+    pub fn contains(&self, page: i32) -> bool {
+        self.entries.contains_key(&page)
+    }
+
     pub fn insert(&mut self, page: i32, surface: ImageSurface) {
         let bytes = (surface.stride() as usize) * (surface.height() as usize);
         self.remove(page);

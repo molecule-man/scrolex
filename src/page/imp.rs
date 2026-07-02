@@ -10,23 +10,26 @@ use gtk::gdk::prelude::*;
 use gtk::gdk::BUTTON_PRIMARY;
 use gtk::glib::clone;
 use gtk::glib::subclass::{prelude::*, Signal};
-use gtk::glib::{self, Priority};
+use gtk::glib;
 use gtk::prelude::*;
 use gtk::subclass::prelude::*;
 use gtk::DrawingArea;
 use once_cell::sync::Lazy;
 
 use super::Rectangle;
-use crate::bg_job::DebouncingJobQueue;
+use crate::bg_job::{RenderPool, RenderPriority};
 use crate::poppler::{Dest, DestExt, LinkType};
 
+// Pages within this many positions of the visible page are rendered ahead of
+// time so scrolling to them is a cache hit instead of a wait.
+const PREFETCH_AHEAD: i32 = 2;
+const PREFETCH_BEHIND: i32 = 1;
+// Cap on renders queued/running at once, so fast scrolling can't pile up an
+// unbounded backlog of prefetch jobs ahead of the page you actually land on.
+const MAX_INFLIGHT_RENDERS: usize = 6;
+
 thread_local!(
-    static RENDER_QUEUE: Lazy<DebouncingJobQueue> = Lazy::new(|| {
-        DebouncingJobQueue::new(
-            1,
-            //Duration::from_millis(10),
-        )
-    });
+    static RENDER_QUEUE: Lazy<RenderPool> = Lazy::new(|| RenderPool::new(4, 4, 4));
 );
 
 #[derive(Default, glib::Properties)]
@@ -499,6 +502,7 @@ impl Page {
             if (surface.width(), surface.height()) == expected {
                 let bbox = self.get_bbox(poppler_page, obj.crop());
                 draw_surface(cr, &surface, &bbox, scale);
+                self.prefetch_neighbors(page_num, scale, scale_factor);
                 return;
             }
             // dimensions changed (e.g. zoom), the cached surface is stale
@@ -512,7 +516,7 @@ impl Page {
             .borrow_mut()
             .insert(page_num);
         if is_new {
-            self.schedule_render(page_num, scale, scale_factor);
+            self.schedule_render(page_num, scale, scale_factor, RenderPriority::Visible);
         }
 
         // nothing to draw yet: fill the area so stale pixels aren't shown
@@ -521,51 +525,93 @@ impl Page {
         cr.rectangle(0.0, 0.0, w * scale, h * scale);
         cr.set_source_rgba(1.0, 1.0, 1.0, 1.0);
         cr.fill().expect("Failed to fill");
+
+        self.prefetch_neighbors(page_num, scale, scale_factor);
     }
 
-    fn schedule_render(&self, page_num: i32, scale: f64, scale_factor: f64) {
+    // Render pages around the visible one ahead of time so scrolling to them is
+    // a cache hit. Best-effort: skips pages already cached or in flight, and
+    // stops once too many renders are queued so a fast scroll can't flood the
+    // queue ahead of the page actually being viewed.
+    fn prefetch_neighbors(&self, current: i32, scale: f64, scale_factor: f64) {
+        let obj = self.obj();
+        let Some(doc) = obj.state().doc() else {
+            return;
+        };
+        let n_pages = doc.n_pages();
+        let cache = obj.state().render_cache();
+        let inflight = obj.state().render_inflight();
+
+        let mut candidates = Vec::with_capacity((PREFETCH_AHEAD + PREFETCH_BEHIND) as usize);
+        for d in 1..=PREFETCH_AHEAD {
+            candidates.push(current + d);
+        }
+        for d in 1..=PREFETCH_BEHIND {
+            candidates.push(current - d);
+        }
+
+        for page_num in candidates {
+            if page_num < 0 || page_num >= n_pages {
+                continue;
+            }
+            if inflight.borrow().len() >= MAX_INFLIGHT_RENDERS {
+                break;
+            }
+            if cache.borrow().contains(page_num) {
+                continue;
+            }
+            if inflight.borrow_mut().insert(page_num) {
+                self.schedule_render(page_num, scale, scale_factor, RenderPriority::Prefetch);
+            }
+        }
+    }
+
+    fn schedule_render(
+        &self,
+        page_num: i32,
+        scale: f64,
+        scale_factor: f64,
+        priority: RenderPriority,
+    ) {
         let obj = self.obj();
         let uri = obj.uri();
         log::trace!("Scheduling render of page {page_num}");
 
-        let (resp_sender, resp_receiver) = oneshot::channel::<Result<RenderedPage, ()>>();
+        let (resp_sender, resp_receiver) = oneshot::channel::<RenderedPage>();
         let obj_clone = obj.clone();
         let uri_check = uri.clone();
         glib::spawn_future_local(async move {
-            let rendered = resp_receiver.await.expect("Failed to receive render");
+            let result = resp_receiver.await;
             let state = obj_clone.state();
             state.render_inflight().borrow_mut().remove(&page_num);
+
+            // request was dropped (evicted from the queue as stale): let the
+            // page reschedule on its next draw
+            let Ok(rendered) = result else {
+                return;
+            };
 
             // the document may have changed while the render was in flight
             if obj_clone.uri() != uri_check {
                 return;
             }
 
-            let Ok(rendered) = rendered else {
-                // render was cancelled (debounced); redraw to reschedule if needed
-                if obj_clone.is_drawable() {
-                    glib::idle_add_local_full(Priority::HIGH, move || {
-                        obj_clone.queue_draw();
-                        glib::ControlFlow::Break
-                    });
-                }
-                return;
-            };
-
             let surface = rendered.into_surface(scale_factor);
             state.render_cache().borrow_mut().insert(page_num, surface);
-            obj_clone.queue_draw();
+
+            // only redraw if this widget is the one showing the rendered page;
+            // prefetched neighbours are picked up when their own widget draws
+            if obj_clone.index() == page_num {
+                obj_clone.queue_draw();
+            }
         });
 
         RENDER_QUEUE.with(move |queue| {
-            queue.execute(
+            queue.submit(
                 &uri,
+                priority,
                 Box::new(move |doc| {
-                    if let Ok(doc) = doc {
-                        request_render(doc, scale, scale_factor, page_num, resp_sender);
-                    } else {
-                        resp_sender.send(Err(())).expect("Failed to send render");
-                    }
+                    request_render(doc, scale, scale_factor, page_num, resp_sender);
                 }),
             );
         });
@@ -620,7 +666,7 @@ fn request_render(
     scale: f64,
     device_scale_factor: f64,
     page_num: i32,
-    resp_sender: oneshot::Sender<Result<RenderedPage, ()>>,
+    resp_sender: oneshot::Sender<RenderedPage>,
 ) {
     let Some(page) = doc.page(page_num) else {
         todo!("Page not found");
@@ -636,14 +682,14 @@ fn request_render(
         })
         .expect("Failed to extract surface data");
     surface.finish();
-    resp_sender
-        .send(Ok(RenderedPage {
-            data: buffer.into_boxed_slice(),
-            width,
-            height,
-            stride,
-        }))
-        .expect("Failed to send render");
+    // ignore send failure: the receiver is gone if the page's widget was
+    // dropped or its render superseded
+    let _ = resp_sender.send(RenderedPage {
+        data: buffer.into_boxed_slice(),
+        width,
+        height,
+        stride,
+    });
 }
 
 pub fn render_surface(page: &poppler::Page, scale: f64, device_scale_factor: f64) -> ImageSurface {
