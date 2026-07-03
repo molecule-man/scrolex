@@ -204,8 +204,15 @@ impl Window {
             // Touchpad (and any other pixel-precise device): a horizontal swipe scrolls the page
             // flow smoothly (like dragging); a vertical swipe steps pages, one per notch of travel.
             _ => {
-                let hadj = self.scrolledwindow.hadjustment();
-                hadj.set_value(self.clamp_scroll(hadj.value() + dx));
+                // Apply the touchpad's horizontal delta to the scroll position, but only when no
+                // page slide is running. During a slide `scroll_tick` owns the adjustment; adding dx
+                // here (from a scroll event that arrives mid-slide) would fight its writes frame by
+                // frame. Vertical page-stepping below runs either way, so flicking through pages
+                // during a slide still works.
+                if self.scroll_anim.borrow().is_none() {
+                    let hadj = self.scrolledwindow.hadjustment();
+                    hadj.set_value(self.clamp_scroll(hadj.value() + dx));
+                }
 
                 let (accum, step) = accumulate_step(
                     self.touch_accum.get(),
@@ -431,6 +438,11 @@ impl Window {
     // stays smooth. `delta` seeds a resting position only for the degenerate case where the
     // selected page's live geometry can't be read at all.
     fn animate_scroll(&self, anchor_x: Option<f64>, delta: f64) {
+        // Cancel any kinetic deceleration the GTK is doing to the scrolled window. Why calling it
+        // two times? The Api is a bit strange: its cancel only runs on a real property change.
+        self.scrolledwindow.set_kinetic_scrolling(true);
+        self.scrolledwindow.set_kinetic_scrolling(false);
+
         let hadj = self.scrolledwindow.hadjustment();
 
         // animation toggled off: jump straight to the page
@@ -501,7 +513,12 @@ impl Window {
         };
         let next = value + (target - value) * k;
 
-        if (target - next).abs() < 0.5 {
+        // Settle when we've arrived, or when this frame's step is sub-pixel. The scroll position
+        // reads back on whole pixels, so a step under half a pixel rounds to nothing and the glide
+        // stalls just short of the target; snap to finish. Guard on dt > 0 so the first frame
+        // (step == 0) doesn't settle instantly.
+        let step = next - value;
+        if (target - next).abs() < 0.5 || (dt > 0 && step.abs() < 0.5) {
             // settled: snap exactly and let the normal sync reconcile selection
             *self.scroll_anim.borrow_mut() = None;
             hadj.set_value(target);
