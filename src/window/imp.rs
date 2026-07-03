@@ -1,4 +1,4 @@
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 
 use glib::clone;
 use glib::subclass::InitializingObject;
@@ -45,10 +45,6 @@ pub struct Window {
 
     drag_coords: RefCell<Option<(f64, f64)>>,
     drag_cursor: RefCell<Option<gtk::gdk::Cursor>>,
-
-    // set while next_page/prev_page reposition the viewport, so the scroll ->
-    // selection sync doesn't override their anchored, lockstep page selection
-    scroll_sync_suppressed: Cell<bool>,
 }
 
 // The central trait for subclassing a GObject
@@ -290,11 +286,9 @@ impl Window {
                 .width(),
         ) + 4.0; // 4px is padding of list item widget. TODO: figure out how to un-hardcode this
 
-        self.scroll_sync_suppressed.set(true);
         self.scrolledwindow
             .hadjustment()
             .set_value(current_pos - width);
-        self.scroll_sync_suppressed.set(false);
     }
 
     fn next_page(&self) {
@@ -318,11 +312,9 @@ impl Window {
             (selection.selected() + 1).min(selection.n_items() - 1),
             true,
         );
-        self.scroll_sync_suppressed.set(true);
         self.scrolledwindow
             .hadjustment()
             .set_value(current_pos + width);
-        self.scroll_sync_suppressed.set(false);
     }
 
     fn ensure_ready_selection(&self) -> Option<&gtk::SingleSelection> {
@@ -418,9 +410,20 @@ impl Window {
         self.scrolledwindow.grab_focus();
     }
 
-    // Track the page at the centre of the viewport as the user scrolls (by
-    // touchpad, scrollbar or drag) and keep the selection on it, so navigation
-    // and the page indicator reflect where the user actually is.
+    // Track the page at the centre of the viewport as the user scrolls (by touchpad, scrollbar or
+    // drag) and keep the selection on it, so navigation and the page indicator reflect where the
+    // user actually is. Page index under a point in the scrolled window's viewport coordinates.
+    fn page_index_at(&self, x: f64, y: f64) -> Option<i32> {
+        let mut node = self.scrolledwindow.pick(x, y, gtk::PickFlags::DEFAULT);
+        while let Some(n) = node {
+            if let Some(page) = n.downcast_ref::<page::Page>() {
+                return Some(page.index());
+            }
+            node = n.parent();
+        }
+        None
+    }
+
     fn setup_scroll_selection_sync(&self) {
         self.scrolledwindow
             .hadjustment()
@@ -428,41 +431,35 @@ impl Window {
                 #[weak(rename_to = imp)]
                 self,
                 move |_| {
-                    // wheel/h/l navigation manages the selection itself as an
-                    // anchor; only free scrolling (touchpad, scrollbar, drag)
-                    // syncs the selection to the viewport
-                    if imp.scroll_sync_suppressed.get() {
+                    let (w, h) = (imp.scrolledwindow.width(), imp.scrolledwindow.height());
+                    let n_items = imp.selection.n_items();
+                    if w == 0 || n_items == 0 {
                         return;
                     }
+                    let selected = imp.selection.selected() as i32;
+                    let cy = f64::from(h) / 2.0;
 
-                    let scrolledwindow = &imp.scrolledwindow;
-                    let selection = &imp.selection;
-                    let (w, h) = (scrolledwindow.width(), scrolledwindow.height());
-                    if w == 0 || selection.n_items() == 0 {
-                        return;
-                    }
-                    let Some(picked) = scrolledwindow.pick(
-                        f64::from(w) / 2.0,
-                        f64::from(h) / 2.0,
-                        gtk::PickFlags::DEFAULT,
-                    ) else {
-                        return;
-                    };
-
-                    // walk up from the picked widget to its Page
-                    let mut node = Some(picked);
-                    while let Some(n) = node {
-                        if let Some(page) = n.downcast_ref::<page::Page>() {
-                            let index = page.index();
-                            if index >= 0
-                                && (index as u32) < selection.n_items()
-                                && selection.selected() != index as u32
-                            {
-                                selection.set_selected(index as u32);
-                            }
-                            break;
+                    // Sample the viewport across its width. Keep the current selection as long as
+                    // its page is still visible anywhere; only move it once that page has scrolled
+                    // off. This anchors wheel/h/l navigation and ignores the layout shifts caused
+                    // by crop/zoom recompute, while still following free scroll.
+                    let mut center = None;
+                    for (i, frac) in [0.05, 0.275, 0.5, 0.725, 0.95].iter().enumerate() {
+                        let Some(index) = imp.page_index_at(f64::from(w) * frac, cy) else {
+                            continue;
+                        };
+                        if index == selected {
+                            return;
                         }
-                        node = n.parent();
+                        if i == 2 {
+                            center = Some(index);
+                        }
+                    }
+
+                    if let Some(index) = center {
+                        if index >= 0 && (index as u32) < n_items {
+                            imp.selection.set_selected(index as u32);
+                        }
                     }
                 }
             ));
