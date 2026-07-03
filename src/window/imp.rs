@@ -22,13 +22,11 @@ use crate::state::State;
 const SCROLL_ANIM_TAU_US: f64 = 130_000.0;
 
 // Page-stepping thresholds for `accumulate_step`. Wheel travel is in unitless notch clicks (1.0 per
-// physical notch). Touchpad travel is in pixels of reported finger movement: a notch of ~120px puts
-// roughly 5 page steps in a full-touchpad swipe. The trigger is a fifth of the notch, so the first
-// page fires early for a responsive feel. Touchpad values are a feel knob — tune freely.
+// physical notch).
 const WHEEL_NOTCH: f64 = 1.0;
 const WHEEL_TRIGGER: f64 = 0.2;
-const TOUCHPAD_NOTCH: f64 = 120.0;
-const TOUCHPAD_TRIGGER: f64 = 24.0;
+const TOUCHPAD_NOTCH: f64 = 40.0;
+const TOUCHPAD_TRIGGER: f64 = 8.0;
 
 // In-flight state of the animated one-page slide.
 //
@@ -923,13 +921,11 @@ mod tests {
     }
 
     #[test]
-    fn touchpad_full_swipe_steps_about_five_pages() {
-        // ~528px of travel is a full-touchpad swipe on the tested device; with a ~120px notch that
-        // advances ~5 pages.
-        let deltas = vec![12.0; 44]; // 528px total
+    fn touchpad_full_swipe_steps_about_fifteen_pages() {
+        let deltas = vec![12.0; 44];
         let steps: i32 = run_scaled(&deltas, TOUCHPAD_NOTCH, TOUCHPAD_TRIGGER)
             .iter()
             .sum();
-        assert_eq!(steps, 5);
+        assert_eq!(steps, 14);
     }
 }
