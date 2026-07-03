@@ -54,7 +54,7 @@ fn main() -> glib::ExitCode {
     });
     app.connect_command_line(|app, cmd| {
         build_ui(app, &cmd.arguments());
-        0
+        glib::ExitCode::SUCCESS
     });
     app.run_with_args(&std::env::args().collect::<Vec<_>>())
 }
