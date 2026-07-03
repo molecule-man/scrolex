@@ -438,8 +438,8 @@ impl Page {
         poppler_page.render(cr);
 
         let elapsed = start.elapsed();
-        log::trace!(
-            "Rendered page {} with multithreading disabled in {elapsed:?}",
+        log::debug!(
+            "Rendered page {} on main thread (sync mode) in {elapsed:?}",
             poppler_page.index()
         );
 
@@ -500,12 +500,14 @@ impl Page {
         let cached = cache.borrow_mut().get(page_num);
         if let Some(surface) = cached {
             if (surface.width(), surface.height()) == expected {
+                log::debug!("draw page {page_num}: cache hit");
                 let bbox = self.get_bbox(poppler_page, obj.crop());
                 draw_surface(cr, &surface, &bbox, scale);
                 self.prefetch_neighbors(page_num, scale, scale_factor);
                 return;
             }
             // dimensions changed (e.g. zoom), the cached surface is stale
+            log::debug!("draw page {page_num}: cache stale (zoom/scale changed)");
             cache.borrow_mut().remove(page_num);
         }
 
@@ -515,6 +517,14 @@ impl Page {
             .render_inflight()
             .borrow_mut()
             .insert(page_num);
+        log::debug!(
+            "draw page {page_num}: cache miss (white flash), {}",
+            if is_new {
+                "scheduling render"
+            } else {
+                "render already in flight"
+            }
+        );
         if is_new {
             self.schedule_render(page_num, scale, scale_factor, RenderPriority::Visible);
         }
@@ -687,8 +697,13 @@ fn request_render(
         todo!("Page not found");
     };
 
+    let start = std::time::Instant::now();
     let surface = render_surface(&page, scale, device_scale_factor);
     let (width, height, stride) = (surface.width(), surface.height(), surface.stride());
+    log::debug!(
+        "Rendered page {page_num} on background thread in {:?}",
+        start.elapsed()
+    );
 
     let mut buffer = vec![0u8; (stride * height) as usize];
     surface

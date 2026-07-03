@@ -96,9 +96,37 @@ impl State {
             }
         }
 
+        self.log_document_info(f);
+
         self.emit_by_name::<()>("loaded", &[]);
 
         Ok(())
+    }
+
+    fn log_document_info(&self, f: &gtk::gio::File) {
+        let Some(doc) = self.doc() else {
+            return;
+        };
+
+        let size_bytes = f
+            .query_info(
+                "standard::size",
+                gtk::gio::FileQueryInfoFlags::NONE,
+                gtk::gio::Cancellable::NONE,
+            )
+            .map(|info| info.size())
+            .unwrap_or(-1);
+
+        let n_pages = doc.n_pages();
+        let first_page_size = doc.page(0).map(|p| p.size());
+
+        log::info!(
+            "Loaded document: {n_pages} pages, {size_bytes} bytes, first page {first_page_size:?} pt, \
+             start page {}, zoom {}, crop {}",
+            self.page(),
+            self.zoom(),
+            self.crop(),
+        );
     }
 
     pub fn save(&self) -> io::Result<()> {

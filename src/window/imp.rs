@@ -155,7 +155,10 @@ impl Window {
     }
 
     #[template_callback]
-    fn handle_scroll(&self, _dx: f64, dy: f64) -> glib::Propagation {
+    fn handle_scroll(&self, dx: f64, dy: f64) -> glib::Propagation {
+        let action = if dy < 0.0 { "prev_page" } else { "next_page" };
+        log::debug!("scroll event: dx={dx}, dy={dy} -> {action}");
+
         if dy < 0.0 {
             self.prev_page();
         } else {
