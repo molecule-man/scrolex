@@ -46,7 +46,7 @@
 							<object class="GtkEntry" id="entry_page_num">
 								<signal name="activate" handler="handle_page_number_entered" swapped="true"/>
 								<signal name="icon-press" handler="handle_page_number_icon_pressed" swapped="true"/>
-								<property name="secondary-icon-name">view-paged</property>
+								<property name="secondary-icon-name">go-jump-symbolic</property>
 								<property name="halign">end</property>
 								<property name="valign">baseline-center</property>
 								<property name="width-chars">4</property>
