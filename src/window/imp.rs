@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use glib::clone;
 use glib::subclass::InitializingObject;
@@ -45,6 +45,10 @@ pub struct Window {
 
     drag_coords: RefCell<Option<(f64, f64)>>,
     drag_cursor: RefCell<Option<gtk::gdk::Cursor>>,
+
+    // set while next_page/prev_page reposition the viewport, so the scroll ->
+    // selection sync doesn't override their anchored, lockstep page selection
+    scroll_sync_suppressed: Cell<bool>,
 }
 
 // The central trait for subclassing a GObject
@@ -79,6 +83,16 @@ impl ObjectImpl for Window {
                 }
             });
         }
+
+        self.setup_scroll_selection_sync();
+
+        // Give keyboard focus to the scroll area rather than the header entry
+        self.scrolledwindow.set_focusable(true);
+        self.listview.set_focusable(false);
+        let scrolledwindow = self.scrolledwindow.clone();
+        self.obj().connect_map(move |_| {
+            scrolledwindow.grab_focus();
+        });
     }
 }
 
@@ -183,6 +197,19 @@ impl Window {
             Key::bracketright => {
                 self.zoom_in();
             }
+            Key::Left | Key::Right => {
+                // fine horizontal scroll; handled here rather than relying on
+                // the scrolled window's own key bindings, which only fire when
+                // it directly holds focus
+                let hadj = self.scrolledwindow.hadjustment();
+                let step = if hadj.step_increment() > 0.0 {
+                    hadj.step_increment()
+                } else {
+                    hadj.page_size() * 0.1
+                };
+                let delta = if keyval == Key::Left { -step } else { step };
+                hadj.set_value(hadj.value() + delta);
+            }
             _ => return glib::Propagation::Proceed,
         }
 
@@ -263,9 +290,11 @@ impl Window {
                 .width(),
         ) + 4.0; // 4px is padding of list item widget. TODO: figure out how to un-hardcode this
 
+        self.scroll_sync_suppressed.set(true);
         self.scrolledwindow
             .hadjustment()
             .set_value(current_pos - width);
+        self.scroll_sync_suppressed.set(false);
     }
 
     fn next_page(&self) {
@@ -289,9 +318,11 @@ impl Window {
             (selection.selected() + 1).min(selection.n_items() - 1),
             true,
         );
+        self.scroll_sync_suppressed.set(true);
         self.scrolledwindow
             .hadjustment()
             .set_value(current_pos + width);
+        self.scroll_sync_suppressed.set(false);
     }
 
     fn ensure_ready_selection(&self) -> Option<&gtk::SingleSelection> {
@@ -382,6 +413,59 @@ impl Window {
             }
             glib::ControlFlow::Break
         });
+
+        // move keyboard focus off the header entry so h/l/arrows work
+        self.scrolledwindow.grab_focus();
+    }
+
+    // Track the page at the centre of the viewport as the user scrolls (by
+    // touchpad, scrollbar or drag) and keep the selection on it, so navigation
+    // and the page indicator reflect where the user actually is.
+    fn setup_scroll_selection_sync(&self) {
+        self.scrolledwindow
+            .hadjustment()
+            .connect_value_changed(clone!(
+                #[weak(rename_to = imp)]
+                self,
+                move |_| {
+                    // wheel/h/l navigation manages the selection itself as an
+                    // anchor; only free scrolling (touchpad, scrollbar, drag)
+                    // syncs the selection to the viewport
+                    if imp.scroll_sync_suppressed.get() {
+                        return;
+                    }
+
+                    let scrolledwindow = &imp.scrolledwindow;
+                    let selection = &imp.selection;
+                    let (w, h) = (scrolledwindow.width(), scrolledwindow.height());
+                    if w == 0 || selection.n_items() == 0 {
+                        return;
+                    }
+                    let Some(picked) = scrolledwindow.pick(
+                        f64::from(w) / 2.0,
+                        f64::from(h) / 2.0,
+                        gtk::PickFlags::DEFAULT,
+                    ) else {
+                        return;
+                    };
+
+                    // walk up from the picked widget to its Page
+                    let mut node = Some(picked);
+                    while let Some(n) = node {
+                        if let Some(page) = n.downcast_ref::<page::Page>() {
+                            let index = page.index();
+                            if index >= 0
+                                && (index as u32) < selection.n_items()
+                                && selection.selected() != index as u32
+                            {
+                                selection.set_selected(index as u32);
+                            }
+                            break;
+                        }
+                        node = n.parent();
+                    }
+                }
+            ));
     }
 
     #[template_callback]
