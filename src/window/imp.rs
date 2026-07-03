@@ -220,6 +220,13 @@ impl Window {
             }
         }
 
+        // Scrolling changes the selection, and when GtkListView moves the selected row it can hand
+        // keyboard focus to a header entry (the list view and its rows aren't focusable). Reassert
+        // focus on the scroll area so h/l/arrows keep working after a scroll.
+        if !self.scrolledwindow.has_focus() {
+            self.scrolledwindow.grab_focus();
+        }
+
         glib::Propagation::Stop
     }
 
