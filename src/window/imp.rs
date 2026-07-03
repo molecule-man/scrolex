@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use glib::clone;
 use glib::subclass::InitializingObject;
@@ -45,6 +45,11 @@ pub struct Window {
 
     drag_coords: RefCell<Option<(f64, f64)>>,
     drag_cursor: RefCell<Option<gtk::gdk::Cursor>>,
+
+    // set while a selection sync is queued on idle, to coalesce a burst of
+    // scroll events (e.g. aggressive wheeling) into a single sync that runs
+    // after the list view has finished re-laying-out
+    sync_pending: Cell<bool>,
 }
 
 // The central trait for subclassing a GObject
@@ -430,39 +435,58 @@ impl Window {
             .connect_value_changed(clone!(
                 #[weak(rename_to = imp)]
                 self,
-                move |_| {
-                    let (w, h) = (imp.scrolledwindow.width(), imp.scrolledwindow.height());
-                    let n_items = imp.selection.n_items();
-                    if w == 0 || n_items == 0 {
-                        return;
-                    }
-                    let selected = imp.selection.selected() as i32;
-                    let cy = f64::from(h) / 2.0;
-
-                    // Sample the viewport across its width. Keep the current selection as long as
-                    // its page is still visible anywhere; only move it once that page has scrolled
-                    // off. This anchors wheel/h/l navigation and ignores the layout shifts caused
-                    // by crop/zoom recompute, while still following free scroll.
-                    let mut center = None;
-                    for (i, frac) in [0.05, 0.275, 0.5, 0.725, 0.95].iter().enumerate() {
-                        let Some(index) = imp.page_index_at(f64::from(w) * frac, cy) else {
-                            continue;
-                        };
-                        if index == selected {
-                            return;
-                        }
-                        if i == 2 {
-                            center = Some(index);
-                        }
-                    }
-
-                    if let Some(index) = center {
-                        if index >= 0 && (index as u32) < n_items {
-                            imp.selection.set_selected(index as u32);
-                        }
-                    }
-                }
+                move |_| imp.schedule_selection_sync()
             ));
+    }
+
+    // Coalesce a burst of scroll events into a single sync run on idle, after
+    // the list view has re-laid-out. Running per-event would read stale page
+    // positions mid-burst (e.g. aggressive wheeling) and mis-select.
+    fn schedule_selection_sync(&self) {
+        if self.sync_pending.replace(true) {
+            return;
+        }
+        glib::idle_add_local_once(clone!(
+            #[weak(rename_to = imp)]
+            self,
+            move || {
+                imp.sync_pending.set(false);
+                imp.sync_selection_to_viewport();
+            }
+        ));
+    }
+
+    // Sample the viewport across its width. Keep the current selection as long
+    // as its page is still visible anywhere; only move it once that page has
+    // scrolled off. This anchors wheel/h/l navigation and ignores the layout
+    // shifts from crop/zoom recompute, while still following free scroll.
+    fn sync_selection_to_viewport(&self) {
+        let (w, h) = (self.scrolledwindow.width(), self.scrolledwindow.height());
+        let n_items = self.selection.n_items();
+        if w == 0 || n_items == 0 {
+            return;
+        }
+        let selected = self.selection.selected() as i32;
+        let cy = f64::from(h) / 2.0;
+
+        let mut center = None;
+        for (i, frac) in [0.05, 0.275, 0.5, 0.725, 0.95].iter().enumerate() {
+            let Some(index) = self.page_index_at(f64::from(w) * frac, cy) else {
+                continue;
+            };
+            if index == selected {
+                return;
+            }
+            if i == 2 {
+                center = Some(index);
+            }
+        }
+
+        if let Some(index) = center {
+            if index >= 0 && (index as u32) < n_items {
+                self.selection.set_selected(index as u32);
+            }
+        }
     }
 
     #[template_callback]
