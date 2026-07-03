@@ -78,6 +78,14 @@ pub struct Window {
 
     // in-flight animated one-page scroll; None when no slide is running
     scroll_anim: RefCell<Option<ScrollAnim>>,
+
+    // accumulates hi-res mouse-wheel deltas: libinput splits one physical notch into several
+    // sub-events that sum to 1.0, so we advance a page only when the running total crosses a whole
+    // notch, keeping the remainder
+    wheel_accum: Cell<f64>,
+    // the previous wheel delta, to detect a direction reversal and reset the accumulator so
+    // reversing doesn't over-step
+    wheel_last_dy: Cell<f64>,
 }
 
 // The central trait for subclassing a GObject
@@ -155,15 +163,38 @@ impl Window {
     }
 
     #[template_callback]
-    fn handle_scroll(&self, dx: f64, dy: f64) -> glib::Propagation {
-        let action = if dy < 0.0 { "prev_page" } else { "next_page" };
-        log::debug!("scroll event: dx={dx}, dy={dy} -> {action}");
+    fn handle_scroll(
+        &self,
+        dx: f64,
+        dy: f64,
+        scroll: &gtk::EventControllerScroll,
+    ) -> glib::Propagation {
+        let unit = scroll.unit();
+        log::debug!("scroll event: dx={dx}, dy={dy}, unit={unit:?}");
 
-        if dy < 0.0 {
-            self.prev_page();
-        } else {
-            self.next_page();
+        match unit {
+            // Mouse wheel: hi-res wheels split one notch into several sub-events summing to 1.0.
+            // Fire the first page as soon as a small fraction of a notch has scrolled (TRIGGER) so
+            // the wheel responds immediately, then pace one page per full notch (subtract NOTCH,
+            // keep the remainder). Steps land at cumulative 0.2, 1.2, 2.2, … of a notch.
+            gtk::gdk::ScrollUnit::Wheel => {
+                let (accum, step) =
+                    wheel_step(self.wheel_accum.get(), self.wheel_last_dy.get(), dy);
+                self.wheel_accum.set(accum);
+                self.wheel_last_dy.set(dy);
+                if step > 0 {
+                    self.next_page();
+                } else if step < 0 {
+                    self.prev_page();
+                }
+            }
+            // Touchpad (and any other pixel-precise device): scroll horizontally (as if dragging)
+            _ => {
+                let hadj = self.scrolledwindow.hadjustment();
+                hadj.set_value(self.clamp_scroll(hadj.value() + dx + dy));
+            }
         }
+
         glib::Propagation::Stop
     }
 
@@ -692,6 +723,30 @@ impl WindowImpl for Window {}
 // Trait shared by all application windows
 impl ApplicationWindowImpl for Window {}
 
+// Advance the mouse-wheel accumulator by one scroll event and decide whether to step a page.
+// Returns the new accumulator and the page step (+1 next, -1 prev, 0 none). Hi-res wheels split one
+// physical notch into several sub-events that sum to 1.0; the first page fires as soon as TRIGGER
+// of a notch has scrolled so the wheel responds immediately, then one page per full NOTCH (steps
+// land at cumulative 0.2, 1.2, 2.2, … of a notch). The step is gated on the event's direction so
+// the opposite-signed remainder left after a fire (e.g. -0.8 after a forward step) can't trigger a
+// bogus step in reverse.
+fn wheel_step(accum: f64, prev_dy: f64, dy: f64) -> (f64, i32) {
+    const NOTCH: f64 = 1.0;
+    const TRIGGER: f64 = 0.2;
+    // On a direction reversal, drop the leftover under-shoot from the previous direction: that
+    // residual belongs to the old direction, and counting it toward the new one gives it a head
+    // start that fires an extra page.
+    let base = if dy * prev_dy < 0.0 { 0.0 } else { accum };
+    let accum = base + dy;
+    if dy > 0.0 && accum >= TRIGGER {
+        (accum - NOTCH, 1)
+    } else if dy < 0.0 && accum <= -TRIGGER {
+        (accum + NOTCH, -1)
+    } else {
+        (accum, 0)
+    }
+}
+
 // Find the Page widget within a list item's widget subtree.
 fn descendant_page(widget: &gtk::Widget) -> Option<page::Page> {
     if let Some(page) = widget.downcast_ref::<page::Page>() {
@@ -705,4 +760,118 @@ fn descendant_page(widget: &gtk::Widget) -> Option<page::Page> {
         child = c.next_sibling();
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::wheel_step;
+
+    fn run(deltas: &[f64]) -> Vec<i32> {
+        let mut accum = 0.0;
+        let mut prev = 0.0;
+        deltas
+            .iter()
+            .map(|&dy| {
+                let (a, step) = wheel_step(accum, prev, dy);
+                accum = a;
+                prev = dy;
+                step
+            })
+            .collect()
+    }
+
+    // One physical notch as a hi-res wheel reports it: several sub-events (multiples of 1/15)
+    // summing to 1.0.
+    const NOTCH: [f64; 4] = [7.0 / 15.0, 2.0 / 15.0, 4.0 / 15.0, 2.0 / 15.0];
+
+    #[test]
+    fn one_notch_steps_exactly_one_page_and_never_reverses() {
+        let steps = run(&NOTCH);
+        assert_eq!(steps.iter().sum::<i32>(), 1);
+        // the opposite-signed remainder after the fire must not trigger a step back
+        assert!(
+            steps.iter().all(|&s| s >= 0),
+            "unexpected reverse step: {steps:?}"
+        );
+    }
+
+    #[test]
+    fn wheel_responds_on_the_first_sub_event() {
+        assert_eq!(run(&NOTCH)[0], 1);
+    }
+
+    #[test]
+    fn two_notches_step_two_pages() {
+        let seq: Vec<f64> = NOTCH.iter().chain(NOTCH.iter()).copied().collect();
+        assert_eq!(run(&seq).iter().sum::<i32>(), 2);
+    }
+
+    #[test]
+    fn reverse_notch_steps_one_page_back_and_never_advances() {
+        let back: Vec<f64> = NOTCH.iter().map(|d| -d).collect();
+        let steps = run(&back);
+        assert_eq!(steps.iter().sum::<i32>(), -1);
+        assert!(
+            steps.iter().all(|&s| s <= 0),
+            "unexpected forward step: {steps:?}"
+        );
+    }
+
+    #[test]
+    fn forward_then_reverse_nets_zero() {
+        let seq: Vec<f64> = NOTCH
+            .iter()
+            .copied()
+            .chain(NOTCH.iter().map(|d| -d))
+            .collect();
+        assert_eq!(run(&seq).iter().sum::<i32>(), 0);
+    }
+
+    #[test]
+    fn reversal_after_partial_forward_steps_one_page_back_not_two() {
+        // Stop mid-notch right after a forward page fires (accumulator left at a negative
+        // residual), then reverse a full notch. The stale residual must not fire a second page back
+        let mut seq = vec![7.0 / 15.0]; // one forward sub-event: fires +1, leaves residual
+        seq.extend(NOTCH.iter().map(|d| -d)); // a full reverse notch
+        let steps = run(&seq);
+        assert_eq!(steps[0], 1, "forward sub-event should fire once");
+        assert_eq!(
+            steps[1..].iter().sum::<i32>(),
+            -1,
+            "reversal must step exactly one page back, got {:?}",
+            &steps[1..]
+        );
+    }
+
+    #[test]
+    fn reversal_from_rest_steps_one_page_back() {
+        // A full forward notch leaves the accumulator at rest, then a reverse notch.
+        let seq: Vec<f64> = NOTCH
+            .iter()
+            .copied()
+            .chain(NOTCH.iter().map(|d| -d))
+            .collect();
+        let steps = run(&seq);
+        assert_eq!(steps[..NOTCH.len()].iter().sum::<i32>(), 1);
+        assert_eq!(steps[NOTCH.len()..].iter().sum::<i32>(), -1);
+    }
+
+    #[test]
+    fn low_res_wheel_single_event_steps_one_page() {
+        assert_eq!(run(&[1.0]), vec![1]);
+        assert_eq!(run(&[-1.0]), vec![-1]);
+    }
+
+    #[test]
+    fn first_step_early_then_paced_one_notch_apart() {
+        // 0.25 per event (exactly representable): first page at 0.25, then every full notch (four
+        // events). Fires land at 0, 4, 8, 12.
+        let fired: Vec<usize> = run(&[0.25; 16])
+            .iter()
+            .enumerate()
+            .filter(|(_, &s)| s != 0)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(fired, vec![0, 4, 8, 12]);
+    }
 }

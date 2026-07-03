@@ -195,7 +195,7 @@
 				</child>
 				<child>
 					<object class="GtkEventControllerScroll">
-						<property name="flags">vertical|discrete</property>
+						<property name="flags">both-axes</property>
 						<signal name="scroll" handler="handle_scroll" swapped="true" />
 					</object>
 				</child>
