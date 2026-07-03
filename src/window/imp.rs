@@ -21,6 +21,15 @@ use crate::state::State;
 // mid-slide, so the page settles instead of vibrating.
 const SCROLL_ANIM_TAU_US: f64 = 130_000.0;
 
+// Page-stepping thresholds for `accumulate_step`. Wheel travel is in unitless notch clicks (1.0 per
+// physical notch). Touchpad travel is in pixels of reported finger movement: a notch of ~120px puts
+// roughly 5 page steps in a full-touchpad swipe. The trigger is a fifth of the notch, so the first
+// page fires early for a responsive feel. Touchpad values are a feel knob — tune freely.
+const WHEEL_NOTCH: f64 = 1.0;
+const WHEEL_TRIGGER: f64 = 0.2;
+const TOUCHPAD_NOTCH: f64 = 120.0;
+const TOUCHPAD_TRIGGER: f64 = 24.0;
+
 // In-flight state of the animated one-page slide.
 //
 // The end position is recomputed live each tick from the selected page widget's actual geometry, so
@@ -86,6 +95,11 @@ pub struct Window {
     // the previous wheel delta, to detect a direction reversal and reset the accumulator so
     // reversing doesn't over-step
     wheel_last_dy: Cell<f64>,
+
+    // same accumulation as the wheel, but for vertical touchpad scroll (kept separate because its
+    // travel is measured in pixels, not notch clicks)
+    touch_accum: Cell<f64>,
+    touch_last_dy: Cell<f64>,
 }
 
 // The central trait for subclassing a GObject
@@ -178,24 +192,46 @@ impl Window {
             // the wheel responds immediately, then pace one page per full notch (subtract NOTCH,
             // keep the remainder). Steps land at cumulative 0.2, 1.2, 2.2, … of a notch.
             gtk::gdk::ScrollUnit::Wheel => {
-                let (accum, step) =
-                    wheel_step(self.wheel_accum.get(), self.wheel_last_dy.get(), dy);
+                let (accum, step) = accumulate_step(
+                    self.wheel_accum.get(),
+                    self.wheel_last_dy.get(),
+                    dy,
+                    WHEEL_NOTCH,
+                    WHEEL_TRIGGER,
+                );
                 self.wheel_accum.set(accum);
                 self.wheel_last_dy.set(dy);
-                if step > 0 {
-                    self.next_page();
-                } else if step < 0 {
-                    self.prev_page();
-                }
+                self.step_page(step);
             }
-            // Touchpad (and any other pixel-precise device): scroll horizontally (as if dragging)
+            // Touchpad (and any other pixel-precise device): a horizontal swipe scrolls the page
+            // flow smoothly (like dragging); a vertical swipe steps pages, one per notch of travel.
             _ => {
                 let hadj = self.scrolledwindow.hadjustment();
-                hadj.set_value(self.clamp_scroll(hadj.value() + dx + dy));
+                hadj.set_value(self.clamp_scroll(hadj.value() + dx));
+
+                let (accum, step) = accumulate_step(
+                    self.touch_accum.get(),
+                    self.touch_last_dy.get(),
+                    dy,
+                    TOUCHPAD_NOTCH,
+                    TOUCHPAD_TRIGGER,
+                );
+                self.touch_accum.set(accum);
+                self.touch_last_dy.set(dy);
+                self.step_page(step);
             }
         }
 
         glib::Propagation::Stop
+    }
+
+    // Apply a page step from a scroll accumulator: +1 forward, -1 back, 0 nothing.
+    fn step_page(&self, step: i32) {
+        if step > 0 {
+            self.next_page();
+        } else if step < 0 {
+            self.prev_page();
+        }
     }
 
     #[template_callback]
@@ -723,25 +759,24 @@ impl WindowImpl for Window {}
 // Trait shared by all application windows
 impl ApplicationWindowImpl for Window {}
 
-// Advance the mouse-wheel accumulator by one scroll event and decide whether to step a page.
-// Returns the new accumulator and the page step (+1 next, -1 prev, 0 none). Hi-res wheels split one
-// physical notch into several sub-events that sum to 1.0; the first page fires as soon as TRIGGER
-// of a notch has scrolled so the wheel responds immediately, then one page per full NOTCH (steps
-// land at cumulative 0.2, 1.2, 2.2, … of a notch). The step is gated on the event's direction so
-// the opposite-signed remainder left after a fire (e.g. -0.8 after a forward step) can't trigger a
-// bogus step in reverse.
-fn wheel_step(accum: f64, prev_dy: f64, dy: f64) -> (f64, i32) {
-    const NOTCH: f64 = 1.0;
-    const TRIGGER: f64 = 0.2;
+// Accumulate a scroll delta and decide whether to step a page. Returns the new accumulator and the
+// page step (+1 next, -1 prev, 0 none). `notch` is the travel that advances one page; the first
+// page fires as soon as `trigger` (< notch) has accumulated so the gesture responds immediately,
+// then one page per full notch (steps land at cumulative trigger, trigger+notch, … ). The step is
+// gated on the event's direction so the opposite-signed remainder left after a fire can't trigger a
+// bogus step in reverse. Shared by the mouse wheel (notch in unitless clicks: a hi-res wheel splits
+// one physical notch into sub-events summing to 1.0) and vertical touchpad scroll (notch in pixels
+// of finger travel).
+fn accumulate_step(accum: f64, prev: f64, delta: f64, notch: f64, trigger: f64) -> (f64, i32) {
     // On a direction reversal, drop the leftover under-shoot from the previous direction: that
     // residual belongs to the old direction, and counting it toward the new one gives it a head
     // start that fires an extra page.
-    let base = if dy * prev_dy < 0.0 { 0.0 } else { accum };
-    let accum = base + dy;
-    if dy > 0.0 && accum >= TRIGGER {
-        (accum - NOTCH, 1)
-    } else if dy < 0.0 && accum <= -TRIGGER {
-        (accum + NOTCH, -1)
+    let base = if delta * prev < 0.0 { 0.0 } else { accum };
+    let accum = base + delta;
+    if delta > 0.0 && accum >= trigger {
+        (accum - notch, 1)
+    } else if delta < 0.0 && accum <= -trigger {
+        (accum + notch, -1)
     } else {
         (accum, 0)
     }
@@ -764,17 +799,22 @@ fn descendant_page(widget: &gtk::Widget) -> Option<page::Page> {
 
 #[cfg(test)]
 mod tests {
-    use super::wheel_step;
+    use super::{accumulate_step, TOUCHPAD_NOTCH, TOUCHPAD_TRIGGER, WHEEL_NOTCH, WHEEL_TRIGGER};
 
+    // Run a sequence of wheel deltas through the accumulator at wheel scale.
     fn run(deltas: &[f64]) -> Vec<i32> {
+        run_scaled(deltas, WHEEL_NOTCH, WHEEL_TRIGGER)
+    }
+
+    fn run_scaled(deltas: &[f64], notch: f64, trigger: f64) -> Vec<i32> {
         let mut accum = 0.0;
         let mut prev = 0.0;
         deltas
             .iter()
-            .map(|&dy| {
-                let (a, step) = wheel_step(accum, prev, dy);
+            .map(|&d| {
+                let (a, step) = accumulate_step(accum, prev, d, notch, trigger);
                 accum = a;
-                prev = dy;
+                prev = d;
                 step
             })
             .collect()
@@ -873,5 +913,23 @@ mod tests {
             .map(|(i, _)| i)
             .collect();
         assert_eq!(fired, vec![0, 4, 8, 12]);
+    }
+
+    #[test]
+    fn touchpad_scale_first_page_fires_before_a_full_notch() {
+        // One trigger's worth of travel (well under a notch) still turns a page.
+        let steps = run_scaled(&[TOUCHPAD_TRIGGER], TOUCHPAD_NOTCH, TOUCHPAD_TRIGGER);
+        assert_eq!(steps, vec![1]);
+    }
+
+    #[test]
+    fn touchpad_full_swipe_steps_about_five_pages() {
+        // ~528px of travel is a full-touchpad swipe on the tested device; with a ~120px notch that
+        // advances ~5 pages.
+        let deltas = vec![12.0; 44]; // 528px total
+        let steps: i32 = run_scaled(&deltas, TOUCHPAD_NOTCH, TOUCHPAD_TRIGGER)
+            .iter()
+            .sum();
+        assert_eq!(steps, 5);
     }
 }
