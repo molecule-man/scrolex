@@ -130,6 +130,18 @@
 						</property>
 					</object>
 				</child>
+				<child type="end">
+					<object class="GtkToggleButton" id="btn_animate_scroll">
+						<property name="active" bind-source="state" bind-property="animate-scroll" bind-flags="bidirectional|sync-create"/>
+						<property name="label">Animate Scroll</property>
+						<property name="tooltip-text">Slide by one page on scroll instead of jumping</property>
+						<property name="cursor">
+							<object class="GdkCursor">
+								<property name="name">pointer</property>
+							</object>
+						</property>
+					</object>
+				</child>
 			</object>
 		</child>
 		<child>

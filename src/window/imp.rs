@@ -15,6 +15,29 @@ use gtk::{prelude::*, GestureClick};
 use crate::page;
 use crate::state::State;
 
+// Time constant of the exponential glide toward the target page position. Larger = slower and
+// smoother; the perceived slide runs a few times this long. The glide is a low-pass follow, which
+// damps the hadjustment jitter that GtkListView injects when async crop relayout makes it re-anchor
+// mid-slide, so the page settles instead of vibrating.
+const SCROLL_ANIM_TAU_US: f64 = 130_000.0;
+
+// In-flight state of the animated one-page slide.
+//
+// The end position is recomputed live each tick from the selected page widget's actual geometry, so
+// async crop/zoom layout shifts during the slide are compensated and the page still lands at the
+// same on-screen spot. `anchor_x` is the viewport x where the selected page's left edge should come
+// to rest. `last_target` remembers the most recent geometry-derived resting position; it is used
+// when the selected page isn't realised yet (e.g. selection has raced ahead during a burst) so the
+// slide chases only real page positions and never overshoots into a reverse correction.
+// `last_frame` is the previous tick's frame time (-1 until the first tick) for a
+// frame-rate-independent glide.
+#[derive(Clone, Copy)]
+struct ScrollAnim {
+    anchor_x: Option<f64>,
+    last_target: f64,
+    last_frame: i64,
+}
+
 // Object holding the state
 #[derive(CompositeTemplate, Default)]
 #[template(resource = "/com/andr2i/scrolex/app.ui")]
@@ -35,6 +58,8 @@ pub struct Window {
     #[template_child]
     pub btn_crop: TemplateChild<ToggleButton>,
     #[template_child]
+    pub btn_animate_scroll: TemplateChild<ToggleButton>,
+    #[template_child]
     pub btn_jump_back: TemplateChild<Button>,
     #[template_child]
     pub scrolledwindow: TemplateChild<ScrolledWindow>,
@@ -50,6 +75,9 @@ pub struct Window {
     // scroll events (e.g. aggressive wheeling) into a single sync that runs
     // after the list view has finished re-laying-out
     sync_pending: Cell<bool>,
+
+    // in-flight animated one-page scroll; None when no slide is running
+    scroll_anim: RefCell<Option<ScrollAnim>>,
 }
 
 // The central trait for subclassing a GObject
@@ -278,7 +306,9 @@ impl Window {
             return;
         };
 
-        let current_pos = self.scrolledwindow.hadjustment().value();
+        // where the page we're leaving sits now; the newly selected page slides
+        // to this same spot
+        let anchor = self.selected_page_left_x();
 
         // normally I'd use list_view.scroll_to() here, but it doesn't scroll if the item
         // is already visible :(
@@ -291,9 +321,7 @@ impl Window {
                 .width(),
         ) + 4.0; // 4px is padding of list item widget. TODO: figure out how to un-hardcode this
 
-        self.scrolledwindow
-            .hadjustment()
-            .set_value(current_pos - width);
+        self.animate_scroll(anchor, -width);
     }
 
     fn next_page(&self) {
@@ -301,7 +329,8 @@ impl Window {
             return;
         };
 
-        let current_pos = self.scrolledwindow.hadjustment().value();
+        // where the page we're leaving sits now; the newly selected page slides to this same spot
+        let anchor = self.selected_page_left_x();
 
         // normally I'd use list_view.scroll_to() here, but it doesn't scroll if the item
         // is already visible :(
@@ -317,9 +346,134 @@ impl Window {
             (selection.selected() + 1).min(selection.n_items() - 1),
             true,
         );
-        self.scrolledwindow
-            .hadjustment()
-            .set_value(current_pos + width);
+        self.animate_scroll(anchor, width);
+    }
+
+    // Slide the horizontal scroll by one page instead of jumping, so the reader sees the page move
+    // and keeps their place. The selected page comes to rest at `anchor_x` (the viewport x it
+    // occupied before the step), matching the old instant behaviour but with motion. Wheeling again
+    // while a slide runs keeps the same anchor and retargets the running animation, so a burst
+    // stays smooth. `delta` seeds a resting position only for the degenerate case where the
+    // selected page's live geometry can't be read at all.
+    fn animate_scroll(&self, anchor_x: Option<f64>, delta: f64) {
+        let hadj = self.scrolledwindow.hadjustment();
+
+        // animation toggled off: jump straight to the page
+        if !self.state.animate_scroll() {
+            hadj.set_value(self.clamp_scroll(hadj.value() + delta));
+            return;
+        }
+
+        let mut anim = self.scroll_anim.borrow_mut();
+        let (anchor_x, prev_target, last_frame) = match anim.as_ref() {
+            Some(a) => (a.anchor_x, Some(a.last_target), a.last_frame),
+            None => (anchor_x, None, -1),
+        };
+        // Prefer the selected page's exact live position. When it isn't laid out yet (selection
+        // raced ahead in a burst), advance by one page-width from the previous target so the burst
+        // keeps covering ground; live geometry snaps it to the exact spot once the page is actually
+        // mapped.
+        let last_target = self
+            .live_target(anchor_x)
+            .unwrap_or_else(|| self.clamp_scroll(prev_target.unwrap_or(hadj.value()) + delta));
+        let start_fresh = anim.is_none();
+        *anim = Some(ScrollAnim {
+            anchor_x,
+            last_target,
+            last_frame,
+        });
+        drop(anim);
+
+        if start_fresh {
+            self.scrolledwindow.add_tick_callback(clone!(
+                #[weak(rename_to = imp)]
+                self,
+                #[upgrade_or]
+                glib::ControlFlow::Break,
+                move |_, clock| imp.scroll_tick(clock)
+            ));
+        }
+    }
+
+    fn scroll_tick(&self, clock: &gtk::gdk::FrameClock) -> glib::ControlFlow {
+        let Some(mut anim) = *self.scroll_anim.borrow() else {
+            return glib::ControlFlow::Break;
+        };
+
+        // Chase the selected page's live resting position; when it isn't realised yet (selection
+        // raced ahead in a burst) hold the last known one. Real page positions only advance as
+        // selection advances, so the target never jumps behind us and the slide never reverses.
+        let target = self.live_target(anim.anchor_x).unwrap_or(anim.last_target);
+        anim.last_target = target;
+
+        let now = clock.frame_time();
+        let dt = if anim.last_frame < 0 {
+            0
+        } else {
+            now - anim.last_frame
+        };
+        anim.last_frame = now;
+
+        let hadj = self.scrolledwindow.hadjustment();
+        let value = hadj.value();
+        // Exponential glide from wherever the value currently is toward the target. Reading the
+        // live value each frame means GtkListView's mid-slide re-anchoring is corrected gently
+        // rather than fought, so no vibration.
+        let k = if dt <= 0 {
+            0.0
+        } else {
+            1.0 - (-(dt as f64) / SCROLL_ANIM_TAU_US).exp()
+        };
+        let next = value + (target - value) * k;
+
+        if (target - next).abs() < 0.5 {
+            // settled: snap exactly and let the normal sync reconcile selection
+            *self.scroll_anim.borrow_mut() = None;
+            hadj.set_value(target);
+            return glib::ControlFlow::Break;
+        }
+
+        *self.scroll_anim.borrow_mut() = Some(anim);
+        hadj.set_value(next);
+        glib::ControlFlow::Continue
+    }
+
+    fn clamp_scroll(&self, value: f64) -> f64 {
+        let hadj = self.scrolledwindow.hadjustment();
+        let lower = hadj.lower();
+        value.clamp(lower, (hadj.upper() - hadj.page_size()).max(lower))
+    }
+
+    // Resting hadjustment that puts the selected page's left edge at `anchor_x`, from its live
+    // geometry. None if there's no anchor or the page widget isn't realised. page_content_left =
+    // on-screen x + current value; the resting value is page_content_left - anchor_x.
+    fn live_target(&self, anchor_x: Option<f64>) -> Option<f64> {
+        let anchor = anchor_x?;
+        let left_x = self.selected_page_left_x()?;
+        let value = self.scrolledwindow.hadjustment().value();
+        Some(self.clamp_scroll(left_x + value - anchor))
+    }
+
+    // On-screen x (in scrolled-window coordinates) of the currently selected page's left edge, if
+    // that page widget is currently laid out in the viewport. Recycled/spare list widgets can
+    // already carry the selected index while sitting unmapped at the origin; trusting their (0, 0)
+    // position would drive the slide backwards, so those are skipped.
+    fn selected_page_left_x(&self) -> Option<f64> {
+        let selected = self.selection.selected() as i32;
+        let mut child = self.listview.first_child();
+        while let Some(c) = child {
+            if let Some(page) = descendant_page(&c) {
+                if page.index() == selected && page.is_mapped() && page.width() > 0 {
+                    if let Some(point) = page
+                        .compute_point(&*self.scrolledwindow, &gtk::graphene::Point::new(0.0, 0.0))
+                    {
+                        return Some(f64::from(point.x()));
+                    }
+                }
+            }
+            child = c.next_sibling();
+        }
+        None
     }
 
     fn ensure_ready_selection(&self) -> Option<&gtk::SingleSelection> {
@@ -439,10 +593,15 @@ impl Window {
             ));
     }
 
-    // Coalesce a burst of scroll events into a single sync run on idle, after
-    // the list view has re-laid-out. Running per-event would read stale page
-    // positions mid-burst (e.g. aggressive wheeling) and mis-select.
+    // Coalesce a burst of scroll events into a single sync run on idle, after the list view has
+    // re-laid-out. Running per-event would read stale page positions mid-burst (e.g. aggressive
+    // wheeling) and mis-select.
     fn schedule_selection_sync(&self) {
+        // during an animated one-page slide the selection is already set explicitly; skip the
+        // viewport sync so the moving pages don't fight it
+        if self.scroll_anim.borrow().is_some() {
+            return;
+        }
         if self.sync_pending.replace(true) {
             return;
         }
@@ -529,3 +688,18 @@ impl WindowImpl for Window {}
 
 // Trait shared by all application windows
 impl ApplicationWindowImpl for Window {}
+
+// Find the Page widget within a list item's widget subtree.
+fn descendant_page(widget: &gtk::Widget) -> Option<page::Page> {
+    if let Some(page) = widget.downcast_ref::<page::Page>() {
+        return Some(page.clone());
+    }
+    let mut child = widget.first_child();
+    while let Some(c) = child {
+        if let Some(page) = descendant_page(&c) {
+            return Some(page);
+        }
+        child = c.next_sibling();
+    }
+    None
+}

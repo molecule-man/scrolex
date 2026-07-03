@@ -20,6 +20,9 @@ pub struct State {
     crop: Cell<bool>,
 
     #[property(get, set)]
+    animate_scroll: Cell<bool>,
+
+    #[property(get, set)]
     doc: RefCell<Option<poppler::Document>>,
 
     #[property(get, set)]
@@ -56,6 +59,13 @@ impl ObjectSubclass for State {
 
 #[glib::derived_properties]
 impl ObjectImpl for State {
+    fn constructed(&self) {
+        self.parent_constructed();
+        // animated scrolling is on by default; the builder-created instance
+        // doesn't run State::new, so set it here
+        self.obj().set_animate_scroll(true);
+    }
+
     fn signals() -> &'static [Signal] {
         static SIGNALS: OnceLock<Vec<Signal>> = OnceLock::new();
         SIGNALS.get_or_init(|| {

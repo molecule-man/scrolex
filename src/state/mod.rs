@@ -23,6 +23,7 @@ impl State {
         let state: Self = glib::Object::builder()
             .property("zoom", 1.0)
             .property("crop", false)
+            .property("animate_scroll", true)
             .property("page", 0_u32)
             .build();
 
