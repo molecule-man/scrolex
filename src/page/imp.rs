@@ -8,9 +8,9 @@ use futures::channel::oneshot;
 use gtk::cairo::{Context, ImageSurface};
 use gtk::gdk::prelude::*;
 use gtk::gdk::BUTTON_PRIMARY;
+use gtk::glib;
 use gtk::glib::clone;
 use gtk::glib::subclass::{prelude::*, Signal};
-use gtk::glib;
 use gtk::prelude::*;
 use gtk::subclass::prelude::*;
 use gtk::DrawingArea;
@@ -512,11 +512,7 @@ impl Page {
         }
 
         // schedule a render unless one is already queued for this page
-        let is_new = obj
-            .state()
-            .render_inflight()
-            .borrow_mut()
-            .insert(page_num);
+        let is_new = obj.state().render_inflight().borrow_mut().insert(page_num);
         log::debug!(
             "draw page {page_num}: cache miss (white flash), {}",
             if is_new {
@@ -560,12 +556,13 @@ impl Page {
         let cache = obj.state().render_cache();
         let inflight = obj.state().render_inflight();
 
+        // The render queue is LIFO, that's why `rev` and start with the BEHIND
         let mut candidates = Vec::with_capacity((PREFETCH_AHEAD + PREFETCH_BEHIND) as usize);
-        for d in 1..=PREFETCH_AHEAD {
-            candidates.push(current + d);
-        }
-        for d in 1..=PREFETCH_BEHIND {
+        for d in (1..=PREFETCH_BEHIND).rev() {
             candidates.push(current - d);
+        }
+        for d in (1..=PREFETCH_AHEAD).rev() {
+            candidates.push(current + d);
         }
 
         for page_num in candidates {
@@ -694,7 +691,8 @@ fn request_render(
     resp_sender: oneshot::Sender<RenderedPage>,
 ) {
     let Some(page) = doc.page(page_num) else {
-        todo!("Page not found");
+        log::warn!("render skipped: page {page_num} not found in document");
+        return;
     };
 
     let start = std::time::Instant::now();

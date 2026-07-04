@@ -20,20 +20,12 @@ glib::wrapper! {
 
 impl State {
     pub(crate) fn new() -> Self {
-        let state: Self = glib::Object::builder()
+        glib::Object::builder()
             .property("zoom", 1.0)
             .property("crop", false)
             .property("animate_scroll", true)
             .property("page", 0_u32)
-            .build();
-
-        // A zoom change alters the rendered surface dimensions, so cached renders are no longer
-        // valid.
-        state.connect_notify_local(Some("zoom"), |state, _| {
-            state.imp().render_cache.borrow_mut().clear();
-        });
-
-        state
+            .build()
     }
 
     pub(crate) fn jump_list_add(&self, page: u32) {
