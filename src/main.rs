@@ -87,6 +87,10 @@ fn build_ui(app: &Application, args: &[OsString]) {
     let window = window::Window::new(app);
     window.set_widget_name("main");
 
+    if args.iter().any(|a| a == "-d" || a == "--debug") {
+        window.add_css_class("debug");
+    }
+
     let state = window.state();
 
     app.connect_shutdown(clone!(
