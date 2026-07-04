@@ -2,15 +2,22 @@
 	background-color: #999;
 }
 
-#main row:hover {
+#main row,
+#main row * {
+	outline: none;
+	box-shadow: none;
+	border: none;
+}
+
+#main.debug row:hover {
 	background-color: #888;
 }
 
-#main row:selected {
+#main.debug row:selected {
 	background-color: #333;
 }
 
-#main row:selected:hover {
+#main.debug row:selected:hover {
 	background-color: #222;
 }
 

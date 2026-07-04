@@ -6,9 +6,6 @@
     clippy::pedantic
 )]
 #![deny(clippy::all, clippy::if_not_else, clippy::enum_glob_use)]
-#![expect(clippy::cast_possible_wrap)]
-#![expect(clippy::cast_sign_loss)]
-#![expect(clippy::cast_possible_truncation)]
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -31,11 +28,7 @@ use scrolex::window;
 const APP_ID: &str = "com.andr2i.scrolex";
 
 fn main() -> glib::ExitCode {
-    #[cfg(feature = "logging")]
-    {
-        env_logger::init();
-        gtk::glib::log_set_default_handler(gtk::glib::rust_log_handler);
-    }
+    init_logging();
 
     // register types for usage in templates
     page::PageNumber::static_type();
@@ -54,9 +47,24 @@ fn main() -> glib::ExitCode {
     });
     app.connect_command_line(|app, cmd| {
         build_ui(app, &cmd.arguments());
-        0
+        glib::ExitCode::SUCCESS
     });
     app.run_with_args(&std::env::args().collect::<Vec<_>>())
+}
+
+fn init_logging() {
+    let verbose = std::env::args().any(|a| a == "-v" || a == "--verbose");
+    let default_filter = if verbose { "scrolex=debug" } else { "warn" };
+
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default_filter))
+        .format_timestamp_millis()
+        .init();
+    gtk::glib::log_set_default_handler(gtk::glib::rust_log_handler);
+
+    log::info!(
+        "scrolex {} starting (verbose={verbose})",
+        env!("CARGO_PKG_VERSION")
+    );
 }
 
 fn load_css() {
@@ -76,6 +84,10 @@ fn build_ui(app: &Application, args: &[OsString]) {
     let window = window::Window::new(app);
     window.set_widget_name("main");
 
+    if args.iter().any(|a| a == "-d" || a == "--debug") {
+        window.add_css_class("debug");
+    }
+
     let state = window.state();
 
     app.connect_shutdown(clone!(
@@ -88,7 +100,11 @@ fn build_ui(app: &Application, args: &[OsString]) {
         }
     ));
 
-    if let Some(fname) = args.get(1) {
+    if let Some(fname) = args
+        .iter()
+        .skip(1)
+        .find(|a| !a.to_string_lossy().starts_with('-'))
+    {
         match from_str_to_uri(fname) {
             Ok(uri) => {
                 state
@@ -98,7 +114,10 @@ fn build_ui(app: &Application, args: &[OsString]) {
                     });
             }
             Err(err) => {
-                window.show_error_dialog(&format!("Invalid file name: {fname:?}. Error: {err}"));
+                window.show_error_dialog(&format!(
+                    "Invalid file name: {}. Error: {err}",
+                    fname.display()
+                ));
             }
         }
     }
@@ -118,6 +137,6 @@ fn from_str_to_uri(oss: &OsString) -> Result<String, std::io::Error> {
 
     Err(std::io::Error::new(
         std::io::ErrorKind::NotFound,
-        format!("File not found: {oss:?}"),
+        format!("File not found: {}", oss.display()),
     ))
 }

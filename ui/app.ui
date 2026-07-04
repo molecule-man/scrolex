@@ -46,7 +46,7 @@
 							<object class="GtkEntry" id="entry_page_num">
 								<signal name="activate" handler="handle_page_number_entered" swapped="true"/>
 								<signal name="icon-press" handler="handle_page_number_icon_pressed" swapped="true"/>
-								<property name="secondary-icon-name">view-paged</property>
+								<property name="secondary-icon-name">go-jump-symbolic</property>
 								<property name="halign">end</property>
 								<property name="valign">baseline-center</property>
 								<property name="width-chars">4</property>
@@ -130,6 +130,18 @@
 						</property>
 					</object>
 				</child>
+				<child type="end">
+					<object class="GtkToggleButton" id="btn_animate_scroll">
+						<property name="active" bind-source="state" bind-property="animate-scroll" bind-flags="bidirectional|sync-create"/>
+						<property name="label">Animate Scroll</property>
+						<property name="tooltip-text">Slide by one page on scroll instead of jumping</property>
+						<property name="cursor">
+							<object class="GdkCursor">
+								<property name="name">pointer</property>
+							</object>
+						</property>
+					</object>
+				</child>
 			</object>
 		</child>
 		<child>
@@ -183,7 +195,7 @@
 				</child>
 				<child>
 					<object class="GtkEventControllerScroll">
-						<property name="flags">vertical|discrete</property>
+						<property name="flags">both-axes</property>
 						<signal name="scroll" handler="handle_scroll" swapped="true" />
 					</object>
 				</child>

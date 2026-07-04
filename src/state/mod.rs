@@ -6,7 +6,7 @@ use gtk::subclass::prelude::*;
 use poppler::Document;
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -23,6 +23,7 @@ impl State {
         glib::Object::builder()
             .property("zoom", 1.0)
             .property("crop", false)
+            .property("animate_scroll", true)
             .property("page", 0_u32)
             .build()
     }
@@ -44,9 +45,12 @@ impl State {
         }
 
         let doc = Document::from_gfile(f, None, gtk::gio::Cancellable::NONE)
-            .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
+            .map_err(io::Error::other)?;
         self.imp().bbox_cache.borrow_mut().clear();
         self.imp().links.borrow_mut().clear();
+        self.imp().render_cache.borrow_mut().clear();
+        self.imp().render_inflight.borrow_mut().clear();
+        self.imp().render_waiters.borrow_mut().clear();
 
         self.emit_by_name::<()>("before-load", &[]);
 
@@ -84,9 +88,37 @@ impl State {
             }
         }
 
+        self.log_document_info(f);
+
         self.emit_by_name::<()>("loaded", &[]);
 
         Ok(())
+    }
+
+    fn log_document_info(&self, f: &gtk::gio::File) {
+        let Some(doc) = self.doc() else {
+            return;
+        };
+
+        let size_bytes = f
+            .query_info(
+                "standard::size",
+                gtk::gio::FileQueryInfoFlags::NONE,
+                gtk::gio::Cancellable::NONE,
+            )
+            .map(|info| info.size())
+            .unwrap_or(-1);
+
+        let n_pages = doc.n_pages();
+        let first_page_size = doc.page(0).map(|p| p.size());
+
+        log::info!(
+            "Loaded document: {n_pages} pages, {size_bytes} bytes, first page {first_page_size:?} pt, \
+             start page {}, zoom {}, crop {}",
+            self.page(),
+            self.zoom(),
+            self.crop(),
+        );
     }
 
     pub fn save(&self) -> io::Result<()> {
@@ -112,6 +144,18 @@ impl State {
 
     pub(crate) fn bbox_cache(&self) -> Rc<RefCell<HashMap<i32, page::Rectangle>>> {
         self.imp().bbox_cache.clone()
+    }
+
+    pub(crate) fn render_cache(&self) -> Rc<RefCell<crate::render_cache::RenderCache>> {
+        self.imp().render_cache.clone()
+    }
+
+    pub(crate) fn render_inflight(&self) -> Rc<RefCell<HashSet<i32>>> {
+        self.imp().render_inflight.clone()
+    }
+
+    pub(crate) fn render_waiters(&self) -> Rc<RefCell<HashMap<i32, glib::WeakRef<page::Page>>>> {
+        self.imp().render_waiters.clone()
     }
 }
 

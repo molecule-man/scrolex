@@ -8,25 +8,28 @@ use futures::channel::oneshot;
 use gtk::cairo::{Context, ImageSurface};
 use gtk::gdk::prelude::*;
 use gtk::gdk::BUTTON_PRIMARY;
+use gtk::glib;
 use gtk::glib::clone;
 use gtk::glib::subclass::{prelude::*, Signal};
-use gtk::glib::{self, Priority};
 use gtk::prelude::*;
 use gtk::subclass::prelude::*;
 use gtk::DrawingArea;
 use once_cell::sync::Lazy;
 
 use super::Rectangle;
-use crate::bg_job::DebouncingJobQueue;
+use crate::bg_job::{RenderPool, RenderPriority};
 use crate::poppler::{Dest, DestExt, LinkType};
 
+// Pages within this many positions of the visible page are rendered ahead of
+// time so scrolling to them is a cache hit instead of a wait.
+const PREFETCH_AHEAD: i32 = 2;
+const PREFETCH_BEHIND: i32 = 1;
+// Cap on renders queued/running at once, so fast scrolling can't pile up an
+// unbounded backlog of prefetch jobs ahead of the page you actually land on.
+const MAX_INFLIGHT_RENDERS: usize = 6;
+
 thread_local!(
-    static RENDER_QUEUE: Lazy<DebouncingJobQueue> = Lazy::new(|| {
-        DebouncingJobQueue::new(
-            1,
-            //Duration::from_millis(10),
-        )
-    });
+    static RENDER_QUEUE: Lazy<RenderPool> = Lazy::new(|| RenderPool::new(4, 4, 4));
 );
 
 #[derive(Default, glib::Properties)]
@@ -82,12 +85,6 @@ impl DrawingAreaImpl for Page {}
 impl Page {
     fn setup_draw_function(&self) {
         let obj = self.obj();
-        let buf = Rc::new(RefCell::new(None::<Box<[u8]>>));
-
-        let buf_clone = Rc::clone(&buf);
-        obj.connect_unmap(move |_| {
-            buf_clone.replace(None);
-        });
 
         obj.set_draw_func(clone!(
             #[strong]
@@ -103,7 +100,7 @@ impl Page {
                 cr.save().expect("Failed to save");
 
                 if obj.state().multithread_rendering() {
-                    imp.multithread_render_to_cairo(cr, &poppler_page, &buf);
+                    imp.multithread_render_to_cairo(cr, &poppler_page);
                 } else {
                     imp.render_to_cairo(cr, &poppler_page);
                 }
@@ -441,8 +438,8 @@ impl Page {
         poppler_page.render(cr);
 
         let elapsed = start.elapsed();
-        log::trace!(
-            "Rendered page {} with multithreading disabled in {elapsed:?}",
+        log::debug!(
+            "Rendered page {} on main thread (sync mode) in {elapsed:?}",
             poppler_page.index()
         );
 
@@ -488,107 +485,158 @@ impl Page {
         log::trace!("Rendered selection {} in {elapsed:?}", poppler_page.index());
     }
 
-    fn multithread_render_to_cairo(
-        &self,
-        cr: &Context,
-        poppler_page: &poppler::Page,
-        buf: &Rc<RefCell<Option<Box<[u8]>>>>,
-    ) {
+    fn multithread_render_to_cairo(&self, cr: &Context, poppler_page: &poppler::Page) {
         let obj = self.obj();
         let page_num = poppler_page.index();
-        log::trace!("Rendering page {page_num} with multithreading enabled");
 
         let (width, height) = poppler_page.size();
         let scale = obj.zoom();
         let scale_factor = obj.scale_factor() as f64;
         let (canvas_width, canvas_height) =
             (width * scale * scale_factor, height * scale * scale_factor);
-        let stride = 4 * canvas_width as i32; // RGB24 has 3 bytes per pixel. But why 4? TODO
+        let expected = (canvas_width as i32, canvas_height as i32);
 
-        if let Some(buffer) = buf.take() {
-            if buffer.len() != (stride * canvas_height as i32) as usize {
-                log::info!("Buffer size mismatch. Requesting new rendering.");
-                buf.replace(None);
-            } else {
-                buf.replace(Some(buffer));
-            }
-        }
-
-        if let Some(buffer) = buf.take() {
-            let return_location = Rc::new(RefCell::new(None));
-            {
-                let holder = DataHolder {
-                    data: Some(buffer),
-                    return_location: Rc::clone(&return_location),
-                };
-                // Create an ImageSurface from the received pixel buffer
-                let surface = ImageSurface::create_for_data(
-                    holder,
-                    gtk::cairo::Format::Rgb24,
-                    canvas_width as i32,
-                    canvas_height as i32,
-                    stride,
-                )
-                .expect("Failed to create image surface");
-                surface.set_device_scale(scale_factor, scale_factor);
+        let cache = obj.state().render_cache();
+        let cached = cache.borrow_mut().get(page_num);
+        if let Some(surface) = cached {
+            if (surface.width(), surface.height()) == expected {
+                log::debug!("draw page {page_num}: cache hit");
                 let bbox = self.get_bbox(poppler_page, obj.crop());
                 draw_surface(cr, &surface, &bbox, scale);
+                self.prefetch_neighbors(page_num, scale, scale_factor);
+                return;
+            }
+            // dimensions changed (e.g. zoom), the cached surface is stale
+            log::debug!("draw page {page_num}: cache stale (zoom/scale changed)");
+            cache.borrow_mut().remove(page_num);
+        }
+
+        // schedule a render unless one is already queued for this page
+        let is_new = obj.state().render_inflight().borrow_mut().insert(page_num);
+        log::debug!(
+            "draw page {page_num}: cache miss (white flash), {}",
+            if is_new {
+                "scheduling render"
+            } else {
+                "render already in flight"
+            }
+        );
+        if is_new {
+            self.schedule_render(page_num, scale, scale_factor, RenderPriority::Visible);
+        }
+
+        // remember that this widget is the one waiting for page_num, so the
+        // render repaints it when it lands (the request may have come from a
+        // different widget's prefetch)
+        obj.state()
+            .render_waiters()
+            .borrow_mut()
+            .insert(page_num, obj.downgrade());
+
+        // nothing to draw yet: fill the area so stale pixels aren't shown
+        let bbox = self.get_cached_bbox(poppler_page, obj.crop());
+        let (w, h) = bbox.size();
+        cr.rectangle(0.0, 0.0, w * scale, h * scale);
+        cr.set_source_rgba(1.0, 1.0, 1.0, 1.0);
+        cr.fill().expect("Failed to fill");
+
+        self.prefetch_neighbors(page_num, scale, scale_factor);
+    }
+
+    // Render pages around the visible one ahead of time so scrolling to them is
+    // a cache hit. Best-effort: skips pages already cached or in flight, and
+    // stops once too many renders are queued so a fast scroll can't flood the
+    // queue ahead of the page actually being viewed.
+    fn prefetch_neighbors(&self, current: i32, scale: f64, scale_factor: f64) {
+        let obj = self.obj();
+        let Some(doc) = obj.state().doc() else {
+            return;
+        };
+        let n_pages = doc.n_pages();
+        let cache = obj.state().render_cache();
+        let inflight = obj.state().render_inflight();
+
+        // The render queue is LIFO, that's why `rev` and start with the BEHIND
+        let mut candidates = Vec::with_capacity((PREFETCH_AHEAD + PREFETCH_BEHIND) as usize);
+        for d in (1..=PREFETCH_BEHIND).rev() {
+            candidates.push(current - d);
+        }
+        for d in (1..=PREFETCH_AHEAD).rev() {
+            candidates.push(current + d);
+        }
+
+        for page_num in candidates {
+            if page_num < 0 || page_num >= n_pages {
+                continue;
+            }
+            if inflight.borrow().len() >= MAX_INFLIGHT_RENDERS {
+                break;
+            }
+            if cache.borrow().contains(page_num) {
+                continue;
+            }
+            if inflight.borrow_mut().insert(page_num) {
+                self.schedule_render(page_num, scale, scale_factor, RenderPriority::Prefetch);
+            }
+        }
+    }
+
+    fn schedule_render(
+        &self,
+        page_num: i32,
+        scale: f64,
+        scale_factor: f64,
+        priority: RenderPriority,
+    ) {
+        let obj = self.obj();
+        let uri = obj.uri();
+        log::trace!("Scheduling render of page {page_num}");
+
+        let (resp_sender, resp_receiver) = oneshot::channel::<RenderedPage>();
+        let obj_clone = obj.clone();
+        let uri_check = uri.clone();
+        glib::spawn_future_local(async move {
+            let result = resp_receiver.await;
+            let state = obj_clone.state();
+            state.render_inflight().borrow_mut().remove(&page_num);
+
+            // request was dropped (evicted from the queue as stale): let the
+            // page reschedule on its next draw
+            let Ok(rendered) = result else {
+                return;
+            };
+
+            // the document may have changed while the render was in flight
+            if obj_clone.uri() != uri_check {
+                return;
             }
 
-            assert!(return_location.borrow().is_some());
-            buf.replace(return_location.take());
-        } else {
-            let (resp_sender, resp_receiver) = oneshot::channel();
-            let buf = Rc::clone(buf);
-            let obj_clone = obj.clone();
-            glib::spawn_future_local(async move {
-                let buffer = resp_receiver.await.expect("Failed to receive buffer");
-                if !obj_clone.is_drawable() {
-                    log::debug!("Page {page_num} not drawable anymore. Aborting.");
-                    //buf.replace(None);
-                    return;
+            let surface = rendered.into_surface(scale_factor);
+            state.render_cache().borrow_mut().insert(page_num, surface);
+
+            // repaint whichever widget is currently waiting to show this page
+            // (not necessarily the one that requested the render)
+            if let Some(widget) = state
+                .render_waiters()
+                .borrow_mut()
+                .remove(&page_num)
+                .and_then(|weak| weak.upgrade())
+            {
+                if widget.index() == page_num {
+                    widget.queue_draw();
                 }
+            }
+        });
 
-                let Ok(buffer) = buffer else {
-                    if obj_clone.is_drawable() {
-                        log::debug!("Page {page_num} is still drawable. Rescheduling.");
-                        glib::idle_add_local_full(Priority::HIGH, move || {
-                            obj_clone.queue_draw();
-                            glib::ControlFlow::Break
-                        });
-                    }
-                    return;
-                };
-
-                let prev = buf.replace(Some(buffer));
-                if prev.is_none() {
-                    glib::idle_add_local_full(Priority::HIGH, move || {
-                        obj_clone.queue_draw();
-                        glib::ControlFlow::Break
-                    });
-                }
-            });
-            let uri = obj.uri();
-            RENDER_QUEUE.with(move |queue| {
-                queue.execute(
-                    &uri,
-                    Box::new(move |doc| {
-                        if let Ok(doc) = doc {
-                            request_render(doc, scale, scale_factor, page_num, resp_sender);
-                        } else {
-                            resp_sender.send(Err(())).expect("Failed to send buffer");
-                        }
-                    }),
-                );
-            });
-
-            let bbox = self.get_cached_bbox(poppler_page, obj.crop());
-            let (w, h) = bbox.size();
-            cr.rectangle(0.0, 0.0, w * scale, h * scale);
-            //cr.scale(scale, scale);
-            cr.set_source_rgba(1.0, 1.0, 1.0, 1.0);
-            cr.fill().expect("Failed to fill");
-        }
+        RENDER_QUEUE.with(move |queue| {
+            queue.submit(
+                &uri,
+                priority,
+                Box::new(move |doc| {
+                    request_render(doc, scale, scale_factor, page_num, resp_sender);
+                }),
+            );
+        });
     }
 
     pub fn render_surface(&self, cr: &Context, surface: &ImageSurface, bbox: &Rectangle) {
@@ -609,29 +657,67 @@ pub fn draw_surface(cr: &Context, surface: &ImageSurface, bbox: &Rectangle, scal
     cr.set_source_rgb(0.0, 0.0, 0.0);
 }
 
+// A rendered page as raw pixels. Rendering happens on a background thread, and
+// `ImageSurface` is not `Send`, so the pixels cross the thread boundary as a
+// plain buffer and the surface is rebuilt on the main thread.
+#[derive(Debug)]
+struct RenderedPage {
+    data: Box<[u8]>,
+    width: i32,
+    height: i32,
+    stride: i32,
+}
+
+impl RenderedPage {
+    fn into_surface(self, device_scale_factor: f64) -> ImageSurface {
+        let surface = ImageSurface::create_for_data(
+            self.data,
+            gtk::cairo::Format::Rgb24,
+            self.width,
+            self.height,
+            self.stride,
+        )
+        .expect("Failed to create image surface");
+        surface.set_device_scale(device_scale_factor, device_scale_factor);
+        surface
+    }
+}
+
 fn request_render(
     doc: &poppler::Document,
     scale: f64,
     device_scale_factor: f64,
     page_num: i32,
-    resp_sender: oneshot::Sender<Result<Box<[u8]>, ()>>,
+    resp_sender: oneshot::Sender<RenderedPage>,
 ) {
     let Some(page) = doc.page(page_num) else {
-        todo!("Page not found");
+        log::warn!("render skipped: page {page_num} not found in document");
+        return;
     };
 
+    let start = std::time::Instant::now();
     let surface = render_surface(&page, scale, device_scale_factor);
+    let (width, height, stride) = (surface.width(), surface.height(), surface.stride());
+    log::debug!(
+        "Rendered page {page_num} on background thread in {:?}",
+        start.elapsed()
+    );
 
-    let mut buffer = vec![0u8; (surface.stride() * surface.height()) as usize];
+    let mut buffer = vec![0u8; (stride * height) as usize];
     surface
         .with_data(|data| {
             buffer.copy_from_slice(data);
         })
         .expect("Failed to extract surface data");
     surface.finish();
-    resp_sender
-        .send(Ok(buffer.into_boxed_slice()))
-        .expect("Failed to send buffer");
+    // ignore send failure: the receiver is gone if the page's widget was
+    // dropped or its render superseded
+    let _ = resp_sender.send(RenderedPage {
+        data: buffer.into_boxed_slice(),
+        width,
+        height,
+        stride,
+    });
 }
 
 pub fn render_surface(page: &poppler::Page, scale: f64, device_scale_factor: f64) -> ImageSurface {
@@ -670,32 +756,6 @@ pub fn render_surface(page: &poppler::Page, scale: f64, device_scale_factor: f64
     //);
 
     surface
-}
-
-struct DataHolder {
-    data: Option<Box<[u8]>>,
-    return_location: Rc<RefCell<Option<Box<[u8]>>>>,
-}
-
-// This stores the pixels back into the return_location as now nothing
-// references the pixels anymore
-impl Drop for DataHolder {
-    fn drop(&mut self) {
-        *self.return_location.borrow_mut() = Some(self.data.take().expect("Holding no image"));
-    }
-}
-
-// Needed for DataSurface::create_for_data() to be able to access the pixels
-impl AsRef<[u8]> for DataHolder {
-    fn as_ref(&self) -> &[u8] {
-        self.data.as_ref().expect("Holding no image").as_ref()
-    }
-}
-
-impl AsMut<[u8]> for DataHolder {
-    fn as_mut(&mut self) -> &mut [u8] {
-        self.data.as_mut().expect("Holding no image").as_mut()
-    }
 }
 
 struct Point {
@@ -897,6 +957,53 @@ startxref
         surface.finish();
 
         assert_snapshot("test_render", &buffer);
+    }
+
+    // Throughput probe: measures how many pages/sec the renderer sustains at
+    // various thread counts. Ignored by default (needs a real PDF); run with:
+    //   PDF_PATH=/abs/file.pdf cargo test --release bench_render_throughput -- --ignored --nocapture
+    // Optional env: PAGE_NUMBER (start page), PAGES (how many to render).
+    #[test]
+    #[ignore]
+    fn bench_render_throughput() {
+        let path = env::var("PDF_PATH").expect("PDF_PATH not set");
+        let uri = format!("file://{path}");
+        let start: i32 = env::var("PAGE_NUMBER")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let count: i32 = env::var("PAGES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(40);
+        let pages: Vec<i32> = (start..start + count).collect();
+
+        for threads in [1usize, 2, 4, 8] {
+            let t0 = std::time::Instant::now();
+            std::thread::scope(|s| {
+                for t in 0..threads {
+                    let uri = uri.clone();
+                    let chunk: Vec<i32> = pages.iter().copied().skip(t).step_by(threads).collect();
+                    if chunk.is_empty() {
+                        continue;
+                    }
+                    s.spawn(move || {
+                        let doc = poppler::Document::from_file(&uri, None).unwrap();
+                        for p in chunk {
+                            if let Some(page) = doc.page(p) {
+                                std::hint::black_box(render_surface(&page, 1.0, 1.0));
+                            }
+                        }
+                    });
+                }
+            });
+            let dt = t0.elapsed();
+            println!(
+                "threads={threads:<2} pages={} time={dt:>8.2?} throughput={:.1} pages/s",
+                pages.len(),
+                pages.len() as f64 / dt.as_secs_f64()
+            );
+        }
     }
 
     #[test]
