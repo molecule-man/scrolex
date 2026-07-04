@@ -51,36 +51,6 @@ pub fn bench_links_lookup(c: &mut Criterion) {
     group.finish();
 }
 
-fn draw_half_page(page: &poppler::Page) -> gtk::cairo::ImageSurface {
-    let (width, height) = page.size();
-    let height = height / 2.0;
-
-    let surface =
-        gtk::cairo::ImageSurface::create(gtk::cairo::Format::ARgb32, width as i32, height as i32)
-            .expect("Couldn't create a surface!");
-
-    let cr = gtk::cairo::Context::new(&surface).expect("Couldn't create a context!");
-    cr.rectangle(0.0, 0.0, width, height);
-    cr.set_source_rgba(1.0, 1.0, 1.0, 1.0);
-    cr.fill().expect("Failed to fill");
-    let mut old_rect = poppler::Rectangle::new();
-    let mut rect = poppler::Rectangle::new();
-    rect.set_x1(0.0);
-    rect.set_y1(0.0);
-    rect.set_x2(width);
-    rect.set_y2(height);
-    page.render_selection(
-        &cr,
-        &mut rect,
-        &mut old_rect,
-        poppler::SelectionStyle::Glyph,
-        &mut poppler::Color::new(),
-        &mut poppler::Color::new(),
-    );
-
-    surface
-}
-
 pub fn render_surface(
     page: &poppler::Page,
     scale: f64,

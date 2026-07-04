@@ -6,9 +6,6 @@
     clippy::pedantic
 )]
 #![deny(clippy::all, clippy::if_not_else, clippy::enum_glob_use)]
-#![expect(clippy::cast_possible_wrap)]
-#![expect(clippy::cast_sign_loss)]
-#![expect(clippy::cast_possible_truncation)]
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -117,7 +114,10 @@ fn build_ui(app: &Application, args: &[OsString]) {
                     });
             }
             Err(err) => {
-                window.show_error_dialog(&format!("Invalid file name: {fname:?}. Error: {err}"));
+                window.show_error_dialog(&format!(
+                    "Invalid file name: {}. Error: {err}",
+                    fname.display()
+                ));
             }
         }
     }
@@ -137,6 +137,6 @@ fn from_str_to_uri(oss: &OsString) -> Result<String, std::io::Error> {
 
     Err(std::io::Error::new(
         std::io::ErrorKind::NotFound,
-        format!("File not found: {oss:?}"),
+        format!("File not found: {}", oss.display()),
     ))
 }
