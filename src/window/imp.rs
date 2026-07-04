@@ -248,6 +248,9 @@ impl Window {
 
     #[template_callback]
     fn handle_drag_start(&self, _n_press: i32, x: f64, y: f64) {
+        // A drag takes over the horizontal position; drop any in-flight slide so scroll_tick stops
+        // writing hadj and fighting the drag.
+        *self.scroll_anim.borrow_mut() = None;
         *self.drag_coords.borrow_mut() = Some((x, y));
 
         if let Some(surface) = self.obj().surface() {
@@ -309,9 +312,13 @@ impl Window {
                 self.zoom_in();
             }
             Key::Left | Key::Right => {
-                // fine horizontal scroll; handled here rather than relying on
-                // the scrolled window's own key bindings, which only fire when
-                // it directly holds focus
+                // fine horizontal scroll; handled here rather than relying on the scrolled window's
+                // own key bindings, which only fire when it directly holds focus
+                //
+                // Like a drag, this fine nudge takes over the horizontal position, so drop any
+                // in-flight page slide; otherwise scroll_tick would overwrite the nudge each frame.
+                // (h/l intentionally keep the slide running - they step pages and retarget it.)
+                *self.scroll_anim.borrow_mut() = None;
                 let hadj = self.scrolledwindow.hadjustment();
                 let step = if hadj.step_increment() > 0.0 {
                     hadj.step_increment()
