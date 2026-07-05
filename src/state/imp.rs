@@ -44,11 +44,8 @@ pub struct State {
     // rendered pages keyed by page index, kept so scrolling back to an already seen page reuses the
     // surface instead of re-rendering (and flashing white)
     pub(crate) render_cache: Rc<RefCell<crate::render_cache::RenderCache>>,
-    // page indices with a render currently queued, to avoid scheduling duplicates. The value is
-    // true once an on-demand (visible) render has been scheduled for the page: a page first claimed
-    // by a neighbour's prefetch must still be upgraded to a visible render when it comes on screen,
-    // so we track the priority rather than mere presence.
-    pub(crate) render_inflight: Rc<RefCell<HashMap<i32, bool>>>,
+    // page indices with a render currently queued, to avoid scheduling duplicates
+    pub(crate) render_inflight: Rc<RefCell<HashSet<i32>>>,
     // widget currently waiting to display each page, so a finished render repaints the right widget
     // even if list recycling moved the requester
     pub(crate) render_waiters: Rc<RefCell<HashMap<i32, glib::WeakRef<crate::page::Page>>>>,

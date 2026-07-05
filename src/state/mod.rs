@@ -162,7 +162,7 @@ impl State {
         self.imp().render_cache.clone()
     }
 
-    pub(crate) fn render_inflight(&self) -> Rc<RefCell<HashMap<i32, bool>>> {
+    pub(crate) fn render_inflight(&self) -> Rc<RefCell<HashSet<i32>>> {
         self.imp().render_inflight.clone()
     }
 
