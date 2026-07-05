@@ -162,7 +162,7 @@ impl State {
         self.imp().render_cache.clone()
     }
 
-    pub(crate) fn render_inflight(&self) -> Rc<RefCell<HashSet<i32>>> {
+    pub(crate) fn render_inflight(&self) -> Rc<RefCell<HashMap<i32, bool>>> {
         self.imp().render_inflight.clone()
     }
 
@@ -192,6 +192,14 @@ impl State {
 
     pub(crate) fn set_preview_scale(&self, scale: f64) {
         self.imp().preview_scale.set(scale);
+    }
+
+    pub(crate) fn scrolling(&self) -> bool {
+        self.imp().scrolling.get()
+    }
+
+    pub(crate) fn set_scrolling(&self, scrolling: bool) {
+        self.imp().scrolling.set(scrolling);
     }
 }
 

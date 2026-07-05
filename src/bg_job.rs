@@ -53,6 +53,12 @@ struct RenderQueue {
     max_visible: usize,
     max_preview: usize,
     max_prefetch: usize,
+    // Prefetch full renders currently running, and the cap on that. Poppler renders can't be
+    // interrupted once started, so we keep at least one worker off prefetch: a fresh on-demand
+    // (visible) render then always finds a worker free to start it, instead of waiting behind a
+    // slow prefetch of a page nobody is looking at.
+    active_prefetch: usize,
+    max_active_prefetch: usize,
 }
 
 impl RenderQueue {
@@ -62,6 +68,7 @@ impl RenderQueue {
         max_visible: usize,
         max_preview: usize,
         max_prefetch: usize,
+        max_active_prefetch: usize,
     ) -> Self {
         Self {
             bbox: Vec::new(),
@@ -74,6 +81,8 @@ impl RenderQueue {
             max_visible,
             max_preview,
             max_prefetch,
+            active_prefetch: 0,
+            max_active_prefetch,
         }
     }
 
@@ -91,14 +100,37 @@ impl RenderQueue {
         }
     }
 
-    // Within each stack newest wins.
-    fn pop(&mut self) -> Option<RenderRequest> {
-        self.bbox
+    // Next runnable request, and whether it is a prefetch job (so the worker releases its reserved
+    // slot when done). Within each stack newest wins. Prefetch is withheld once max_active_prefetch
+    // are already running, even when prefetch jobs are queued, so a worker stays free for on-demand
+    // work; cheap tiers (previews) are never withheld.
+    fn pop(&mut self) -> Option<(RenderRequest, bool)> {
+        if let Some(req) = self
+            .bbox
             .pop()
             .or_else(|| self.visible_preview.pop())
             .or_else(|| self.visible.pop())
             .or_else(|| self.preview.pop())
-            .or_else(|| self.prefetch.pop())
+        {
+            return Some((req, false));
+        }
+        if self.active_prefetch < self.max_active_prefetch {
+            if let Some(req) = self.prefetch.pop() {
+                self.active_prefetch += 1;
+                return Some((req, true));
+            }
+        }
+        None
+    }
+
+    // Drop queued look-ahead (prefetch full renders and prefetch previews). Called when the
+    // viewport moves, i.e. a new on-demand visible render is requested: the queued look-ahead
+    // targets a position that's no longer current and would only tie up a worker on a page near
+    // nobody's viewport. The new viewport re-queues its own look-ahead on the next draw. In-flight
+    // renders can't be stopped; this clears only what's still waiting.
+    fn clear_lookahead(&mut self) {
+        self.prefetch.clear();
+        self.preview.clear();
     }
 }
 
@@ -118,6 +150,9 @@ impl RenderPool {
         max_preview: usize,
         max_prefetch: usize,
     ) -> Self {
+        // Keep one worker off prefetch so on-demand renders never queue behind it, but never drop
+        // below one (a single-worker pool must still prefetch).
+        let max_active_prefetch = pool_size.saturating_sub(1).max(1);
         let inner = Arc::new((
             Mutex::new(RenderQueue::new(
                 max_bbox,
@@ -125,6 +160,7 @@ impl RenderPool {
                 max_visible,
                 max_preview,
                 max_prefetch,
+                max_active_prefetch,
             )),
             Condvar::new(),
         ));
@@ -132,6 +168,15 @@ impl RenderPool {
             Self::spawn_bg_thread(inner.clone());
         }
         Self { inner }
+    }
+
+    // Drop queued look-ahead. Called when the focused page changes (the viewport moved to new
+    // territory), so workers don't grind through prefetch for the position just left. Not called per
+    // visible render: on open several pages come on screen at once, and clearing on each would let
+    // the last one drawn win the prefetch window and reorder the queue away from the focused page.
+    pub(crate) fn discard_lookahead(&self) {
+        let (lock, _cvar) = &*self.inner;
+        lock.lock().unwrap().clear_lookahead();
     }
 
     pub(crate) fn submit(&self, uri: &str, priority: RenderPriority, job: Job) {
@@ -153,12 +198,12 @@ impl RenderPool {
             let mut doc_uri = String::new();
 
             loop {
-                let req = {
+                let (req, is_prefetch) = {
                     let (lock, cvar) = &*inner;
                     let mut queue = lock.lock().unwrap();
                     loop {
-                        if let Some(req) = queue.pop() {
-                            break req;
+                        if let Some(popped) = queue.pop() {
+                            break popped;
                         }
                         queue = cvar.wait(queue).unwrap();
                     }
@@ -174,6 +219,14 @@ impl RenderPool {
                 }
 
                 (req.job)(doc.as_ref().unwrap());
+
+                // release the reserved prefetch slot and wake a worker that may have been holding
+                // off prefetch while this one ran
+                if is_prefetch {
+                    let (lock, cvar) = &*inner;
+                    lock.lock().unwrap().active_prefetch -= 1;
+                    cvar.notify_one();
+                }
             }
         });
     }
@@ -191,9 +244,14 @@ mod tests {
         }
     }
 
+    // Drains in priority order, releasing each prefetch slot as if the job finished immediately so
+    // the reservation cap doesn't stall a single-threaded drain.
     fn drain(queue: &mut RenderQueue) -> Vec<String> {
         let mut order = Vec::new();
-        while let Some(req) = queue.pop() {
+        while let Some((req, is_prefetch)) = queue.pop() {
+            if is_prefetch {
+                queue.active_prefetch -= 1;
+            }
             order.push(req.uri);
         }
         order
@@ -201,7 +259,7 @@ mod tests {
 
     #[test]
     fn priority_order_and_newest_wins() {
-        let mut q = RenderQueue::new(4, 4, 4, 4, 4);
+        let mut q = RenderQueue::new(4, 4, 4, 4, 4, 1);
         q.push(RenderPriority::Prefetch, req("p1"));
         q.push(RenderPriority::Preview, req("pv1"));
         q.push(RenderPriority::Visible, req("v1"));
@@ -223,12 +281,59 @@ mod tests {
 
     #[test]
     fn over_cap_drops_oldest() {
-        let mut q = RenderQueue::new(2, 2, 2, 2, 2);
+        let mut q = RenderQueue::new(2, 2, 2, 2, 2, 1);
         q.push(RenderPriority::Visible, req("v1"));
         q.push(RenderPriority::Visible, req("v2"));
         q.push(RenderPriority::Visible, req("v3"));
 
         // v1 (oldest) evicted; newest served first
         assert_eq!(drain(&mut q), vec!["v3", "v2"]);
+    }
+
+    #[test]
+    fn prefetch_is_withheld_while_the_slot_is_taken() {
+        let mut q = RenderQueue::new(4, 4, 4, 4, 4, 1);
+        q.push(RenderPriority::Prefetch, req("pf1"));
+        q.push(RenderPriority::Prefetch, req("pf2"));
+
+        // the newest prefetch takes the only slot...
+        let (first, is_prefetch) = q.pop().unwrap();
+        assert_eq!(first.uri, "pf2");
+        assert!(is_prefetch);
+
+        // ...and the next is withheld while it runs, though the queue isn't empty
+        assert!(q.pop().is_none());
+
+        // once the running prefetch finishes, the slot frees and the next one runs
+        q.active_prefetch -= 1;
+        assert_eq!(q.pop().unwrap().0.uri, "pf1");
+    }
+
+    #[test]
+    fn on_demand_work_runs_while_the_prefetch_slot_is_full() {
+        let mut q = RenderQueue::new(4, 4, 4, 4, 4, 1);
+        q.push(RenderPriority::Prefetch, req("pf1"));
+        q.pop().unwrap(); // takes the only prefetch slot
+
+        // a visible render arriving while prefetch is saturated is still served immediately
+        q.push(RenderPriority::Visible, req("v1"));
+        let (req, is_prefetch) = q.pop().unwrap();
+        assert_eq!(req.uri, "v1");
+        assert!(!is_prefetch);
+    }
+
+    #[test]
+    fn clearing_lookahead_drops_prefetch_and_preview_only() {
+        let mut q = RenderQueue::new(4, 4, 4, 4, 4, 4);
+        q.push(RenderPriority::Bbox, req("b"));
+        q.push(RenderPriority::VisiblePreview, req("vp"));
+        q.push(RenderPriority::Visible, req("v"));
+        q.push(RenderPriority::Preview, req("pv"));
+        q.push(RenderPriority::Prefetch, req("pf"));
+
+        q.clear_lookahead();
+
+        // look-ahead tiers gone; on-demand tiers untouched
+        assert_eq!(drain(&mut q), vec!["b", "vp", "v"]);
     }
 }

@@ -59,6 +59,11 @@ const RENDER_THREADS: usize = 2;
 thread_local!(
     static RENDER_QUEUE: Lazy<RenderPool> =
         Lazy::new(|| RenderPool::new(RENDER_THREADS, 8, 6, 3, MAX_INFLIGHT_PREVIEWS, 4));
+    // Focused page at the last look-ahead discard. Several pages come on screen per frame, but the
+    // focus only changes when the user navigates; discarding once per change (not per page drawn)
+    // drops the prefetch for the position just left without letting same-frame draws reorder the
+    // queue away from the focused page.
+    static LAST_DISCARD_PAGE: Cell<i32> = const { Cell::new(-1) };
 );
 
 #[derive(Default, glib::Properties)]
@@ -594,6 +599,16 @@ impl Page {
         let obj = self.obj();
         let page_num = poppler_page.index();
 
+        // When the focused page changes, drop the look-ahead queued for the position just left so
+        // workers don't render prefetch for pages the viewport has moved away from. Gated on the
+        // focus actually changing so the several pages drawn per frame don't each clear (and reorder)
+        // the queue.
+        let focus = obj.state().page() as i32;
+        if LAST_DISCARD_PAGE.get() != focus {
+            LAST_DISCARD_PAGE.set(focus);
+            RENDER_QUEUE.with(|queue| queue.discard_lookahead());
+        }
+
         let (width, height) = poppler_page.size();
         let scale = obj.zoom();
         let scale_factor = obj.scale_factor() as f64;
@@ -608,7 +623,9 @@ impl Page {
                 log::debug!("draw page {page_num}: cache hit");
                 let bbox = self.get_bbox(poppler_page, obj.crop());
                 draw_surface(cr, &surface, &bbox, scale);
-                self.prefetch_neighbors(page_num, scale, scale_factor);
+                if !obj.state().scrolling() {
+                    self.prefetch_neighbors(page_num, scale, scale_factor);
+                }
                 self.prefetch_previews(page_num);
                 return;
             }
@@ -617,10 +634,26 @@ impl Page {
             cache.borrow_mut().remove(page_num);
         }
 
-        // schedule the full render unless one is already queued for this page
-        let is_new = obj.state().render_inflight().borrow_mut().insert(page_num);
-        if is_new {
-            self.schedule_render(page_num, scale, scale_factor, RenderPriority::Visible);
+        // While scrolling, defer the full render: it's slow and uninterruptible, so rendering pages
+        // that are flying past would saturate the workers and starve the previews. The preview
+        // below stands in; the settle refresh redraws the visible pages once motion stops, and this
+        // path then schedules their full renders.
+        if !obj.state().scrolling() {
+            // schedule the full render at visible priority unless one is already scheduled for this
+            // page. A page a neighbour prefetched is inflight at prefetch priority; now that it's on
+            // screen it must still be upgraded to a visible render (otherwise it renders slowly
+            // behind the prefetch queue), so we key off whether a *visible* render exists, not mere
+            // presence.
+            let needs_visible = {
+                let inflight = obj.state().render_inflight();
+                let mut inflight = inflight.borrow_mut();
+                let had_visible = inflight.get(&page_num).copied() == Some(true);
+                inflight.insert(page_num, true);
+                !had_visible
+            };
+            if needs_visible {
+                self.schedule_render(page_num, scale, scale_factor, RenderPriority::Visible);
+            }
         }
 
         // remember that this widget is the one waiting for page_num, so the
@@ -645,10 +678,13 @@ impl Page {
             cr.fill().expect("Failed to fill");
         }
 
-        // prefetch full neighbours and a wider window of previews, then queue this page's own
-        // preview at the highest render priority so a blurry stand-in appears before any full
-        // render (never white on a fast scroll)
-        self.prefetch_neighbors(page_num, scale, scale_factor);
+        // prefetch a wider window of previews and queue this page's own preview at the highest
+        // render priority so a blurry stand-in appears before any full render (never white on a
+        // fast scroll). Full-render prefetch waits until the view settles - during scroll it would
+        // only compete with the visible pages for the workers.
+        if !obj.state().scrolling() {
+            self.prefetch_neighbors(page_num, scale, scale_factor);
+        }
         self.prefetch_previews(page_num);
         self.schedule_preview_if_needed(page_num, RenderPriority::VisiblePreview);
     }
@@ -685,7 +721,12 @@ impl Page {
             if cache.borrow().contains(page_num) {
                 continue;
             }
-            if inflight.borrow_mut().insert(page_num) {
+            // skip pages that already have any render (visible or prefetch) queued
+            let is_new = {
+                let mut inflight = inflight.borrow_mut();
+                !inflight.contains_key(&page_num) && inflight.insert(page_num, false).is_none()
+            };
+            if is_new {
                 self.schedule_render(page_num, scale, scale_factor, RenderPriority::Prefetch);
             }
         }
