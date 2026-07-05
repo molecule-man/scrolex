@@ -20,16 +20,38 @@ use super::Rectangle;
 use crate::bg_job::{RenderPool, RenderPriority};
 use crate::poppler::{Dest, DestExt, LinkType};
 
-// Pages within this many positions of the visible page are rendered ahead of
-// time so scrolling to them is a cache hit instead of a wait.
-const PREFETCH_AHEAD: i32 = 2;
-const PREFETCH_BEHIND: i32 = 1;
-// Cap on renders queued/running at once, so fast scrolling can't pile up an
-// unbounded backlog of prefetch jobs ahead of the page you actually land on.
+// Full-resolution pages within this many positions either side of the visible page are rendered
+// ahead of time so scrolling (in either direction) lands on a cached page instead of a wait.
+const PREFETCH_WINDOW: i32 = 2;
+// Cap on full renders queued/running at once, so fast scrolling can't pile up an unbounded backlog
+// of prefetch jobs ahead of the page you actually land on.
 const MAX_INFLIGHT_RENDERS: usize = 6;
 
+// Low-resolution previews rendered ahead of the visible page and shown (upscaled) while the full
+// render is pending, so aggressive scrolling shows blurry pages rather than blank ones. Rendered at
+// PREVIEW_SCALE - for vector documents that is several times cheaper than a full render, so a wide
+// window can be kept warm - and disabled for a document once a preview costs more than
+// PREVIEW_SLOW_MS (e.g. decode-bound scans, where a low-res render is no cheaper than the full
+// one). Stored in page units (device scale 1) so they survive zoom and are rescaled at draw time.
+const PREVIEW_SCALE: f64 = 0.25;
+// Pages either side of the visible one to keep previewed. Symmetric so scrolling back has as much
+// runway as forward; already-cached pages are skipped, so effort tracks the direction of travel.
+const PREVIEW_WINDOW: i32 = 32;
+const MAX_INFLIGHT_PREVIEWS: usize = 12;
+const PREVIEW_SLOW_MS: u128 = 250;
+
+// Background worker threads. Each keeps its own poppler Document open (poppler isn't safe to share
+// across threads), and that Document accumulates an unreclaimable per-page cache as pages are
+// visited - tens of MB over a session on a large document - so resident memory scales with this
+// count. One pool serves bbox, visible renders, previews and prefetch, so this count is the total
+// number of resident Documents. Rendering parallelises near-linearly to ~4 threads before turning
+// memory-bandwidth bound; two keeps most of that throughput at a fraction of the per-document
+// memory.
+const RENDER_THREADS: usize = 2;
+
 thread_local!(
-    static RENDER_QUEUE: Lazy<RenderPool> = Lazy::new(|| RenderPool::new(4, 4, 4));
+    static RENDER_QUEUE: Lazy<RenderPool> =
+        Lazy::new(|| RenderPool::new(RENDER_THREADS, 8, 6, 3, MAX_INFLIGHT_PREVIEWS, 4));
 );
 
 #[derive(Default, glib::Properties)]
@@ -370,23 +392,48 @@ impl Page {
             cb(&bbox);
             return;
         }
+
+        // In sync mode we deliberately don't touch the render pool, so a fast document stays down
+        // to a single resident poppler Document. Compute the bbox on the main thread from the page
+        // we already hold (layout is far cheaper than a render). The pool path is used only once
+        // rendering has moved to background threads anyway.
+        if !self.obj().state().multithread_rendering() {
+            let bbox = get_bbox(page, true);
+            self.state
+                .borrow()
+                .bbox_cache()
+                .borrow_mut()
+                .insert(page.index(), bbox);
+            cb(&bbox);
+            return;
+        }
+
         let bbox_cache = self.state.borrow().bbox_cache().clone();
 
         let uri = self.obj().uri();
         let page_num = page.index();
         let (resp_sender, resp_receiver) = oneshot::channel();
-        crate::bg_job::execute(
-            &uri,
-            Box::new(move |doc| {
-                if let Some(page) = doc.page(page_num) {
-                    let bbox = get_bbox(&page, true);
-                    resp_sender.send(bbox).expect("Failed to send bbox");
-                }
-            }),
-        );
+        RENDER_QUEUE.with(move |queue| {
+            queue.submit(
+                &uri,
+                RenderPriority::Bbox,
+                Box::new(move |doc| {
+                    if let Some(page) = doc.page(page_num) {
+                        let bbox = get_bbox(&page, true);
+                        // ignore send failure: the awaiting task is gone if the
+                        // page's widget was dropped
+                        let _ = resp_sender.send(bbox);
+                    }
+                }),
+            );
+        });
 
         glib::spawn_future_local(async move {
-            let bbox = resp_receiver.await.expect("Failed to receive bbox");
+            // the request may have been dropped from the queue as stale; if so the page re-requests
+            // its bbox on the next draw
+            let Ok(bbox) = resp_receiver.await else {
+                return;
+            };
             bbox_cache.borrow_mut().insert(page_num, bbox);
             cb(&bbox);
         });
@@ -439,7 +486,7 @@ impl Page {
 
         let elapsed = start.elapsed();
         log::debug!(
-            "Rendered page {} on main thread (sync mode) in {elapsed:?}",
+            "Rendered page {} [on-demand (visible), sync] on main thread in {elapsed:?} (scale_factor={scale_factor})",
             poppler_page.index()
         );
 
@@ -504,6 +551,7 @@ impl Page {
                 let bbox = self.get_bbox(poppler_page, obj.crop());
                 draw_surface(cr, &surface, &bbox, scale);
                 self.prefetch_neighbors(page_num, scale, scale_factor);
+                self.prefetch_previews(page_num);
                 return;
             }
             // dimensions changed (e.g. zoom), the cached surface is stale
@@ -511,16 +559,8 @@ impl Page {
             cache.borrow_mut().remove(page_num);
         }
 
-        // schedule a render unless one is already queued for this page
+        // schedule the full render unless one is already queued for this page
         let is_new = obj.state().render_inflight().borrow_mut().insert(page_num);
-        log::debug!(
-            "draw page {page_num}: cache miss (white flash), {}",
-            if is_new {
-                "scheduling render"
-            } else {
-                "render already in flight"
-            }
-        );
         if is_new {
             self.schedule_render(page_num, scale, scale_factor, RenderPriority::Visible);
         }
@@ -533,14 +573,26 @@ impl Page {
             .borrow_mut()
             .insert(page_num, obj.downgrade());
 
-        // nothing to draw yet: fill the area so stale pixels aren't shown
+        // show a low-res preview (upscaled) if we have one, otherwise white
         let bbox = self.get_cached_bbox(poppler_page, obj.crop());
-        let (w, h) = bbox.size();
-        cr.rectangle(0.0, 0.0, w * scale, h * scale);
-        cr.set_source_rgba(1.0, 1.0, 1.0, 1.0);
-        cr.fill().expect("Failed to fill");
+        let preview = obj.state().preview_cache().borrow_mut().get(page_num);
+        if let Some(preview) = preview {
+            log::debug!("draw page {page_num}: cache miss, showing preview");
+            draw_preview(cr, &preview, &bbox, scale);
+        } else {
+            log::debug!("draw page {page_num}: cache miss (white flash)");
+            let (w, h) = bbox.size();
+            cr.rectangle(0.0, 0.0, w * scale, h * scale);
+            cr.set_source_rgba(1.0, 1.0, 1.0, 1.0);
+            cr.fill().expect("Failed to fill");
+        }
 
+        // prefetch full neighbours and a wider window of previews, then queue this page's own
+        // preview at the highest render priority so a blurry stand-in appears before any full
+        // render (never white on a fast scroll)
         self.prefetch_neighbors(page_num, scale, scale_factor);
+        self.prefetch_previews(page_num);
+        self.schedule_preview_if_needed(page_num, RenderPriority::VisiblePreview);
     }
 
     // Render pages around the visible one ahead of time so scrolling to them is
@@ -556,12 +608,12 @@ impl Page {
         let cache = obj.state().render_cache();
         let inflight = obj.state().render_inflight();
 
-        // The render queue is LIFO, that's why `rev` and start with the BEHIND
-        let mut candidates = Vec::with_capacity((PREFETCH_AHEAD + PREFETCH_BEHIND) as usize);
-        for d in (1..=PREFETCH_BEHIND).rev() {
+        // The queue is LIFO, so push farthest first: the nearest neighbours on either side pop and
+        // render first, and within a distance the page ahead goes before the one behind (a mild
+        // forward bias for reading order).
+        let mut candidates = Vec::with_capacity(2 * PREFETCH_WINDOW as usize);
+        for d in (1..=PREFETCH_WINDOW).rev() {
             candidates.push(current - d);
-        }
-        for d in (1..=PREFETCH_AHEAD).rev() {
             candidates.push(current + d);
         }
 
@@ -614,6 +666,13 @@ impl Page {
             let surface = rendered.into_surface(scale_factor);
             state.render_cache().borrow_mut().insert(page_num, surface);
 
+            log::debug!(
+                "memory: rss={:.0}MB render_cache={:?} preview_cache={:?}",
+                current_rss_mb(),
+                state.render_cache().borrow(),
+                state.preview_cache().borrow(),
+            );
+
             // repaint whichever widget is currently waiting to show this page
             // (not necessarily the one that requested the render)
             if let Some(widget) = state
@@ -633,7 +692,111 @@ impl Page {
                 &uri,
                 priority,
                 Box::new(move |doc| {
-                    request_render(doc, scale, scale_factor, page_num, resp_sender);
+                    request_render(doc, scale, scale_factor, page_num, priority, resp_sender);
+                }),
+            );
+        });
+    }
+
+    // Prefetch low-res previews over a wide symmetric window (they're cheap and tiny), so scrolling
+    // either way shows blurry pages instead of blank ones.
+    fn prefetch_previews(&self, current: i32) {
+        let obj = self.obj();
+        if !obj.state().preview_enabled() {
+            return;
+        }
+        let Some(doc) = obj.state().doc() else {
+            return;
+        };
+        let n_pages = doc.n_pages();
+
+        // Walk outward from the visible page, interleaving both directions, and push so the nearest
+        // pages end up on top of the LIFO queue (rendered first). Pages already cached - typically
+        // the side scrolled from - are skipped, so effort tracks the direction of travel.
+        let mut candidates = Vec::with_capacity(2 * PREVIEW_WINDOW as usize);
+        for d in (1..=PREVIEW_WINDOW).rev() {
+            candidates.push(current + d);
+            candidates.push(current - d);
+        }
+        for page_num in candidates {
+            if page_num >= 0 && page_num < n_pages {
+                self.schedule_preview_if_needed(page_num, RenderPriority::Preview);
+            }
+        }
+    }
+
+    // Queue this page's preview unless it's cached, already queued, or the preview budget of
+    // in-flight jobs is full. `priority` is VisiblePreview for the page on screen (render its blur
+    // before anything else) and Preview for the look-ahead window.
+    fn schedule_preview_if_needed(&self, page_num: i32, priority: RenderPriority) {
+        let obj = self.obj();
+        let state = obj.state();
+        if !state.preview_enabled() || state.preview_cache().borrow().contains(page_num) {
+            return;
+        }
+        if state.preview_inflight().borrow().len() >= MAX_INFLIGHT_PREVIEWS {
+            return;
+        }
+        if state.preview_inflight().borrow_mut().insert(page_num) {
+            self.schedule_preview(page_num, priority);
+        }
+    }
+
+    fn schedule_preview(&self, page_num: i32, priority: RenderPriority) {
+        let obj = self.obj();
+        let uri = obj.uri();
+
+        let (resp_sender, resp_receiver) = oneshot::channel::<RenderedPage>();
+        let obj_clone = obj.clone();
+        let uri_check = uri.clone();
+        glib::spawn_future_local(async move {
+            let result = resp_receiver.await;
+            let state = obj_clone.state();
+            state.preview_inflight().borrow_mut().remove(&page_num);
+
+            let Ok(rendered) = result else {
+                return;
+            };
+            if obj_clone.uri() != uri_check {
+                return;
+            }
+
+            // if previews aren't cheap for this document (e.g. decode-bound images), stop making
+            // them - they'd only waste cycles
+            if rendered.render_ms > PREVIEW_SLOW_MS {
+                log::debug!(
+                    "preview page {page_num} took {}ms (>{PREVIEW_SLOW_MS}); disabling previews",
+                    rendered.render_ms
+                );
+                state.set_preview_enabled(false);
+                state.preview_cache().borrow_mut().clear();
+                state.preview_inflight().borrow_mut().clear();
+                return;
+            }
+
+            let surface = rendered.into_surface(1.0);
+            state.preview_cache().borrow_mut().insert(page_num, surface);
+
+            // repaint the waiting widget, but leave the waiter registered so the
+            // full render still repaints it when it lands
+            if let Some(widget) = state
+                .render_waiters()
+                .borrow()
+                .get(&page_num)
+                .and_then(glib::WeakRef::upgrade)
+            {
+                if widget.index() == page_num {
+                    widget.queue_draw();
+                }
+            }
+        });
+
+        RENDER_QUEUE.with(move |queue| {
+            queue.submit(
+                &uri,
+                priority,
+                Box::new(move |doc| {
+                    request_render(doc, PREVIEW_SCALE, 1.0, page_num, priority, resp_sender);
                 }),
             );
         });
@@ -657,6 +820,17 @@ pub fn draw_surface(cr: &Context, surface: &ImageSurface, bbox: &Rectangle, scal
     cr.set_source_rgb(0.0, 0.0, 0.0);
 }
 
+// Draw a PREVIEW_SCALE preview surface upscaled to fill the same area a full render at `scale`
+// would occupy (blurry stand-in while the full render lands).
+fn draw_preview(cr: &Context, preview: &ImageSurface, bbox: &Rectangle, scale: f64) {
+    let upscale = scale / PREVIEW_SCALE;
+    cr.save().unwrap();
+    cr.scale(upscale, upscale);
+    draw_surface(cr, preview, bbox, PREVIEW_SCALE);
+    cr.restore().unwrap();
+    cr.set_source_rgb(0.0, 0.0, 0.0);
+}
+
 // A rendered page as raw pixels. Rendering happens on a background thread, and
 // `ImageSurface` is not `Send`, so the pixels cross the thread boundary as a
 // plain buffer and the surface is rebuilt on the main thread.
@@ -666,6 +840,7 @@ struct RenderedPage {
     width: i32,
     height: i32,
     stride: i32,
+    render_ms: u128,
 }
 
 impl RenderedPage {
@@ -688,6 +863,7 @@ fn request_render(
     scale: f64,
     device_scale_factor: f64,
     page_num: i32,
+    priority: RenderPriority,
     resp_sender: oneshot::Sender<RenderedPage>,
 ) {
     let Some(page) = doc.page(page_num) else {
@@ -698,9 +874,10 @@ fn request_render(
     let start = std::time::Instant::now();
     let surface = render_surface(&page, scale, device_scale_factor);
     let (width, height, stride) = (surface.width(), surface.height(), surface.stride());
+    let render_ms = start.elapsed().as_millis();
     log::debug!(
-        "Rendered page {page_num} on background thread in {:?}",
-        start.elapsed()
+        "Rendered page {page_num} [{}] on background thread in {render_ms}ms (scale_factor={device_scale_factor})",
+        priority.label()
     );
 
     let mut buffer = vec![0u8; (stride * height) as usize];
@@ -717,7 +894,24 @@ fn request_render(
         width,
         height,
         stride,
+        render_ms,
     });
+}
+
+// Resident set size in MB, read from /proc (Linux). Used only for diagnostic logging, so a read
+// failure just reports 0.
+fn current_rss_mb() -> f64 {
+    let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
+        return 0.0;
+    };
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("VmRSS:") {
+            if let Ok(kb) = rest.trim().trim_end_matches("kB").trim().parse::<f64>() {
+                return kb / 1024.0;
+            }
+        }
+    }
+    0.0
 }
 
 pub fn render_surface(page: &poppler::Page, scale: f64, device_scale_factor: f64) -> ImageSurface {
@@ -976,6 +1170,10 @@ startxref
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(40);
+        let scale: f64 = env::var("SCALE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1.0);
         let pages: Vec<i32> = (start..start + count).collect();
 
         for threads in [1usize, 2, 4, 8] {
@@ -991,7 +1189,7 @@ startxref
                         let doc = poppler::Document::from_file(&uri, None).unwrap();
                         for p in chunk {
                             if let Some(page) = doc.page(p) {
-                                std::hint::black_box(render_surface(&page, 1.0, 1.0));
+                                std::hint::black_box(render_surface(&page, scale, 1.0));
                             }
                         }
                     });
@@ -999,11 +1197,105 @@ startxref
             });
             let dt = t0.elapsed();
             println!(
-                "threads={threads:<2} pages={} time={dt:>8.2?} throughput={:.1} pages/s",
+                "scale={scale} threads={threads:<2} pages={} time={dt:>8.2?} throughput={:.1} pages/s",
                 pages.len(),
                 pages.len() as f64 / dt.as_secs_f64()
             );
         }
+    }
+
+    // Memory probe: isolates the two costs of the N-threads/N-documents render pool - the resident
+    // poppler Documents (one per thread) versus the glibc malloc arena high-water mark left by
+    // transient render allocations. For a given THREADS it renders PAGES across that many threads
+    // (each with its own Document, matching the real pool), keeps all threads/documents alive, and
+    // reports VmRSS after rendering and again after malloc_trim(0). The gap that malloc_trim
+    // reclaims is the arena bloat (fixable without dropping parallelism); the residual scaling with
+    // THREADS is the per-document cost. Run per thread count in separate processes so arenas don't
+    // carry over:
+    //   PDF_PATH=/abs/file.pdf THREADS=4 cargo test --release bench_render_memory -- --ignored --nocapture
+    // Optional env: PAGE_NUMBER, PAGES, MALLOC_ARENA_MAX (set before running).
+    #[test]
+    #[ignore]
+    fn bench_render_memory() {
+        use std::sync::{mpsc, Arc, Mutex};
+
+        extern "C" {
+            fn malloc_trim(pad: usize) -> i32;
+        }
+        let rss_mb = current_rss_mb;
+
+        let path = env::var("PDF_PATH").expect("PDF_PATH not set");
+        let uri = format!("file://{path}");
+        let start: i32 = env::var("PAGE_NUMBER")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let count: i32 = env::var("PAGES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(40);
+        let threads: usize = env::var("THREADS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(4);
+        // re-render the same pages this many times to imitate a long scrolling
+        // session churning allocations, so growth-with-churn (a leak) shows up
+        // distinct from the one-pass working set
+        let passes: usize = env::var("PASSES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1);
+        let pages: Vec<i32> = (start..start + count).collect();
+
+        let baseline = rss_mb();
+
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let (exit_tx, exit_rx) = mpsc::channel::<()>();
+        let exit_rx = Arc::new(Mutex::new(exit_rx));
+
+        std::thread::scope(|s| {
+            for t in 0..threads {
+                let uri = uri.clone();
+                let chunk: Vec<i32> = pages.iter().copied().skip(t).step_by(threads).collect();
+                let done_tx = done_tx.clone();
+                let exit_rx = exit_rx.clone();
+                s.spawn(move || {
+                    // each thread keeps its own Document, like the real pool
+                    let doc = poppler::Document::from_file(&uri, None).unwrap();
+                    for _ in 0..passes {
+                        for p in &chunk {
+                            if let Some(page) = doc.page(*p) {
+                                std::hint::black_box(render_surface(&page, 1.0, 1.0));
+                            }
+                        }
+                    }
+                    // report done, then hold the Document resident until released
+                    done_tx.send(()).unwrap();
+                    let _ = exit_rx.lock().unwrap().recv();
+                    std::hint::black_box(&doc);
+                });
+            }
+
+            for _ in 0..threads {
+                done_rx.recv().unwrap();
+            }
+
+            let after_render = rss_mb();
+            unsafe { malloc_trim(0) };
+            let after_trim = rss_mb();
+
+            println!(
+                "threads={threads:<2} passes={passes} pages={} baseline={baseline:.0}MB after_render={after_render:.0}MB \
+                 after_trim={after_trim:.0}MB reclaimed_by_trim={:.0}MB resident_over_baseline={:.0}MB",
+                pages.len(),
+                after_render - after_trim,
+                after_trim - baseline,
+            );
+
+            for _ in 0..threads {
+                exit_tx.send(()).unwrap();
+            }
+        });
     }
 
     #[test]
