@@ -69,6 +69,12 @@ pub struct Page {
     highlighted: RefCell<Rectangle>,
     bbox: RefCell<Rectangle>,
     cursor_guard: Cell<bool>,
+
+    // false until the widget has been mapped and its final device scale factor is in effect.
+    // Rendering before then would use a provisional scale factor (the compositor assigns the real
+    // one right after map) and be thrown away and re-rendered - expensive on HiDPI. While false,
+    // the page paints blank.
+    scale_known: Cell<bool>,
 }
 
 #[glib::object_subclass]
@@ -84,6 +90,7 @@ impl ObjectImpl for Page {
         self.parent_constructed();
 
         self.setup_draw_function();
+        self.setup_scale_tracking();
         self.setup_state_listeners();
         self.setup_text_selection();
         self.setup_link_handling();
@@ -119,6 +126,16 @@ impl Page {
                     return;
                 };
 
+                // Hold off rendering until the final device scale factor is known (set just after
+                // map); otherwise the first render uses a provisional scale and is immediately
+                // re-rendered. Paint blank meanwhile - the deferred redraw renders at the real
+                // scale.
+                if !imp.scale_known.get() {
+                    cr.set_source_rgb(1.0, 1.0, 1.0);
+                    cr.paint().expect("Failed to fill");
+                    return;
+                }
+
                 cr.save().expect("Failed to save");
 
                 if obj.state().multithread_rendering() {
@@ -137,6 +154,40 @@ impl Page {
                 }
             }
         ));
+    }
+
+    // Mark the device scale factor as known once it has settled after map, so the draw function can
+    // start rendering at the final scale.
+    fn setup_scale_tracking(&self) {
+        let obj = self.obj();
+
+        // The compositor assigns the surface's scale factor right after map, so
+        // defer one main-loop iteration before allowing the first render; by
+        // then the scale-factor notification (higher priority than idle) has
+        // been applied. Recycled list widgets keep the flag set across remaps.
+        obj.connect_map(|page| {
+            // recycled list widgets keep the flag set across remaps; only the
+            // genuine first map needs to defer
+            if page.imp().scale_known.get() {
+                return;
+            }
+            glib::idle_add_local_once(clone!(
+                #[weak]
+                page,
+                move || {
+                    page.imp().scale_known.set(true);
+                    page.queue_draw();
+                }
+            ));
+        });
+
+        // A scale-factor change (e.g. moving to a monitor with a different
+        // scale) is authoritative: the current cached surface is now stale, and
+        // the draw's dimension check re-renders it at the new scale.
+        obj.connect_scale_factor_notify(|page| {
+            page.imp().scale_known.set(true);
+            page.queue_draw();
+        });
     }
 
     fn setup_state_listeners(&self) {
