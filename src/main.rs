@@ -27,6 +27,13 @@ use scrolex::window;
 
 const APP_ID: &str = "com.andr2i.scrolex";
 
+extern "C" {
+    // POSIX _exit: terminate immediately without running atexit handlers or C++ static destructors
+    // (see the shutdown handler for why we need that).
+    #[link_name = "_exit"]
+    fn libc_exit(status: i32) -> !;
+}
+
 fn main() -> glib::ExitCode {
     init_logging();
 
@@ -97,6 +104,13 @@ fn build_ui(app: &Application, args: &[OsString]) {
             if let Err(err) = state.save() {
                 eprintln!("Error saving state: {err}");
             }
+
+            // The background render threads (bg_job) are detached and may be mid poppler render at
+            // this point; a poppler render can't be interrupted. Terminating normally would let the
+            // C library destructors free poppler/cairo/pixman globals out from under a
+            // still-running render thread, which segfaults. State is saved above, so exit
+            // immediately without running those destructors and let the OS reclaim everything.
+            unsafe { libc_exit(0) };
         }
     ));
 
