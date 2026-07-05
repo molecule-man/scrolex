@@ -14,9 +14,9 @@ use std::{env, fs};
 
 use crate::page;
 
-// Memory budget for the low-resolution preview cache. Previews are ~100 KB each, so this holds a
-// wide scroll window.
-const PREVIEW_CACHE_BUDGET: usize = 20 * 1024 * 1024;
+// Memory budget for the low-resolution preview cache. Spread over the resident preview window this
+// also bounds the adaptive preview scale, so it holds a wide scroll window without thrashing.
+pub(crate) const PREVIEW_CACHE_BUDGET: usize = 20 * 1024 * 1024;
 
 glib::wrapper! {
     pub struct State(ObjectSubclass<imp::State>);
@@ -60,6 +60,9 @@ impl State {
         self.imp().preview_cache.borrow_mut().clear();
         self.imp().preview_inflight.borrow_mut().clear();
         self.imp().preview_enabled.set(true);
+        self.imp()
+            .preview_scale
+            .set(crate::page::PREVIEW_INITIAL_SCALE);
 
         self.emit_by_name::<()>("before-load", &[]);
 
@@ -181,6 +184,14 @@ impl State {
 
     pub(crate) fn set_preview_enabled(&self, enabled: bool) {
         self.imp().preview_enabled.set(enabled);
+    }
+
+    pub(crate) fn preview_scale(&self) -> f64 {
+        self.imp().preview_scale.get()
+    }
+
+    pub(crate) fn set_preview_scale(&self, scale: f64) {
+        self.imp().preview_scale.set(scale);
     }
 }
 

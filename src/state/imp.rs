@@ -59,6 +59,9 @@ pub struct State {
     // dominates regardless of scale) - then they'd only waste cycles. Cell wrapped so it defaults
     // to false; set true on load.
     pub(crate) preview_enabled: Cell<bool>,
+    // render scale for previews, adapted per document toward the time and memory budgets. Defaults
+    // to 0.0 (Cell); set to the initial scale in constructed and on load.
+    pub(crate) preview_scale: Cell<f64>,
 }
 
 #[glib::object_subclass]
@@ -80,6 +83,7 @@ impl ObjectImpl for State {
         // window uses doesn't run State::new.
         *self.preview_cache.borrow_mut() =
             crate::render_cache::RenderCache::new(super::PREVIEW_CACHE_BUDGET);
+        self.preview_scale.set(crate::page::PREVIEW_INITIAL_SCALE);
 
         // Zooming could have made the cache entries inaccurate. Drop them. This must live here
         // rather than in State::new: the builder-created instance the window uses doesn't run

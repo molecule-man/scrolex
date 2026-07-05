@@ -28,16 +28,23 @@ const PREFETCH_WINDOW: i32 = 2;
 const MAX_INFLIGHT_RENDERS: usize = 6;
 
 // Low-resolution previews rendered ahead of the visible page and shown (upscaled) while the full
-// render is pending, so aggressive scrolling shows blurry pages rather than blank ones. Rendered at
-// PREVIEW_SCALE - for vector documents that is several times cheaper than a full render, so a wide
-// window can be kept warm - and disabled for a document once a preview costs more than
-// PREVIEW_SLOW_MS (e.g. decode-bound scans, where a low-res render is no cheaper than the full
-// one). Stored in page units (device scale 1) so they survive zoom and are rescaled at draw time.
-const PREVIEW_SCALE: f64 = 0.25;
+// render is pending, so aggressive scrolling shows blurry pages rather than blank ones. The render
+// scale adapts per document toward two budgets at once (see adapt_preview_scale): PREVIEW_TARGET_MS
+// keeps a single preview fast, and the preview-cache budget spread over the resident window keeps
+// each preview small enough that the whole window stays cached without thrashing. Stored in page
+// units (device scale 1) so they survive zoom and are rescaled at draw time.
+pub(crate) const PREVIEW_INITIAL_SCALE: f64 = 0.25;
+const PREVIEW_MIN_SCALE: f64 = 0.1;
+const PREVIEW_MAX_SCALE: f64 = 0.5;
+// Per-preview render-time budget the adaptive scale steers toward.
+const PREVIEW_TARGET_MS: u128 = 40;
 // Pages either side of the visible one to keep previewed. Symmetric so scrolling back has as much
 // runway as forward; already-cached pages are skipped, so effort tracks the direction of travel.
 const PREVIEW_WINDOW: i32 = 32;
 const MAX_INFLIGHT_PREVIEWS: usize = 12;
+// A preview slower than this even at PREVIEW_MIN_SCALE means shrinking won't help (decode-bound
+// scans, where a low-res render is no cheaper than the full one); give up and stop previewing the
+// document.
 const PREVIEW_SLOW_MS: u128 = 250;
 
 // Background worker threads. Each keeps its own poppler Document open (poppler isn't safe to share
@@ -718,8 +725,9 @@ impl Page {
             state.render_cache().borrow_mut().insert(page_num, surface);
 
             log::debug!(
-                "memory: rss={:.0}MB render_cache={:?} preview_cache={:?}",
+                "memory: rss={:.0}MB preview_scale={:.3} render_cache={:?} preview_cache={:?}",
                 current_rss_mb(),
+                state.preview_scale(),
                 state.render_cache().borrow(),
                 state.preview_cache().borrow(),
             );
@@ -796,6 +804,7 @@ impl Page {
     fn schedule_preview(&self, page_num: i32, priority: RenderPriority) {
         let obj = self.obj();
         let uri = obj.uri();
+        let scale = obj.state().preview_scale();
 
         let (resp_sender, resp_receiver) = oneshot::channel::<RenderedPage>();
         let obj_clone = obj.clone();
@@ -812,17 +821,31 @@ impl Page {
                 return;
             }
 
-            // if previews aren't cheap for this document (e.g. decode-bound images), stop making
-            // them - they'd only waste cycles
-            if rendered.render_ms > PREVIEW_SLOW_MS {
+            // decode-bound documents (e.g. scanned images) don't get cheaper as the scale shrinks:
+            // if a preview is still slow at the floor, it never will pay off - stop making them.
+            let cur_scale = state.preview_scale();
+            if rendered.render_ms > PREVIEW_SLOW_MS && cur_scale <= PREVIEW_MIN_SCALE {
                 log::debug!(
-                    "preview page {page_num} took {}ms (>{PREVIEW_SLOW_MS}); disabling previews",
+                    "preview page {page_num} took {}ms (>{PREVIEW_SLOW_MS}) at min scale; disabling previews",
                     rendered.render_ms
                 );
                 state.set_preview_enabled(false);
                 state.preview_cache().borrow_mut().clear();
                 state.preview_inflight().borrow_mut().clear();
                 return;
+            }
+
+            // steer the scale for future previews toward the time and memory budgets, based on what
+            // this render (at cur_scale) actually cost
+            let bytes = (rendered.stride * rendered.height).max(0) as usize;
+            let new_scale = adapt_preview_scale(cur_scale, rendered.render_ms, bytes);
+            if new_scale != cur_scale {
+                log::debug!(
+                    "preview scale {cur_scale:.3} -> {new_scale:.3} (page {page_num}: {}ms, {}KB)",
+                    rendered.render_ms,
+                    bytes / 1024
+                );
+                state.set_preview_scale(new_scale);
             }
 
             let surface = rendered.into_surface(1.0);
@@ -847,7 +870,7 @@ impl Page {
                 &uri,
                 priority,
                 Box::new(move |doc| {
-                    request_render(doc, PREVIEW_SCALE, 1.0, page_num, priority, resp_sender);
+                    request_render(doc, scale, 1.0, page_num, priority, resp_sender);
                 }),
             );
         });
@@ -871,15 +894,46 @@ pub fn draw_surface(cr: &Context, surface: &ImageSurface, bbox: &Rectangle, scal
     cr.set_source_rgb(0.0, 0.0, 0.0);
 }
 
-// Draw a PREVIEW_SCALE preview surface upscaled to fill the same area a full render at `scale`
-// would occupy (blurry stand-in while the full render lands).
+// Draw a low-res preview surface upscaled to fill the same area a full render at `scale` would
+// occupy (blurry stand-in while the full render lands). The preview's own render scale is recovered
+// from its pixel size versus the page size in points, so a cache holding previews rendered at
+// different (adaptive) scales still upscales each one correctly.
 fn draw_preview(cr: &Context, preview: &ImageSurface, bbox: &Rectangle, scale: f64) {
-    let upscale = scale / PREVIEW_SCALE;
+    let (bbox_w, _) = bbox.size();
+    let preview_scale = if bbox_w > 0.0 {
+        preview.width() as f64 / bbox_w
+    } else {
+        scale
+    };
+    let upscale = scale / preview_scale;
     cr.save().unwrap();
     cr.scale(upscale, upscale);
-    draw_surface(cr, preview, bbox, PREVIEW_SCALE);
+    draw_surface(cr, preview, bbox, preview_scale);
     cr.restore().unwrap();
     cr.set_source_rgb(0.0, 0.0, 0.0);
+}
+
+// Steer the preview render scale toward two budgets at once, from what the last preview render (at
+// `cur_scale`) actually cost: a per-preview time budget (keep the stand-in fast) and a per-preview
+// size budget (keep the whole window resident so previews don't thrash their cache). Both costs
+// grow ~scale^2, so each budget maps to a scale by the same square-root correction; we take the
+// tighter of the two and clamp to the usable range.
+fn adapt_preview_scale(cur_scale: f64, render_ms: u128, bytes: usize) -> f64 {
+    // Pages we want kept warm at once: the full symmetric window plus the visible page. The cache
+    // budget divided by this is the per-preview size ceiling; tying it to the budget and window
+    // keeps a single source of truth if either changes.
+    const RESIDENT_PREVIEWS: usize = (2 * PREVIEW_WINDOW + 1) as usize;
+    let target_bytes = (crate::state::PREVIEW_CACHE_BUDGET / RESIDENT_PREVIEWS) as f64;
+
+    let render_ms = render_ms.max(1) as f64;
+    let bytes = bytes.max(1) as f64;
+
+    let scale_time = cur_scale * (PREVIEW_TARGET_MS as f64 / render_ms).sqrt();
+    let scale_mem = cur_scale * (target_bytes / bytes).sqrt();
+
+    scale_time
+        .min(scale_mem)
+        .clamp(PREVIEW_MIN_SCALE, PREVIEW_MAX_SCALE)
 }
 
 // A rendered page as raw pixels. Rendering happens on a background thread, and
@@ -1403,5 +1457,43 @@ startxref
         let mut decompressed_data = Vec::new();
         decoder.read_to_end(&mut decompressed_data)?;
         Ok(decompressed_data)
+    }
+
+    #[test]
+    fn preview_scale_shrinks_for_slow_renders() {
+        // a vector page rendered well over budget at 0.25 should drop toward hitting the time
+        // budget (cost ~scale^2, so sqrt(40/160) = 0.5x)
+        let scale = adapt_preview_scale(0.25, 160, 100_000);
+        assert!((scale - 0.125).abs() < EPSILON, "got {scale}");
+    }
+
+    #[test]
+    fn preview_scale_floors_at_min_for_very_slow_renders() {
+        let scale = adapt_preview_scale(0.25, 5_000, 100_000);
+        assert!((scale - PREVIEW_MIN_SCALE).abs() < EPSILON, "got {scale}");
+    }
+
+    #[test]
+    fn preview_scale_caps_at_max_when_both_budgets_are_slack() {
+        // cheap and small: time budget wants a big scale, memory budget allows it -> clamp to max
+        let scale = adapt_preview_scale(0.25, 8, 50_000);
+        assert!((scale - PREVIEW_MAX_SCALE).abs() < EPSILON, "got {scale}");
+    }
+
+    #[test]
+    fn preview_scale_memory_budget_caps_a_cheap_but_fat_render() {
+        // fast render (time budget alone would push to max) but a large surface: the memory budget
+        // must pull the scale below max so the resident window still fits the cache
+        let scale = adapt_preview_scale(0.25, 4, 100_000);
+        assert!(scale < PREVIEW_MAX_SCALE, "memory budget should bind: got {scale}");
+        // sqrt((20MB/65) / 100KB) * 0.25 ~= 0.449
+        assert!((scale - 0.449).abs() < 0.01, "got {scale}");
+    }
+
+    #[test]
+    fn preview_scale_handles_zero_measurements() {
+        // a render measured as 0ms / 0 bytes must not divide by zero; both budgets read as slack
+        let scale = adapt_preview_scale(0.25, 0, 0);
+        assert!((scale - PREVIEW_MAX_SCALE).abs() < EPSILON, "got {scale}");
     }
 }
