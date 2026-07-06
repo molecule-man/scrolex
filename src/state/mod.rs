@@ -54,6 +54,7 @@ impl State {
             Document::from_gfile(f, None, gtk::gio::Cancellable::NONE).map_err(io::Error::other)?;
         self.imp().bbox_cache.borrow_mut().clear();
         self.imp().links.borrow_mut().clear();
+        self.imp().search.borrow_mut().clear();
         self.imp().render_cache.borrow_mut().clear();
         self.imp().render_inflight.borrow_mut().clear();
         self.imp().render_waiters.borrow_mut().clear();
@@ -156,6 +157,10 @@ impl State {
 
     pub(crate) fn bbox_cache(&self) -> Rc<RefCell<HashMap<i32, page::Rectangle>>> {
         self.imp().bbox_cache.clone()
+    }
+
+    pub(crate) fn search(&self) -> Rc<RefCell<crate::search::Search>> {
+        self.imp().search.clone()
     }
 
     pub(crate) fn render_cache(&self) -> Rc<RefCell<crate::render_cache::RenderCache>> {

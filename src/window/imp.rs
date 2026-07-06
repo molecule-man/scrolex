@@ -8,9 +8,11 @@ use gtk::glib::subclass::prelude::*;
 use gtk::glib::subclass::types::ObjectSubclassIsExt;
 use gtk::subclass::prelude::*;
 use gtk::{
-    glib, Button, CompositeTemplate, ListView, ScrolledWindow, SingleSelection, ToggleButton,
+    glib, Button, CompositeTemplate, Label, ListView, ScrolledWindow, SearchBar, SearchEntry,
+    SingleSelection, ToggleButton,
 };
 use gtk::{prelude::*, GestureClick};
+use futures::StreamExt;
 
 use crate::page;
 use crate::state::State;
@@ -47,6 +49,9 @@ const ZOOM_STEP: f64 = 1.1;
 // full-rendered. Long enough that a continuous scroll doesn't repeatedly arm it, short enough that
 // stopping feels immediate.
 const SETTLE_MS: u64 = 150;
+
+// Quiet period after the last keystroke before a search sweep launches, coalescing a burst of typing.
+const SEARCH_DEBOUNCE_MS: u64 = 100;
 
 // In-flight state of the animated one-page slide.
 //
@@ -100,6 +105,17 @@ pub struct Window {
     pub listview: TemplateChild<ListView>,
     #[template_child]
     pub entry_page_num: TemplateChild<gtk::Entry>,
+    #[template_child]
+    pub search_bar: TemplateChild<SearchBar>,
+    #[template_child]
+    pub search_entry: TemplateChild<SearchEntry>,
+    #[template_child]
+    pub search_status: TemplateChild<Label>,
+    #[template_child]
+    pub btn_search_case: TemplateChild<ToggleButton>,
+
+    // set while a re-search is queued, to coalesce keystrokes into one sweep
+    search_debounce: RefCell<Option<glib::SourceId>>,
 
     drag_coords: RefCell<Option<(f64, f64)>>,
     drag_cursor: RefCell<Option<gtk::gdk::Cursor>>,
@@ -173,6 +189,7 @@ impl ObjectImpl for Window {
 
         self.setup_scroll_selection_sync();
         self.setup_thread_setting();
+        self.setup_search();
 
         // Give keyboard focus to the scroll area rather than the header entry
         self.scrolledwindow.set_focusable(true);
@@ -382,6 +399,9 @@ impl Window {
             Key::o => {
                 self.open_document();
             }
+            Key::f => {
+                self.open_search();
+            }
             Key::l => {
                 self.next_page();
             }
@@ -393,6 +413,16 @@ impl Window {
             }
             Key::bracketright => {
                 self.zoom_in();
+            }
+            Key::n | Key::N => {
+                if self.state.search().borrow().total() == 0 {
+                    return glib::Propagation::Proceed;
+                }
+                if keyval == Key::N {
+                    self.prev_match();
+                } else {
+                    self.next_match();
+                }
             }
             Key::Left | Key::Right => {
                 // fine horizontal scroll; handled here rather than relying on the scrolled window's
@@ -925,6 +955,357 @@ impl Window {
                 self.selection.set_selected(index as u32);
             }
         }
+    }
+
+    fn setup_search(&self) {
+        // let the search bar drive its entry (built-in reveal/conceal plumbing)
+        self.search_bar.connect_entry(&*self.search_entry);
+
+        // Route every dismissal (Esc, close button, stop-search) through one cleanup.
+        self.search_bar.connect_search_mode_enabled_notify(clone!(
+            #[weak(rename_to = imp)]
+            self,
+            move |bar| {
+                if !bar.is_search_mode() {
+                    imp.clear_search();
+                }
+            }
+        ));
+
+        // Window-level keys so Ctrl+F / F3 / Esc work regardless of focus. Capture phase lets F3 fire
+        // while typing and stops Esc from double-firing the entry's stop-search.
+        let key = gtk::EventControllerKey::new();
+        key.set_propagation_phase(gtk::PropagationPhase::Capture);
+        key.connect_key_pressed(clone!(
+            #[weak(rename_to = imp)]
+            self,
+            #[upgrade_or]
+            glib::Propagation::Proceed,
+            move |_, keyval, _keycode, modifier| imp.handle_global_key(keyval, modifier)
+        ));
+        self.obj().add_controller(key);
+    }
+
+    fn handle_global_key(&self, keyval: Key, modifier: ModifierType) -> glib::Propagation {
+        match keyval {
+            Key::f if modifier.contains(ModifierType::CONTROL_MASK) => {
+                self.open_search();
+                glib::Propagation::Stop
+            }
+            Key::F3 => {
+                if modifier.contains(ModifierType::SHIFT_MASK) {
+                    self.prev_match();
+                } else {
+                    self.next_match();
+                }
+                glib::Propagation::Stop
+            }
+            Key::Escape if self.search_bar.is_search_mode() => {
+                self.search_bar.set_search_mode(false);
+                glib::Propagation::Stop
+            }
+            _ => glib::Propagation::Proceed,
+        }
+    }
+
+    fn open_search(&self) {
+        self.search_bar.set_search_mode(true);
+        self.search_entry.grab_focus();
+        self.search_entry.select_region(0, -1);
+        // restore highlights for a leftover query
+        let query = self.search_entry.text().to_string();
+        if !query.is_empty() {
+            self.run_search(query);
+        }
+    }
+
+    // Cleanup on dismissal: clear highlights, refocus the document, but keep the query text so
+    // reopening restores it.
+    fn clear_search(&self) {
+        if let Some(source) = self.search_debounce.take() {
+            source.remove();
+        }
+
+        let pages: Vec<i32> = {
+            let search = self.state.search();
+            let mut search = search.borrow_mut();
+            let pages = search.results.keys().copied().collect();
+            search.clear();
+            pages
+        };
+        for page in pages {
+            self.redraw_page(page);
+        }
+        self.update_search_status();
+        self.scrolledwindow.grab_focus();
+    }
+
+    #[template_callback]
+    fn menu_search(&self, btn: &Button) {
+        // dismiss the settings popover first
+        if let Some(popover) = btn
+            .ancestor(gtk::Popover::static_type())
+            .and_downcast::<gtk::Popover>()
+        {
+            popover.popdown();
+        }
+        self.open_search();
+    }
+
+    #[template_callback]
+    fn search_changed(&self, entry: &SearchEntry) {
+        self.schedule_search(entry.text().to_string());
+    }
+
+    #[template_callback]
+    fn search_activate(&self) {
+        // Enter advances; the first match was auto-revealed when the sweep began
+        self.next_match();
+    }
+
+    #[template_callback]
+    fn search_stop(&self) {
+        self.search_bar.set_search_mode(false);
+    }
+
+    #[template_callback]
+    fn search_next(&self) {
+        self.next_match();
+    }
+
+    #[template_callback]
+    fn search_prev(&self) {
+        self.prev_match();
+    }
+
+    #[template_callback]
+    fn search_case_toggled(&self, btn: &ToggleButton) {
+        self.state.search().borrow_mut().case_sensitive = btn.is_active();
+        // deliberate action, no debounce
+        self.run_search(self.search_entry.text().to_string());
+    }
+
+    fn schedule_search(&self, query: String) {
+        if let Some(source) = self.search_debounce.take() {
+            source.remove();
+        }
+        // clear immediately when emptied, so highlights vanish without a delay
+        if query.is_empty() {
+            self.run_search(query);
+            return;
+        }
+        let source = glib::timeout_add_local_once(
+            std::time::Duration::from_millis(SEARCH_DEBOUNCE_MS),
+            clone!(
+                #[weak(rename_to = imp)]
+                self,
+                move || {
+                    imp.search_debounce.replace(None);
+                    imp.run_search(query);
+                }
+            ),
+        );
+        self.search_debounce.replace(Some(source));
+    }
+
+    // Launch a fresh sweep: cancel the previous (epoch bump), clear old highlights, then stream
+    // results back and repaint pages as matches arrive.
+    fn run_search(&self, query: String) {
+        let old_pages: Vec<i32> = self
+            .state
+            .search()
+            .borrow()
+            .results
+            .keys()
+            .copied()
+            .collect();
+
+        let (epoch, shared_epoch, flags) = {
+            let search = self.state.search();
+            let mut search = search.borrow_mut();
+            search.query = query.clone();
+            let (epoch, shared) = search.begin_sweep();
+            (epoch, shared, search.flags())
+        };
+
+        for page in old_pages {
+            self.redraw_page(page);
+        }
+        self.update_search_status();
+
+        let Some(doc) = self.state.doc() else {
+            return;
+        };
+        if query.is_empty() {
+            return;
+        }
+
+        let mut rx = crate::search::spawn_search(
+            self.state.uri(),
+            query,
+            flags,
+            doc.n_pages(),
+            self.selection.selected() as i32,
+            epoch,
+            shared_epoch,
+        );
+
+        glib::spawn_future_local(clone!(
+            #[weak(rename_to = imp)]
+            self,
+            async move {
+                while let Some(update) = rx.next().await {
+                    {
+                        let search = imp.state.search();
+                        let mut search = search.borrow_mut();
+                        if update.epoch != search.epoch() {
+                            continue; // superseded
+                        }
+                        let first = search.current.is_none();
+                        search.results.insert(update.page, update.rects);
+                        if first {
+                            // outward order => first arrival is the nearest match
+                            search.current = Some((update.page, 0));
+                        }
+                        drop(search);
+                        if first {
+                            imp.reveal_current();
+                        }
+                    }
+                    imp.redraw_page(update.page);
+                    imp.update_search_status();
+                }
+
+                // sweep done (or superseded); report no results if it found nothing
+                let search = imp.state.search();
+                let search = search.borrow();
+                if search.epoch() == epoch && !search.query.is_empty() && search.total() == 0 {
+                    imp.search_status.set_text("No results");
+                }
+            }
+        ));
+    }
+
+    fn next_match(&self) {
+        self.move_match(true);
+    }
+
+    fn prev_match(&self) {
+        self.move_match(false);
+    }
+
+    fn move_match(&self, forward: bool) {
+        let (old, new) = {
+            let search = self.state.search();
+            let mut search = search.borrow_mut();
+            let Some(next) = search.step(forward) else {
+                return;
+            };
+            let old = search.current;
+            search.current = Some(next);
+            (old, next)
+        };
+        if let Some((page, _)) = old {
+            self.redraw_page(page);
+        }
+        self.reveal_current();
+        self.redraw_page(new.0);
+        self.update_search_status();
+    }
+
+    // Bring the current match into view: select its page (keeping entry focus), then scroll
+    // horizontally to the match once the page is laid out.
+    fn reveal_current(&self) {
+        let (page, rect) = {
+            let search = self.state.search();
+            let search = search.borrow();
+            let Some((p, i)) = search.current else {
+                return;
+            };
+            let Some(r) = search.rect(p, i) else {
+                return;
+            };
+            (p, r)
+        };
+
+        self.scroll_to_page_no_focus(page);
+        glib::timeout_add_local_once(
+            std::time::Duration::from_millis(60),
+            clone!(
+                #[weak(rename_to = imp)]
+                self,
+                move || {
+                    imp.reveal_match_x(page, rect);
+                    imp.redraw_page(page);
+                }
+            ),
+        );
+    }
+
+    fn scroll_to_page_no_focus(&self, page_index: i32) {
+        let Some(selection) = self.ensure_ready_selection() else {
+            return;
+        };
+        let idx = (page_index.max(0) as u32).min(selection.n_items().saturating_sub(1));
+        // SELECT only (no FOCUS) so typing focus stays in the entry
+        self.listview
+            .scroll_to(idx, gtk::ListScrollFlags::SELECT, None);
+    }
+
+    // Scroll horizontally if the current match's column is off-screen, landing it near the left third.
+    // No-op unless its page is selected and laid out.
+    fn reveal_match_x(&self, page_index: i32, rect: page::Rectangle) {
+        if self.selection.selected() as i32 != page_index {
+            return;
+        }
+        let Some(left_x) = self.selected_page_left_x() else {
+            return;
+        };
+        let vw = f64::from(self.scrolledwindow.width());
+        if vw <= 0.0 {
+            return;
+        }
+        let zoom = self.state.zoom();
+        let bbox_x1 = self
+            .state
+            .bbox_cache()
+            .borrow()
+            .get(&page_index)
+            .map_or(0.0, |b| b.x1);
+        let match_x = left_x + (rect.x1 - bbox_x1) * zoom;
+        let margin = vw * 0.15;
+        if match_x < margin || match_x > vw - margin {
+            *self.scroll_anim.borrow_mut() = None; // stop any in-flight slide
+            let hadj = self.scrolledwindow.hadjustment();
+            let delta = match_x - vw * 0.3;
+            hadj.set_value(self.clamp_scroll(hadj.value() + delta));
+        }
+    }
+
+    fn redraw_page(&self, index: i32) {
+        let mut child = self.listview.first_child();
+        while let Some(c) = child {
+            if let Some(page) = descendant_page(&c) {
+                if page.index() == index && page.is_mapped() {
+                    page.queue_draw();
+                }
+            }
+            child = c.next_sibling();
+        }
+    }
+
+    fn update_search_status(&self) {
+        let search = self.state.search();
+        let search = search.borrow();
+        let text = if search.query.is_empty() {
+            String::new()
+        } else if let Some(ordinal) = search.current_ordinal() {
+            format!("{ordinal} / {}", search.total())
+        } else {
+            // query set, no match yet: still searching
+            "Searching…".to_string()
+        };
+        self.search_status.set_text(&text);
     }
 
     #[template_callback]
