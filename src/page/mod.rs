@@ -3,6 +3,7 @@ mod page_number_imp;
 
 pub use imp::draw_surface;
 pub use imp::render_surface;
+pub(crate) use imp::set_render_threads;
 pub(crate) use imp::PREVIEW_INITIAL_SCALE;
 
 use gtk::gio::prelude::*;

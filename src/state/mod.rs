@@ -209,6 +209,22 @@ impl State {
     pub(crate) fn set_scroll_forward(&self, forward: bool) {
         self.imp().scroll_forward.set(forward);
     }
+
+    pub(crate) fn render_threads(&self) -> usize {
+        self.imp().render_threads.get()
+    }
+
+    pub(crate) fn set_render_threads(&self, n: usize) {
+        self.imp().render_threads.set(n);
+    }
+
+    pub(crate) fn visible_page_count(&self) -> i32 {
+        self.imp().visible_page_count.get()
+    }
+
+    pub(crate) fn set_visible_page_count(&self, count: i32) {
+        self.imp().visible_page_count.set(count);
+    }
 }
 
 impl Default for State {

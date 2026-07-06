@@ -131,13 +131,71 @@
 					</object>
 				</child>
 				<child type="end">
-					<object class="GtkToggleButton" id="btn_animate_scroll">
-						<property name="active" bind-source="state" bind-property="animate-scroll" bind-flags="bidirectional|sync-create"/>
-						<property name="label">Animate Scroll</property>
-						<property name="tooltip-text">Slide by one page on scroll instead of jumping</property>
+					<object class="GtkMenuButton" id="btn_menu">
+						<property name="icon-name">open-menu-symbolic</property>
+						<property name="tooltip-text">Settings</property>
 						<property name="cursor">
 							<object class="GdkCursor">
 								<property name="name">pointer</property>
+							</object>
+						</property>
+						<property name="popover">
+							<object class="GtkPopover">
+								<property name="child">
+									<object class="GtkBox">
+										<property name="orientation">vertical</property>
+										<property name="spacing">12</property>
+										<property name="margin-top">8</property>
+										<property name="margin-bottom">8</property>
+										<property name="margin-start">8</property>
+										<property name="margin-end">8</property>
+										<child>
+											<object class="GtkToggleButton" id="btn_animate_scroll">
+												<property name="active" bind-source="state" bind-property="animate-scroll" bind-flags="bidirectional|sync-create"/>
+												<property name="label">Animate Scroll</property>
+												<property name="tooltip-text">Slide by one page on scroll instead of jumping</property>
+											</object>
+										</child>
+										<child>
+											<object class="GtkBox">
+												<property name="orientation">horizontal</property>
+												<property name="spacing">8</property>
+												<child>
+													<object class="GtkLabel">
+														<property name="label">Render threads</property>
+														<property name="halign">start</property>
+														<property name="hexpand">true</property>
+													</object>
+												</child>
+												<child>
+													<object class="GtkSpinButton" id="spin_threads">
+														<property name="numeric">true</property>
+														<property name="tooltip-text">Background page-render threads</property>
+														<property name="adjustment">
+															<object class="GtkAdjustment">
+																<property name="lower">1</property>
+																<property name="upper">64</property>
+																<property name="step-increment">1</property>
+																<property name="page-increment">1</property>
+															</object>
+														</property>
+													</object>
+												</child>
+											</object>
+										</child>
+										<child>
+											<object class="GtkLabel">
+												<property name="label">More threads render faster but use more memory.</property>
+												<property name="wrap">true</property>
+												<property name="max-width-chars">28</property>
+												<property name="xalign">0</property>
+												<style>
+													<class name="dim-label"/>
+												</style>
+											</object>
+										</child>
+									</object>
+								</property>
 							</object>
 						</property>
 					</object>

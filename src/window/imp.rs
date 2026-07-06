@@ -72,6 +72,8 @@ pub struct Window {
     #[template_child]
     pub btn_animate_scroll: TemplateChild<ToggleButton>,
     #[template_child]
+    pub spin_threads: TemplateChild<gtk::SpinButton>,
+    #[template_child]
     pub btn_jump_back: TemplateChild<Button>,
     #[template_child]
     pub scrolledwindow: TemplateChild<ScrolledWindow>,
@@ -143,6 +145,7 @@ impl ObjectImpl for Window {
         }
 
         self.setup_scroll_selection_sync();
+        self.setup_thread_setting();
 
         // Give keyboard focus to the scroll area rather than the header entry
         self.scrolledwindow.set_focusable(true);
@@ -737,9 +740,64 @@ impl Window {
         self.settle_source.replace(Some(source));
     }
 
+    // Load the render-thread setting into the spin button and pool, and persist any user change.
+    fn setup_thread_setting(&self) {
+        let max = crate::config::max_render_threads();
+        let threads = crate::config::load_render_threads();
+        self.spin_threads.set_range(1.0, max as f64);
+        self.spin_threads.set_increments(1.0, 1.0);
+        self.spin_threads.set_value(threads as f64);
+        self.apply_render_threads(threads);
+
+        self.spin_threads.connect_value_changed(clone!(
+            #[weak(rename_to = imp)]
+            self,
+            move |spin| {
+                let n = spin.value() as usize;
+                imp.apply_render_threads(n);
+                crate::config::save_render_threads(n);
+            }
+        ));
+    }
+
+    fn apply_render_threads(&self, n: usize) {
+        log::info!("Render threads: {n}");
+        self.state.set_render_threads(n);
+        crate::page::set_render_threads(n);
+    }
+
+    // Count pages that fit fully across the viewport width; prefetch depth is derived from it.
+    fn update_visible_page_count(&self) {
+        let viewport_w = f64::from(self.scrolledwindow.width());
+        if viewport_w <= 0.0 {
+            return;
+        }
+        let mut count = 0;
+        let mut child = self.listview.first_child();
+        while let Some(c) = child {
+            if let Some(page) = descendant_page(&c) {
+                if page.is_mapped() && page.width() > 0 {
+                    if let Some(p) = page.compute_point(
+                        &*self.scrolledwindow,
+                        &gtk::graphene::Point::new(0.0, 0.0),
+                    ) {
+                        let left = f64::from(p.x());
+                        let right = left + f64::from(page.width());
+                        if left >= -0.5 && right <= viewport_w + 0.5 {
+                            count += 1;
+                        }
+                    }
+                }
+            }
+            child = c.next_sibling();
+        }
+        self.state.set_visible_page_count(count);
+    }
+
     // Redraw every page widget currently laid out in the viewport. With scrolling now off, each
     // one's draw schedules its full render (and prefetch), so the settled pages sharpen.
     fn refresh_visible_renders(&self) {
+        self.update_visible_page_count();
         let mut child = self.listview.first_child();
         while let Some(c) = child {
             if let Some(page) = descendant_page(&c) {
@@ -783,6 +841,8 @@ impl Window {
         if w == 0 || n_items == 0 {
             return;
         }
+        self.update_visible_page_count();
+
         let selected = self.selection.selected() as i32;
         let cy = f64::from(h) / 2.0;
 
