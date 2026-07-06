@@ -1,86 +1,40 @@
 // Background worker pool that runs jobs against a poppler Document. Each worker
 // keeps its own Document open (Document is not Send), reopening only when the
-// requested uri changes.
+// requested uri changes. One pool serves every kind of job - bbox/layout,
+// visible-page renders and low-res previews - so the number of resident
+// Documents equals the pool size, independent of how many job kinds exist.
 
-use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
-use once_cell::sync::Lazy;
-use poppler::Document;
-
-// Pool used for bbox computation (cheap, latency-sensitive layout work).
-const BBOX_POOL_SIZE: usize = 1;
-
-thread_local!(
-    pub(crate) static JOB_MANAGER: Lazy<JobManager> = Lazy::new(|| JobManager::new(BBOX_POOL_SIZE));
-);
-
-type Job = Box<dyn FnOnce(&Document) + Send + 'static>;
-
-struct Request {
-    uri: String,
-    job: Job,
-}
-
-pub(crate) struct JobManager {
-    send: std::sync::mpsc::Sender<Request>,
-}
-
-impl JobManager {
-    pub(crate) fn new(pool_size: usize) -> Self {
-        let (send, recv) = std::sync::mpsc::channel();
-        let recv = Arc::new(Mutex::new(recv));
-        let manager = Self { send };
-        for _ in 0..pool_size {
-            Self::spawn_bg_thread(recv.clone());
-        }
-        manager
-    }
-
-    pub(crate) fn execute(&self, uri: &str, job: Job) {
-        self.send
-            .send(Request {
-                uri: uri.to_string(),
-                job,
-            })
-            .expect("Failed to send job request");
-    }
-
-    fn spawn_bg_thread(recv: Arc<Mutex<Receiver<Request>>>) {
-        thread::spawn(move || {
-            let mut doc = None;
-            let mut doc_uri = String::new();
-
-            loop {
-                let req = recv.lock().unwrap().recv().unwrap();
-                if doc.is_none() || doc_uri != req.uri {
-                    let f = gtk::gio::File::for_uri(&req.uri);
-                    doc = Some(
-                        Document::from_gfile(&f, None, gtk::gio::Cancellable::NONE)
-                            .expect("Couldn't open the file!"),
-                    );
-                    doc_uri.clone_from(&req.uri);
-                }
-                let doc = doc.as_ref().unwrap();
-
-                (req.job)(doc);
-            }
-        });
-    }
-}
-
-pub(crate) fn execute(uri: &str, job: Job) {
-    JOB_MANAGER.with(|manager| manager.execute(uri, job));
-}
-
-// Priority of a render request. Visible pages always render before prefetched
-// ones.
+// Priority of a queued job. Visible (on-screen full renders) outrank the low-res previews: the
+// current page's own blur (VisiblePreview) still comes first so a stand-in appears in ~40ms, but
+// the look-ahead previews yield to the sharp renders of pages on screen. Prefetch (full render of
+// the next pages in the scroll direction) is nice-to-have and runs last, only once everything on
+// screen is done.
 #[derive(Clone, Copy)]
 pub(crate) enum RenderPriority {
+    Bbox,
+    VisiblePreview,
     Visible,
+    Preview,
     Prefetch,
 }
+
+impl RenderPriority {
+    // Short tag for logging what kind of work a render was.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            RenderPriority::Bbox => "bbox",
+            RenderPriority::VisiblePreview => "low-res (visible)",
+            RenderPriority::Visible => "on-demand (visible)",
+            RenderPriority::Preview => "low-res (prefetch)",
+            RenderPriority::Prefetch => "on-demand (prefetch)",
+        }
+    }
+}
+
+type Job = Box<dyn FnOnce(&poppler::Document) + Send + 'static>;
 
 struct RenderRequest {
     uri: String,
@@ -88,29 +42,50 @@ struct RenderRequest {
 }
 
 struct RenderQueue {
-    // Both are LIFO stacks (newest at the end): when scrolling fast, the page
+    // Each is a LIFO stack (newest at the end): when scrolling fast, the page
     // just landed on renders before ones scrolled past. Oldest entries are
     // dropped once a stack is over its cap; a dropped request's job is simply
-    // never run.
+    // never run (callers treat a dropped job as "reschedule on next draw").
+    bbox: Vec<RenderRequest>,
+    visible_preview: Vec<RenderRequest>,
     visible: Vec<RenderRequest>,
+    preview: Vec<RenderRequest>,
     prefetch: Vec<RenderRequest>,
+    max_bbox: usize,
+    max_visible_preview: usize,
     max_visible: usize,
+    max_preview: usize,
     max_prefetch: usize,
 }
 
 impl RenderQueue {
-    fn new(max_visible: usize, max_prefetch: usize) -> Self {
+    fn new(
+        max_bbox: usize,
+        max_visible_preview: usize,
+        max_visible: usize,
+        max_preview: usize,
+        max_prefetch: usize,
+    ) -> Self {
         Self {
+            bbox: Vec::new(),
+            visible_preview: Vec::new(),
             visible: Vec::new(),
+            preview: Vec::new(),
             prefetch: Vec::new(),
+            max_bbox,
+            max_visible_preview,
             max_visible,
+            max_preview,
             max_prefetch,
         }
     }
 
     fn push(&mut self, priority: RenderPriority, req: RenderRequest) {
         let (stack, max) = match priority {
+            RenderPriority::Bbox => (&mut self.bbox, self.max_bbox),
+            RenderPriority::VisiblePreview => (&mut self.visible_preview, self.max_visible_preview),
             RenderPriority::Visible => (&mut self.visible, self.max_visible),
+            RenderPriority::Preview => (&mut self.preview, self.max_preview),
             RenderPriority::Prefetch => (&mut self.prefetch, self.max_prefetch),
         };
         stack.push(req);
@@ -119,27 +94,43 @@ impl RenderQueue {
         }
     }
 
-    // Visible pages take priority; within each stack the newest wins.
+    // Next runnable request, highest priority first and newest within a tier. All threads pull from
+    // here, so whenever visible work exists every thread takes it; prefetch only runs once the
+    // higher tiers are drained.
     fn pop(&mut self) -> Option<RenderRequest> {
-        if let Some(req) = self.visible.pop() {
-            Some(req)
-        } else {
-            self.prefetch.pop()
-        }
+        self.bbox
+            .pop()
+            .or_else(|| self.visible_preview.pop())
+            .or_else(|| self.visible.pop())
+            .or_else(|| self.preview.pop())
+            .or_else(|| self.prefetch.pop())
     }
 }
 
-// Thread pool for page rendering. Prioritises the visible page over prefetch
-// and bounds how many requests wait, so a fast scroll can't build an unbounded
-// backlog ahead of the page being viewed.
+// Thread pool serving all background poppler work. Prioritises layout and the visible page over
+// previews, and bounds how many requests wait so a fast scroll can't build an unbounded backlog
+// ahead of the page being viewed.
 pub(crate) struct RenderPool {
     inner: Arc<(Mutex<RenderQueue>, Condvar)>,
 }
 
 impl RenderPool {
-    pub(crate) fn new(pool_size: usize, max_visible: usize, max_prefetch: usize) -> Self {
+    pub(crate) fn new(
+        pool_size: usize,
+        max_bbox: usize,
+        max_visible_preview: usize,
+        max_visible: usize,
+        max_preview: usize,
+        max_prefetch: usize,
+    ) -> Self {
         let inner = Arc::new((
-            Mutex::new(RenderQueue::new(max_visible, max_prefetch)),
+            Mutex::new(RenderQueue::new(
+                max_bbox,
+                max_visible_preview,
+                max_visible,
+                max_preview,
+                max_prefetch,
+            )),
             Condvar::new(),
         ));
         for _ in 0..pool_size {
@@ -181,7 +172,7 @@ impl RenderPool {
                 if doc.is_none() || doc_uri != req.uri {
                     let f = gtk::gio::File::for_uri(&req.uri);
                     doc = Some(
-                        Document::from_gfile(&f, None, gtk::gio::Cancellable::NONE)
+                        poppler::Document::from_gfile(&f, None, gtk::gio::Cancellable::NONE)
                             .expect("Couldn't open the file!"),
                     );
                     doc_uri.clone_from(&req.uri);
@@ -214,20 +205,29 @@ mod tests {
     }
 
     #[test]
-    fn visible_beats_prefetch_and_newest_wins() {
-        let mut q = RenderQueue::new(4, 4);
-        q.push(RenderPriority::Prefetch, req("p1"));
+    fn priority_order_and_newest_wins() {
+        let mut q = RenderQueue::new(4, 4, 4, 4, 4);
+        q.push(RenderPriority::Prefetch, req("pf1"));
+        q.push(RenderPriority::Preview, req("pv1"));
         q.push(RenderPriority::Visible, req("v1"));
-        q.push(RenderPriority::Prefetch, req("p2"));
+        q.push(RenderPriority::VisiblePreview, req("vp1"));
+        q.push(RenderPriority::Bbox, req("b1"));
+        q.push(RenderPriority::Prefetch, req("pf2"));
+        q.push(RenderPriority::Preview, req("pv2"));
         q.push(RenderPriority::Visible, req("v2"));
+        q.push(RenderPriority::VisiblePreview, req("vp2"));
+        q.push(RenderPriority::Bbox, req("b2"));
 
-        // both visible pages first (newest first), then prefetch (newest first)
-        assert_eq!(drain(&mut q), vec!["v2", "v1", "p2", "p1"]);
+        // bbox, then visible preview, visible full, look-ahead preview, prefetch; newest first
+        assert_eq!(
+            drain(&mut q),
+            vec!["b2", "b1", "vp2", "vp1", "v2", "v1", "pv2", "pv1", "pf2", "pf1"]
+        );
     }
 
     #[test]
     fn over_cap_drops_oldest() {
-        let mut q = RenderQueue::new(2, 2);
+        let mut q = RenderQueue::new(2, 2, 2, 2, 2);
         q.push(RenderPriority::Visible, req("v1"));
         q.push(RenderPriority::Visible, req("v2"));
         q.push(RenderPriority::Visible, req("v3"));

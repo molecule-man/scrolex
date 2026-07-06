@@ -28,6 +28,11 @@ const WHEEL_TRIGGER: f64 = 0.2;
 const TOUCHPAD_NOTCH: f64 = 40.0;
 const TOUCHPAD_TRIGGER: f64 = 8.0;
 
+// Quiet period after the last scroll motion before the view is treated as settled and its pages are
+// full-rendered. Long enough that a continuous scroll doesn't repeatedly arm it, short enough that
+// stopping feels immediate.
+const SETTLE_MS: u64 = 150;
+
 // In-flight state of the animated one-page slide.
 //
 // The end position is recomputed live each tick from the selected page widget's actual geometry, so
@@ -85,6 +90,10 @@ pub struct Window {
 
     // in-flight animated one-page scroll; None when no slide is running
     scroll_anim: RefCell<Option<ScrollAnim>>,
+
+    // fires once scrolling has been quiet for SETTLE_MS, to flip State::scrolling back off and
+    // full-render the pages that came to rest on screen; reset on every scroll motion
+    settle_source: RefCell<Option<glib::SourceId>>,
 
     // accumulates hi-res mouse-wheel deltas: libinput splits one physical notch into several
     // sub-events that sum to 1.0, so we advance a page only when the running total crosses a whole
@@ -183,6 +192,7 @@ impl Window {
     ) -> glib::Propagation {
         let unit = scroll.unit();
         log::debug!("scroll event: dx={dx}, dy={dy}, unit={unit:?}");
+        self.note_scroll_activity();
 
         match unit {
             // Mouse wheel: hi-res wheels split one notch into several sub-events summing to 1.0.
@@ -265,6 +275,7 @@ impl Window {
             if let Some((x, _)) = gc.point(seq) {
                 let dx = x - prev_x;
                 let hadjustment = self.scrolledwindow.hadjustment();
+                self.note_scroll_activity();
                 hadjustment.set_value(hadjustment.value() - dx);
             }
         }
@@ -319,6 +330,7 @@ impl Window {
                 // in-flight page slide; otherwise scroll_tick would overwrite the nudge each frame.
                 // (h/l intentionally keep the slide running - they step pages and retarget it.)
                 *self.scroll_anim.borrow_mut() = None;
+                self.note_scroll_activity();
                 let hadj = self.scrolledwindow.hadjustment();
                 let step = if hadj.step_increment() > 0.0 {
                     hadj.step_increment()
@@ -395,6 +407,8 @@ impl Window {
             return;
         };
 
+        self.state.set_scroll_forward(false);
+
         // where the page we're leaving sits now; the newly selected page slides
         // to this same spot
         let anchor = self.selected_page_left_x();
@@ -417,6 +431,8 @@ impl Window {
         let Some(selection) = self.ensure_ready_selection() else {
             return;
         };
+
+        self.state.set_scroll_forward(true);
 
         // where the page we're leaving sits now; the newly selected page slides to this same spot
         let anchor = self.selected_page_left_x();
@@ -445,6 +461,10 @@ impl Window {
     // stays smooth. `delta` seeds a resting position only for the degenerate case where the
     // selected page's live geometry can't be read at all.
     fn animate_scroll(&self, anchor_x: Option<f64>, delta: f64) {
+        // Keyboard/step navigation reaches the view here (not through the scroll controller), so
+        // arm the settle timer here too - full renders wait until the stepping stops.
+        self.note_scroll_activity();
+
         // Cancel any kinetic deceleration the GTK is doing to the scrolled window. Why calling it
         // two times? The Api is a bit strange: its cancel only runs on a real property change.
         self.scrolledwindow.set_kinetic_scrolling(true);
@@ -690,6 +710,45 @@ impl Window {
                 self,
                 move |_| imp.schedule_selection_sync()
             ));
+    }
+
+    // Mark the view as scrolling and (re)arm the settle timer. Driven by user scroll input (wheel,
+    // touchpad, page steps) - deliberately NOT by the hadjustment, whose animation frames would keep
+    // resetting the timer for the whole glide and hold full renders hostage until the slide settled.
+    // When the timer fires (input has been quiet for SETTLE_MS), drop the scrolling flag and redraw
+    // the on-screen pages so their full renders get scheduled.
+    fn note_scroll_activity(&self) {
+        self.state.set_scrolling(true);
+        if let Some(source) = self.settle_source.take() {
+            source.remove();
+        }
+        let source = glib::timeout_add_local_once(
+            std::time::Duration::from_millis(SETTLE_MS),
+            clone!(
+                #[weak(rename_to = imp)]
+                self,
+                move || {
+                    imp.settle_source.replace(None);
+                    imp.state.set_scrolling(false);
+                    imp.refresh_visible_renders();
+                }
+            ),
+        );
+        self.settle_source.replace(Some(source));
+    }
+
+    // Redraw every page widget currently laid out in the viewport. With scrolling now off, each
+    // one's draw schedules its full render (and prefetch), so the settled pages sharpen.
+    fn refresh_visible_renders(&self) {
+        let mut child = self.listview.first_child();
+        while let Some(c) = child {
+            if let Some(page) = descendant_page(&c) {
+                if page.is_mapped() {
+                    page.queue_draw();
+                }
+            }
+            child = c.next_sibling();
+        }
     }
 
     // Coalesce a burst of scroll events into a single sync run on idle, after the list view has

@@ -5,9 +5,10 @@ use std::collections::HashMap;
 
 use gtk::cairo::ImageSurface;
 
-// Default memory budget for cached page surfaces. Large scanned pages can be
-// tens of MB each, so this bounds how many are kept resident.
-const DEFAULT_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+// Default memory budget for cached full-resolution page surfaces. This tracks the resident-memory
+// plateau almost 1:1, so it's the main memory dial. It only needs to cover the active scrolling
+// working set (visible page plus prefetched neighbours).
+const DEFAULT_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 
 struct Entry {
     surface: ImageSurface,

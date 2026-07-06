@@ -49,6 +49,27 @@ pub struct State {
     // widget currently waiting to display each page, so a finished render repaints the right widget
     // even if list recycling moved the requester
     pub(crate) render_waiters: Rc<RefCell<HashMap<i32, glib::WeakRef<crate::page::Page>>>>,
+
+    // low-resolution page previews rendered ahead and shown instantly (upscaled) while the full
+    // render is pending, so aggressive scrolling shows blurry pages, not blank. Small budget
+    // (previews are tiny), kept across zoom (they're rescaled).
+    pub(crate) preview_cache: Rc<RefCell<crate::render_cache::RenderCache>>,
+    pub(crate) preview_inflight: Rc<RefCell<HashSet<i32>>>,
+    // disabled once we see previews aren't cheap for this document (e.g. an image whose decode
+    // dominates regardless of scale) - then they'd only waste cycles. Cell wrapped so it defaults
+    // to false; set true on load.
+    pub(crate) preview_enabled: Cell<bool>,
+    // render scale for previews, adapted per document toward the time and memory budgets. Defaults
+    // to 0.0 (Cell); set to the initial scale in constructed and on load.
+    pub(crate) preview_scale: Cell<f64>,
+    // true while the view is scrolling (reset shortly after motion stops). Full renders are 1.3s
+    // and can't be interrupted, so scheduling them for pages flying past would saturate the workers
+    // and starve the cheap previews that keep pages from flashing white. While scrolling we render
+    // only previews and defer full renders until the view settles.
+    pub(crate) scrolling: Cell<bool>,
+    // direction of travel, used to prefetch the pages being read toward: true = forward (higher page
+    // numbers), the default; flipped when the user scrolls back.
+    pub(crate) scroll_forward: Cell<bool>,
 }
 
 #[glib::object_subclass]
@@ -64,6 +85,14 @@ impl ObjectImpl for State {
         // animated scrolling is on by default; the builder-created instance doesn't run State::new,
         // so set it here
         self.obj().set_animate_scroll(true);
+
+        // Previews are tiny; give their cache its own small budget rather than the default
+        // (full-render) one. Must live here, not in State::new: the builder-created instance the
+        // window uses doesn't run State::new.
+        *self.preview_cache.borrow_mut() =
+            crate::render_cache::RenderCache::new(super::PREVIEW_CACHE_BUDGET);
+        self.preview_scale.set(crate::page::PREVIEW_INITIAL_SCALE);
+        self.scroll_forward.set(true);
 
         // Zooming could have made the cache entries inaccurate. Drop them. This must live here
         // rather than in State::new: the builder-created instance the window uses doesn't run

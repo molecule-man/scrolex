@@ -14,12 +14,18 @@ use std::{env, fs};
 
 use crate::page;
 
+// Memory budget for the low-resolution preview cache. Spread over the resident preview window this
+// also bounds the adaptive preview scale, so it holds a wide scroll window without thrashing.
+pub(crate) const PREVIEW_CACHE_BUDGET: usize = 20 * 1024 * 1024;
+
 glib::wrapper! {
     pub struct State(ObjectSubclass<imp::State>);
 }
 
 impl State {
     pub(crate) fn new() -> Self {
+        // the preview-cache budget and other builder-instance setup live in State's `constructed`,
+        // which runs here too
         glib::Object::builder()
             .property("zoom", 1.0)
             .property("crop", false)
@@ -44,13 +50,19 @@ impl State {
             self.save()?;
         }
 
-        let doc = Document::from_gfile(f, None, gtk::gio::Cancellable::NONE)
-            .map_err(io::Error::other)?;
+        let doc =
+            Document::from_gfile(f, None, gtk::gio::Cancellable::NONE).map_err(io::Error::other)?;
         self.imp().bbox_cache.borrow_mut().clear();
         self.imp().links.borrow_mut().clear();
         self.imp().render_cache.borrow_mut().clear();
         self.imp().render_inflight.borrow_mut().clear();
         self.imp().render_waiters.borrow_mut().clear();
+        self.imp().preview_cache.borrow_mut().clear();
+        self.imp().preview_inflight.borrow_mut().clear();
+        self.imp().preview_enabled.set(true);
+        self.imp()
+            .preview_scale
+            .set(crate::page::PREVIEW_INITIAL_SCALE);
 
         self.emit_by_name::<()>("before-load", &[]);
 
@@ -156,6 +168,46 @@ impl State {
 
     pub(crate) fn render_waiters(&self) -> Rc<RefCell<HashMap<i32, glib::WeakRef<page::Page>>>> {
         self.imp().render_waiters.clone()
+    }
+
+    pub(crate) fn preview_cache(&self) -> Rc<RefCell<crate::render_cache::RenderCache>> {
+        self.imp().preview_cache.clone()
+    }
+
+    pub(crate) fn preview_inflight(&self) -> Rc<RefCell<HashSet<i32>>> {
+        self.imp().preview_inflight.clone()
+    }
+
+    pub(crate) fn preview_enabled(&self) -> bool {
+        self.imp().preview_enabled.get()
+    }
+
+    pub(crate) fn set_preview_enabled(&self, enabled: bool) {
+        self.imp().preview_enabled.set(enabled);
+    }
+
+    pub(crate) fn preview_scale(&self) -> f64 {
+        self.imp().preview_scale.get()
+    }
+
+    pub(crate) fn set_preview_scale(&self, scale: f64) {
+        self.imp().preview_scale.set(scale);
+    }
+
+    pub(crate) fn scrolling(&self) -> bool {
+        self.imp().scrolling.get()
+    }
+
+    pub(crate) fn set_scrolling(&self, scrolling: bool) {
+        self.imp().scrolling.set(scrolling);
+    }
+
+    pub(crate) fn scroll_forward(&self) -> bool {
+        self.imp().scroll_forward.get()
+    }
+
+    pub(crate) fn set_scroll_forward(&self, forward: bool) {
+        self.imp().scroll_forward.set(forward);
     }
 }
 
