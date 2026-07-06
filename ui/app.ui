@@ -270,6 +270,12 @@
 						<signal name="key-pressed" handler="handle_key_press" swapped="true" />
 					</object>
 				</child>
+				<child>
+					<object class="GtkGestureZoom">
+						<signal name="begin" handler="handle_zoom_begin" swapped="true" />
+						<signal name="scale-changed" handler="handle_zoom_scale_changed" swapped="true" />
+					</object>
+				</child>
 			</object>
 		</child>
 	</template>

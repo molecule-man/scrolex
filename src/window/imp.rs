@@ -125,6 +125,10 @@ pub struct Window {
     // travel is measured in pixels, not notch clicks)
     touch_accum: Cell<f64>,
     touch_last_dy: Cell<f64>,
+
+    // zoom captured when a pinch gesture begins; scale-changed reports scale relative to that start,
+    // so the live zoom is base * scale
+    zoom_gesture_base: Cell<f64>,
 }
 
 // The central trait for subclassing a GObject
@@ -316,6 +320,22 @@ impl Window {
     #[template_callback]
     fn zoom_in(&self) {
         self.state.set_zoom(self.state.zoom() * 1.1);
+    }
+
+    #[template_callback]
+    fn handle_zoom_begin(&self) {
+        self.zoom_gesture_base.set(self.state.zoom());
+    }
+
+    #[template_callback]
+    fn handle_zoom_scale_changed(&self, scale: f64) {
+        if scale <= 0.0 {
+            return;
+        }
+        // A pinch rescales the cheap previews live; defer the slow full re-renders until the gesture
+        // settles, the same way scrolling does.
+        self.note_scroll_activity();
+        self.state.set_zoom(self.zoom_gesture_base.get() * scale);
     }
 
     #[template_callback]
