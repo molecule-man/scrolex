@@ -60,6 +60,7 @@ ideal for large monitors and wide screens.
 | `]`             | Zoom in                                  |
 | `[`             | Zoom out                                 |
 | Mouse wheel     | Move one page left/right per notch       |
+| Ctrl + scroll   | Zoom in/out (mouse wheel or touchpad)    |
 
 ## Installation
 

@@ -40,6 +40,9 @@ const WHEEL_TRIGGER: f64 = 0.2;
 const TOUCHPAD_NOTCH: f64 = 40.0;
 const TOUCHPAD_TRIGGER: f64 = 8.0;
 
+// Multiplicative zoom step per notch.
+const ZOOM_STEP: f64 = 1.1;
+
 // Quiet period after the last scroll motion before the view is treated as settled and its pages are
 // full-rendered. Long enough that a continuous scroll doesn't repeatedly arm it, short enough that
 // stopping feels immediate.
@@ -125,6 +128,14 @@ pub struct Window {
     // travel is measured in pixels, not notch clicks)
     touch_accum: Cell<f64>,
     touch_last_dy: Cell<f64>,
+
+    // zoom captured when a pinch gesture begins; scale-changed reports scale relative to that start,
+    // so the live zoom is base * scale
+    zoom_gesture_base: Cell<f64>,
+
+    // true while a touchpad pinch is in progress; gates off the two-finger scroll events the touchpad
+    // still emits during a pinch
+    zoom_gesturing: Cell<bool>,
 }
 
 // The central trait for subclassing a GObject
@@ -211,6 +222,26 @@ impl Window {
     ) -> glib::Propagation {
         let unit = scroll.unit();
         log::debug!("scroll event: dx={dx}, dy={dy}, unit={unit:?}");
+
+        // swallow the two-finger scroll a pinch emits alongside the zoom gesture
+        if self.zoom_gesturing.get() {
+            return glib::Propagation::Stop;
+        }
+
+        // Ctrl+scroll zooms instead of navigating; dy<0 zooms in, dy>0 out. Touchpad pixels are
+        // scaled to the wheel's notch so both zoom at a comparable rate.
+        if scroll.current_event_state().contains(ModifierType::CONTROL_MASK) {
+            if dy != 0.0 {
+                let notches = match unit {
+                    gtk::gdk::ScrollUnit::Wheel => dy,
+                    _ => dy / TOUCHPAD_NOTCH,
+                };
+                self.note_scroll_activity();
+                self.state.set_zoom(self.state.zoom() * ZOOM_STEP.powf(-notches));
+            }
+            return glib::Propagation::Stop;
+        }
+
         self.note_scroll_activity();
 
         match unit {
@@ -310,12 +341,34 @@ impl Window {
 
     #[template_callback]
     fn zoom_out(&self) {
-        self.state.set_zoom(self.state.zoom() / 1.1);
+        self.state.set_zoom(self.state.zoom() / ZOOM_STEP);
     }
 
     #[template_callback]
     fn zoom_in(&self) {
-        self.state.set_zoom(self.state.zoom() * 1.1);
+        self.state.set_zoom(self.state.zoom() * ZOOM_STEP);
+    }
+
+    #[template_callback]
+    fn handle_zoom_begin(&self) {
+        self.zoom_gesturing.set(true);
+        self.zoom_gesture_base.set(self.state.zoom());
+    }
+
+    #[template_callback]
+    fn handle_zoom_end(&self) {
+        self.zoom_gesturing.set(false);
+    }
+
+    #[template_callback]
+    fn handle_zoom_scale_changed(&self, scale: f64) {
+        if scale <= 0.0 {
+            return;
+        }
+        // A pinch rescales the cheap previews live; defer the slow full re-renders until the gesture
+        // settles, the same way scrolling does.
+        self.note_scroll_activity();
+        self.state.set_zoom(self.zoom_gesture_base.get() * scale);
     }
 
     #[template_callback]
