@@ -61,6 +61,10 @@ ideal for large monitors and wide screens.
 | `[`             | Zoom out                                 |
 | Mouse wheel     | Move one page left/right per notch       |
 | Ctrl + scroll   | Zoom in/out (mouse wheel or touchpad)    |
+| `f` / Ctrl + f  | Search in document                       |
+| `n` / `F3`      | Next match                               |
+| `N` / Shift + F3 | Previous match                          |
+| Esc             | Close search                             |
 
 ## Installation
 

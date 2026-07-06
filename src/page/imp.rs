@@ -175,6 +175,8 @@ impl Page {
                 if w * w > 0.0 && h * h > 0.0 {
                     imp.render_selection_overlay(cr, &poppler_page, highlighted);
                 }
+
+                imp.render_search_overlay(cr, &poppler_page);
             }
         ));
     }
@@ -604,6 +606,44 @@ impl Page {
 
         let elapsed = start.elapsed();
         log::trace!("Rendered selection {} in {elapsed:?}", poppler_page.index());
+    }
+
+    // Paint match rects for this page: matches yellow, the current match orange. Same zoom/crop
+    // transform as the page render, so highlights land on the words.
+    fn render_search_overlay(&self, cr: &Context, poppler_page: &poppler::Page) {
+        let obj = self.obj();
+        let index = obj.index();
+        let search = obj.state().search();
+        let search = search.borrow();
+        let Some(rects) = search.results.get(&index) else {
+            return;
+        };
+        if rects.is_empty() {
+            return;
+        }
+
+        let bbox = self.get_bbox(poppler_page, obj.crop());
+        let scale = obj.zoom();
+
+        cr.save().expect("Failed to save");
+        if bbox.x1 != 0.0 || bbox.y1 != 0.0 {
+            cr.translate(-bbox.x1 * scale, -bbox.y1 * scale);
+        }
+        cr.scale(scale, scale);
+
+        for (i, rect) in rects.iter().enumerate() {
+            let (w, h) = rect.size();
+            cr.rectangle(rect.x1, rect.y1, w, h);
+            if search.current == Some((index, i)) {
+                cr.set_source_rgba(1.0, 0.55, 0.0, 0.45);
+            } else {
+                cr.set_source_rgba(1.0, 0.9, 0.0, 0.4);
+            }
+            cr.fill().expect("Failed to fill");
+        }
+        cr.restore().expect("Failed to restore");
+        // reset to opaque black so a later fill/mask on this context isn't tinted
+        cr.set_source_rgb(0.0, 0.0, 0.0);
     }
 
     fn multithread_render_to_cairo(&self, cr: &Context, poppler_page: &poppler::Page) {

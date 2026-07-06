@@ -40,6 +40,7 @@ pub struct State {
     pub(super) jump_stack: Rc<RefCell<jump_stack::JumpStack>>,
     pub(crate) bbox_cache: Rc<RefCell<HashMap<i32, crate::page::Rectangle>>>,
     pub(crate) links: Rc<RefCell<crate::links::Links>>,
+    pub(crate) search: Rc<RefCell<crate::search::Search>>,
 
     // rendered pages keyed by page index, kept so scrolling back to an already seen page reuses the
     // surface instead of re-rendering (and flashing white)
