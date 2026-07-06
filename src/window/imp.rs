@@ -21,6 +21,18 @@ use crate::state::State;
 // mid-slide, so the page settles instead of vibrating.
 const SCROLL_ANIM_TAU_US: f64 = 130_000.0;
 
+// Per-frame dt is clamped to this. When the frame clock stalls and resumes (or crop relayout
+// delays a frame) a huge dt drives the glide gain toward 1, which turns the live-target follow into
+// a sustained oscillation instead of a decaying one; clamping keeps it contractive.
+const SCROLL_ANIM_MAX_DT_US: i64 = 32_000;
+// Hard ceiling on a single glide. The live target is read from page geometry that crop relayout can
+// keep nudging, so bound the glide so it can't chase a moving target forever; snap and stop.
+const SCROLL_ANIM_MAX_US: i64 = 2_000_000;
+// Minimum approach speed (px/frame) near the target. The exponential glide asymptotes and never
+// quite arrives; a floor closes the last few pixels at constant velocity so the glide can finish on
+// the target instead of settling a few pixels short and snapping (a visible jerk).
+const SCROLL_ANIM_MIN_STEP: f64 = 1.5;
+
 // Page-stepping thresholds for `accumulate_step`. Wheel travel is in unitless notch clicks (1.0 per
 // physical notch).
 const WHEEL_NOTCH: f64 = 1.0;
@@ -48,6 +60,10 @@ struct ScrollAnim {
     anchor_x: Option<f64>,
     last_target: f64,
     last_frame: i64,
+    // frame time the glide began (-1 until the first tick); bounds total glide duration
+    start_frame: i64,
+    // travel direction (+1 forward, -1 back); the glide never moves against it
+    dir: f64,
 }
 
 // Object holding the state
@@ -482,9 +498,9 @@ impl Window {
         }
 
         let mut anim = self.scroll_anim.borrow_mut();
-        let (anchor_x, prev_target, last_frame) = match anim.as_ref() {
-            Some(a) => (a.anchor_x, Some(a.last_target), a.last_frame),
-            None => (anchor_x, None, -1),
+        let (anchor_x, prev_target, last_frame, start_frame) = match anim.as_ref() {
+            Some(a) => (a.anchor_x, Some(a.last_target), a.last_frame, a.start_frame),
+            None => (anchor_x, None, -1, -1),
         };
         // Prefer the selected page's exact live position. When it isn't laid out yet (selection
         // raced ahead in a burst), advance by one page-width from the previous target so the burst
@@ -498,6 +514,8 @@ impl Window {
             anchor_x,
             last_target,
             last_frame,
+            start_frame,
+            dir: delta.signum(),
         });
         drop(anim);
 
@@ -524,7 +542,10 @@ impl Window {
         anim.last_target = target;
 
         let now = clock.frame_time();
-        let dt = if anim.last_frame < 0 {
+        if anim.start_frame < 0 {
+            anim.start_frame = now;
+        }
+        let raw_dt = if anim.last_frame < 0 {
             0
         } else {
             now - anim.last_frame
@@ -533,25 +554,12 @@ impl Window {
 
         let hadj = self.scrolledwindow.hadjustment();
         let value = hadj.value();
-        // Exponential glide from wherever the value currently is toward the target. Reading the
-        // live value each frame means GtkListView's mid-slide re-anchoring is corrected gently
-        // rather than fought, so no vibration.
-        let k = if dt <= 0 {
-            0.0
-        } else {
-            1.0 - (-(dt as f64) / SCROLL_ANIM_TAU_US).exp()
-        };
-        let next = value + (target - value) * k;
-
-        // Settle when we've arrived, or when this frame's step is sub-pixel. The scroll position
-        // reads back on whole pixels, so a step under half a pixel rounds to nothing and the glide
-        // stalls just short of the target; snap to finish. Guard on dt > 0 so the first frame
-        // (step == 0) doesn't settle instantly.
-        let step = next - value;
-        if (target - next).abs() < 0.5 || (dt > 0 && step.abs() < 0.5) {
-            // settled: snap exactly and let the normal sync reconcile selection
+        let (next, settled) = glide_step(value, target, raw_dt, now - anim.start_frame, anim.dir);
+        if settled {
+            // land at the eased position (within sub-pixel of target) and let the normal sync
+            // reconcile selection; never jump to a distant target - that snap is the visible jerk
             *self.scroll_anim.borrow_mut() = None;
-            hadj.set_value(target);
+            hadj.set_value(next);
             return glib::ControlFlow::Break;
         }
 
@@ -930,6 +938,43 @@ fn accumulate_step(accum: f64, prev: f64, delta: f64, notch: f64, trigger: f64) 
     }
 }
 
+// One frame of the exponential glide toward `target`. Returns the next scroll value and whether the
+// glide has settled. `dt_us` is clamped so a stalled-then-resumed frame clock can't spike the gain
+// into a sustained oscillation; the glide settles on arrival, on a sub-pixel step, or once
+// `elapsed_us` passes the ceiling (bounding a target that relayout keeps nudging).
+fn glide_step(value: f64, target: f64, dt_us: i64, elapsed_us: i64, dir: f64) -> (f64, bool) {
+    let dt = dt_us.min(SCROLL_ANIM_MAX_DT_US);
+    let k = if dt <= 0 {
+        0.0
+    } else {
+        1.0 - (-(dt as f64) / SCROLL_ANIM_TAU_US).exp()
+    };
+    let remaining = target - value;
+    let mut step = remaining * k;
+    // Floor the approach speed so the exponential tail closes in a few frames rather than crawling
+    // toward a target it never reaches (which forced a settle-and-snap a few pixels short). Never
+    // overshoot the target.
+    if dt > 0 && step.abs() < SCROLL_ANIM_MIN_STEP {
+        step = SCROLL_ANIM_MIN_STEP.copysign(remaining);
+    }
+    if step.abs() > remaining.abs() {
+        step = remaining;
+    }
+    let mut next = value + step;
+    // Never move against the travel direction: crop relayout can jump the live target backward for a
+    // frame, which otherwise shows as a visible reverse (the "back and forth" wobble).
+    if dir > 0.0 {
+        next = next.max(value);
+    } else if dir < 0.0 {
+        next = next.min(value);
+    }
+    // Settle on arrival, when the target has jumped behind us (relayout overshoot; don't reverse to
+    // chase it), or once the glide has run past its ceiling.
+    let overshot = (dir > 0.0 && target < value) || (dir < 0.0 && target > value);
+    let settled = (target - next).abs() < 0.5 || overshot || elapsed_us > SCROLL_ANIM_MAX_US;
+    (next, settled)
+}
+
 // Find the Page widget within a list item's widget subtree.
 fn descendant_page(widget: &gtk::Widget) -> Option<page::Page> {
     if let Some(page) = widget.downcast_ref::<page::Page>() {
@@ -947,7 +992,76 @@ fn descendant_page(widget: &gtk::Widget) -> Option<page::Page> {
 
 #[cfg(test)]
 mod tests {
-    use super::{accumulate_step, TOUCHPAD_NOTCH, TOUCHPAD_TRIGGER, WHEEL_NOTCH, WHEEL_TRIGGER};
+    use super::{
+        accumulate_step, glide_step, SCROLL_ANIM_MAX_US, TOUCHPAD_NOTCH, TOUCHPAD_TRIGGER,
+        WHEEL_NOTCH, WHEEL_TRIGGER,
+    };
+
+    // Drive the glide toward a fixed target at a steady frame rate; return frames until it settles.
+    fn glide_frames(mut value: f64, target: f64, dt_us: i64) -> usize {
+        let dir = (target - value).signum();
+        let mut elapsed = 0;
+        for frame in 1..100_000 {
+            let (next, settled) = glide_step(value, target, dt_us, elapsed, dir);
+            value = next;
+            elapsed += dt_us;
+            if settled {
+                return frame;
+            }
+        }
+        panic!("glide never settled");
+    }
+
+    #[test]
+    fn glide_settles_at_normal_frame_rate() {
+        // a full page-width glide at 60fps settles in well under a second
+        let frames = glide_frames(0.0, 500.0, 16_000);
+        assert!(frames > 1 && frames < 60, "settled in {frames} frames");
+    }
+
+    #[test]
+    fn glide_settles_even_with_huge_dt() {
+        // a stalled-then-resumed clock delivers a 1s dt; clamping keeps the step bounded (no wild
+        // overshoot) and it still converges
+        let (next, _) = glide_step(0.0, 500.0, 1_000_000, 0, 1.0);
+        assert!(next < 500.0, "clamped step overshot: {next}");
+        glide_frames(0.0, 500.0, 1_000_000);
+    }
+
+    #[test]
+    fn glide_force_settles_past_ceiling() {
+        // a target far away still settles once the duration ceiling is passed
+        let (_, settled) = glide_step(0.0, 100_000.0, 16_000, SCROLL_ANIM_MAX_US + 1, 1.0);
+        assert!(settled);
+    }
+
+    #[test]
+    fn glide_never_reverses_on_backward_target_jump() {
+        // relayout jumps the target behind us mid-forward-glide: the view must not move back
+        let (next, settled) = glide_step(100.0, 50.0, 16_000, 0, 1.0);
+        assert_eq!(next, 100.0, "glide reversed to {next}");
+        assert!(settled, "should settle rather than crawl backward");
+    }
+
+    #[test]
+    fn glide_lands_on_target_without_snapping() {
+        // the glide must ease all the way onto the target, not settle a few pixels short and snap
+        // (which is the visible jerk); the last moving step is bounded so there's no jump
+        let mut value = 0.0;
+        let mut elapsed = 0;
+        loop {
+            let (next, settled) = glide_step(value, 500.0, 16_000, elapsed, 1.0);
+            let step = next - value;
+            value = next;
+            elapsed += 16_000;
+            if settled {
+                assert!(step.abs() < 2.0, "final step was a {step}px jump");
+                break;
+            }
+            assert!(elapsed < 5_000_000, "glide never settled");
+        }
+        assert!((value - 500.0).abs() < 0.5, "landed short at {value}");
+    }
 
     // Run a sequence of wheel deltas through the accumulator at wheel scale.
     fn run(deltas: &[f64]) -> Vec<i32> {
