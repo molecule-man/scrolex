@@ -201,6 +201,14 @@ impl State {
     pub(crate) fn set_scrolling(&self, scrolling: bool) {
         self.imp().scrolling.set(scrolling);
     }
+
+    pub(crate) fn scroll_forward(&self) -> bool {
+        self.imp().scroll_forward.get()
+    }
+
+    pub(crate) fn set_scroll_forward(&self, forward: bool) {
+        self.imp().scroll_forward.set(forward);
+    }
 }
 
 impl Default for State {

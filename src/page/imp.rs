@@ -35,6 +35,9 @@ const PREVIEW_TARGET_MS: u128 = 40;
 // runway as forward; already-cached pages are skipped, so effort tracks the direction of travel.
 const PREVIEW_WINDOW: i32 = 32;
 const MAX_INFLIGHT_PREVIEWS: usize = 12;
+// Full-resolution pages rendered ahead in the direction of travel, once nothing on screen is left
+// to render, so reading on to the next page lands on a cached (sharp) page instead of a wait.
+const PREFETCH_AHEAD: i32 = 2;
 // A preview slower than this even at PREVIEW_MIN_SCALE means shrinking won't help (decode-bound
 // scans, where a low-res render is no cheaper than the full one); give up and stop previewing the
 // document.
@@ -43,21 +46,21 @@ const PREVIEW_SLOW_MS: u128 = 250;
 // Background worker threads. Each keeps its own poppler Document open (poppler isn't safe to share
 // across threads), and that Document accumulates an unreclaimable per-page cache as pages are
 // visited - tens of MB over a session on a large document - so resident memory scales with this
-// count. One pool serves bbox, visible renders and previews, so this count is the total number of
-// resident Documents. Rendering parallelises near-linearly to ~4 threads before turning
-// memory-bandwidth bound; two keeps most of that throughput at a fraction of the per-document
-// memory.
-const RENDER_THREADS: usize = 2;
+// count. One pool serves bbox, visible renders, previews and prefetch, so this count is the total
+// number of resident Documents. Rendering parallelises near-linearly to ~4 threads before turning
+// memory-bandwidth bound; four takes that full throughput for the visible pages, and once they're
+// done the same threads roll onto the look-ahead prefetch.
+const RENDER_THREADS: usize = 4;
 
 thread_local!(
-    // Pool caps: bbox, visible-preview, visible, preview. The visible cap must exceed the number of
-    // pages that can be on screen at once: the settle pass queues a visible render for every visible
-    // page in one go, and any dropped past the cap would never reschedule (nothing redraws them) and
-    // stay stuck in low-res. Fast-scroll flooding, the reason this was once small, is now prevented
-    // by the settle-debounce (no visible renders scheduled while scrolling), so a generous cap is
-    // safe.
+    // Pool caps: bbox, visible-preview, visible, preview, prefetch. The visible cap must exceed the
+    // number of pages that can be on screen at once: the settle pass queues a visible render for
+    // every visible page in one go, and any dropped past the cap would never reschedule (nothing
+    // redraws them) and stay stuck in low-res. Fast-scroll flooding, the reason this was once small,
+    // is now prevented by the settle-debounce (no visible renders scheduled while scrolling), so a
+    // generous cap is safe.
     static RENDER_QUEUE: Lazy<RenderPool> =
-        Lazy::new(|| RenderPool::new(RENDER_THREADS, 8, 8, 8, MAX_INFLIGHT_PREVIEWS));
+        Lazy::new(|| RenderPool::new(RENDER_THREADS, 8, 8, 8, MAX_INFLIGHT_PREVIEWS, 4));
 );
 
 #[derive(Default, glib::Properties)]
@@ -608,6 +611,7 @@ impl Page {
                 let bbox = self.get_bbox(poppler_page, obj.crop());
                 draw_surface(cr, &surface, &bbox, scale);
                 self.prefetch_previews(page_num);
+                self.prefetch_next(page_num);
                 return;
             }
             // dimensions changed (e.g. zoom), the cached surface is stale
@@ -653,6 +657,43 @@ impl Page {
         // fast scroll)
         self.prefetch_previews(page_num);
         self.schedule_preview_if_needed(page_num, RenderPriority::VisiblePreview);
+        self.prefetch_next(page_num);
+    }
+
+    // Full-render the next pages in the scroll direction, so reading on lands on a cached page. A
+    // no-op while scrolling (a fling would only pile up soon-stale prefetch) and skips pages already
+    // cached or queued - so from a screenful of visible pages this reaches just past the last one in
+    // the direction of travel. Nice-to-have: the lowest render priority, run only once everything on
+    // screen is done.
+    fn prefetch_next(&self, current: i32) {
+        let obj = self.obj();
+        let state = obj.state();
+        if state.scrolling() {
+            return;
+        }
+        let Some(doc) = state.doc() else {
+            return;
+        };
+        let n_pages = doc.n_pages();
+        let dir = if state.scroll_forward() { 1 } else { -1 };
+        let scale = obj.zoom();
+        let scale_factor = obj.scale_factor() as f64;
+        let cache = state.render_cache();
+        let inflight = state.render_inflight();
+
+        // farthest first so the LIFO queue pops the nearest ahead-page first
+        for d in (1..=PREFETCH_AHEAD).rev() {
+            let page_num = current + dir * d;
+            if page_num < 0 || page_num >= n_pages {
+                continue;
+            }
+            if cache.borrow().contains(page_num) {
+                continue;
+            }
+            if inflight.borrow_mut().insert(page_num) {
+                self.schedule_render(page_num, scale, scale_factor, RenderPriority::Prefetch);
+            }
+        }
     }
 
     fn schedule_render(
@@ -1449,7 +1490,10 @@ startxref
         // fast render (time budget alone would push to max) but a large surface: the memory budget
         // must pull the scale below max so the resident window still fits the cache
         let scale = adapt_preview_scale(0.25, 4, 100_000);
-        assert!(scale < PREVIEW_MAX_SCALE, "memory budget should bind: got {scale}");
+        assert!(
+            scale < PREVIEW_MAX_SCALE,
+            "memory budget should bind: got {scale}"
+        );
         // sqrt((20MB/65) / 100KB) * 0.25 ~= 0.449
         assert!((scale - 0.449).abs() < 0.01, "got {scale}");
     }

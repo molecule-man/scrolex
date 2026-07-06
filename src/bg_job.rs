@@ -9,13 +9,16 @@ use std::thread;
 
 // Priority of a queued job. Visible (on-screen full renders) outrank the low-res previews: the
 // current page's own blur (VisiblePreview) still comes first so a stand-in appears in ~40ms, but
-// the look-ahead previews yield to the sharp renders of pages on screen.
+// the look-ahead previews yield to the sharp renders of pages on screen. Prefetch (full render of
+// the next pages in the scroll direction) is nice-to-have and runs last, only once everything on
+// screen is done.
 #[derive(Clone, Copy)]
 pub(crate) enum RenderPriority {
     Bbox,
     VisiblePreview,
     Visible,
     Preview,
+    Prefetch,
 }
 
 impl RenderPriority {
@@ -26,6 +29,7 @@ impl RenderPriority {
             RenderPriority::VisiblePreview => "low-res (visible)",
             RenderPriority::Visible => "on-demand (visible)",
             RenderPriority::Preview => "low-res (prefetch)",
+            RenderPriority::Prefetch => "on-demand (prefetch)",
         }
     }
 }
@@ -46,10 +50,12 @@ struct RenderQueue {
     visible_preview: Vec<RenderRequest>,
     visible: Vec<RenderRequest>,
     preview: Vec<RenderRequest>,
+    prefetch: Vec<RenderRequest>,
     max_bbox: usize,
     max_visible_preview: usize,
     max_visible: usize,
     max_preview: usize,
+    max_prefetch: usize,
 }
 
 impl RenderQueue {
@@ -58,16 +64,19 @@ impl RenderQueue {
         max_visible_preview: usize,
         max_visible: usize,
         max_preview: usize,
+        max_prefetch: usize,
     ) -> Self {
         Self {
             bbox: Vec::new(),
             visible_preview: Vec::new(),
             visible: Vec::new(),
             preview: Vec::new(),
+            prefetch: Vec::new(),
             max_bbox,
             max_visible_preview,
             max_visible,
             max_preview,
+            max_prefetch,
         }
     }
 
@@ -77,6 +86,7 @@ impl RenderQueue {
             RenderPriority::VisiblePreview => (&mut self.visible_preview, self.max_visible_preview),
             RenderPriority::Visible => (&mut self.visible, self.max_visible),
             RenderPriority::Preview => (&mut self.preview, self.max_preview),
+            RenderPriority::Prefetch => (&mut self.prefetch, self.max_prefetch),
         };
         stack.push(req);
         while stack.len() > max {
@@ -84,13 +94,16 @@ impl RenderQueue {
         }
     }
 
-    // Next runnable request, highest priority first and newest within a tier.
+    // Next runnable request, highest priority first and newest within a tier. All threads pull from
+    // here, so whenever visible work exists every thread takes it; prefetch only runs once the
+    // higher tiers are drained.
     fn pop(&mut self) -> Option<RenderRequest> {
         self.bbox
             .pop()
             .or_else(|| self.visible_preview.pop())
             .or_else(|| self.visible.pop())
             .or_else(|| self.preview.pop())
+            .or_else(|| self.prefetch.pop())
     }
 }
 
@@ -108,6 +121,7 @@ impl RenderPool {
         max_visible_preview: usize,
         max_visible: usize,
         max_preview: usize,
+        max_prefetch: usize,
     ) -> Self {
         let inner = Arc::new((
             Mutex::new(RenderQueue::new(
@@ -115,6 +129,7 @@ impl RenderPool {
                 max_visible_preview,
                 max_visible,
                 max_preview,
+                max_prefetch,
             )),
             Condvar::new(),
         ));
@@ -191,26 +206,28 @@ mod tests {
 
     #[test]
     fn priority_order_and_newest_wins() {
-        let mut q = RenderQueue::new(4, 4, 4, 4);
+        let mut q = RenderQueue::new(4, 4, 4, 4, 4);
+        q.push(RenderPriority::Prefetch, req("pf1"));
         q.push(RenderPriority::Preview, req("pv1"));
         q.push(RenderPriority::Visible, req("v1"));
         q.push(RenderPriority::VisiblePreview, req("vp1"));
         q.push(RenderPriority::Bbox, req("b1"));
+        q.push(RenderPriority::Prefetch, req("pf2"));
         q.push(RenderPriority::Preview, req("pv2"));
         q.push(RenderPriority::Visible, req("v2"));
         q.push(RenderPriority::VisiblePreview, req("vp2"));
         q.push(RenderPriority::Bbox, req("b2"));
 
-        // bbox, then visible preview, visible full, look-ahead preview; newest first in each
+        // bbox, then visible preview, visible full, look-ahead preview, prefetch; newest first
         assert_eq!(
             drain(&mut q),
-            vec!["b2", "b1", "vp2", "vp1", "v2", "v1", "pv2", "pv1"]
+            vec!["b2", "b1", "vp2", "vp1", "v2", "v1", "pv2", "pv1", "pf2", "pf1"]
         );
     }
 
     #[test]
     fn over_cap_drops_oldest() {
-        let mut q = RenderQueue::new(2, 2, 2, 2);
+        let mut q = RenderQueue::new(2, 2, 2, 2, 2);
         q.push(RenderPriority::Visible, req("v1"));
         q.push(RenderPriority::Visible, req("v2"));
         q.push(RenderPriority::Visible, req("v3"));

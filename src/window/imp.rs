@@ -407,6 +407,8 @@ impl Window {
             return;
         };
 
+        self.state.set_scroll_forward(false);
+
         // where the page we're leaving sits now; the newly selected page slides
         // to this same spot
         let anchor = self.selected_page_left_x();
@@ -429,6 +431,8 @@ impl Window {
         let Some(selection) = self.ensure_ready_selection() else {
             return;
         };
+
+        self.state.set_scroll_forward(true);
 
         // where the page we're leaving sits now; the newly selected page slides to this same spot
         let anchor = self.selected_page_left_x();

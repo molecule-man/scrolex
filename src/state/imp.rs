@@ -67,6 +67,9 @@ pub struct State {
     // and starve the cheap previews that keep pages from flashing white. While scrolling we render
     // only previews and defer full renders until the view settles.
     pub(crate) scrolling: Cell<bool>,
+    // direction of travel, used to prefetch the pages being read toward: true = forward (higher page
+    // numbers), the default; flipped when the user scrolls back.
+    pub(crate) scroll_forward: Cell<bool>,
 }
 
 #[glib::object_subclass]
@@ -89,6 +92,7 @@ impl ObjectImpl for State {
         *self.preview_cache.borrow_mut() =
             crate::render_cache::RenderCache::new(super::PREVIEW_CACHE_BUDGET);
         self.preview_scale.set(crate::page::PREVIEW_INITIAL_SCALE);
+        self.scroll_forward.set(true);
 
         // Zooming could have made the cache entries inaccurate. Drop them. This must live here
         // rather than in State::new: the builder-created instance the window uses doesn't run
