@@ -5,7 +5,7 @@ use std::rc::Rc;
 use std::sync::OnceLock;
 
 use futures::channel::oneshot;
-use gtk::cairo::{Context, ImageSurface};
+use gtk::cairo::{Context, FontSlant, FontWeight, ImageSurface};
 use gtk::gdk::prelude::*;
 use gtk::gdk::BUTTON_PRIMARY;
 use gtk::glib;
@@ -659,11 +659,9 @@ impl Page {
             log::debug!("draw page {page_num}: cache miss, showing preview");
             draw_preview(cr, &preview, &bbox, scale);
         } else {
-            log::debug!("draw page {page_num}: cache miss (white flash)");
+            log::debug!("draw page {page_num}: cache miss (loading placeholder)");
             let (w, h) = bbox.size();
-            cr.rectangle(0.0, 0.0, w * scale, h * scale);
-            cr.set_source_rgba(1.0, 1.0, 1.0, 1.0);
-            cr.fill().expect("Failed to fill");
+            draw_loading_placeholder(cr, w * scale, h * scale);
         }
 
         // prefetch a wider window of previews and queue this page's own preview at the highest
@@ -970,6 +968,27 @@ fn adapt_preview_scale(cur_scale: f64, render_ms: u128, bytes: usize) -> f64 {
     scale_time
         .min(scale_mem)
         .clamp(PREVIEW_MIN_SCALE, PREVIEW_MAX_SCALE)
+}
+
+fn draw_loading_placeholder(cr: &Context, width: f64, height: f64) {
+    cr.rectangle(0.0, 0.0, width, height);
+    cr.set_source_rgb(1.0, 1.0, 1.0);
+    cr.fill().expect("Failed to fill");
+
+    let label = "Loading …";
+    let font_size = (width.min(height) * 0.06).clamp(14.0, 40.0);
+    cr.select_font_face("sans-serif", FontSlant::Normal, FontWeight::Normal);
+    cr.set_font_size(font_size);
+    if let Ok(extents) = cr.text_extents(label) {
+        let x = (width - extents.width()) / 2.0 - extents.x_bearing();
+        let y = (height - extents.height()) / 2.0 - extents.y_bearing();
+        cr.move_to(x, y);
+        cr.set_source_rgb(0.6, 0.6, 0.6);
+        let _ = cr.show_text(label);
+    }
+
+    // reset to opaque black so a later fill/mask on this context isn't tinted grey
+    cr.set_source_rgb(0.0, 0.0, 0.0);
 }
 
 // A rendered page as raw pixels. Rendering happens on a background thread, and
