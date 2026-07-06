@@ -48,6 +48,19 @@ ideal for large monitors and wide screens.
     Linux systems. Whether you're using X11 or Wayland, Scrolex will run
     smoothly.
 
+## Shortcuts
+
+| Key / Action    | Description                              |
+| --------------- | ---------------------------------------- |
+| `o`             | Open a document                          |
+| `l`             | Next page                                |
+| `h`             | Previous page                            |
+| `→`             | Scroll right                             |
+| `←`             | Scroll left                              |
+| `]`             | Zoom in                                  |
+| `[`             | Zoom out                                 |
+| Mouse wheel     | Move one page left/right per notch       |
+
 ## Installation
 
 ### 0. Dependencies
