@@ -61,6 +61,16 @@ impl RenderCache {
         self.entries.contains_key(&page)
     }
 
+    // Rough number of pages that fit the budget, from the average cached page size. 0 until
+    // something is cached. Used to bound prefetch so it can't render more than it can keep.
+    pub fn page_capacity(&self) -> usize {
+        if self.entries.is_empty() {
+            return 0;
+        }
+        let avg = self.total_bytes / self.entries.len();
+        self.budget_bytes.checked_div(avg).unwrap_or(0)
+    }
+
     pub fn insert(&mut self, page: i32, surface: ImageSurface) {
         let bytes = (surface.stride() as usize) * (surface.height() as usize);
         self.remove(page);

@@ -56,6 +56,9 @@ struct RenderQueue {
     max_visible: usize,
     max_preview: usize,
     max_prefetch: usize,
+    // worker count bookkeeping for set_size: live threads and how many should exit next
+    live_threads: usize,
+    stop_requested: usize,
 }
 
 impl RenderQueue {
@@ -77,6 +80,8 @@ impl RenderQueue {
             max_visible,
             max_preview,
             max_prefetch,
+            live_threads: 0,
+            stop_requested: 0,
         }
     }
 
@@ -133,10 +138,26 @@ impl RenderPool {
             )),
             Condvar::new(),
         ));
-        for _ in 0..pool_size {
-            Self::spawn_bg_thread(inner.clone());
+        let pool = Self { inner };
+        pool.set_size(pool_size);
+        pool
+    }
+
+    // Grow or shrink the worker pool. Growing spawns threads; shrinking asks surplus workers to exit
+    // after their current job, dropping their resident poppler Document and freeing its memory.
+    pub(crate) fn set_size(&self, n: usize) {
+        let (lock, cvar) = &*self.inner;
+        let mut queue = lock.lock().unwrap();
+        let plan = plan_resize(queue.live_threads, queue.stop_requested, n);
+        queue.live_threads = n;
+        queue.stop_requested = plan.stop_requested;
+        drop(queue);
+        for _ in 0..plan.to_spawn {
+            Self::spawn_bg_thread(self.inner.clone());
         }
-        Self { inner }
+        if plan.notify {
+            cvar.notify_all();
+        }
     }
 
     pub(crate) fn submit(&self, uri: &str, priority: RenderPriority, job: Job) {
@@ -162,6 +183,10 @@ impl RenderPool {
                     let (lock, cvar) = &*inner;
                     let mut queue = lock.lock().unwrap();
                     loop {
+                        if queue.stop_requested > 0 {
+                            queue.stop_requested -= 1;
+                            return; // pool shrank: exit and drop this thread's Document
+                        }
                         if let Some(req) = queue.pop() {
                             break req;
                         }
@@ -181,6 +206,31 @@ impl RenderPool {
                 (req.job)(doc.as_ref().unwrap());
             }
         });
+    }
+}
+
+struct ResizePlan {
+    stop_requested: usize,
+    to_spawn: usize,
+    notify: bool,
+}
+
+// Resize from `live` workers (with `pending_stops` exits not yet honored) to `target`. Growing
+// first cancels pending stops, then spawns the rest; shrinking queues more stops.
+fn plan_resize(live: usize, pending_stops: usize, target: usize) -> ResizePlan {
+    if target > live {
+        let revived = pending_stops.min(target - live);
+        ResizePlan {
+            stop_requested: pending_stops - revived,
+            to_spawn: (target - live) - revived,
+            notify: false,
+        }
+    } else {
+        ResizePlan {
+            stop_requested: pending_stops + (live - target),
+            to_spawn: 0,
+            notify: target < live,
+        }
     }
 }
 
@@ -234,5 +284,31 @@ mod tests {
 
         // v1 (oldest) evicted; newest served first
         assert_eq!(drain(&mut q), vec!["v3", "v2"]);
+    }
+
+    #[test]
+    fn grow_spawns_missing_threads() {
+        let p = plan_resize(2, 0, 5);
+        assert_eq!((p.to_spawn, p.stop_requested, p.notify), (3, 0, false));
+    }
+
+    #[test]
+    fn shrink_queues_stops() {
+        let p = plan_resize(5, 0, 2);
+        assert_eq!((p.to_spawn, p.stop_requested, p.notify), (0, 3, true));
+    }
+
+    // Growing again before pending stops are honored revives them instead of over-spawning.
+    #[test]
+    fn grow_revives_pending_stops() {
+        // was 5, shrunk to 2 (3 stops pending, 2 live), now back to 4
+        let p = plan_resize(2, 3, 4);
+        assert_eq!((p.to_spawn, p.stop_requested, p.notify), (0, 1, false));
+    }
+
+    #[test]
+    fn no_change_is_noop() {
+        let p = plan_resize(3, 0, 3);
+        assert_eq!((p.to_spawn, p.stop_requested, p.notify), (0, 0, false));
     }
 }

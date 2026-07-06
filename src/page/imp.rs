@@ -35,22 +35,10 @@ const PREVIEW_TARGET_MS: u128 = 40;
 // runway as forward; already-cached pages are skipped, so effort tracks the direction of travel.
 const PREVIEW_WINDOW: i32 = 32;
 const MAX_INFLIGHT_PREVIEWS: usize = 12;
-// Full-resolution pages rendered ahead in the direction of travel, once nothing on screen is left
-// to render, so reading on to the next page lands on a cached (sharp) page instead of a wait.
-const PREFETCH_AHEAD: i32 = 2;
 // A preview slower than this even at PREVIEW_MIN_SCALE means shrinking won't help (decode-bound
 // scans, where a low-res render is no cheaper than the full one); give up and stop previewing the
 // document.
 const PREVIEW_SLOW_MS: u128 = 250;
-
-// Background worker threads. Each keeps its own poppler Document open (poppler isn't safe to share
-// across threads), and that Document accumulates an unreclaimable per-page cache as pages are
-// visited - tens of MB over a session on a large document - so resident memory scales with this
-// count. One pool serves bbox, visible renders, previews and prefetch, so this count is the total
-// number of resident Documents. Rendering parallelises near-linearly to ~4 threads before turning
-// memory-bandwidth bound; four takes that full throughput for the visible pages, and once they're
-// done the same threads roll onto the look-ahead prefetch.
-const RENDER_THREADS: usize = 4;
 
 thread_local!(
     // Pool caps: bbox, visible-preview, visible, preview, prefetch. The visible cap must exceed the
@@ -59,9 +47,35 @@ thread_local!(
     // redraws them) and stay stuck in low-res. Fast-scroll flooding, the reason this was once small,
     // is now prevented by the settle-debounce (no visible renders scheduled while scrolling), so a
     // generous cap is safe.
-    static RENDER_QUEUE: Lazy<RenderPool> =
-        Lazy::new(|| RenderPool::new(RENDER_THREADS, 8, 8, 8, MAX_INFLIGHT_PREVIEWS, 4));
+    static RENDER_QUEUE: Lazy<RenderPool> = Lazy::new(|| {
+        RenderPool::new(
+            crate::config::DEFAULT_RENDER_THREADS,
+            8,
+            8,
+            8,
+            MAX_INFLIGHT_PREVIEWS,
+            8,
+        )
+    });
 );
+
+// Resize the render pool. The pool starts at DEFAULT_RENDER_THREADS; the window applies the
+// configured count at startup and whenever the setting changes.
+pub(crate) fn set_render_threads(n: usize) {
+    RENDER_QUEUE.with(|queue| queue.set_size(n));
+}
+
+// How many pages to prefetch ahead: the threads not busy on visible pages, but never more full
+// pages than the cache can hold beyond the visible ones - else completed prefetches evict the
+// visible pages and thrash. `capacity` 0 means nothing is cached yet, so fall back to at least one.
+fn prefetch_depth(threads: usize, visible: usize, capacity: usize) -> usize {
+    let want = threads.saturating_sub(visible);
+    if capacity == 0 {
+        want.max(1)
+    } else {
+        want.min(capacity.saturating_sub(visible + 1))
+    }
+}
 
 #[derive(Default, glib::Properties)]
 #[properties(wrapper_type = super::Page)]
@@ -681,8 +695,12 @@ impl Page {
         let cache = state.render_cache();
         let inflight = state.render_inflight();
 
+        let visible = state.visible_page_count().max(1) as usize;
+        let capacity = cache.borrow().page_capacity();
+        let ahead = prefetch_depth(state.render_threads(), visible, capacity) as i32;
+
         // farthest first so the LIFO queue pops the nearest ahead-page first
-        for d in (1..=PREFETCH_AHEAD).rev() {
+        for d in (1..=ahead).rev() {
             let page_num = current + dir * d;
             if page_num < 0 || page_num >= n_pages {
                 continue;
@@ -715,9 +733,22 @@ impl Page {
             let state = obj_clone.state();
             state.render_inflight().borrow_mut().remove(&page_num);
 
-            // request was dropped (evicted from the queue as stale): let the
-            // page reschedule on its next draw
+            // Request was dropped (evicted from the queue as over-cap). Once settled, redraw any
+            // widget still waiting for this page so it reschedules - otherwise a page whose render
+            // was dropped stays stuck on its preview with nothing to trigger a retry.
             let Ok(rendered) = result else {
+                if !state.scrolling() {
+                    if let Some(widget) = state
+                        .render_waiters()
+                        .borrow()
+                        .get(&page_num)
+                        .and_then(glib::WeakRef::upgrade)
+                    {
+                        if widget.index() == page_num {
+                            widget.queue_draw();
+                        }
+                    }
+                }
                 return;
             };
 
@@ -1124,6 +1155,16 @@ mod tests {
     use std::fs;
     use std::io::{Read, Write};
     use std::path::Path;
+
+    #[test]
+    fn prefetch_depth_bounds() {
+        // spare threads run ahead, capped so visible pages + 1 headroom stay in the cache
+        assert_eq!(prefetch_depth(11, 3, 8), 4); // min(11-3, 8-4)
+        assert_eq!(prefetch_depth(4, 1, 8), 3); // threads-bound, cache has room
+        assert_eq!(prefetch_depth(11, 3, 0), 8); // capacity unknown: thread-bound
+        assert_eq!(prefetch_depth(11, 7, 8), 0); // no room left: don't evict visible pages
+        assert_eq!(prefetch_depth(2, 3, 8), 0); // more visible than threads
+    }
 
     const EPSILON: f64 = 0.0001;
     const SMALL_PDF: &[u8] = b"%PDF-1.2 \n\
