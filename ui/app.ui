@@ -274,6 +274,8 @@
 					<object class="GtkGestureZoom">
 						<signal name="begin" handler="handle_zoom_begin" swapped="true" />
 						<signal name="scale-changed" handler="handle_zoom_scale_changed" swapped="true" />
+						<signal name="end" handler="handle_zoom_end" swapped="true" />
+						<signal name="cancel" handler="handle_zoom_end" swapped="true" />
 					</object>
 				</child>
 			</object>
