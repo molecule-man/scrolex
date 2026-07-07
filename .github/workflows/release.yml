@@ -14,17 +14,19 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - name: Get the release version from the tag
-        if: env.VERSION == ''
-        run: echo "VERSION=${{ github.ref_name }}" >> $GITHUB_ENV
+      - name: Get the release version from Cargo.toml
+        shell: bash
+        run: |
+          version=$(grep -m1 '^version *= *' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')
+          echo "VERSION=$version" >> "$GITHUB_ENV"
       - name: Show the version
         run: |
           echo "version is: $VERSION"
       - name: Check that tag version and Cargo.toml version are the same
         shell: bash
         run: |
-          if ! grep -q "version = \"$VERSION\"" Cargo.toml; then
-            echo "version does not match Cargo.toml" >&2
+          if [ "$VERSION" != "${{ github.ref_name }}" ]; then
+            echo "Cargo.toml version ($VERSION) does not match tag (${{ github.ref_name }})" >&2
             exit 1
           fi
       - name: Create GitHub release

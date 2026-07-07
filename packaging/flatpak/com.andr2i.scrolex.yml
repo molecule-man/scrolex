@@ -68,6 +68,7 @@ modules:
       - install -Dm644 resources/icon.png /app/share/icons/hicolor/64x64/apps/com.andr2i.scrolex.png
       - install -Dm644 resources/scrolex.desktop /app/share/applications/com.andr2i.scrolex.desktop
       - desktop-file-edit --set-icon=com.andr2i.scrolex /app/share/applications/com.andr2i.scrolex.desktop
+      - sed -i -e "s/@VERSION@/$(sed -nE 's/^version *= *\"(.*)\"/\1/p; /^version/q' Cargo.toml)/" -e "s/@DATE@/$(date +%F)/" resources/com.andr2i.scrolex.metainfo.xml
       - install -Dm644 resources/com.andr2i.scrolex.metainfo.xml /app/share/metainfo/com.andr2i.scrolex.metainfo.xml
     sources:
       - type: git
