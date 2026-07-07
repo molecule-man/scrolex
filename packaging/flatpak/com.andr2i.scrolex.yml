@@ -1,0 +1,78 @@
+id: com.andr2i.scrolex
+runtime: org.gnome.Platform
+runtime-version: '49'
+sdk: org.gnome.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: scrolex
+
+finish-args:
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --share=ipc
+  - --device=dri
+  - --filesystem=host:ro
+
+modules:
+  - name: openjpeg
+    buildsystem: cmake-ninja
+    config-opts:
+      - -DCMAKE_BUILD_TYPE=Release
+      - -DCMAKE_INSTALL_LIBDIR=lib
+      - -DBUILD_STATIC_LIBS=OFF
+    sources:
+      - type: archive
+        url: https://github.com/uclouvain/openjpeg/archive/refs/tags/v2.5.3.tar.gz
+        sha256: 368fe0468228e767433c9ebdea82ad9d801a3ad1e4234421f352c8b06e7aa707
+    cleanup:
+      - /bin
+      - /include
+      - /lib/pkgconfig
+
+  - name: poppler
+    buildsystem: cmake-ninja
+    config-opts:
+      - -DCMAKE_BUILD_TYPE=Release
+      - -DCMAKE_INSTALL_LIBDIR=lib
+      - -DENABLE_GLIB=ON
+      - -DENABLE_QT5=OFF
+      - -DENABLE_QT6=OFF
+      - -DENABLE_CPP=OFF
+      - -DENABLE_UTILS=OFF
+      - -DENABLE_BOOST=OFF
+      - -DENABLE_GOBJECT_INTROSPECTION=OFF
+      - -DENABLE_NSS3=OFF
+      - -DENABLE_GPGME=OFF
+      - -DENABLE_LIBCURL=OFF
+      - -DENABLE_LIBOPENJPEG=openjpeg2
+      - -DBUILD_GTK_TESTS=OFF
+      - -DBUILD_MANUAL_TESTS=OFF
+    sources:
+      - type: archive
+        url: https://poppler.freedesktop.org/poppler-26.07.0.tar.xz
+        sha256: 304832f48f8a47fdca90c6b6d1f684e68f37c10c9a0726f345f4ca9df4ca01e2
+    cleanup:
+      - /bin
+      - /include
+      - /lib/pkgconfig
+
+  - name: scrolex
+    buildsystem: simple
+    build-options:
+      append-path: /usr/lib/sdk/rust-stable/bin
+      env:
+        CARGO_HOME: /run/build/scrolex/cargo
+      build-args:
+        - --share=network
+    build-commands:
+      - cargo build --release
+      - install -Dm755 target/release/scrolex /app/bin/scrolex
+      - install -Dm644 resources/icon.png /app/share/icons/hicolor/64x64/apps/com.andr2i.scrolex.png
+      - install -Dm644 resources/scrolex.desktop /app/share/applications/com.andr2i.scrolex.desktop
+      - desktop-file-edit --set-icon=com.andr2i.scrolex /app/share/applications/com.andr2i.scrolex.desktop
+      - sed -i -e "s/@VERSION@/$(sed -nE 's/^version *= *\"(.*)\"/\1/p; /^version/q' Cargo.toml)/" -e "s/@DATE@/$(date +%F)/" resources/com.andr2i.scrolex.metainfo.xml
+      - install -Dm644 resources/com.andr2i.scrolex.metainfo.xml /app/share/metainfo/com.andr2i.scrolex.metainfo.xml
+    sources:
+      - type: git
+        path: ../..
+        branch: main
