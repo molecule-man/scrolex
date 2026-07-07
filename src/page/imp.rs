@@ -534,16 +534,6 @@ impl Page {
         let (width, height) = poppler_page.size();
         let scale_factor = obj.scale_factor() as f64;
 
-        // surface has to be created anew because existing surface created with different scale
-        // factor has different size
-        let surface = ImageSurface::create(
-            gtk::cairo::Format::Rgb24,
-            (width * scale_factor) as i32,
-            (height * scale_factor) as i32,
-        )
-        .expect("Failed to create image surface");
-        cr.set_source_surface(surface, 0., 0.).unwrap();
-
         let bbox = self.get_bbox(poppler_page, obj.crop());
         let scale = obj.zoom();
 
@@ -956,8 +946,11 @@ impl Page {
 }
 
 pub fn draw_surface(cr: &Context, surface: &ImageSurface, bbox: &Rectangle, scale: f64) {
-    cr.scale(1.0, 1.0);
-    cr.set_source_surface(surface, -bbox.x1 * scale, -bbox.y1 * scale)
+    // Snap the paste position to a whole device pixel; a fractional offset resamples and blurs the
+    // 1:1 surface (crop's bbox margins would otherwise land it off-grid).
+    let (device_scale, _) = surface.device_scale();
+    let snap = |v: f64| (v * device_scale).round() / device_scale;
+    cr.set_source_surface(surface, snap(-bbox.x1 * scale), snap(-bbox.y1 * scale))
         .unwrap();
     let (w, h) = bbox.size();
     cr.rectangle(0.0, 0.0, w * scale, h * scale);
