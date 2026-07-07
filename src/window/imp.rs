@@ -581,17 +581,25 @@ impl Window {
         }
 
         let mut anim = self.scroll_anim.borrow_mut();
+        // A retarget resets the duration ceiling (start_frame -1); else a long burst force-settles
+        // short of target, landing the page off its anchor. last_frame carries over to keep pacing.
         let (anchor_x, prev_target, last_frame, start_frame) = match anim.as_ref() {
-            Some(a) => (a.anchor_x, Some(a.last_target), a.last_frame, a.start_frame),
+            Some(a) => (a.anchor_x, Some(a.last_target), a.last_frame, -1),
             None => (anchor_x, None, -1, -1),
         };
         // Prefer the selected page's exact live position. When it isn't laid out yet (selection
         // raced ahead in a burst), advance by one page-width from the previous target so the burst
         // keeps covering ground; live geometry snaps it to the exact spot once the page is actually
         // mapped.
-        let last_target = self
-            .live_target(anchor_x)
+        let live = self.live_target(anchor_x);
+        let last_target = live
             .unwrap_or_else(|| self.clamp_scroll(prev_target.unwrap_or(hadj.value()) + delta));
+        log::debug!(
+            "slide arm: anchor_x={anchor_x:?} target={last_target:.2} live={} fresh={} hadj={:.2}",
+            live.is_some(),
+            anim.is_none(),
+            hadj.value(),
+        );
         let start_fresh = anim.is_none();
         *anim = Some(ScrollAnim {
             anchor_x,
@@ -643,6 +651,11 @@ impl Window {
             // reconcile selection; never jump to a distant target - that snap is the visible jerk
             *self.scroll_anim.borrow_mut() = None;
             hadj.set_value(next);
+            log::debug!(
+                "slide settle: target={target:.2} value={next:.2} short={:.2} left_x={:?}",
+                target - next,
+                self.selected_page_left_x(),
+            );
             return glib::ControlFlow::Break;
         }
 
