@@ -70,9 +70,11 @@ ideal for large monitors and wide screens.
 
 ### 0. Dependencies
 
-If you are not installing the app via a package manager (currently only
-available on AUR), you will need to manually install the `gtk4` and `poppler`
-dependencies.
+Packaged installs bundle everything they need, so **no manual dependency
+installation is required** for the Flatpak, AUR, or `.deb` methods below.
+
+You only need to install `gtk4` and `poppler` yourself when running the raw
+pre-built binary or building from source.
 
 On arch, you can install these dependencies with:
 
@@ -80,12 +82,35 @@ On arch, you can install these dependencies with:
 sudo pacman -S gtk4 poppler
 ```
 
-### 1. Download from GitHub Releases
+### 1. Install the Flatpak bundle
+
+Download the `.flatpak` bundle from the [GitHub releases page][1].
+
+The bundle is self-contained, but it pulls its runtime (the GNOME Platform and
+GPU/codec extensions) from Flathub, so Flathub must be configured first. If it
+isn't already, add it:
+
+```bash
+flatpak remote-add --if-not-exists --user flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+```
+
+Then install the bundle by pointing `flatpak install` at the file directly, and
+run it:
+
+```bash
+flatpak install --user scrolex_*.flatpak
+flatpak run com.andr2i.scrolex
+```
+
+Drop `--user` from all commands to install system-wide instead (requires
+root).
+
+### 2. Download from GitHub Releases
 
 You can download the latest pre-built binary directly from the [GitHub releases
 page][1].
 
-### 2. Install from AUR (Arch Linux)
+### 3. Install from AUR (Arch Linux)
 
 If you're using Arch Linux or any Arch-based distribution, you can install
 Scrolex from the Arch User Repository (AUR).
@@ -94,7 +119,7 @@ Scrolex from the Arch User Repository (AUR).
 yay -S scrolex-bin
 ```
 
-### 3. Download and install .deb package from GitHub Releases
+### 4. Download and install .deb package from GitHub Releases
 
 If you are Debian (or Ubuntu) user, then you can download a `.deb` file directly from the [GitHub releases
 page][1] and install it.
@@ -104,7 +129,7 @@ curl -LO 'https://github.com/molecule-man/scrolex/releases/download/0.1.0/scrole
 sudo dpkg -i scrolex_0.1.0.deb
 ```
 
-### 4. Build from source
+### 5. Build from source
 
 ```bash
 # clone the repository
