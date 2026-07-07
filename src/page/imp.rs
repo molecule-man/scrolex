@@ -52,7 +52,6 @@ thread_local!(
             crate::config::DEFAULT_RENDER_THREADS,
             8,
             8,
-            8,
             MAX_INFLIGHT_PREVIEWS,
             8,
         )
@@ -234,7 +233,7 @@ impl Page {
         let page = self.obj().clone();
         let (w, h) = poppler_page.size();
 
-        self.get_bbox_async(
+        self.resolve_bbox(
             &poppler_page,
             page.crop(),
             clone!(
@@ -460,7 +459,11 @@ impl Page {
         Rectangle::new(0.0, 0.0, w, h)
     }
 
-    fn get_bbox_async<F>(&self, page: &poppler::Page, crop: bool, cb: F)
+    // Resolve the page's bounding box and hand it to `cb`. Computed on the main thread from the
+    // page we already hold: the layout is far cheaper than a full render, and resolving it inline
+    // sizes the widget at once. A pooled job would lag behind the renders during a fast scroll,
+    // leaving the page stuck at its stale size until the box arrived.
+    fn resolve_bbox<F>(&self, page: &poppler::Page, crop: bool, cb: F)
     where
         F: FnOnce(&Rectangle) + 'static,
     {
@@ -469,50 +472,13 @@ impl Page {
             return;
         }
 
-        // In sync mode we deliberately don't touch the render pool, so a fast document stays down
-        // to a single resident poppler Document. Compute the bbox on the main thread from the page
-        // we already hold (layout is far cheaper than a render). The pool path is used only once
-        // rendering has moved to background threads anyway.
-        if !self.obj().state().multithread_rendering() {
-            let bbox = get_bbox(page, true);
-            self.state
-                .borrow()
-                .bbox_cache()
-                .borrow_mut()
-                .insert(page.index(), bbox);
-            cb(&bbox);
-            return;
-        }
-
-        let bbox_cache = self.state.borrow().bbox_cache().clone();
-
-        let uri = self.obj().uri();
-        let page_num = page.index();
-        let (resp_sender, resp_receiver) = oneshot::channel();
-        RENDER_QUEUE.with(move |queue| {
-            queue.submit(
-                &uri,
-                RenderPriority::Bbox,
-                Box::new(move |doc| {
-                    if let Some(page) = doc.page(page_num) {
-                        let bbox = get_bbox(&page, true);
-                        // ignore send failure: the awaiting task is gone if the
-                        // page's widget was dropped
-                        let _ = resp_sender.send(bbox);
-                    }
-                }),
-            );
-        });
-
-        glib::spawn_future_local(async move {
-            // the request may have been dropped from the queue as stale; if so the page re-requests
-            // its bbox on the next draw
-            let Ok(bbox) = resp_receiver.await else {
-                return;
-            };
-            bbox_cache.borrow_mut().insert(page_num, bbox);
-            cb(&bbox);
-        });
+        let bbox = get_bbox(page, true);
+        self.state
+            .borrow()
+            .bbox_cache()
+            .borrow_mut()
+            .insert(page.index(), bbox);
+        cb(&bbox);
     }
 
     fn lookup_bbox(&self, page: &poppler::Page, crop: bool) -> Option<Rectangle> {
@@ -533,16 +499,6 @@ impl Page {
         let obj = self.obj();
         let (width, height) = poppler_page.size();
         let scale_factor = obj.scale_factor() as f64;
-
-        // surface has to be created anew because existing surface created with different scale
-        // factor has different size
-        let surface = ImageSurface::create(
-            gtk::cairo::Format::Rgb24,
-            (width * scale_factor) as i32,
-            (height * scale_factor) as i32,
-        )
-        .expect("Failed to create image surface");
-        cr.set_source_surface(surface, 0., 0.).unwrap();
 
         let bbox = self.get_bbox(poppler_page, obj.crop());
         let scale = obj.zoom();
@@ -697,7 +653,7 @@ impl Page {
         let preview = obj.state().preview_cache().borrow_mut().get(page_num);
         if let Some(preview) = preview {
             log::debug!("draw page {page_num}: cache miss, showing preview");
-            draw_preview(cr, &preview, &bbox, scale);
+            draw_preview(cr, &preview, &bbox, scale, width);
         } else {
             log::debug!("draw page {page_num}: cache miss (loading placeholder)");
             let (w, h) = bbox.size();
@@ -956,8 +912,11 @@ impl Page {
 }
 
 pub fn draw_surface(cr: &Context, surface: &ImageSurface, bbox: &Rectangle, scale: f64) {
-    cr.scale(1.0, 1.0);
-    cr.set_source_surface(surface, -bbox.x1 * scale, -bbox.y1 * scale)
+    // Snap the paste position to a whole device pixel; a fractional offset resamples and blurs the
+    // 1:1 surface (crop's bbox margins would otherwise land it off-grid).
+    let (device_scale, _) = surface.device_scale();
+    let snap = |v: f64| (v * device_scale).round() / device_scale;
+    cr.set_source_surface(surface, snap(-bbox.x1 * scale), snap(-bbox.y1 * scale))
         .unwrap();
     let (w, h) = bbox.size();
     cr.rectangle(0.0, 0.0, w * scale, h * scale);
@@ -969,13 +928,13 @@ pub fn draw_surface(cr: &Context, surface: &ImageSurface, bbox: &Rectangle, scal
 }
 
 // Draw a low-res preview surface upscaled to fill the same area a full render at `scale` would
-// occupy (blurry stand-in while the full render lands). The preview's own render scale is recovered
-// from its pixel size versus the page size in points, so a cache holding previews rendered at
-// different (adaptive) scales still upscales each one correctly.
-fn draw_preview(cr: &Context, preview: &ImageSurface, bbox: &Rectangle, scale: f64) {
-    let (bbox_w, _) = bbox.size();
-    let preview_scale = if bbox_w > 0.0 {
-        preview.width() as f64 / bbox_w
+// occupy (blurry stand-in while the full render lands). The preview is a full-page render, so its
+// render scale is recovered from the full page width (not the cropped bbox) and its device scale;
+// a cache holding previews rendered at different (adaptive) scales still upscales each correctly.
+fn draw_preview(cr: &Context, preview: &ImageSurface, bbox: &Rectangle, scale: f64, page_width: f64) {
+    let (device_scale, _) = preview.device_scale();
+    let preview_scale = if page_width > 0.0 {
+        preview.width() as f64 / (page_width * device_scale)
     } else {
         scale
     };
