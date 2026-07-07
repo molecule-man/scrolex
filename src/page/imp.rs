@@ -653,7 +653,7 @@ impl Page {
         let preview = obj.state().preview_cache().borrow_mut().get(page_num);
         if let Some(preview) = preview {
             log::debug!("draw page {page_num}: cache miss, showing preview");
-            draw_preview(cr, &preview, &bbox, scale);
+            draw_preview(cr, &preview, &bbox, scale, width);
         } else {
             log::debug!("draw page {page_num}: cache miss (loading placeholder)");
             let (w, h) = bbox.size();
@@ -928,13 +928,13 @@ pub fn draw_surface(cr: &Context, surface: &ImageSurface, bbox: &Rectangle, scal
 }
 
 // Draw a low-res preview surface upscaled to fill the same area a full render at `scale` would
-// occupy (blurry stand-in while the full render lands). The preview's own render scale is recovered
-// from its pixel size versus the page size in points, so a cache holding previews rendered at
-// different (adaptive) scales still upscales each one correctly.
-fn draw_preview(cr: &Context, preview: &ImageSurface, bbox: &Rectangle, scale: f64) {
-    let (bbox_w, _) = bbox.size();
-    let preview_scale = if bbox_w > 0.0 {
-        preview.width() as f64 / bbox_w
+// occupy (blurry stand-in while the full render lands). The preview is a full-page render, so its
+// render scale is recovered from the full page width (not the cropped bbox) and its device scale;
+// a cache holding previews rendered at different (adaptive) scales still upscales each correctly.
+fn draw_preview(cr: &Context, preview: &ImageSurface, bbox: &Rectangle, scale: f64, page_width: f64) {
+    let (device_scale, _) = preview.device_scale();
+    let preview_scale = if page_width > 0.0 {
+        preview.width() as f64 / (page_width * device_scale)
     } else {
         scale
     };
