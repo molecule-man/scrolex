@@ -38,6 +38,7 @@ jobs:
 
   build-release:
     name: build-release
+    if: false # temporarily disabled while iterating on the flatpak build
     needs: ['create-release']
     runs-on: ${{ matrix.os }}
     env:
@@ -233,6 +234,7 @@ jobs:
 
   build-release-deb:
     name: build-release-deb
+    if: false # temporarily disabled while iterating on the flatpak build
     needs: ['create-release']
     runs-on: ubuntu-24.04
     env:
