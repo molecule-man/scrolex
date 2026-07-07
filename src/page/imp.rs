@@ -52,7 +52,6 @@ thread_local!(
             crate::config::DEFAULT_RENDER_THREADS,
             8,
             8,
-            8,
             MAX_INFLIGHT_PREVIEWS,
             8,
         )
@@ -234,7 +233,7 @@ impl Page {
         let page = self.obj().clone();
         let (w, h) = poppler_page.size();
 
-        self.get_bbox_async(
+        self.resolve_bbox(
             &poppler_page,
             page.crop(),
             clone!(
@@ -460,7 +459,11 @@ impl Page {
         Rectangle::new(0.0, 0.0, w, h)
     }
 
-    fn get_bbox_async<F>(&self, page: &poppler::Page, crop: bool, cb: F)
+    // Resolve the page's bounding box and hand it to `cb`. Computed on the main thread from the
+    // page we already hold: the layout is far cheaper than a full render, and resolving it inline
+    // sizes the widget at once. A pooled job would lag behind the renders during a fast scroll,
+    // leaving the page stuck at its stale size until the box arrived.
+    fn resolve_bbox<F>(&self, page: &poppler::Page, crop: bool, cb: F)
     where
         F: FnOnce(&Rectangle) + 'static,
     {
@@ -469,50 +472,13 @@ impl Page {
             return;
         }
 
-        // In sync mode we deliberately don't touch the render pool, so a fast document stays down
-        // to a single resident poppler Document. Compute the bbox on the main thread from the page
-        // we already hold (layout is far cheaper than a render). The pool path is used only once
-        // rendering has moved to background threads anyway.
-        if !self.obj().state().multithread_rendering() {
-            let bbox = get_bbox(page, true);
-            self.state
-                .borrow()
-                .bbox_cache()
-                .borrow_mut()
-                .insert(page.index(), bbox);
-            cb(&bbox);
-            return;
-        }
-
-        let bbox_cache = self.state.borrow().bbox_cache().clone();
-
-        let uri = self.obj().uri();
-        let page_num = page.index();
-        let (resp_sender, resp_receiver) = oneshot::channel();
-        RENDER_QUEUE.with(move |queue| {
-            queue.submit(
-                &uri,
-                RenderPriority::Bbox,
-                Box::new(move |doc| {
-                    if let Some(page) = doc.page(page_num) {
-                        let bbox = get_bbox(&page, true);
-                        // ignore send failure: the awaiting task is gone if the
-                        // page's widget was dropped
-                        let _ = resp_sender.send(bbox);
-                    }
-                }),
-            );
-        });
-
-        glib::spawn_future_local(async move {
-            // the request may have been dropped from the queue as stale; if so the page re-requests
-            // its bbox on the next draw
-            let Ok(bbox) = resp_receiver.await else {
-                return;
-            };
-            bbox_cache.borrow_mut().insert(page_num, bbox);
-            cb(&bbox);
-        });
+        let bbox = get_bbox(page, true);
+        self.state
+            .borrow()
+            .bbox_cache()
+            .borrow_mut()
+            .insert(page.index(), bbox);
+        cb(&bbox);
     }
 
     fn lookup_bbox(&self, page: &poppler::Page, crop: bool) -> Option<Rectangle> {
