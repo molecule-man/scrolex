@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>com.andr2i.scrolex</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <name>Scrolex</name>
+  <summary>A horizontally scrolled PDF viewer</summary>
+  <description>
+    <p>
+      Scrolex is a PDF viewer that lays pages out along a single horizontal
+      strip, letting you scroll continuously through a document. It supports
+      zooming, including Ctrl+scroll and touchpad gestures, and text search.
+    </p>
+  </description>
+  <launchable type="desktop-id">com.andr2i.scrolex.desktop</launchable>
+  <url type="homepage">https://github.com/molecule-man/scrolex</url>
+  <url type="bugtracker">https://github.com/molecule-man/scrolex/issues</url>
+  <developer id="com.andr2i">
+    <name>Andrii Berezhynskyi</name>
+  </developer>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.3.0" date="2026-07-07"/>
+  </releases>
+</component>

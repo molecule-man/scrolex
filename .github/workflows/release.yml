@@ -282,3 +282,58 @@ jobs:
         cd "$DEB_DIR"
         version="${{ needs.create-release.outputs.version }}"
         gh release upload "$version" "$DEB_NAME" "$SUM"
+
+  build-release-flatpak:
+    name: build-release-flatpak
+    needs: ['create-release']
+    runs-on: ubuntu-24.04
+    env:
+      APP_ID: com.andr2i.scrolex
+      MANIFEST: packaging/flatpak/com.andr2i.scrolex.yml
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Install flatpak-builder
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install --assume-yes flatpak flatpak-builder
+        flatpak remote-add --if-not-exists --user flathub https://flathub.org/repo/flathub.flatpakrepo
+
+    - name: Pin app source to release tag
+      shell: bash
+      run: |
+        version="${{ needs.create-release.outputs.version }}"
+        sed -i "s/branch: main/tag: $version/" "$MANIFEST"
+
+    - name: Build Flatpak bundle
+      shell: bash
+      run: |
+        version="${{ needs.create-release.outputs.version }}"
+        BUNDLE=scrolex_$version.flatpak
+        echo "BUNDLE=$BUNDLE" >> $GITHUB_ENV
+        # ubuntu-24.04 restricts unprivileged user namespaces, which bwrap needs
+        sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+        flatpak-builder --user --disable-rofiles-fuse --install-deps-from=flathub \
+          --repo=repo --force-clean build-dir "$MANIFEST"
+        flatpak build-bundle repo "$BUNDLE" "$APP_ID" \
+          --runtime-repo=https://flathub.org/repo/flathub.flatpakrepo
+
+    - name: Create sha256 sum of flatpak bundle
+      shell: bash
+      run: |
+        sum="$BUNDLE.sha256"
+        shasum -a 256 "$BUNDLE" > "$sum"
+        echo "SUM=$sum" >> $GITHUB_ENV
+
+    - name: Upload release archive
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      shell: bash
+      run: |
+        version="${{ needs.create-release.outputs.version }}"
+        gh release upload "$version" "$BUNDLE" "$SUM"
