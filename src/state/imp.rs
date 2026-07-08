@@ -60,6 +60,8 @@ pub struct State {
     // dominates regardless of scale) - then they'd only waste cycles. Cell wrapped so it defaults
     // to false; set true on load.
     pub(crate) preview_enabled: Cell<bool>,
+    // consecutive previews slow even at min scale; disable previews once it proves the doc is decode-bound.
+    pub(crate) preview_slow_streak: Cell<u32>,
     // render scale for previews, adapted per document toward the time and memory budgets. Defaults
     // to 0.0 (Cell); set to the initial scale in constructed and on load.
     pub(crate) preview_scale: Cell<f64>,

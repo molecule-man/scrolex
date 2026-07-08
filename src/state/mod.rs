@@ -61,6 +61,7 @@ impl State {
         self.imp().preview_cache.borrow_mut().clear();
         self.imp().preview_inflight.borrow_mut().clear();
         self.imp().preview_enabled.set(true);
+        self.imp().preview_slow_streak.set(0);
         self.imp()
             .preview_scale
             .set(crate::page::PREVIEW_INITIAL_SCALE);
@@ -189,6 +190,14 @@ impl State {
 
     pub(crate) fn set_preview_enabled(&self, enabled: bool) {
         self.imp().preview_enabled.set(enabled);
+    }
+
+    pub(crate) fn preview_slow_streak(&self) -> u32 {
+        self.imp().preview_slow_streak.get()
+    }
+
+    pub(crate) fn set_preview_slow_streak(&self, streak: u32) {
+        self.imp().preview_slow_streak.set(streak);
     }
 
     pub(crate) fn preview_scale(&self) -> f64 {
