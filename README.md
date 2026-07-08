@@ -54,9 +54,11 @@ https://github.com/user-attachments/assets/225c4b69-eb15-48d0-b978-f7bd747d463e
 
 | Key / Action    | Description                              |
 | --------------- | ---------------------------------------- |
-| `o`             | Open a document                          |
-| `l`             | Next page                                |
-| `h`             | Previous page                            |
+| `o` / Ctrl + o  | Open a document                          |
+| `l` / PageDown  | Next page                                |
+| `h` / PageUp    | Previous page                            |
+| Home            | First page                               |
+| End             | Last page                                |
 | `→`             | Scroll right                             |
 | `←`             | Scroll left                              |
 | `]`             | Zoom in                                  |

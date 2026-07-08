@@ -1,5 +1,6 @@
 use std::cell::{Cell, RefCell};
 
+use futures::StreamExt;
 use glib::clone;
 use glib::subclass::InitializingObject;
 use gtk::gdk::{EventSequence, Key, ModifierType};
@@ -12,7 +13,6 @@ use gtk::{
     SingleSelection, ToggleButton,
 };
 use gtk::{prelude::*, GestureClick};
-use futures::StreamExt;
 
 use crate::page;
 use crate::state::State;
@@ -247,14 +247,18 @@ impl Window {
 
         // Ctrl+scroll zooms instead of navigating; dy<0 zooms in, dy>0 out. Touchpad pixels are
         // scaled to the wheel's notch so both zoom at a comparable rate.
-        if scroll.current_event_state().contains(ModifierType::CONTROL_MASK) {
+        if scroll
+            .current_event_state()
+            .contains(ModifierType::CONTROL_MASK)
+        {
             if dy != 0.0 {
                 let notches = match unit {
                     gtk::gdk::ScrollUnit::Wheel => dy,
                     _ => dy / TOUCHPAD_NOTCH,
                 };
                 self.note_scroll_activity();
-                self.state.set_zoom(self.state.zoom() * ZOOM_STEP.powf(-notches));
+                self.state
+                    .set_zoom(self.state.zoom() * ZOOM_STEP.powf(-notches));
             }
             return glib::Propagation::Stop;
         }
@@ -402,11 +406,18 @@ impl Window {
             Key::f => {
                 self.open_search();
             }
-            Key::l => {
+            Key::l | Key::Page_Down => {
                 self.next_page();
             }
-            Key::h => {
+            Key::h | Key::Page_Up => {
                 self.prev_page();
+            }
+            Key::Home => {
+                self.goto_page(1);
+            }
+            Key::End => {
+                // clamps to the last page in navigate_to_page
+                self.goto_page(u32::MAX);
             }
             Key::bracketleft => {
                 self.zoom_out();
@@ -592,8 +603,8 @@ impl Window {
         // keeps covering ground; live geometry snaps it to the exact spot once the page is actually
         // mapped.
         let live = self.live_target(anchor_x);
-        let last_target = live
-            .unwrap_or_else(|| self.clamp_scroll(prev_target.unwrap_or(hadj.value()) + delta));
+        let last_target =
+            live.unwrap_or_else(|| self.clamp_scroll(prev_target.unwrap_or(hadj.value()) + delta));
         log::debug!(
             "slide arm: anchor_x={anchor_x:?} target={last_target:.2} live={} fresh={} hadj={:.2}",
             live.is_some(),
@@ -886,10 +897,9 @@ impl Window {
         while let Some(c) = child {
             if let Some(page) = descendant_page(&c) {
                 if page.is_mapped() && page.width() > 0 {
-                    if let Some(p) = page.compute_point(
-                        &*self.scrolledwindow,
-                        &gtk::graphene::Point::new(0.0, 0.0),
-                    ) {
+                    if let Some(p) = page
+                        .compute_point(&*self.scrolledwindow, &gtk::graphene::Point::new(0.0, 0.0))
+                    {
                         let left = f64::from(p.x());
                         let right = left + f64::from(page.width());
                         if left >= -0.5 && right <= viewport_w + 0.5 {
@@ -990,8 +1000,8 @@ impl Window {
             }
         ));
 
-        // Window-level keys so Ctrl+F / F3 / Esc work regardless of focus. Capture phase lets F3 fire
-        // while typing and stops Esc from double-firing the entry's stop-search.
+        // Search keys (Ctrl+F / F3 / Esc) that must work regardless of focus. Capture phase lets F3
+        // fire while typing and stops Esc from double-firing the entry's stop-search.
         let key = gtk::EventControllerKey::new();
         key.set_propagation_phase(gtk::PropagationPhase::Capture);
         key.connect_key_pressed(clone!(
@@ -999,12 +1009,12 @@ impl Window {
             self,
             #[upgrade_or]
             glib::Propagation::Proceed,
-            move |_, keyval, _keycode, modifier| imp.handle_global_key(keyval, modifier)
+            move |_, keyval, _keycode, modifier| imp.handle_search_key(keyval, modifier)
         ));
         self.obj().add_controller(key);
     }
 
-    fn handle_global_key(&self, keyval: Key, modifier: ModifierType) -> glib::Propagation {
+    fn handle_search_key(&self, keyval: Key, modifier: ModifierType) -> glib::Propagation {
         match keyval {
             Key::f if modifier.contains(ModifierType::CONTROL_MASK) => {
                 self.open_search();
