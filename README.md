@@ -19,6 +19,8 @@ displays and designed for distraction-free, efficient reading. With its
 horizontal scrolling layout, Scrolex lets you see more pages at once, making it
 ideal for large monitors and wide screens.
 
+https://github.com/user-attachments/assets/225c4b69-eb15-48d0-b978-f7bd747d463e
+
 ## Features
 
 1. Horizontal Scrolling Layout
