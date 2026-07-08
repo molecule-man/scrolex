@@ -36,9 +36,10 @@ const PREVIEW_TARGET_MS: u128 = 40;
 const PREVIEW_WINDOW: i32 = 32;
 const MAX_INFLIGHT_PREVIEWS: usize = 12;
 // A preview slower than this even at PREVIEW_MIN_SCALE means shrinking won't help (decode-bound
-// scans, where a low-res render is no cheaper than the full one); give up and stop previewing the
-// document.
+// scans, where a low-res render is no cheaper than the full one).
 const PREVIEW_SLOW_MS: u128 = 250;
+// Consecutive slow-at-min-scale previews before giving up on the document; shrugs off one-off outliers.
+const PREVIEW_SLOW_STREAK_LIMIT: u32 = 5;
 
 thread_local!(
     // Pool caps: bbox, visible-preview, visible, preview, prefetch. The visible cap must exceed the
@@ -852,17 +853,24 @@ impl Page {
             }
 
             // decode-bound documents (e.g. scanned images) don't get cheaper as the scale shrinks:
-            // if a preview is still slow at the floor, it never will pay off - stop making them.
+            // once several previews in a row are slow at the floor they never will pay off - stop
+            // making new ones. A one-off slow page just bumps the streak; a cheap preview clears it.
+            // Keep the already-rendered previews cached either way - they're valid placeholders.
             let cur_scale = state.preview_scale();
             if rendered.render_ms > PREVIEW_SLOW_MS && cur_scale <= PREVIEW_MIN_SCALE {
-                log::debug!(
-                    "preview page {page_num} took {}ms (>{PREVIEW_SLOW_MS}) at min scale; disabling previews",
-                    rendered.render_ms
-                );
-                state.set_preview_enabled(false);
-                state.preview_cache().borrow_mut().clear();
-                state.preview_inflight().borrow_mut().clear();
-                return;
+                let streak = state.preview_slow_streak() + 1;
+                state.set_preview_slow_streak(streak);
+                if streak >= PREVIEW_SLOW_STREAK_LIMIT {
+                    log::debug!(
+                        "preview page {page_num} took {}ms (>{PREVIEW_SLOW_MS}) at min scale, {streak}x in a row; disabling previews",
+                        rendered.render_ms
+                    );
+                    state.set_preview_enabled(false);
+                    state.preview_inflight().borrow_mut().clear();
+                    return;
+                }
+            } else {
+                state.set_preview_slow_streak(0);
             }
 
             // steer the scale for future previews toward the time and memory budgets, based on what
