@@ -79,6 +79,19 @@
 					</object>
 				</child>
 				<child type="start">
+					<object class="GtkToggleButton" id="btn_toc">
+						<property name="active" bind-source="toc_revealer" bind-property="reveal-child" bind-flags="bidirectional"/>
+						<property name="sensitive">false</property>
+						<property name="icon-name">view-list-symbolic</property>
+						<property name="tooltip-text">Contents (t)</property>
+						<property name="cursor">
+							<object class="GdkCursor">
+								<property name="name">pointer</property>
+							</object>
+						</property>
+					</object>
+				</child>
+				<child type="start">
 					<object class="GtkButton" id="btn_zoom_out">
 						<signal name="clicked" handler="zoom_out" swapped="true"/>
 						<property name="icon-name">zoom-out</property>
@@ -278,6 +291,8 @@
 					</object>
 				</child>
 				<child>
+				<object class="GtkOverlay">
+				<property name="child">
 			<object class="GtkScrolledWindow" id="scrolledwindow">
 				<property name="hscrollbar-policy">automatic</property>
 				<property name="vscrollbar-policy">never</property>
@@ -354,6 +369,34 @@
 					</object>
 				</child>
 			</object>
+				</property>
+				<child type="overlay">
+					<object class="GtkRevealer" id="toc_revealer">
+						<property name="halign">start</property>
+						<property name="valign">fill</property>
+						<property name="transition-type">slide-right</property>
+						<property name="reveal-child">false</property>
+						<child>
+							<object class="GtkScrolledWindow">
+								<property name="hscrollbar-policy">never</property>
+								<property name="vscrollbar-policy">automatic</property>
+								<property name="propagate-natural-width">true</property>
+								<property name="max-content-width">400</property>
+								<property name="width-request">240</property>
+								<style>
+									<class name="toc-panel"/>
+								</style>
+								<child>
+									<object class="GtkListBox" id="toc_list">
+										<property name="selection-mode">none</property>
+										<signal name="row-activated" handler="toc_row_activated" swapped="true"/>
+									</object>
+								</child>
+							</object>
+						</child>
+					</object>
+				</child>
+				</object>
 				</child>
 			</object>
 		</child>

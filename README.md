@@ -55,6 +55,7 @@ https://github.com/user-attachments/assets/225c4b69-eb15-48d0-b978-f7bd747d463e
 | Key / Action    | Description                              |
 | --------------- | ---------------------------------------- |
 | `o` / Ctrl + o  | Open a document                          |
+| `t`             | Toggle table of contents                 |
 | `l` / PageDown  | Next page                                |
 | `h` / PageUp    | Previous page                            |
 | Home            | First page                               |

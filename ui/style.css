@@ -27,3 +27,17 @@
 	min-width: 1px;
 	min-height: 1px;
 }
+
+.toc-panel {
+	background-color: @window_bg_color;
+	border-right: 1px solid @borders;
+}
+
+/* override #main row's grey fill so labels sit on the dark panel */
+#main .toc-panel row {
+	background-color: transparent;
+}
+
+#main .toc-panel row:hover {
+	background-color: alpha(currentColor, 0.12);
+}
