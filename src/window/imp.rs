@@ -837,6 +837,11 @@ impl Window {
                 move || {
                     imp.settle_source.replace(None);
                     imp.state.set_scrolling(false);
+                    // Clear accumulators so the next gesture starts fresh in either direction.
+                    imp.wheel_accum.set(0.0);
+                    imp.wheel_last_dy.set(0.0);
+                    imp.touch_accum.set(0.0);
+                    imp.touch_last_dy.set(0.0);
                     imp.refresh_visible_renders();
                 }
             ),
@@ -1371,10 +1376,14 @@ impl ApplicationWindowImpl for Window {}
 // one physical notch into sub-events summing to 1.0) and vertical touchpad scroll (notch in pixels
 // of finger travel).
 fn accumulate_step(accum: f64, prev: f64, delta: f64, notch: f64, trigger: f64) -> (f64, i32) {
-    // On a direction reversal, drop the leftover under-shoot from the previous direction: that
-    // residual belongs to the old direction, and counting it toward the new one gives it a head
-    // start that fires an extra page.
-    let base = if delta * prev < 0.0 { 0.0 } else { accum };
+    // On a mid-gesture reversal, seed against the new direction so the first reverse step needs
+    // nearly a full notch of travel, not the eager `trigger` (stops an accidental back-nudge from
+    // firing a page back). A reversal after settling starts fresh (see `note_scroll_activity`).
+    let base = if delta * prev < 0.0 {
+        (notch - 2.0 * trigger).copysign(prev)
+    } else {
+        accum
+    };
     let accum = base + delta;
     if delta > 0.0 && accum >= trigger {
         (accum - notch, 1)
@@ -1590,6 +1599,28 @@ mod tests {
             "reversal must step exactly one page back, got {:?}",
             &steps[1..]
         );
+    }
+
+    #[test]
+    fn small_reverse_after_forward_step_does_not_step_back() {
+        // Forward 0.8 fires one page and leaves a residual, then an accidental 0.2 back-nudge. The
+        // reverse is well under a notch, so it must not fire a page back.
+        let steps = run(&[0.2, 0.6, -0.1, -0.1]);
+        assert_eq!(steps[0], 1, "forward should fire once");
+        assert!(
+            steps[1..].iter().all(|&s| s == 0),
+            "sub-notch reverse fired a step: {steps:?}"
+        );
+    }
+
+    #[test]
+    fn deliberate_full_notch_reverse_after_forward_step_steps_back() {
+        // The same forward step, then a committed full-notch reverse still turns one page back.
+        let mut seq = vec![0.2, 0.6];
+        seq.extend(NOTCH.iter().map(|d| -d));
+        let steps = run(&seq);
+        assert_eq!(steps[0], 1);
+        assert_eq!(steps[2..].iter().sum::<i32>(), -1, "got {steps:?}");
     }
 
     #[test]
