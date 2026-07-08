@@ -113,6 +113,15 @@ pub struct Window {
     pub search_status: TemplateChild<Label>,
     #[template_child]
     pub btn_search_case: TemplateChild<ToggleButton>,
+    #[template_child]
+    pub btn_toc: TemplateChild<ToggleButton>,
+    #[template_child]
+    pub toc_revealer: TemplateChild<gtk::Revealer>,
+    #[template_child]
+    pub toc_list: TemplateChild<gtk::ListBox>,
+
+    // target page per outline row (index-aligned), None for non-navigable entries
+    toc_pages: RefCell<Vec<Option<i32>>>,
 
     // set while a re-search is queued, to coalesce keystrokes into one sweep
     search_debounce: RefCell<Option<glib::SourceId>>,
@@ -190,6 +199,7 @@ impl ObjectImpl for Window {
         self.setup_scroll_selection_sync();
         self.setup_thread_setting();
         self.setup_search();
+        self.setup_toc();
 
         // Give keyboard focus to the scroll area rather than the header entry
         self.scrolledwindow.set_focusable(true);
@@ -402,6 +412,12 @@ impl Window {
         match keyval {
             Key::o => {
                 self.open_document();
+            }
+            Key::t => {
+                if self.btn_toc.is_sensitive() {
+                    self.toc_revealer
+                        .set_reveal_child(!self.toc_revealer.reveals_child());
+                }
             }
             Key::f => {
                 self.open_search();
@@ -730,6 +746,94 @@ impl Window {
         self.model.remove_all();
     }
 
+    fn populate_toc(&self, doc: &poppler::Document) {
+        self.toc_list.remove_all();
+        let items = crate::poppler::outline(doc);
+        let mut pages = Vec::with_capacity(items.len());
+        for item in &items {
+            let label = gtk::Label::new(Some(&item.title));
+            label.set_xalign(0.0);
+            label.set_wrap(true);
+            label.set_margin_start(8 + item.depth as i32 * 16);
+            label.set_margin_end(8);
+            label.set_margin_top(3);
+            label.set_margin_bottom(3);
+            if item.page.is_none() {
+                label.add_css_class("dim-label");
+            }
+            let row = gtk::ListBoxRow::new();
+            row.set_child(Some(&label));
+            row.set_activatable(item.page.is_some());
+            self.toc_list.append(&row);
+            pages.push(item.page);
+        }
+        self.btn_toc.set_sensitive(!pages.is_empty());
+        self.toc_pages.replace(pages);
+        self.toc_revealer.set_reveal_child(false);
+    }
+
+    #[template_callback]
+    fn toc_row_activated(&self, row: &gtk::ListBoxRow) {
+        let idx = row.index();
+        let page = if idx >= 0 {
+            self.toc_pages.borrow().get(idx as usize).copied().flatten()
+        } else {
+            None
+        };
+        if let Some(page) = page {
+            self.goto_page(page as u32);
+        }
+        self.toc_revealer.set_reveal_child(false);
+    }
+
+    fn setup_toc(&self) {
+        // follow focus into the panel while open, back to the reader when it closes
+        self.toc_revealer.connect_reveal_child_notify(clone!(
+            #[weak(rename_to = imp)]
+            self,
+            move |rev| {
+                if rev.reveals_child() {
+                    imp.toc_list.grab_focus();
+                } else {
+                    imp.scrolledwindow.grab_focus();
+                }
+            }
+        ));
+
+        // Esc or t closes; the panel holds focus while open, so the reader's key handler never sees these.
+        let key = gtk::EventControllerKey::new();
+        key.connect_key_pressed(clone!(
+            #[weak(rename_to = imp)]
+            self,
+            #[upgrade_or]
+            glib::Propagation::Proceed,
+            move |_, keyval, _, _| {
+                if keyval == Key::Escape || keyval == Key::t {
+                    imp.toc_revealer.set_reveal_child(false);
+                    glib::Propagation::Stop
+                } else {
+                    glib::Propagation::Proceed
+                }
+            }
+        ));
+        self.toc_revealer.add_controller(key);
+
+        // A click on the page area (never on the panel, which is a separate overlay child) dismisses.
+        let click = gtk::GestureClick::new();
+        click.set_propagation_phase(gtk::PropagationPhase::Capture);
+        click.connect_pressed(clone!(
+            #[weak(rename_to = imp)]
+            self,
+            move |gesture, _, _, _| {
+                if imp.toc_revealer.reveals_child() {
+                    imp.toc_revealer.set_reveal_child(false);
+                    gesture.set_state(gtk::EventSequenceState::Claimed);
+                }
+            }
+        ));
+        self.scrolledwindow.add_controller(click);
+    }
+
     #[template_callback]
     fn open_document(&self) {
         let filter = gtk::FileFilter::new();
@@ -771,6 +875,8 @@ impl Window {
         let Some(doc) = state.doc() else {
             return;
         };
+
+        self.populate_toc(&doc);
 
         let model = self.model.clone();
         let selection = self.selection.clone();
