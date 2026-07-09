@@ -777,12 +777,21 @@ impl Page {
             }
         });
 
+        let uri_job = uri.clone();
         RENDER_QUEUE.with(move |queue| {
             queue.submit(
                 &uri,
                 priority,
                 Box::new(move |doc| {
-                    request_render(doc, scale, scale_factor, page_num, priority, resp_sender);
+                    request_render(
+                        doc,
+                        &uri_job,
+                        scale,
+                        scale_factor,
+                        page_num,
+                        priority,
+                        resp_sender,
+                    );
                 }),
             );
         });
@@ -903,12 +912,13 @@ impl Page {
             }
         });
 
+        let uri_job = uri.clone();
         RENDER_QUEUE.with(move |queue| {
             queue.submit(
                 &uri,
                 priority,
                 Box::new(move |doc| {
-                    request_render(doc, scale, 1.0, page_num, priority, resp_sender);
+                    request_render(doc, &uri_job, scale, 1.0, page_num, priority, resp_sender);
                 }),
             );
         });
@@ -939,7 +949,13 @@ pub fn draw_surface(cr: &Context, surface: &ImageSurface, bbox: &Rectangle, scal
 // occupy (blurry stand-in while the full render lands). The preview is a full-page render, so its
 // render scale is recovered from the full page width (not the cropped bbox) and its device scale;
 // a cache holding previews rendered at different (adaptive) scales still upscales each correctly.
-fn draw_preview(cr: &Context, preview: &ImageSurface, bbox: &Rectangle, scale: f64, page_width: f64) {
+fn draw_preview(
+    cr: &Context,
+    preview: &ImageSurface,
+    bbox: &Rectangle,
+    scale: f64,
+    page_width: f64,
+) {
     let (device_scale, _) = preview.device_scale();
     let preview_scale = if page_width > 0.0 {
         preview.width() as f64 / (page_width * device_scale)
@@ -1027,6 +1043,7 @@ impl RenderedPage {
 
 fn request_render(
     doc: &poppler::Document,
+    uri: &str,
     scale: f64,
     device_scale_factor: f64,
     page_num: i32,
@@ -1039,7 +1056,8 @@ fn request_render(
     };
 
     let start = std::time::Instant::now();
-    let surface = render_surface(&page, scale, device_scale_factor);
+    let surface = crate::image_page::render_image_page(uri, &page, scale, device_scale_factor)
+        .unwrap_or_else(|| render_surface(&page, scale, device_scale_factor));
     let (width, height, stride) = (surface.width(), surface.height(), surface.stride());
     let render_ms = start.elapsed().as_millis();
     log::debug!(
