@@ -9,12 +9,15 @@ use std::sync::{Arc, Mutex};
 
 use gtk::cairo::{Context, Format, ImageSurface};
 use gtk::prelude::FileExt;
+use lopdf::content::{Content, Operation};
 use once_cell::sync::Lazy;
 
-// Content byte range of one page's JPEG stream in the file.
+// One qualifying page: its JPEG's byte range plus the image placement rect (x, y, w, h) in
+// top-left page-point space, taken from the page's content-stream matrix.
 struct ImageEntry {
     content_start: u64,
     length: usize,
+    place: (f64, f64, f64, f64),
 }
 
 // Per-document map of qualifying image-only pages (0-based index). Small and immutable once built,
@@ -41,7 +44,6 @@ pub fn render_image_page(
 ) -> Option<ImageSurface> {
     let index = index_for(uri)?;
     let entry = index.pages.get(&page.index())?;
-    let area = single_image_area(page)?;
 
     let jpeg = read_bytes(&index.path, entry)?;
     if jpeg.get(..2) != Some(&[0xFF, 0xD8]) {
@@ -49,23 +51,30 @@ pub fn render_image_page(
     }
 
     let (page_w, page_h) = page.size();
-    let (aw, ah) = (area.2 - area.0, area.3 - area.1);
-    let target_w = (aw * scale * dsf).round().max(1.0) as u16;
-    let target_h = (ah * scale * dsf).round().max(1.0) as u16;
+    let place = flip_y(page_h, entry.place);
+    let target_w = (place.2 * scale * dsf).round().max(1.0) as u16;
+    let target_h = (place.3 * scale * dsf).round().max(1.0) as u16;
     let img = decode(&jpeg, target_w, target_h)?;
 
-    // Aspect transposed vs placement => page rotation we don't apply; fall back.
-    if transposed(aw, ah, img.width as f64, img.height as f64) {
-        return None;
-    }
+    Some(compose(page_w, page_h, place, &img, scale, dsf))
+}
 
-    Some(compose(page_w, page_h, area, &img, scale, dsf))
+// Convert a placement rect from PDF's bottom-left origin to the top-left render space.
+fn flip_y(page_h: f64, place: (f64, f64, f64, f64)) -> (f64, f64, f64, f64) {
+    let (x, y_bottom, w, h) = place;
+    (x, page_h - y_bottom - h, w, h)
 }
 
 // Start building the index for `uri` (once) so it is ready before rendering saturates the CPU.
 // Fire-and-forget.
 pub fn prewarm(uri: &str) {
     let _ = index_for(uri);
+}
+
+// Drop any cached index for `uri`, so a reopen after the file changed rebuilds against the new
+// bytes (offsets are absolute) and a prior indexing failure is retried.
+pub fn invalidate(uri: &str) {
+    INDICES.lock().unwrap().remove(uri);
 }
 
 // Lazily build the index once per uri on a background thread. Returns None while building or if the
@@ -107,8 +116,9 @@ fn build_index(uri: &str) -> Option<ImageIndex> {
     Some(ImageIndex { path, pages })
 }
 
-// A page qualifies if it is upright and its only XObject is a lone DCTDecode image with no mask, no
-// /Decode and a non-indexed colorspace.
+// A page qualifies only if it is upright, unannotated, and its content stream paints nothing but a
+// single lone DCTDecode image (no text/vector/overlay) with a handled colorspace, no mask and no
+// /Decode. Anything else falls back to poppler, so accepted pages match poppler's output.
 fn page_entry(
     doc: &lopdf::Document,
     pid: lopdf::ObjectId,
@@ -124,16 +134,21 @@ fn page_entry(
     {
         return None;
     }
+    // Any annotation (stamp, signature, widget, ...) is painted by poppler but not by us.
+    if doc.get_page_annotations(pid).is_ok_and(|a| !a.is_empty()) {
+        return None;
+    }
 
     let resources = deref_dict(doc, page.get(b"Resources").ok()?)?;
     let xobjects = deref_dict(doc, resources.get(b"XObject").ok()?)?;
 
-    let mut images = xobjects.iter().filter_map(|(_, oref)| {
+    let mut images = xobjects.iter().filter_map(|(name, oref)| {
         let (_, obj) = doc.dereference(oref).ok()?;
         let stream = obj.as_stream().ok()?;
-        (stream.dict.get(b"Subtype").ok()?.as_name().ok()? == b"Image").then_some((oref, stream))
+        (stream.dict.get(b"Subtype").ok()?.as_name().ok()? == b"Image")
+            .then(|| (name.clone(), stream))
     });
-    let (oref, stream) = images.next()?;
+    let (name, stream) = images.next()?;
     if images.next().is_some() {
         return None; // more than one image on the page
     }
@@ -143,14 +158,16 @@ fn page_entry(
         || dict.get(b"SMask").is_ok()
         || dict.get(b"Mask").is_ok()
         || dict.get(b"Decode").is_ok()
+        || !colorspace_supported(doc, dict)
     {
         return None;
     }
-    if colorspace_is_indexed(doc, dict) {
-        return None;
-    }
 
-    let id = oref.as_reference().ok()?;
+    // Content stream must draw only this image, and give its placement (upright, unrotated).
+    let content = Content::decode(&doc.get_page_content(pid).ok()?).ok()?;
+    let place = image_placement(&content.operations, &name)?;
+
+    let id = deref_ref(&xobjects, &name)?;
     let offset = match doc.reference_table.get(id.0)? {
         lopdf::xref::XrefEntry::Normal { offset, .. } => *offset as u64,
         _ => return None,
@@ -159,7 +176,22 @@ fn page_entry(
     Some(ImageEntry {
         content_start,
         length: stream.content.len(),
+        place,
     })
+}
+
+// Object id the XObject `name` references.
+fn deref_ref(xobjects: &lopdf::Dictionary, name: &[u8]) -> Option<lopdf::ObjectId> {
+    xobjects.get(name).ok()?.as_reference().ok()
+}
+
+// Numeric value of an Integer or Real object.
+fn num(obj: &lopdf::Object) -> Option<f64> {
+    match obj {
+        lopdf::Object::Integer(i) => Some(*i as f64),
+        lopdf::Object::Real(r) => Some(f64::from(*r)),
+        _ => None,
+    }
 }
 
 // Resolve an object (following one reference) to an owned dictionary.
@@ -177,20 +209,93 @@ fn filter_is_dct(dict: &lopdf::Dictionary) -> bool {
     }
 }
 
-fn colorspace_is_indexed(doc: &lopdf::Document, dict: &lopdf::Dictionary) -> bool {
+// Only colorspaces our JPEG decode reproduces faithfully. Device/Cal/ICCBased map straight onto the
+// JPEG's own gray/RGB/CMYK components; Indexed, Separation, DeviceN, Lab need PDF-side handling we
+// don't do, so those fall back to poppler. Absent (some DCT images omit it) is fine - trust the JPEG.
+fn colorspace_supported(doc: &lopdf::Document, dict: &lopdf::Dictionary) -> bool {
     let Ok(cs) = dict.get(b"ColorSpace") else {
-        return false;
+        return true;
     };
     let Ok((_, cs)) = doc.dereference(cs) else {
         return false;
     };
-    match cs {
-        lopdf::Object::Name(n) => n == b"Indexed" || n == b"I",
-        lopdf::Object::Array(a) => {
-            matches!(a.first(), Some(lopdf::Object::Name(n)) if n == b"Indexed" || n == b"I")
+    let name = match cs {
+        lopdf::Object::Name(n) => n.clone(),
+        lopdf::Object::Array(a) => match a.first() {
+            Some(lopdf::Object::Name(n)) => n.clone(),
+            _ => return false,
+        },
+        _ => return false,
+    };
+    matches!(
+        name.as_slice(),
+        b"DeviceGray"
+            | b"DeviceRGB"
+            | b"DeviceCMYK"
+            | b"CalGray"
+            | b"CalRGB"
+            | b"ICCBased"
+            | b"G"
+            | b"RGB"
+            | b"CMYK"
+    )
+}
+
+// Placement (x, y_bottom, w, h) in PDF bottom-left page-point space for an image drawn by exactly
+// one `Do`, or None unless the content stream draws only that image, upright and unrotated (no
+// text, vector marks, shading, inline images or other XObjects).
+fn image_placement(ops: &[Operation], image: &[u8]) -> Option<(f64, f64, f64, f64)> {
+    let mut stack: Vec<[f64; 6]> = Vec::new();
+    let mut ctm = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+    let mut placed: Option<[f64; 6]> = None;
+
+    for op in ops {
+        match op.operator.as_str() {
+            "q" => stack.push(ctm),
+            "Q" => ctm = stack.pop().unwrap_or([1.0, 0.0, 0.0, 1.0, 0.0, 0.0]),
+            "cm" => ctm = concat(matrix(&op.operands)?, ctm),
+            "Do" => {
+                if placed.is_some() || op.operands.first()?.as_name().ok()? != image {
+                    return None; // second Do, or a different (form) XObject
+                }
+                placed = Some(ctm);
+            }
+            // Any operator that puts marks on the page other than our image disqualifies it.
+            "Tj" | "TJ" | "'" | "\"" | "BT" | "S" | "s" | "f" | "F" | "f*" | "B" | "B*" | "b"
+            | "b*" | "sh" | "BI" => return None,
+            _ => {}
         }
-        _ => false,
     }
+
+    let m = placed?;
+    if m[1].abs() > 0.01 || m[2].abs() > 0.01 || m[0] <= 0.0 || m[3] <= 0.0 {
+        return None; // rotated, skewed, or flipped placement
+    }
+    Some((m[4], m[5], m[0], m[3])) // e, f, w, h
+}
+
+// 2x3 affine [a b c d e f] from the operands of a `cm`.
+fn matrix(ops: &[lopdf::Object]) -> Option<[f64; 6]> {
+    let mut m = [0.0; 6];
+    if ops.len() != 6 {
+        return None;
+    }
+    for (i, o) in ops.iter().enumerate() {
+        m[i] = num(o)?;
+    }
+    Some(m)
+}
+
+// PDF matrix concatenation: `a` applied first, then `b` (CTM' = a x b).
+fn concat(a: [f64; 6], b: [f64; 6]) -> [f64; 6] {
+    [
+        a[0] * b[0] + a[1] * b[2],
+        a[0] * b[1] + a[1] * b[3],
+        a[2] * b[0] + a[3] * b[2],
+        a[2] * b[1] + a[3] * b[3],
+        a[4] * b[0] + a[5] * b[2] + b[4],
+        a[4] * b[1] + a[5] * b[3] + b[5],
+    ]
 }
 
 // Byte offset of a stream's content: scan from the object start for the `stream` keyword and skip
@@ -267,17 +372,12 @@ fn cmyk_to_rgb(cmyk: &[u8]) -> Vec<u8> {
     out
 }
 
-// True when one of the rectangles is landscape and the other portrait.
-fn transposed(aw: f64, ah: f64, iw: f64, ih: f64) -> bool {
-    (aw >= ah) != (iw >= ih)
-}
-
-// Paint the decoded image onto a full-page canvas surface, matching render_surface's dimensions and
-// coordinate space.
+// Paint the decoded image into its placement rect on a full-page canvas surface, matching
+// render_surface's dimensions and coordinate space. `place` is (x, y, w, h) in top-left points.
 fn compose(
     page_w: f64,
     page_h: f64,
-    area: (f64, f64, f64, f64),
+    place: (f64, f64, f64, f64),
     img: &Decoded,
     scale: f64,
     dsf: f64,
@@ -294,11 +394,8 @@ fn compose(
     cr.fill().expect("fill");
 
     let src = source_surface(img);
-    cr.translate(area.0, area.1);
-    cr.scale(
-        (area.2 - area.0) / img.width as f64,
-        (area.3 - area.1) / img.height as f64,
-    );
+    cr.translate(place.0, place.1);
+    cr.scale(place.2 / img.width as f64, place.3 / img.height as f64);
     cr.set_source_surface(&src, 0.0, 0.0).expect("source");
     cr.paint().expect("paint");
     cr.set_source_rgb(0.0, 0.0, 0.0);
@@ -324,18 +421,6 @@ fn source_surface(img: &Decoded) -> ImageSurface {
         }
     }
     ImageSurface::create_for_data(data, Format::Rgb24, w, h, stride).expect("src surface")
-}
-
-// The page's single image placement rect (x1,y1,x2,y2) in page points, or None unless poppler sees
-// exactly one image (matches the index's single-image rule).
-fn single_image_area(page: &poppler::Page) -> Option<(f64, f64, f64, f64)> {
-    let mappings = page.image_mapping();
-    if mappings.len() != 1 {
-        return None;
-    }
-    let raw = mappings[0].as_ptr();
-    let area = unsafe { (*raw).area };
-    Some((area.x1, area.y1, area.x2, area.y2))
 }
 
 #[cfg(test)]
@@ -392,6 +477,86 @@ mod tests {
             assert!(render_image_page(&uri, &page, 1.0, 1.0).is_none());
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+    }
+
+    fn op(operator: &str, operands: Vec<lopdf::Object>) -> Operation {
+        Operation {
+            operator: operator.into(),
+            operands,
+        }
+    }
+
+    fn cm(a: f64, b: f64, c: f64, d: f64, e: f64, f: f64) -> Operation {
+        op(
+            "cm",
+            vec![a.into(), b.into(), c.into(), d.into(), e.into(), f.into()],
+        )
+    }
+
+    fn do_(name: &str) -> Operation {
+        op("Do", vec![lopdf::Object::Name(name.into())])
+    }
+
+    #[test]
+    fn placement_full_page_image() {
+        let ops = [
+            op("q", vec![]),
+            cm(48.0, 0.0, 0.0, 36.0, 0.0, 0.0),
+            do_("Im0"),
+            op("Q", vec![]),
+        ];
+        assert_eq!(image_placement(&ops, b"Im0"), Some((0.0, 0.0, 48.0, 36.0)));
+    }
+
+    #[test]
+    fn placement_partial_image() {
+        let ops = [cm(10.0, 0.0, 0.0, 20.0, 5.0, 6.0), do_("Im0")];
+        assert_eq!(image_placement(&ops, b"Im0"), Some((5.0, 6.0, 10.0, 20.0)));
+    }
+
+    #[test]
+    fn flip_y_maps_pdf_bottom_left_to_top_left() {
+        // image 10x20 at PDF (5,6) on a 36-tall page => top-left y = 36 - 6 - 20 = 10.
+        assert_eq!(
+            flip_y(36.0, (5.0, 6.0, 10.0, 20.0)),
+            (5.0, 10.0, 10.0, 20.0)
+        );
+        // a full-page image is flip-invariant.
+        assert_eq!(flip_y(36.0, (0.0, 0.0, 48.0, 36.0)), (0.0, 0.0, 48.0, 36.0));
+    }
+
+    #[test]
+    fn placement_rejects_text_vector_and_extra_draws() {
+        let base = cm(48.0, 0.0, 0.0, 36.0, 0.0, 0.0);
+        // visible text
+        assert!(image_placement(&[base.clone(), op("BT", vec![]), do_("Im0")], b"Im0").is_none());
+        // a filled path
+        assert!(image_placement(&[base.clone(), op("f", vec![]), do_("Im0")], b"Im0").is_none());
+        // a second image draw
+        assert!(image_placement(&[base.clone(), do_("Im0"), do_("Im0")], b"Im0").is_none());
+        // draw of a different XObject (e.g. a form)
+        assert!(image_placement(&[base.clone(), do_("Fm0")], b"Im0").is_none());
+        // rotated placement
+        assert!(
+            image_placement(&[cm(0.0, 48.0, -36.0, 0.0, 0.0, 0.0), do_("Im0")], b"Im0").is_none()
+        );
+    }
+
+    #[test]
+    fn colorspace_whitelist() {
+        let sup = |cs: lopdf::Object| {
+            let mut d = lopdf::Dictionary::new();
+            d.set("ColorSpace", cs);
+            colorspace_supported(&lopdf::Document::new(), &d)
+        };
+        assert!(sup(lopdf::Object::Name(b"DeviceRGB".to_vec())));
+        assert!(sup(lopdf::Object::Array(vec![lopdf::Object::Name(
+            b"ICCBased".to_vec()
+        )])));
+        assert!(!sup(lopdf::Object::Name(b"Separation".to_vec())));
+        assert!(!sup(lopdf::Object::Array(vec![lopdf::Object::Name(
+            b"Indexed".to_vec()
+        )])));
     }
 
     // Fast-path vs poppler on a real scan. Ignored (needs a file):
