@@ -74,6 +74,7 @@ impl State {
         self.imp().jump_stack.borrow_mut().reset();
         self.set_prev_page(0);
         self.set_uri(uri);
+        crate::image_page::prewarm(&self.uri());
         self.set_doc(doc);
         self.set_zoom(1.0);
         self.set_crop(false);

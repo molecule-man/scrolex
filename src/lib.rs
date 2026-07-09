@@ -1,5 +1,6 @@
 pub mod bg_job;
 pub mod config;
+pub mod image_page;
 pub mod jump_stack;
 pub mod links;
 pub mod page;
