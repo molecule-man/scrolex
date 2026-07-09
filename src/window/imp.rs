@@ -39,8 +39,8 @@ const SCROLL_ANIM_MIN_STEP: f64 = 1.5;
 // physical notch).
 const WHEEL_NOTCH: f64 = 1.0;
 const WHEEL_TRIGGER: f64 = 0.2;
+// Touchpad pixels per notch, used to scale a pinch's pixel travel onto the wheel's zoom rate.
 const TOUCHPAD_NOTCH: f64 = 40.0;
-const TOUCHPAD_TRIGGER: f64 = 8.0;
 
 // Multiplicative zoom step per notch.
 const ZOOM_STEP: f64 = 1.1;
@@ -152,11 +152,6 @@ pub struct Window {
     // the previous wheel delta, to detect a direction reversal and reset the accumulator so
     // reversing doesn't over-step
     wheel_last_dy: Cell<f64>,
-
-    // same accumulation as the wheel, but for vertical touchpad scroll (kept separate because its
-    // travel is measured in pixels, not notch clicks)
-    touch_accum: Cell<f64>,
-    touch_last_dy: Cell<f64>,
 
     // zoom captured when a pinch gesture begins; scale-changed reports scale relative to that start,
     // so the live zoom is base * scale
@@ -296,29 +291,21 @@ impl Window {
                 self.wheel_last_dy.set(dy);
                 self.step_page(step);
             }
-            // Touchpad (and any other pixel-precise device): a horizontal swipe scrolls the page
-            // flow smoothly (like dragging); a vertical swipe steps pages, one per notch of travel.
+            // Touchpad (and any other pixel-precise device): a horizontal swipe pans the page flow;
+            // a vertical swipe pans a zoomed-in page along the axis the outer scroller owns.
             _ => {
-                // Apply the touchpad's horizontal delta to the scroll position, but only when no
-                // page slide is running. During a slide `scroll_tick` owns the adjustment; adding dx
-                // here (from a scroll event that arrives mid-slide) would fight its writes frame by
-                // frame. Vertical page-stepping below runs either way, so flicking through pages
-                // during a slide still works.
+                // Apply the horizontal delta to the scroll position, but only when no page slide is
+                // running. During a slide `scroll_tick` owns the adjustment; adding dx here (from a
+                // scroll event that arrives mid-slide) would fight its writes frame by frame.
                 if self.scroll_anim.borrow().is_none() {
                     let hadj = self.scrolledwindow.hadjustment();
                     hadj.set_value(self.clamp_scroll(hadj.value() + dx));
                 }
 
-                let (accum, step) = accumulate_step(
-                    self.touch_accum.get(),
-                    self.touch_last_dy.get(),
-                    dy,
-                    TOUCHPAD_NOTCH,
-                    TOUCHPAD_TRIGGER,
-                );
-                self.touch_accum.set(accum);
-                self.touch_last_dy.set(dy);
-                self.step_page(step);
+                // Vertical pan is independent of the horizontal slide, so it always applies. The
+                // adjustment clamps to its range, so this is a no-op when the page fits the viewport.
+                let vadj = self.vscrolledwindow.vadjustment();
+                vadj.set_value(vadj.value() + dy);
             }
         }
 
@@ -987,8 +974,6 @@ impl Window {
                     // Clear accumulators so the next gesture starts fresh in either direction.
                     imp.wheel_accum.set(0.0);
                     imp.wheel_last_dy.set(0.0);
-                    imp.touch_accum.set(0.0);
-                    imp.touch_last_dy.set(0.0);
                     imp.refresh_visible_renders();
                 }
             ),
@@ -1594,10 +1579,7 @@ fn descendant_page(widget: &gtk::Widget) -> Option<page::Page> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        accumulate_step, glide_step, SCROLL_ANIM_MAX_US, TOUCHPAD_NOTCH, TOUCHPAD_TRIGGER,
-        WHEEL_NOTCH, WHEEL_TRIGGER,
-    };
+    use super::{accumulate_step, glide_step, SCROLL_ANIM_MAX_US, WHEEL_NOTCH, WHEEL_TRIGGER};
 
     // Drive the glide toward a fixed target at a steady frame rate; return frames until it settles.
     fn glide_frames(mut value: f64, target: f64, dt_us: i64) -> usize {
@@ -1799,21 +1781,5 @@ mod tests {
             .map(|(i, _)| i)
             .collect();
         assert_eq!(fired, vec![0, 4, 8, 12]);
-    }
-
-    #[test]
-    fn touchpad_scale_first_page_fires_before_a_full_notch() {
-        // One trigger's worth of travel (well under a notch) still turns a page.
-        let steps = run_scaled(&[TOUCHPAD_TRIGGER], TOUCHPAD_NOTCH, TOUCHPAD_TRIGGER);
-        assert_eq!(steps, vec![1]);
-    }
-
-    #[test]
-    fn touchpad_full_swipe_steps_about_fifteen_pages() {
-        let deltas = vec![12.0; 44];
-        let steps: i32 = run_scaled(&deltas, TOUCHPAD_NOTCH, TOUCHPAD_TRIGGER)
-            .iter()
-            .sum();
-        assert_eq!(steps, 14);
     }
 }
