@@ -77,6 +77,17 @@ fn prefetch_depth(threads: usize, visible: usize, capacity: usize) -> usize {
     }
 }
 
+// Preview prefetch half-width, bounded so both directions fit the preview cache - else big-page docs
+// schedule previews that evict each other, thrashing the cache and render pool. Full window until
+// the cache has sized its first preview (`capacity` 0).
+fn preview_window(capacity: usize) -> i32 {
+    if capacity == 0 {
+        PREVIEW_WINDOW
+    } else {
+        (capacity as i32 / 2).clamp(1, PREVIEW_WINDOW)
+    }
+}
+
 #[derive(Default, glib::Properties)]
 #[properties(wrapper_type = super::Page)]
 pub struct Page {
@@ -797,7 +808,7 @@ impl Page {
         });
     }
 
-    // Prefetch low-res previews over a wide symmetric window (they're cheap and tiny), so scrolling
+    // Prefetch low-res previews over a symmetric window (they're cheap and tiny), so scrolling
     // either way shows blurry pages instead of blank ones.
     fn prefetch_previews(&self, current: i32) {
         let obj = self.obj();
@@ -808,12 +819,13 @@ impl Page {
             return;
         };
         let n_pages = doc.n_pages();
+        let window = preview_window(obj.state().preview_cache().borrow().page_capacity());
 
         // Walk outward from the visible page, interleaving both directions, and push so the nearest
         // pages end up on top of the LIFO queue (rendered first). Pages already cached - typically
         // the side scrolled from - are skipped, so effort tracks the direction of travel.
-        let mut candidates = Vec::with_capacity(2 * PREVIEW_WINDOW as usize);
-        for d in (1..=PREVIEW_WINDOW).rev() {
+        let mut candidates = Vec::with_capacity(2 * window as usize);
+        for d in (1..=window).rev() {
             candidates.push(current + d);
             candidates.push(current - d);
         }
@@ -1208,6 +1220,15 @@ mod tests {
         assert_eq!(prefetch_depth(11, 3, 0), 8); // capacity unknown: thread-bound
         assert_eq!(prefetch_depth(11, 7, 8), 0); // no room left: don't evict visible pages
         assert_eq!(prefetch_depth(2, 3, 8), 0); // more visible than threads
+    }
+
+    #[test]
+    fn preview_window_fits_cache() {
+        // both directions must fit: 2 * window <= capacity, so no scheduled preview evicts another
+        assert_eq!(preview_window(0), PREVIEW_WINDOW); // unknown size: full window
+        assert_eq!(preview_window(43), 21); // big pages: clamp to capacity/2 (no thrash)
+        assert_eq!(preview_window(1), 1); // room for almost nothing, still make progress
+        assert_eq!(preview_window(1000), PREVIEW_WINDOW); // tiny pages: capped at full window
     }
 
     const EPSILON: f64 = 0.0001;
