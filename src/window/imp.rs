@@ -45,6 +45,10 @@ const TOUCHPAD_TRIGGER: f64 = 8.0;
 // Multiplicative zoom step per notch.
 const ZOOM_STEP: f64 = 1.1;
 
+// GtkListItem theme padding around each page (px); the visible inter-page gap.
+// TODO: un-hardcode by measuring row_width - page.width().
+const ITEM_PADDING_PX: f64 = 4.0;
+
 // Quiet period after the last scroll motion before the view is treated as settled and its pages are
 // full-rendered. Long enough that a continuous scroll doesn't repeatedly arm it, short enough that
 // stopping feels immediate.
@@ -94,11 +98,15 @@ pub struct Window {
     #[template_child]
     pub btn_crop: TemplateChild<ToggleButton>,
     #[template_child]
+    pub btn_fit: TemplateChild<ToggleButton>,
+    #[template_child]
     pub btn_animate_scroll: TemplateChild<ToggleButton>,
     #[template_child]
     pub spin_threads: TemplateChild<gtk::SpinButton>,
     #[template_child]
     pub btn_jump_back: TemplateChild<Button>,
+    #[template_child]
+    pub content_box: TemplateChild<gtk::Box>,
     #[template_child]
     pub scrolledwindow: TemplateChild<ScrolledWindow>,
     #[template_child]
@@ -161,6 +169,13 @@ pub struct Window {
     // true while a touchpad pinch is in progress; gates off the two-finger scroll events the touchpad
     // still emits during a pinch
     zoom_gesturing: Cell<bool>,
+
+    // pages fit across the viewport in fit-width mode
+    fit_pages: Cell<i32>,
+    // fit deferred because the viewport wasn't realised yet
+    fit_pending: Cell<bool>,
+    // tallest effective page height (points); caps the fit zoom so pages fit vertically
+    slot_height: Cell<f64>,
 }
 
 // The central trait for subclassing a GObject
@@ -200,6 +215,7 @@ impl ObjectImpl for Window {
         self.setup_thread_setting();
         self.setup_search();
         self.setup_toc();
+        self.setup_fit();
 
         // Give keyboard focus to the scroll area rather than the header entry
         self.scrolledwindow.set_focusable(true);
@@ -267,8 +283,7 @@ impl Window {
                     _ => dy / TOUCHPAD_NOTCH,
                 };
                 self.note_scroll_activity();
-                self.state
-                    .set_zoom(self.state.zoom() * ZOOM_STEP.powf(-notches));
+                self.set_zoom_manual(self.state.zoom() * ZOOM_STEP.powf(-notches));
             }
             return glib::Propagation::Stop;
         }
@@ -372,12 +387,172 @@ impl Window {
 
     #[template_callback]
     fn zoom_out(&self) {
-        self.state.set_zoom(self.state.zoom() / ZOOM_STEP);
+        if self.state.fit_width() {
+            self.fit_pages_delta(1);
+        } else {
+            self.set_zoom_manual(self.state.zoom() / ZOOM_STEP);
+        }
     }
 
     #[template_callback]
     fn zoom_in(&self) {
-        self.state.set_zoom(self.state.zoom() * ZOOM_STEP);
+        if self.state.fit_width() {
+            self.fit_pages_delta(-1);
+        } else {
+            self.set_zoom_manual(self.state.zoom() * ZOOM_STEP);
+        }
+    }
+
+    fn setup_fit(&self) {
+        self.state.connect_notify_local(
+            Some("fit-width"),
+            clone!(
+                #[weak(rename_to = imp)]
+                self,
+                move |state, _| {
+                    log::debug!("fit-width toggled: {}", state.fit_width());
+                    if state.fit_width() {
+                        imp.compute_slot();
+                        imp.apply_fit(true);
+                        // align the current view once the new zoom has been laid out
+                        glib::idle_add_local_once(clone!(
+                            #[weak]
+                            imp,
+                            move || imp.snap_to_page_grid()
+                        ));
+                    } else {
+                        imp.refresh_visible_renders();
+                    }
+                }
+            ),
+        );
+
+        self.state.connect_notify_local(
+            Some("crop"),
+            clone!(
+                #[weak(rename_to = imp)]
+                self,
+                move |state, _| {
+                    if state.fit_width() {
+                        imp.compute_slot();
+                        imp.apply_fit(false);
+                    }
+                }
+            ),
+        );
+
+        self.scrolledwindow.hadjustment().connect_notify_local(
+            Some("page-size"),
+            clone!(
+                #[weak(rename_to = imp)]
+                self,
+                move |_, _| {
+                    if imp.state.fit_width() || imp.fit_pending.get() {
+                        imp.fit_pending.set(false);
+                        imp.apply_fit(false);
+                    }
+                }
+            ),
+        );
+    }
+
+    // Manual zoom cancels fit-width mode; the fit feature calls state.set_zoom directly.
+    fn set_zoom_manual(&self, zoom: f64) {
+        self.state.set_fit_width(false);
+        self.state.set_zoom(zoom);
+    }
+
+    fn fit_pages_delta(&self, d: i32) {
+        self.fit_pages.set((self.fit_pages.get() + d).max(1));
+        self.apply_fit(false);
+    }
+
+    // Per-page stride (px) in fit-width mode: slot plus inter-page gap. None when not fitting.
+    fn fit_stride(&self) -> Option<f64> {
+        if !self.state.fit_width() {
+            return None;
+        }
+        let s = self.state.slot_width() * self.state.zoom() + ITEM_PADDING_PX;
+        (s > 0.0).then_some(s)
+    }
+
+    // Snap the scroll position onto the uniform page grid so pages rest whole.
+    fn snap_to_page_grid(&self) {
+        if self.scroll_anim.borrow().is_some() {
+            return;
+        }
+        let Some(s) = self.fit_stride() else {
+            return;
+        };
+        let hadj = self.scrolledwindow.hadjustment();
+        let snapped = self.clamp_scroll(snap_pos(hadj.value(), hadj.lower(), s));
+        log::debug!("snap_to_page_grid: {:.1} -> {snapped:.1}", hadj.value());
+        hadj.set_value(snapped);
+    }
+
+    // Widest and tallest effective page (points) across the document: the uniform slot and the
+    // height cap.
+    fn compute_slot(&self) {
+        let Some(doc) = self.state.doc() else {
+            return;
+        };
+        let crop = self.state.crop();
+        let (mut slot_w, mut slot_h) = (0.0_f64, 0.0_f64);
+        for i in 0..doc.n_pages() {
+            let Some(page) = doc.page(i) else { continue };
+            let (w, h) = if crop {
+                let cache = self.state.bbox_cache();
+                let mut cache = cache.borrow_mut();
+                let r = cache
+                    .entry(i)
+                    .or_insert_with(|| crate::page::get_bbox(&page, true));
+                (r.x2 - r.x1, r.y2 - r.y1)
+            } else {
+                page.size()
+            };
+            slot_w = slot_w.max(w);
+            slot_h = slot_h.max(h);
+        }
+        log::debug!("compute_slot: crop={crop} slot={slot_w:.1}x{slot_h:.1}pt");
+        self.state.set_slot_width(slot_w);
+        self.slot_height.set(slot_h);
+    }
+
+    // Zoom so N pages span the viewport width, capped so the tallest page still fits its height (no
+    // vertical scroll exists to reach an overflowing page). recompute_n picks N as the closest
+    // integer to the current fit.
+    fn apply_fit(&self, recompute_n: bool) {
+        let vw = f64::from(self.scrolledwindow.width());
+        if vw <= 0.0 {
+            log::debug!("apply_fit deferred: viewport width 0");
+            self.fit_pending.set(true);
+            return;
+        }
+        let s = self.state.slot_width();
+        if s <= 0.0 {
+            log::debug!("apply_fit skipped: slot_width 0");
+            return;
+        }
+        let p = ITEM_PADDING_PX;
+        // fit_pages == 0 means none established yet (initial fit deferred until the viewport had width)
+        let n = if recompute_n || self.fit_pages.get() == 0 {
+            ((vw / (s * self.state.zoom() + p)).round() as i32).max(1)
+        } else {
+            self.fit_pages.get()
+        };
+        self.fit_pages.set(n);
+        let mut zoom = fit_zoom(vw, s, n, p);
+        // The horizontal scrolled window sizes to the page row, not the window, so its own height
+        // isn't the available space. Take the content box minus the search bar instead.
+        let vh = f64::from(self.content_box.height() - self.search_bar.height());
+        let sh = self.slot_height.get();
+        if sh > 0.0 && vh > 0.0 {
+            zoom = zoom.min(vh / sh);
+        }
+        log::debug!("apply_fit: vw={vw:.0} vh={vh:.0} slot={s:.1}x{sh:.1} n={n} zoom={zoom:.3}");
+        if zoom > 0.0 {
+            self.state.set_zoom(zoom);
+        }
     }
 
     #[template_callback]
@@ -399,7 +574,7 @@ impl Window {
         // A pinch rescales the cheap previews live; defer the slow full re-renders until the gesture
         // settles, the same way scrolling does.
         self.note_scroll_activity();
-        self.state.set_zoom(self.zoom_gesture_base.get() * scale);
+        self.set_zoom_manual(self.zoom_gesture_base.get() * scale);
     }
 
     #[template_callback]
@@ -421,6 +596,9 @@ impl Window {
             }
             Key::f => {
                 self.open_search();
+            }
+            Key::w => {
+                self.state.set_fit_width(!self.state.fit_width());
             }
             Key::l | Key::Page_Down => {
                 self.next_page();
@@ -508,7 +686,7 @@ impl Window {
             return;
         }
 
-        self.state.set_zoom(zoom / 100.0);
+        self.set_zoom_manual(zoom / 100.0);
     }
 
     fn goto_page(&self, page_num: u32) {
@@ -539,8 +717,8 @@ impl Window {
         self.state.set_scroll_forward(false);
 
         // where the page we're leaving sits now; the newly selected page slides
-        // to this same spot
-        let anchor = self.selected_page_left_x();
+        // to this same spot (grid-aligned in fit mode so pages rest whole)
+        let anchor = self.step_anchor();
 
         // normally I'd use list_view.scroll_to() here, but it doesn't scroll if the item
         // is already visible :(
@@ -551,7 +729,7 @@ impl Window {
                 .and_downcast::<page::PageNumber>()
                 .unwrap()
                 .width(),
-        ) + 4.0; // 4px is padding of list item widget. TODO: figure out how to un-hardcode this
+        ) + ITEM_PADDING_PX;
 
         self.animate_scroll(anchor, -width);
     }
@@ -564,7 +742,8 @@ impl Window {
         self.state.set_scroll_forward(true);
 
         // where the page we're leaving sits now; the newly selected page slides to this same spot
-        let anchor = self.selected_page_left_x();
+        // (grid-aligned in fit mode so pages rest whole)
+        let anchor = self.step_anchor();
 
         // normally I'd use list_view.scroll_to() here, but it doesn't scroll if the item
         // is already visible :(
@@ -574,7 +753,7 @@ impl Window {
                 .and_downcast::<page::PageNumber>()
                 .unwrap()
                 .width(),
-        ) + 4.0; // 4px is padding of list item widget. TODO: figure out how to un-hardcode this
+        ) + ITEM_PADDING_PX;
 
         selection.select_item(
             (selection.selected() + 1).min(selection.n_items() - 1),
@@ -683,6 +862,8 @@ impl Window {
                 target - next,
                 self.selected_page_left_x(),
             );
+            // a force-settled glide can land off-grid; realign so pages rest whole
+            self.snap_to_page_grid();
             return glib::ControlFlow::Break;
         }
 
@@ -727,6 +908,16 @@ impl Window {
             child = c.next_sibling();
         }
         None
+    }
+
+    // Resting x for a page step. In fit mode the selected page's current left edge is snapped to the
+    // nearest grid slot, so a burst of steps can't accumulate an off-grid offset.
+    fn step_anchor(&self) -> Option<f64> {
+        let left_x = self.selected_page_left_x();
+        match (self.fit_stride(), left_x) {
+            (Some(s), Some(x)) => Some((x / s).round() * s),
+            _ => left_x,
+        }
     }
 
     fn ensure_ready_selection(&self) -> Option<&gtk::SingleSelection> {
@@ -910,6 +1101,11 @@ impl Window {
 
         // move keyboard focus off the header entry so h/l/arrows work
         self.scrolledwindow.grab_focus();
+
+        if state.fit_width() {
+            self.compute_slot();
+            self.apply_fit(true);
+        }
     }
 
     // Track the page at the centre of the viewport as the user scrolls (by touchpad, scrollbar or
@@ -959,6 +1155,7 @@ impl Window {
                     imp.wheel_last_dy.set(0.0);
                     imp.touch_accum.set(0.0);
                     imp.touch_last_dy.set(0.0);
+                    imp.snap_to_page_grid();
                     imp.refresh_visible_renders();
                 }
             ),
@@ -1547,6 +1744,16 @@ fn glide_step(value: f64, target: f64, dt_us: i64, elapsed_us: i64, dir: f64) ->
     (next, settled)
 }
 
+// Zoom that fits n uniform slots (width s points, gap p px each) across a vw-px viewport.
+fn fit_zoom(vw: f64, s: f64, n: i32, p: f64) -> f64 {
+    (vw / n as f64 - p) / s
+}
+
+// Nearest grid position (stride s) to value, offset from lower.
+fn snap_pos(value: f64, lower: f64, s: f64) -> f64 {
+    lower + ((value - lower) / s).round() * s
+}
+
 // Find the Page widget within a list item's widget subtree.
 fn descendant_page(widget: &gtk::Widget) -> Option<page::Page> {
     if let Some(page) = widget.downcast_ref::<page::Page>() {
@@ -1565,9 +1772,28 @@ fn descendant_page(widget: &gtk::Widget) -> Option<page::Page> {
 #[cfg(test)]
 mod tests {
     use super::{
-        accumulate_step, glide_step, SCROLL_ANIM_MAX_US, TOUCHPAD_NOTCH, TOUCHPAD_TRIGGER,
-        WHEEL_NOTCH, WHEEL_TRIGGER,
+        accumulate_step, fit_zoom, glide_step, snap_pos, SCROLL_ANIM_MAX_US, TOUCHPAD_NOTCH,
+        TOUCHPAD_TRIGGER, WHEEL_NOTCH, WHEEL_TRIGGER,
     };
+
+    #[test]
+    fn fit_zoom_fills_viewport_with_whole_pages() {
+        // n slots plus their gaps span the viewport exactly
+        let (vw, s, p) = (1000.0, 400.0, 4.0);
+        for n in 1..=4 {
+            let z = fit_zoom(vw, s, n, p);
+            let stride = s * z + p;
+            assert!((stride * n as f64 - vw).abs() < 1e-9, "n={n}");
+        }
+    }
+
+    #[test]
+    fn snap_pos_lands_on_grid() {
+        let (lower, s) = (10.0, 100.0);
+        assert_eq!(snap_pos(10.0, lower, s), 10.0);
+        assert_eq!(snap_pos(155.0, lower, s), 110.0);
+        assert_eq!(snap_pos(165.0, lower, s), 210.0);
+    }
 
     // Drive the glide toward a fixed target at a steady frame rate; return frames until it settles.
     fn glide_frames(mut value: f64, target: f64, dt_us: i64) -> usize {

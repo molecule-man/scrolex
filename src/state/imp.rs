@@ -20,6 +20,13 @@ pub struct State {
     crop: Cell<bool>,
 
     #[property(get, set)]
+    fit_width: Cell<bool>,
+
+    // uniform layout-slot width (points); max effective page width. 0 = unset.
+    #[property(get, set)]
+    slot_width: Cell<f64>,
+
+    #[property(get, set)]
     animate_scroll: Cell<bool>,
 
     #[property(get, set)]
@@ -93,6 +100,8 @@ impl ObjectImpl for State {
         // animated scrolling is on by default; the builder-created instance doesn't run State::new,
         // so set it here
         self.obj().set_animate_scroll(true);
+        self.obj().set_fit_width(false);
+        self.obj().set_slot_width(0.0);
 
         // Previews are tiny; give their cache its own small budget rather than the default
         // (full-render) one. Must live here, not in State::new: the builder-created instance the

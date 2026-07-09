@@ -29,6 +29,8 @@ impl State {
         glib::Object::builder()
             .property("zoom", 1.0)
             .property("crop", false)
+            .property("fit_width", false)
+            .property("slot_width", 0.0)
             .property("animate_scroll", true)
             .property("page", 0_u32)
             .build()
@@ -77,6 +79,8 @@ impl State {
         self.set_doc(doc);
         self.set_zoom(1.0);
         self.set_crop(false);
+        self.set_fit_width(false);
+        self.set_slot_width(0.0);
         self.set_page(0);
         self.set_multithread_rendering(false);
 
@@ -96,6 +100,9 @@ impl State {
                     Some(("crop", value)) => {
                         let crop = value.parse().unwrap_or(false);
                         self.set_crop(crop);
+                    }
+                    Some(("fit_width", value)) => {
+                        self.set_fit_width(value.parse().unwrap_or(false));
                     }
                     _ => {}
                 }
@@ -152,6 +159,7 @@ impl State {
         writeln!(file, "zoom={}", self.zoom())?;
         writeln!(file, "page={}", self.page())?;
         writeln!(file, "crop={}", self.crop())?;
+        writeln!(file, "fit_width={}", self.fit_width())?;
 
         file.flush()
     }

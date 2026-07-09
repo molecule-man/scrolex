@@ -3,6 +3,7 @@ mod page_number_imp;
 
 pub use imp::draw_surface;
 pub use imp::render_surface;
+pub(crate) use imp::get_bbox;
 pub(crate) use imp::set_render_threads;
 pub(crate) use imp::PREVIEW_INITIAL_SCALE;
 
@@ -102,6 +103,14 @@ impl Page {
 
     pub(crate) fn zoom(&self) -> f64 {
         self.state().zoom()
+    }
+
+    pub(crate) fn fit_width(&self) -> bool {
+        self.state().fit_width()
+    }
+
+    pub(crate) fn slot_width(&self) -> f64 {
+        self.state().slot_width()
     }
 
     pub(crate) fn uri(&self) -> String {

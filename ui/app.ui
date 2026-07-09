@@ -144,6 +144,18 @@
 					</object>
 				</child>
 				<child type="end">
+					<object class="GtkToggleButton" id="btn_fit">
+						<property name="active" bind-source="state" bind-property="fit-width" bind-flags="bidirectional"/>
+						<property name="label">Fit Width</property>
+						<property name="tooltip-text">Fit whole pages across the width (w)</property>
+						<property name="cursor">
+							<object class="GdkCursor">
+								<property name="name">pointer</property>
+							</object>
+						</property>
+					</object>
+				</child>
+				<child type="end">
 					<object class="GtkMenuButton" id="btn_menu">
 						<property name="icon-name">open-menu-symbolic</property>
 						<property name="tooltip-text">Settings</property>
@@ -223,7 +235,7 @@
 			</object>
 		</child>
 		<child>
-			<object class="GtkBox">
+			<object class="GtkBox" id="content_box">
 				<property name="orientation">vertical</property>
 				<child>
 					<object class="GtkSearchBar" id="search_bar">

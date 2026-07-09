@@ -159,6 +159,14 @@ impl Page {
                     return;
                 }
 
+                // fill the slot white, then center the page within it
+                cr.set_source_rgb(1.0, 1.0, 1.0);
+                cr.paint().expect("Failed to fill");
+                let pad = imp.pad_pts() * obj.zoom();
+                if pad != 0.0 {
+                    cr.translate(pad, 0.0);
+                }
+
                 cr.save().expect("Failed to save");
 
                 if obj.state().multithread_rendering() {
@@ -225,6 +233,16 @@ impl Page {
         obj.property_expression("state")
             .chain_property::<crate::state::State>("zoom")
             .watch(gtk::Widget::NONE, move || obj.imp().resize());
+
+        let obj = self.obj().clone();
+        obj.property_expression("state")
+            .chain_property::<crate::state::State>("slot_width")
+            .watch(gtk::Widget::NONE, move || obj.imp().resize());
+
+        let obj = self.obj().clone();
+        obj.property_expression("state")
+            .chain_property::<crate::state::State>("fit_width")
+            .watch(gtk::Widget::NONE, move || obj.imp().resize());
     }
 
     pub(super) fn resize(&self) {
@@ -249,10 +267,27 @@ impl Page {
 
                     imp.bbox.replace(bbox);
                     let (w, h) = bbox.size();
-                    page.set_size_request((w * page.zoom()) as i32, (h * page.zoom()) as i32);
+                    let slot_w = imp.slot_width(w);
+                    page.set_size_request((slot_w * page.zoom()) as i32, (h * page.zoom()) as i32);
                 }
             ),
         );
+    }
+
+    // Slot width (points): the uniform width every page occupies in fit mode, else the bbox width.
+    fn slot_width(&self, bbox_width: f64) -> f64 {
+        let obj = self.obj();
+        if obj.fit_width() && obj.slot_width() > bbox_width {
+            obj.slot_width()
+        } else {
+            bbox_width
+        }
+    }
+
+    // Horizontal offset (points) that centers the bbox in its slot.
+    fn pad_pts(&self) -> f64 {
+        let bbox_w = self.bbox.borrow().size().0;
+        (self.slot_width(bbox_w) - bbox_w) / 2.0
     }
 
     fn poppler_page(&self) -> Option<poppler::Page> {
@@ -1125,7 +1160,7 @@ struct Point {
 }
 
 fn undo_zoom_and_crop(page: &super::Page, x: f64, y: f64) -> Point {
-    let mut x = x / page.zoom();
+    let mut x = x / page.zoom() - page.imp().pad_pts();
     let mut y = y / page.zoom();
 
     if page.crop() {
@@ -1136,7 +1171,7 @@ fn undo_zoom_and_crop(page: &super::Page, x: f64, y: f64) -> Point {
     Point { x, y }
 }
 
-fn get_bbox(page: &poppler::Page, crop: bool) -> Rectangle {
+pub(crate) fn get_bbox(page: &poppler::Page, crop: bool) -> Rectangle {
     let (width, height) = page.size();
     let mut bbox = poppler::Rectangle::default();
     bbox.set_x1(0.0);
