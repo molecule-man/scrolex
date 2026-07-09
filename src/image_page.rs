@@ -141,7 +141,7 @@ fn page_entry(
     file: &mut std::fs::File,
 ) -> Option<ImageEntry> {
     let page = doc.get_dictionary(pid).ok()?;
-    if effective_rotate(doc, page) != 0 {
+    if effective_rotate(doc, page) != 0 || !mediabox_origin_zero(doc, page) {
         return None;
     }
     // Any annotation (stamp, signature, widget, ...) is painted by poppler but not by us.
@@ -164,7 +164,7 @@ fn page_entry(
     }
 
     let dict = &stream.dict;
-    let flate = dct_flate_wrapped(dict)?;
+    let flate = dct_flate_wrapped(doc, dict)?;
     if dict.get(b"SMask").is_ok()
         || dict.get(b"Mask").is_ok()
         || dict.get(b"Decode").is_ok()
@@ -201,8 +201,14 @@ fn deref_ref(xobjects: &lopdf::Dictionary, name: &[u8]) -> Option<lopdf::ObjectI
 fn effective_rotate(doc: &lopdf::Document, page: &lopdf::Dictionary) -> i64 {
     let mut dict = page.clone();
     for _ in 0..32 {
-        if let Ok(r) = dict.get(b"Rotate").and_then(lopdf::Object::as_i64) {
-            return r;
+        if let Ok(rot) = dict.get(b"Rotate") {
+            // /Rotate defined here wins (nearest); resolve indirect values. If it can't be read as a
+            // number, report non-zero so the page falls back rather than risk unrotated placement.
+            return doc
+                .dereference(rot)
+                .ok()
+                .and_then(|(_, o)| o.as_i64().ok())
+                .unwrap_or(90);
         }
         let Ok(parent) = dict.get(b"Parent").and_then(lopdf::Object::as_reference) else {
             return 0;
@@ -213,6 +219,31 @@ fn effective_rotate(doc: &lopdf::Document, page: &lopdf::Dictionary) -> i64 {
         dict = pd.clone();
     }
     0
+}
+
+// Whether the page's MediaBox origin is (0,0) (honoring inheritance). Placement is computed in
+// default user space against page.size(), so a non-zero origin would offset the image; such pages
+// fall back to poppler.
+fn mediabox_origin_zero(doc: &lopdf::Document, page: &lopdf::Dictionary) -> bool {
+    let mut dict = page.clone();
+    for _ in 0..32 {
+        if let Ok(mb) = dict.get(b"MediaBox") {
+            let Ok((_, lopdf::Object::Array(a))) = doc.dereference(mb) else {
+                return false;
+            };
+            let x0 = a.first().and_then(num).unwrap_or(0.0);
+            let y0 = a.get(1).and_then(num).unwrap_or(0.0);
+            return x0.abs() < 1.0 && y0.abs() < 1.0;
+        }
+        let Ok(parent) = dict.get(b"Parent").and_then(lopdf::Object::as_reference) else {
+            return false; // MediaBox is required; if we can't find it, don't risk the fast path
+        };
+        let Ok(pd) = doc.get_dictionary(parent) else {
+            return false;
+        };
+        dict = pd.clone();
+    }
+    false
 }
 
 // Numeric value of an Integer or Real object.
@@ -232,14 +263,16 @@ fn deref_dict(doc: &lopdf::Document, obj: &lopdf::Object) -> Option<lopdf::Dicti
 // Whether a DCTDecode image stream is additionally FlateDecode-wrapped (`Some(true)` for the chain
 // [FlateDecode, DCTDecode]), a bare JPEG (`Some(false)`), or a filter we can't turn into raw JPEG
 // bytes (`None` -> fall back). Scanners commonly Flate-wrap the JPEG, so both must be accepted.
-fn dct_flate_wrapped(dict: &lopdf::Dictionary) -> Option<bool> {
-    let names: Vec<&[u8]> = match dict.get(b"Filter") {
-        Ok(lopdf::Object::Name(n)) => vec![n.as_slice()],
-        Ok(lopdf::Object::Array(a)) => a
-            .iter()
-            .map(|o| o.as_name())
-            .collect::<Result<_, _>>()
-            .ok()?,
+fn dct_flate_wrapped(doc: &lopdf::Document, dict: &lopdf::Dictionary) -> Option<bool> {
+    let names: Vec<Vec<u8>> = match doc.dereference(dict.get(b"Filter").ok()?).ok()?.1 {
+        lopdf::Object::Name(n) => vec![n.clone()],
+        lopdf::Object::Array(a) => {
+            let mut v = Vec::with_capacity(a.len());
+            for o in a {
+                v.push(doc.dereference(o).ok()?.1.as_name().ok()?.to_vec());
+            }
+            v
+        }
         _ => return None,
     };
     match names.len() {
@@ -251,7 +284,6 @@ fn dct_flate_wrapped(dict: &lopdf::Dictionary) -> Option<bool> {
 
 // Inflate a zlib/FlateDecode stream to the JPEG bytes it wraps.
 fn inflate(data: &[u8]) -> Option<Vec<u8>> {
-    use std::io::Read;
     let mut out = Vec::new();
     flate2::read::ZlibDecoder::new(data)
         .read_to_end(&mut out)
@@ -548,6 +580,17 @@ mod tests {
 
         let surface = render_when_ready(&uri, &page).expect("fast path should accept Flate+DCT");
         assert_eq!((surface.width(), surface.height()), (w as i32, h as i32));
+
+        // Non-white pixels prove inflate produced a real JPEG (not a stream that decoded to blank).
+        let mut colored = false;
+        surface
+            .with_data(|d| {
+                colored = d
+                    .chunks_exact(4)
+                    .any(|p| p[0] != 255 || p[1] != 255 || p[2] != 255);
+            })
+            .unwrap();
+        assert!(colored, "surface is blank white");
     }
 
     #[gtk::test]
@@ -664,23 +707,16 @@ mod tests {
         };
         let name = |s: &[u8]| lopdf::Object::Name(s.to_vec());
         let arr = |v: Vec<&[u8]>| lopdf::Object::Array(v.into_iter().map(name).collect());
+        let doc = lopdf::Document::new();
+        let w = |f: lopdf::Object| dct_flate_wrapped(&doc, &dict(f));
 
-        assert_eq!(dct_flate_wrapped(&dict(name(b"DCTDecode"))), Some(false));
-        assert_eq!(
-            dct_flate_wrapped(&dict(arr(vec![b"DCTDecode"]))),
-            Some(false)
-        );
-        assert_eq!(
-            dct_flate_wrapped(&dict(arr(vec![b"FlateDecode", b"DCTDecode"]))),
-            Some(true)
-        );
+        assert_eq!(w(name(b"DCTDecode")), Some(false));
+        assert_eq!(w(arr(vec![b"DCTDecode"])), Some(false));
+        assert_eq!(w(arr(vec![b"FlateDecode", b"DCTDecode"])), Some(true));
         // unsupported chains fall back
-        assert_eq!(dct_flate_wrapped(&dict(name(b"FlateDecode"))), None);
-        assert_eq!(dct_flate_wrapped(&dict(arr(vec![b"JPXDecode"]))), None);
-        assert_eq!(
-            dct_flate_wrapped(&dict(arr(vec![b"DCTDecode", b"FlateDecode"]))),
-            None
-        );
+        assert_eq!(w(name(b"FlateDecode")), None);
+        assert_eq!(w(arr(vec![b"JPXDecode"])), None);
+        assert_eq!(w(arr(vec![b"DCTDecode", b"FlateDecode"])), None);
     }
 
     #[test]
