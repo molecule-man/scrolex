@@ -101,6 +101,10 @@ pub struct Window {
     pub btn_jump_back: TemplateChild<Button>,
     #[template_child]
     pub scrolledwindow: TemplateChild<ScrolledWindow>,
+    // outer scroller that provides the vertical axis the horizontal listview can't; pans a
+    // zoomed-in page whose rendered height exceeds the viewport
+    #[template_child]
+    pub vscrolledwindow: TemplateChild<ScrolledWindow>,
     #[template_child]
     pub listview: TemplateChild<ListView>,
     #[template_child]
@@ -339,7 +343,7 @@ impl Window {
 
     #[template_callback]
     fn handle_drag_start(&self, _n_press: i32, x: f64, y: f64) {
-        // A drag takes over the horizontal position; drop any in-flight slide so scroll_tick stops
+        // A drag takes over the scroll position; drop any in-flight slide so scroll_tick stops
         // writing hadj and fighting the drag.
         *self.scroll_anim.borrow_mut() = None;
         *self.drag_coords.borrow_mut() = Some((x, y));
@@ -352,12 +356,13 @@ impl Window {
 
     #[template_callback]
     fn handle_drag_move(&self, seq: Option<&EventSequence>, gc: &GestureClick) {
-        if let Some((prev_x, _)) = *self.drag_coords.borrow() {
-            if let Some((x, _)) = gc.point(seq) {
-                let dx = x - prev_x;
-                let hadjustment = self.scrolledwindow.hadjustment();
+        if let Some((prev_x, prev_y)) = *self.drag_coords.borrow() {
+            if let Some((x, y)) = gc.point(seq) {
                 self.note_scroll_activity();
-                hadjustment.set_value(hadjustment.value() - dx);
+                let hadjustment = self.scrolledwindow.hadjustment();
+                hadjustment.set_value(hadjustment.value() - (x - prev_x));
+                let vadjustment = self.vscrolledwindow.vadjustment();
+                vadjustment.set_value(vadjustment.value() - (y - prev_y));
             }
         }
         *self.drag_coords.borrow_mut() = gc.point(seq);
@@ -468,6 +473,19 @@ impl Window {
                 };
                 let delta = if keyval == Key::Left { -step } else { step };
                 hadj.set_value(hadj.value() + delta);
+            }
+            Key::Up | Key::Down | Key::k | Key::j => {
+                // vertical pan of a zoomed-in page. The outer scroller owns the vertical axis (the
+                // horizontal listview doesn't scroll its cross axis); k/Up pan up, j/Down pan down.
+                self.note_scroll_activity();
+                let vadj = self.vscrolledwindow.vadjustment();
+                let step = if vadj.step_increment() > 0.0 {
+                    vadj.step_increment()
+                } else {
+                    vadj.page_size() * 0.1
+                };
+                let up = keyval == Key::Up || keyval == Key::k;
+                vadj.set_value(vadj.value() + if up { -step } else { step });
             }
             _ => return glib::Propagation::Proceed,
         }
