@@ -346,7 +346,7 @@ impl Window {
         // A drag takes over the scroll position; drop any in-flight slide so scroll_tick stops
         // writing hadj and fighting the drag.
         *self.scroll_anim.borrow_mut() = None;
-        *self.drag_coords.borrow_mut() = Some((x, y));
+        *self.drag_coords.borrow_mut() = self.drag_point_in_window(x, y);
 
         if let Some(surface) = self.obj().surface() {
             *self.drag_cursor.borrow_mut() = surface.cursor();
@@ -356,16 +356,28 @@ impl Window {
 
     #[template_callback]
     fn handle_drag_move(&self, seq: Option<&EventSequence>, gc: &GestureClick) {
+        let Some((x, y)) = gc
+            .point(seq)
+            .and_then(|(px, py)| self.drag_point_in_window(px, py))
+        else {
+            return;
+        };
         if let Some((prev_x, prev_y)) = *self.drag_coords.borrow() {
-            if let Some((x, y)) = gc.point(seq) {
-                self.note_scroll_activity();
-                let hadjustment = self.scrolledwindow.hadjustment();
-                hadjustment.set_value(hadjustment.value() - (x - prev_x));
-                let vadjustment = self.vscrolledwindow.vadjustment();
-                vadjustment.set_value(vadjustment.value() - (y - prev_y));
-            }
+            self.note_scroll_activity();
+            let hadjustment = self.scrolledwindow.hadjustment();
+            hadjustment.set_value(hadjustment.value() - (x - prev_x));
+            let vadjustment = self.vscrolledwindow.vadjustment();
+            vadjustment.set_value(vadjustment.value() - (y - prev_y));
         }
-        *self.drag_coords.borrow_mut() = gc.point(seq);
+        *self.drag_coords.borrow_mut() = Some((x, y));
+    }
+
+    // Pointer in the fixed window frame, not the inner scroller's: panning slides that inner frame,
+    // so deltas measured there feed back into the pan and oscillate.
+    fn drag_point_in_window(&self, x: f64, y: f64) -> Option<(f64, f64)> {
+        self.scrolledwindow
+            .compute_point(&*self.obj(), &gtk::graphene::Point::new(x as f32, y as f32))
+            .map(|p| (f64::from(p.x()), f64::from(p.y())))
     }
 
     #[template_callback]
