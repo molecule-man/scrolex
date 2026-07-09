@@ -62,6 +62,8 @@ https://github.com/user-attachments/assets/225c4b69-eb15-48d0-b978-f7bd747d463e
 | End             | Last page                                |
 | `→`             | Scroll right                             |
 | `←`             | Scroll left                              |
+| `k` / `↑`       | Pan up (zoomed-in page)                  |
+| `j` / `↓`       | Pan down (zoomed-in page)                |
 | `]`             | Zoom in                                  |
 | `[`             | Zoom out                                 |
 | Mouse wheel     | Move one page left/right per notch       |
