@@ -39,8 +39,8 @@ const SCROLL_ANIM_MIN_STEP: f64 = 1.5;
 // physical notch).
 const WHEEL_NOTCH: f64 = 1.0;
 const WHEEL_TRIGGER: f64 = 0.2;
+// Touchpad pixels per notch, used to scale a pinch's pixel travel onto the wheel's zoom rate.
 const TOUCHPAD_NOTCH: f64 = 40.0;
-const TOUCHPAD_TRIGGER: f64 = 8.0;
 
 // Multiplicative zoom step per notch.
 const ZOOM_STEP: f64 = 1.1;
@@ -101,6 +101,10 @@ pub struct Window {
     pub btn_jump_back: TemplateChild<Button>,
     #[template_child]
     pub scrolledwindow: TemplateChild<ScrolledWindow>,
+    // outer scroller that provides the vertical axis the horizontal listview can't; pans a
+    // zoomed-in page whose rendered height exceeds the viewport
+    #[template_child]
+    pub vscrolledwindow: TemplateChild<ScrolledWindow>,
     #[template_child]
     pub listview: TemplateChild<ListView>,
     #[template_child]
@@ -148,11 +152,6 @@ pub struct Window {
     // the previous wheel delta, to detect a direction reversal and reset the accumulator so
     // reversing doesn't over-step
     wheel_last_dy: Cell<f64>,
-
-    // same accumulation as the wheel, but for vertical touchpad scroll (kept separate because its
-    // travel is measured in pixels, not notch clicks)
-    touch_accum: Cell<f64>,
-    touch_last_dy: Cell<f64>,
 
     // zoom captured when a pinch gesture begins; scale-changed reports scale relative to that start,
     // so the live zoom is base * scale
@@ -292,29 +291,21 @@ impl Window {
                 self.wheel_last_dy.set(dy);
                 self.step_page(step);
             }
-            // Touchpad (and any other pixel-precise device): a horizontal swipe scrolls the page
-            // flow smoothly (like dragging); a vertical swipe steps pages, one per notch of travel.
+            // Touchpad (and any other pixel-precise device): a horizontal swipe pans the page flow;
+            // a vertical swipe pans a zoomed-in page along the axis the outer scroller owns.
             _ => {
-                // Apply the touchpad's horizontal delta to the scroll position, but only when no
-                // page slide is running. During a slide `scroll_tick` owns the adjustment; adding dx
-                // here (from a scroll event that arrives mid-slide) would fight its writes frame by
-                // frame. Vertical page-stepping below runs either way, so flicking through pages
-                // during a slide still works.
+                // Apply the horizontal delta to the scroll position, but only when no page slide is
+                // running. During a slide `scroll_tick` owns the adjustment; adding dx here (from a
+                // scroll event that arrives mid-slide) would fight its writes frame by frame.
                 if self.scroll_anim.borrow().is_none() {
                     let hadj = self.scrolledwindow.hadjustment();
                     hadj.set_value(self.clamp_scroll(hadj.value() + dx));
                 }
 
-                let (accum, step) = accumulate_step(
-                    self.touch_accum.get(),
-                    self.touch_last_dy.get(),
-                    dy,
-                    TOUCHPAD_NOTCH,
-                    TOUCHPAD_TRIGGER,
-                );
-                self.touch_accum.set(accum);
-                self.touch_last_dy.set(dy);
-                self.step_page(step);
+                // Vertical pan is independent of the horizontal slide, so it always applies. The
+                // adjustment clamps to its range, so this is a no-op when the page fits the viewport.
+                let vadj = self.vscrolledwindow.vadjustment();
+                vadj.set_value(vadj.value() + dy);
             }
         }
 
@@ -339,10 +330,10 @@ impl Window {
 
     #[template_callback]
     fn handle_drag_start(&self, _n_press: i32, x: f64, y: f64) {
-        // A drag takes over the horizontal position; drop any in-flight slide so scroll_tick stops
+        // A drag takes over the scroll position; drop any in-flight slide so scroll_tick stops
         // writing hadj and fighting the drag.
         *self.scroll_anim.borrow_mut() = None;
-        *self.drag_coords.borrow_mut() = Some((x, y));
+        *self.drag_coords.borrow_mut() = self.drag_point_in_window(x, y);
 
         if let Some(surface) = self.obj().surface() {
             *self.drag_cursor.borrow_mut() = surface.cursor();
@@ -352,15 +343,28 @@ impl Window {
 
     #[template_callback]
     fn handle_drag_move(&self, seq: Option<&EventSequence>, gc: &GestureClick) {
-        if let Some((prev_x, _)) = *self.drag_coords.borrow() {
-            if let Some((x, _)) = gc.point(seq) {
-                let dx = x - prev_x;
-                let hadjustment = self.scrolledwindow.hadjustment();
-                self.note_scroll_activity();
-                hadjustment.set_value(hadjustment.value() - dx);
-            }
+        let Some((x, y)) = gc
+            .point(seq)
+            .and_then(|(px, py)| self.drag_point_in_window(px, py))
+        else {
+            return;
+        };
+        if let Some((prev_x, prev_y)) = *self.drag_coords.borrow() {
+            self.note_scroll_activity();
+            let hadjustment = self.scrolledwindow.hadjustment();
+            hadjustment.set_value(hadjustment.value() - (x - prev_x));
+            let vadjustment = self.vscrolledwindow.vadjustment();
+            vadjustment.set_value(vadjustment.value() - (y - prev_y));
         }
-        *self.drag_coords.borrow_mut() = gc.point(seq);
+        *self.drag_coords.borrow_mut() = Some((x, y));
+    }
+
+    // Pointer in the fixed window frame, not the inner scroller's: panning slides that inner frame,
+    // so deltas measured there feed back into the pan and oscillate.
+    fn drag_point_in_window(&self, x: f64, y: f64) -> Option<(f64, f64)> {
+        self.scrolledwindow
+            .compute_point(&*self.obj(), &gtk::graphene::Point::new(x as f32, y as f32))
+            .map(|p| (f64::from(p.x()), f64::from(p.y())))
     }
 
     #[template_callback]
@@ -468,6 +472,19 @@ impl Window {
                 };
                 let delta = if keyval == Key::Left { -step } else { step };
                 hadj.set_value(hadj.value() + delta);
+            }
+            Key::Up | Key::Down | Key::k | Key::j => {
+                // vertical pan of a zoomed-in page. The outer scroller owns the vertical axis (the
+                // horizontal listview doesn't scroll its cross axis); k/Up pan up, j/Down pan down.
+                self.note_scroll_activity();
+                let vadj = self.vscrolledwindow.vadjustment();
+                let step = if vadj.step_increment() > 0.0 {
+                    vadj.step_increment()
+                } else {
+                    vadj.page_size() * 0.1
+                };
+                let up = keyval == Key::Up || keyval == Key::k;
+                vadj.set_value(vadj.value() + if up { -step } else { step });
             }
             _ => return glib::Propagation::Proceed,
         }
@@ -957,8 +974,6 @@ impl Window {
                     // Clear accumulators so the next gesture starts fresh in either direction.
                     imp.wheel_accum.set(0.0);
                     imp.wheel_last_dy.set(0.0);
-                    imp.touch_accum.set(0.0);
-                    imp.touch_last_dy.set(0.0);
                     imp.refresh_visible_renders();
                 }
             ),
@@ -1564,10 +1579,7 @@ fn descendant_page(widget: &gtk::Widget) -> Option<page::Page> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        accumulate_step, glide_step, SCROLL_ANIM_MAX_US, TOUCHPAD_NOTCH, TOUCHPAD_TRIGGER,
-        WHEEL_NOTCH, WHEEL_TRIGGER,
-    };
+    use super::{accumulate_step, glide_step, SCROLL_ANIM_MAX_US, WHEEL_NOTCH, WHEEL_TRIGGER};
 
     // Drive the glide toward a fixed target at a steady frame rate; return frames until it settles.
     fn glide_frames(mut value: f64, target: f64, dt_us: i64) -> usize {
@@ -1769,21 +1781,5 @@ mod tests {
             .map(|(i, _)| i)
             .collect();
         assert_eq!(fired, vec![0, 4, 8, 12]);
-    }
-
-    #[test]
-    fn touchpad_scale_first_page_fires_before_a_full_notch() {
-        // One trigger's worth of travel (well under a notch) still turns a page.
-        let steps = run_scaled(&[TOUCHPAD_TRIGGER], TOUCHPAD_NOTCH, TOUCHPAD_TRIGGER);
-        assert_eq!(steps, vec![1]);
-    }
-
-    #[test]
-    fn touchpad_full_swipe_steps_about_fifteen_pages() {
-        let deltas = vec![12.0; 44];
-        let steps: i32 = run_scaled(&deltas, TOUCHPAD_NOTCH, TOUCHPAD_TRIGGER)
-            .iter()
-            .sum();
-        assert_eq!(steps, 14);
     }
 }

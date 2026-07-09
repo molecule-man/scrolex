@@ -293,9 +293,16 @@
 				<child>
 				<object class="GtkOverlay">
 				<property name="child">
+			<object class="GtkScrolledWindow" id="vscrolledwindow">
+				<property name="hscrollbar-policy">never</property>
+				<property name="vscrollbar-policy">automatic</property>
+				<property name="hexpand">true</property>
+				<property name="vexpand">true</property>
+				<child>
 			<object class="GtkScrolledWindow" id="scrolledwindow">
 				<property name="hscrollbar-policy">automatic</property>
 				<property name="vscrollbar-policy">never</property>
+				<property name="propagate-natural-height">true</property>
 				<property name="hexpand">true</property>
 				<child>
 					<object class="GtkListView" id="listview">
@@ -369,6 +376,8 @@
 					</object>
 				</child>
 			</object>
+			</child>
+		</object>
 				</property>
 				<child type="overlay">
 					<object class="GtkRevealer" id="toc_revealer">
