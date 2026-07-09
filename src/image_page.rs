@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use gtk::cairo::{Context, Format, ImageSurface};
@@ -18,6 +19,8 @@ struct ImageEntry {
     content_start: u64,
     length: usize,
     place: (f64, f64, f64, f64),
+    // stream is FlateDecode-wrapped around the JPEG (filter chain [FlateDecode, DCTDecode])
+    flate: bool,
 }
 
 // Per-document map of qualifying image-only pages (0-based index). Small and immutable once built,
@@ -28,12 +31,14 @@ struct ImageIndex {
 }
 
 enum IndexState {
-    Building,
+    // carries a generation so a build superseded by an invalidate/reopen doesn't publish stale data
+    Building(u64),
     Ready(Arc<ImageIndex>),
     Failed,
 }
 
 static INDICES: Lazy<Mutex<HashMap<String, IndexState>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+static GENERATION: AtomicU64 = AtomicU64::new(0);
 
 // Full-page surface for `page` if it is a single-JPEG scan we handle, else None.
 pub fn render_image_page(
@@ -45,15 +50,20 @@ pub fn render_image_page(
     let index = index_for(uri)?;
     let entry = index.pages.get(&page.index())?;
 
-    let jpeg = read_bytes(&index.path, entry)?;
+    let raw = read_bytes(&index.path, entry)?;
+    let jpeg = if entry.flate { inflate(&raw)? } else { raw };
     if jpeg.get(..2) != Some(&[0xFF, 0xD8]) {
         return None;
     }
 
     let (page_w, page_h) = page.size();
     let place = flip_y(page_h, entry.place);
-    let target_w = (place.2 * scale * dsf).round().max(1.0) as u16;
-    let target_h = (place.3 * scale * dsf).round().max(1.0) as u16;
+    let target_w = (place.2 * scale * dsf)
+        .round()
+        .clamp(1.0, f64::from(u16::MAX)) as u16;
+    let target_h = (place.3 * scale * dsf)
+        .round()
+        .clamp(1.0, f64::from(u16::MAX)) as u16;
     let img = decode(&jpeg, target_w, target_h)?;
 
     Some(compose(page_w, page_h, place, &img, scale, dsf))
@@ -86,7 +96,8 @@ fn index_for(uri: &str) -> Option<Arc<ImageIndex>> {
         Some(_) => return None,
         None => {}
     }
-    map.insert(uri.to_string(), IndexState::Building);
+    let generation = GENERATION.fetch_add(1, Ordering::Relaxed);
+    map.insert(uri.to_string(), IndexState::Building(generation));
     drop(map);
 
     let uri = uri.to_string();
@@ -95,7 +106,12 @@ fn index_for(uri: &str) -> Option<Arc<ImageIndex>> {
             Some(idx) => IndexState::Ready(Arc::new(idx)),
             None => IndexState::Failed,
         };
-        INDICES.lock().unwrap().insert(uri, state);
+        // Publish only if this is still the same build; an invalidate/reopen bumps the generation
+        // so a superseded build silently discards its (now stale) result.
+        let mut map = INDICES.lock().unwrap();
+        if matches!(map.get(&uri), Some(IndexState::Building(g)) if *g == generation) {
+            map.insert(uri, state);
+        }
     });
     None
 }
@@ -117,21 +133,15 @@ fn build_index(uri: &str) -> Option<ImageIndex> {
 }
 
 // A page qualifies only if it is upright, unannotated, and its content stream paints nothing but a
-// single lone DCTDecode image (no text/vector/overlay) with a handled colorspace, no mask and no
-// /Decode. Anything else falls back to poppler, so accepted pages match poppler's output.
+// single lone DCTDecode image (invisible OCR text is fine; visible text/vector/overlay is not) with
+// a handled colorspace, no mask and no /Decode. Anything else falls back to poppler's render.
 fn page_entry(
     doc: &lopdf::Document,
     pid: lopdf::ObjectId,
     file: &mut std::fs::File,
 ) -> Option<ImageEntry> {
     let page = doc.get_dictionary(pid).ok()?;
-    if page
-        .get(b"Rotate")
-        .ok()
-        .and_then(|o| o.as_i64().ok())
-        .unwrap_or(0)
-        != 0
-    {
+    if effective_rotate(doc, page) != 0 {
         return None;
     }
     // Any annotation (stamp, signature, widget, ...) is painted by poppler but not by us.
@@ -154,8 +164,8 @@ fn page_entry(
     }
 
     let dict = &stream.dict;
-    if !filter_is_dct(dict)
-        || dict.get(b"SMask").is_ok()
+    let flate = dct_flate_wrapped(dict)?;
+    if dict.get(b"SMask").is_ok()
         || dict.get(b"Mask").is_ok()
         || dict.get(b"Decode").is_ok()
         || !colorspace_supported(doc, dict)
@@ -177,12 +187,32 @@ fn page_entry(
         content_start,
         length: stream.content.len(),
         place,
+        flate,
     })
 }
 
 // Object id the XObject `name` references.
 fn deref_ref(xobjects: &lopdf::Dictionary, name: &[u8]) -> Option<lopdf::ObjectId> {
     xobjects.get(name).ok()?.as_reference().ok()
+}
+
+// Effective page rotation in degrees, honoring /Rotate inherited from the page tree (nearest wins).
+// Any non-zero value means we can't place the image uprightly, so the page falls back to poppler.
+fn effective_rotate(doc: &lopdf::Document, page: &lopdf::Dictionary) -> i64 {
+    let mut dict = page.clone();
+    for _ in 0..32 {
+        if let Ok(r) = dict.get(b"Rotate").and_then(lopdf::Object::as_i64) {
+            return r;
+        }
+        let Ok(parent) = dict.get(b"Parent").and_then(lopdf::Object::as_reference) else {
+            return 0;
+        };
+        let Ok(pd) = doc.get_dictionary(parent) else {
+            return 0;
+        };
+        dict = pd.clone();
+    }
+    0
 }
 
 // Numeric value of an Integer or Real object.
@@ -199,14 +229,34 @@ fn deref_dict(doc: &lopdf::Document, obj: &lopdf::Object) -> Option<lopdf::Dicti
     doc.dereference(obj).ok()?.1.as_dict().ok().cloned()
 }
 
-fn filter_is_dct(dict: &lopdf::Dictionary) -> bool {
-    match dict.get(b"Filter") {
-        Ok(lopdf::Object::Name(n)) => n == b"DCTDecode",
-        Ok(lopdf::Object::Array(a)) => {
-            a.len() == 1 && matches!(&a[0], lopdf::Object::Name(n) if n == b"DCTDecode")
-        }
-        _ => false,
+// Whether a DCTDecode image stream is additionally FlateDecode-wrapped (`Some(true)` for the chain
+// [FlateDecode, DCTDecode]), a bare JPEG (`Some(false)`), or a filter we can't turn into raw JPEG
+// bytes (`None` -> fall back). Scanners commonly Flate-wrap the JPEG, so both must be accepted.
+fn dct_flate_wrapped(dict: &lopdf::Dictionary) -> Option<bool> {
+    let names: Vec<&[u8]> = match dict.get(b"Filter") {
+        Ok(lopdf::Object::Name(n)) => vec![n.as_slice()],
+        Ok(lopdf::Object::Array(a)) => a
+            .iter()
+            .map(|o| o.as_name())
+            .collect::<Result<_, _>>()
+            .ok()?,
+        _ => return None,
+    };
+    match names.len() {
+        1 if names[0] == b"DCTDecode" => Some(false),
+        2 if names[0] == b"FlateDecode" && names[1] == b"DCTDecode" => Some(true),
+        _ => None,
     }
+}
+
+// Inflate a zlib/FlateDecode stream to the JPEG bytes it wraps.
+fn inflate(data: &[u8]) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut out = Vec::new();
+    flate2::read::ZlibDecoder::new(data)
+        .read_to_end(&mut out)
+        .ok()?;
+    Some(out)
 }
 
 // Only colorspaces our JPEG decode reproduces faithfully. Device/Cal/ICCBased map straight onto the
@@ -241,28 +291,35 @@ fn colorspace_supported(doc: &lopdf::Document, dict: &lopdf::Dictionary) -> bool
     )
 }
 
-// Placement (x, y_bottom, w, h) in PDF bottom-left page-point space for an image drawn by exactly
-// one `Do`, or None unless the content stream draws only that image, upright and unrotated (no
-// text, vector marks, shading, inline images or other XObjects).
+// Placement (x, y_bottom, w, h) in PDF bottom-left page-point space for a page whose content stream
+// draws exactly one image (`Do` of `image`) and nothing else visible, or None otherwise. Invisible
+// OCR text (render mode 3) is allowed - poppler paints no marks for it, so output still matches.
+// Visible text, vector paint, clipping, shading, inline images, transparency (`gs`) and other
+// XObjects all disqualify the page, as does a rotated/skewed/flipped placement.
 fn image_placement(ops: &[Operation], image: &[u8]) -> Option<(f64, f64, f64, f64)> {
-    let mut stack: Vec<[f64; 6]> = Vec::new();
-    let mut ctm = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+    const ID: [f64; 6] = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+    let mut ctm = ID;
+    let mut tr = 0i64; // text render mode; 3 = invisible
+    let mut stack: Vec<([f64; 6], i64)> = Vec::new();
     let mut placed: Option<[f64; 6]> = None;
 
     for op in ops {
         match op.operator.as_str() {
-            "q" => stack.push(ctm),
-            "Q" => ctm = stack.pop().unwrap_or([1.0, 0.0, 0.0, 1.0, 0.0, 0.0]),
+            "q" => stack.push((ctm, tr)),
+            "Q" => (ctm, tr) = stack.pop().unwrap_or((ID, 0)),
             "cm" => ctm = concat(matrix(&op.operands)?, ctm),
+            "Tr" => tr = op.operands.first().and_then(num).unwrap_or(0.0) as i64,
             "Do" => {
                 if placed.is_some() || op.operands.first()?.as_name().ok()? != image {
                     return None; // second Do, or a different (form) XObject
                 }
                 placed = Some(ctm);
             }
-            // Any operator that puts marks on the page other than our image disqualifies it.
-            "Tj" | "TJ" | "'" | "\"" | "BT" | "S" | "s" | "f" | "F" | "f*" | "B" | "B*" | "b"
-            | "b*" | "sh" | "BI" => return None,
+            // Text shows marks unless it is invisible (render mode 3).
+            "Tj" | "TJ" | "'" | "\"" if tr != 3 => return None,
+            // Anything that paints, clips or changes compositing breaks output parity with poppler.
+            "S" | "s" | "f" | "F" | "f*" | "B" | "B*" | "b" | "b*" | "W" | "W*" | "sh" | "BI"
+            | "gs" => return None,
             _ => {}
         }
     }
@@ -468,6 +525,32 @@ mod tests {
     }
 
     #[gtk::test]
+    fn renders_ocr_scan_page() {
+        // A full-page image with an invisible OCR text layer must still take the fast path.
+        let uri = fixture_uri("image_scan_ocr.pdf");
+        let doc = poppler::Document::from_file(&uri, None).unwrap();
+        let page = doc.page(0).unwrap();
+        let (w, h) = page.size();
+
+        let surface =
+            render_when_ready(&uri, &page).expect("fast path should accept an OCR'd scan");
+        assert_eq!((surface.width(), surface.height()), (w as i32, h as i32));
+    }
+
+    #[gtk::test]
+    fn renders_flate_wrapped_jpeg() {
+        // Real OCR scans often wrap the JPEG in FlateDecode ([FlateDecode, DCTDecode]); the fast
+        // path must inflate first and still render it.
+        let uri = fixture_uri("image_scan_flate.pdf");
+        let doc = poppler::Document::from_file(&uri, None).unwrap();
+        let page = doc.page(0).unwrap();
+        let (w, h) = page.size();
+
+        let surface = render_when_ready(&uri, &page).expect("fast path should accept Flate+DCT");
+        assert_eq!((surface.width(), surface.height()), (w as i32, h as i32));
+    }
+
+    #[gtk::test]
     fn falls_back_for_non_image_page() {
         let uri = fixture_uri("outline.pdf");
         let doc = poppler::Document::from_file(&uri, None).unwrap();
@@ -495,6 +578,14 @@ mod tests {
 
     fn do_(name: &str) -> Operation {
         op("Do", vec![lopdf::Object::Name(name.into())])
+    }
+
+    fn tr(mode: i64) -> Operation {
+        op("Tr", vec![mode.into()])
+    }
+
+    fn tj() -> Operation {
+        op("Tj", vec![lopdf::Object::string_literal("text")])
     }
 
     #[test]
@@ -526,19 +617,69 @@ mod tests {
     }
 
     #[test]
-    fn placement_rejects_text_vector_and_extra_draws() {
+    fn accepts_invisible_ocr_text() {
+        // full-page image plus an invisible (render mode 3) OCR text layer: still image-only visually.
+        let ops = [
+            cm(48.0, 0.0, 0.0, 36.0, 0.0, 0.0),
+            do_("Im0"),
+            op("BT", vec![]),
+            tr(3),
+            tj(),
+            op("ET", vec![]),
+        ];
+        assert_eq!(image_placement(&ops, b"Im0"), Some((0.0, 0.0, 48.0, 36.0)));
+    }
+
+    #[test]
+    fn placement_rejects_marks_clip_and_transparency() {
         let base = cm(48.0, 0.0, 0.0, 36.0, 0.0, 0.0);
-        // visible text
-        assert!(image_placement(&[base.clone(), op("BT", vec![]), do_("Im0")], b"Im0").is_none());
-        // a filled path
-        assert!(image_placement(&[base.clone(), op("f", vec![]), do_("Im0")], b"Im0").is_none());
-        // a second image draw
+        let reject = |extra: Operation| {
+            image_placement(&[base.clone(), extra, do_("Im0")], b"Im0").is_none()
+        };
+        assert!(reject(tj())); // visible text (default render mode 0)
+        assert!(image_placement(
+            &[base.clone(), tr(3), tj(), tr(0), tj(), do_("Im0")],
+            b"Im0"
+        )
+        .is_none()); // becomes visible again
+        assert!(reject(op("f", vec![]))); // filled path
+        assert!(reject(op("W", vec![]))); // clipping
+        assert!(reject(op("gs", vec![lopdf::Object::Name(b"GS1".into())]))); // transparency/blend
+        assert!(reject(op("sh", vec![lopdf::Object::Name(b"Sh1".into())]))); // shading
+                                                                             // a second image draw, and a draw of a different XObject
         assert!(image_placement(&[base.clone(), do_("Im0"), do_("Im0")], b"Im0").is_none());
-        // draw of a different XObject (e.g. a form)
         assert!(image_placement(&[base.clone(), do_("Fm0")], b"Im0").is_none());
         // rotated placement
         assert!(
             image_placement(&[cm(0.0, 48.0, -36.0, 0.0, 0.0, 0.0), do_("Im0")], b"Im0").is_none()
+        );
+    }
+
+    #[test]
+    fn filter_chain_acceptance() {
+        let dict = |f: lopdf::Object| {
+            let mut d = lopdf::Dictionary::new();
+            d.set("Filter", f);
+            d
+        };
+        let name = |s: &[u8]| lopdf::Object::Name(s.to_vec());
+        let arr = |v: Vec<&[u8]>| lopdf::Object::Array(v.into_iter().map(name).collect());
+
+        assert_eq!(dct_flate_wrapped(&dict(name(b"DCTDecode"))), Some(false));
+        assert_eq!(
+            dct_flate_wrapped(&dict(arr(vec![b"DCTDecode"]))),
+            Some(false)
+        );
+        assert_eq!(
+            dct_flate_wrapped(&dict(arr(vec![b"FlateDecode", b"DCTDecode"]))),
+            Some(true)
+        );
+        // unsupported chains fall back
+        assert_eq!(dct_flate_wrapped(&dict(name(b"FlateDecode"))), None);
+        assert_eq!(dct_flate_wrapped(&dict(arr(vec![b"JPXDecode"]))), None);
+        assert_eq!(
+            dct_flate_wrapped(&dict(arr(vec![b"DCTDecode", b"FlateDecode"]))),
+            None
         );
     }
 
