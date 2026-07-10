@@ -22,10 +22,16 @@ pub fn overlay_pdf(src: &Document, page_id: ObjectId) -> Option<Vec<u8>> {
 
     let mut out = Document::with_version("1.5");
     let mut map = HashMap::new();
+    let mut broken = false;
 
     let resources = strip_xobjects(src, &resources, &image_names);
-    let resources = copy(src, &mut out, &resources, &mut map);
-    let annots = copy_annots(src, &mut out, page_id, &mut map);
+    let resources = copy(src, &mut out, &resources, &mut map, &mut broken);
+    let annots = copy_annots(src, &mut out, page_id, &mut map, &mut broken);
+    // A dangling reference means we'd render the page with a mark's font/appearance missing; fall
+    // back to full poppler instead of silently dropping it.
+    if broken {
+        return None;
+    }
     let content_id = out.add_object(Stream::new(Dictionary::new(), content));
 
     let pages_id = out.new_object_id();
@@ -58,8 +64,8 @@ pub fn overlay_pdf(src: &Document, page_id: ObjectId) -> Option<Vec<u8>> {
 }
 
 // Deep-copy an object graph from `src` into `dst`, remapping ids so referenced fonts/ExtGState/AP
-// streams come along. Missing references collapse to Null.
-fn copy(src: &Document, dst: &mut Document, obj: &Object, map: &mut HashMap<ObjectId, ObjectId>) -> Object {
+// streams come along. A missing reference collapses to Null and sets `broken`.
+fn copy(src: &Document, dst: &mut Document, obj: &Object, map: &mut HashMap<ObjectId, ObjectId>, broken: &mut bool) -> Object {
     match obj {
         Object::Reference(id) => {
             if let Some(new_id) = map.get(id) {
@@ -68,16 +74,19 @@ fn copy(src: &Document, dst: &mut Document, obj: &Object, map: &mut HashMap<Obje
             let new_id = dst.new_object_id();
             map.insert(*id, new_id);
             let copied = match src.get_object(*id) {
-                Ok(o) => copy(src, dst, &o.clone(), map),
-                Err(_) => Object::Null,
+                Ok(o) => copy(src, dst, &o.clone(), map, broken),
+                Err(_) => {
+                    *broken = true;
+                    Object::Null
+                }
             };
             dst.set_object(new_id, copied);
             Object::Reference(new_id)
         }
-        Object::Array(items) => Object::Array(items.iter().map(|o| copy(src, dst, o, map)).collect()),
-        Object::Dictionary(dict) => Object::Dictionary(copy_dict(src, dst, dict, map)),
+        Object::Array(items) => Object::Array(items.iter().map(|o| copy(src, dst, o, map, broken)).collect()),
+        Object::Dictionary(dict) => Object::Dictionary(copy_dict(src, dst, dict, map, broken)),
         Object::Stream(stream) => {
-            let dict = copy_dict(src, dst, &stream.dict, map);
+            let dict = copy_dict(src, dst, &stream.dict, map, broken);
             let mut copied = Stream::new(dict, stream.content.clone());
             copied.allows_compression = stream.allows_compression;
             Object::Stream(copied)
@@ -86,17 +95,17 @@ fn copy(src: &Document, dst: &mut Document, obj: &Object, map: &mut HashMap<Obje
     }
 }
 
-fn copy_dict(src: &Document, dst: &mut Document, dict: &Dictionary, map: &mut HashMap<ObjectId, ObjectId>) -> Dictionary {
+fn copy_dict(src: &Document, dst: &mut Document, dict: &Dictionary, map: &mut HashMap<ObjectId, ObjectId>, broken: &mut bool) -> Dictionary {
     let mut out = Dictionary::new();
     for (key, value) in dict.iter() {
-        out.set(key.clone(), copy(src, dst, value, map));
+        out.set(key.clone(), copy(src, dst, value, map, broken));
     }
     out
 }
 
-// Rebuild the annotation array, dropping the /P and /Popup back-references that would otherwise
-// drag the original page (and its image) into the copy.
-fn copy_annots(src: &Document, dst: &mut Document, page_id: ObjectId, map: &mut HashMap<ObjectId, ObjectId>) -> Option<Object> {
+// Rebuild the annotation array, dropping the back-references (/P, /Popup, /IRT, /Parent) that would
+// otherwise drag the original page (and its image), or the AcroForm tree, into the copy.
+fn copy_annots(src: &Document, dst: &mut Document, page_id: ObjectId, map: &mut HashMap<ObjectId, ObjectId>, broken: &mut bool) -> Option<Object> {
     let annots = src.get_page_annotations(page_id).ok()?;
     if annots.is_empty() {
         return None;
@@ -105,11 +114,11 @@ fn copy_annots(src: &Document, dst: &mut Document, page_id: ObjectId, map: &mut 
     for annot in annots {
         let mut dict = Dictionary::new();
         for (key, value) in annot.iter() {
-            if key != b"P" && key != b"Popup" {
+            if !matches!(key.as_slice(), b"P" | b"Popup" | b"IRT" | b"Parent") {
                 dict.set(key.clone(), value.clone());
             }
         }
-        let copied = copy(src, dst, &Object::Dictionary(dict), map);
+        let copied = copy(src, dst, &Object::Dictionary(dict), map, broken);
         refs.push(Object::Reference(dst.add_object(copied)));
     }
     Some(Object::Array(refs))
@@ -222,7 +231,7 @@ mod tests {
         let build = t.elapsed();
 
         let overlay_doc = poppler::Document::from_data(&bytes, None).unwrap();
-        let overlay = overlay_doc.page(page_index.min(0) as i32).unwrap();
+        let overlay = overlay_doc.page(0).unwrap();
 
         let t = std::time::Instant::now();
         let _ = render_overlay(&overlay, scale);

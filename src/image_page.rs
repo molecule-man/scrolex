@@ -166,7 +166,9 @@ fn page_entry(
     file: &mut std::fs::File,
 ) -> Option<ImageEntry> {
     let page = doc.get_dictionary(pid).ok()?;
-    if effective_rotate(doc, page) != 0 || !mediabox_origin_zero(doc, page) {
+    // Placement and the composed surface work in MediaBox (origin-zero) space; a differing CropBox
+    // would shift poppler's page.size() and misalign both the blit and the overlay.
+    if effective_rotate(doc, page) != 0 || !mediabox_origin_zero(doc, page) || !cropbox_matches_mediabox(doc, page) {
         return None;
     }
     let has_annotations = doc.get_page_annotations(pid).is_ok_and(|a| !a.is_empty());
@@ -200,9 +202,11 @@ fn page_entry(
     let (place, has_visible_text) = image_placement(&content.operations, &name)?;
 
     // Marks over the image (visible text, annotations) go to a poppler overlay; bail to full
-    // poppler if we can't build it rather than drop them.
+    // poppler if we can't build one poppler can render, rather than drop the marks.
     let overlay = if has_annotations || has_visible_text {
-        Some(crate::page_overlay::overlay_pdf(doc, pid)?)
+        let bytes = crate::page_overlay::overlay_pdf(doc, pid)?;
+        poppler::Document::from_data(&bytes, None).ok()?.page(0)?;
+        Some(bytes)
     } else {
         None
     };
@@ -275,6 +279,38 @@ fn mediabox_origin_zero(doc: &lopdf::Document, page: &lopdf::Dictionary) -> bool
         dict = pd.clone();
     }
     false
+}
+
+// Whether the page's effective CropBox equals its MediaBox (or there is none). page.size() follows
+// the CropBox while placement assumes MediaBox, so a differing CropBox would misalign the render.
+fn cropbox_matches_mediabox(doc: &lopdf::Document, page: &lopdf::Dictionary) -> bool {
+    let Some(crop) = inherited_rect(doc, page, b"CropBox") else {
+        return true;
+    };
+    match inherited_rect(doc, page, b"MediaBox") {
+        Some(media) => crop.iter().zip(&media).all(|(a, b)| (a - b).abs() < 1.0),
+        None => false,
+    }
+}
+
+// Resolve a rectangle attribute (4 numbers), honoring page-tree inheritance. None if absent/invalid.
+fn inherited_rect(doc: &lopdf::Document, page: &lopdf::Dictionary, key: &[u8]) -> Option<[f64; 4]> {
+    let mut dict = page.clone();
+    for _ in 0..32 {
+        if let Ok(v) = dict.get(key) {
+            let (_, lopdf::Object::Array(a)) = doc.dereference(v).ok()? else {
+                return None;
+            };
+            let mut rect = [0.0; 4];
+            for (i, slot) in rect.iter_mut().enumerate() {
+                *slot = a.get(i).and_then(num)?;
+            }
+            return Some(rect);
+        }
+        let parent = dict.get(b"Parent").and_then(lopdf::Object::as_reference).ok()?;
+        dict = doc.get_dictionary(parent).ok()?.clone();
+    }
+    None
 }
 
 // Numeric value of an Integer or Real object.
@@ -636,6 +672,11 @@ mod tests {
         found
     }
 
+    // The fixtures' scan is a uniform ~205 gray; a pixel in that range is the untouched background.
+    fn is_scan_gray(p: &[u8]) -> bool {
+        p[..3].iter().all(|&c| (190..=220).contains(&c))
+    }
+
     #[gtk::test]
     fn overlay_renders_on_worker_thread() {
         // The real render path runs draw_overlay's poppler from_data + render on a background
@@ -674,6 +715,8 @@ mod tests {
             any_pixel(&surface, |p| p[0] < 120 && p[1] < 120 && p[2] < 120),
             "overlay text not painted"
         );
+        // The scan must show through: poppler overlays marks, it must not blank the background.
+        assert!(any_pixel(&surface, is_scan_gray), "scan background not preserved");
     }
 
     #[gtk::test]
@@ -690,6 +733,7 @@ mod tests {
             any_pixel(&surface, |p| p[0] > 180 && p[1] < 90 && p[2] < 90),
             "blue ink annotation not painted"
         );
+        assert!(any_pixel(&surface, is_scan_gray), "scan background not preserved");
     }
 
     #[gtk::test]
@@ -811,12 +855,13 @@ mod tests {
         let reject = |extra: Operation| {
             image_placement(&[base.clone(), extra, do_("Im0")], b"Im0").is_none()
         };
-        assert!(reject(tj())); // visible text (default render mode 0)
+        // `reject` puts the op before the image `Do`, so visible text here is behind the scan.
+        assert!(reject(tj())); // visible text before the image (see accepts_visible_text_after_image)
         assert!(image_placement(
             &[base.clone(), tr(3), tj(), tr(0), tj(), do_("Im0")],
             b"Im0"
         )
-        .is_none()); // becomes visible again
+        .is_none()); // visible again, still before the image
         assert!(reject(op("f", vec![]))); // filled path
         assert!(reject(op("W", vec![]))); // clipping
         assert!(reject(op("gs", vec![lopdf::Object::Name(b"GS1".into())]))); // transparency/blend
