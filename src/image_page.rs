@@ -173,10 +173,10 @@ fn page_entry(
     }
     // Classify /Annots the same way the overlay builder does (lopdf's get_page_annotations drops
     // inline dictionaries, which the overlay does render); a malformed array falls back to poppler.
-    let (has_annotations, annotations) = classify_annotations(doc, pid)?;
+    let (has_annotations, has_widget) = classify_annotations(doc, pid)?;
     // Widget/form annotations need AcroForm and field-hierarchy state the overlay can't carry;
     // such pages fall back to full poppler.
-    if annotations.iter().any(is_widget) {
+    if has_widget {
         return None;
     }
 
@@ -247,36 +247,33 @@ fn is_widget(annot: &lopdf::Dictionary) -> bool {
         .is_some_and(|n| n == b"Widget")
 }
 
-// Whether the page has any annotation to overlay, plus the annotation dictionaries (resolved
-// references and inline dicts, matching copy_annots; nulls skipped). None if /Annots is present but
-// not a resolvable array, so the page falls back to full poppler.
-fn classify_annotations(doc: &lopdf::Document, pid: lopdf::ObjectId) -> Option<(bool, Vec<lopdf::Dictionary>)> {
+// (has_annotation, has_widget) for the page, classifying /Annots the same way copy_annots does
+// (resolved references and inline dicts count; nulls skip). None if /Annots is present but not a
+// resolvable array, so the page falls back to full poppler.
+fn classify_annotations(doc: &lopdf::Document, pid: lopdf::ObjectId) -> Option<(bool, bool)> {
     let page = doc.get_dictionary(pid).ok()?;
     let Ok(annots) = page.get(b"Annots") else {
-        return Some((false, Vec::new())); // no /Annots
+        return Some((false, false)); // no /Annots
     };
     let lopdf::Object::Array(entries) = doc.dereference(annots).ok()?.1 else {
         return None; // present but not an array
     };
-    let mut dicts = Vec::new();
-    let mut any = false;
+    let (mut any, mut widget) = (false, false);
     for entry in entries {
         match entry {
             lopdf::Object::Null => {}
             lopdf::Object::Reference(id) => {
                 any = true;
-                if let Ok(d) = doc.get_dictionary(*id) {
-                    dicts.push(d.clone());
-                }
+                widget |= doc.get_dictionary(*id).is_ok_and(is_widget);
             }
             lopdf::Object::Dictionary(d) => {
                 any = true;
-                dicts.push(d.clone());
+                widget |= is_widget(d);
             }
             _ => any = true,
         }
     }
-    Some((any, dicts))
+    Some((any, widget))
 }
 
 // Effective page rotation in degrees, honoring /Rotate inherited from the page tree (nearest wins).
@@ -1063,21 +1060,21 @@ mod tests {
         (doc, pid)
     }
 
+    fn inline(subtype: &str) -> lopdf::Object {
+        let mut d = lopdf::Dictionary::new();
+        d.set("Subtype", subtype);
+        lopdf::Object::Dictionary(d)
+    }
+
     #[test]
     fn classify_annotations_counts_inline_dicts() {
         // A page with only an inline annotation dict must register as annotated (not scan-only), so
         // it takes the overlay path — get_page_annotations would have dropped it.
-        let (doc, pid) = page_with_annots(vec![
-            lopdf::Object::Dictionary({
-                let mut d = lopdf::Dictionary::new();
-                d.set("Subtype", "Highlight");
-                d
-            }),
-            lopdf::Object::Null,
-        ]);
-        let (has, dicts) = classify_annotations(&doc, pid).unwrap();
-        assert!(has);
-        assert_eq!(dicts.len(), 1);
+        let (doc, pid) = page_with_annots(vec![inline("Highlight"), lopdf::Object::Null]);
+        assert_eq!(classify_annotations(&doc, pid), Some((true, false)));
+        // an inline widget is detected too
+        let (doc, pid) = page_with_annots(vec![inline("Widget")]);
+        assert_eq!(classify_annotations(&doc, pid), Some((true, true)));
     }
 
     #[test]
@@ -1085,19 +1082,33 @@ mod tests {
         // absent /Annots
         let mut doc = lopdf::Document::with_version("1.5");
         let empty = doc.add_object(lopdf::Dictionary::new());
-        assert_eq!(classify_annotations(&doc, empty), Some((false, vec![])));
+        assert_eq!(classify_annotations(&doc, empty), Some((false, false)));
         // null-only -> not annotated
         let (d, p) = page_with_annots(vec![lopdf::Object::Null]);
-        assert_eq!(classify_annotations(&d, p), Some((false, vec![])));
-        // dangling ref -> counts as annotated but yields no dict (copy_annots forces fallback)
+        assert_eq!(classify_annotations(&d, p), Some((false, false)));
+        // resolvable reference (the common path) -> annotated, no widget
+        let mut doc = lopdf::Document::with_version("1.5");
+        let a = doc.add_object({
+            let mut d = lopdf::Dictionary::new();
+            d.set("Subtype", "Highlight");
+            d
+        });
+        let p = doc.add_object({
+            let mut page = lopdf::Dictionary::new();
+            page.set("Annots", vec![lopdf::Object::Reference(a)]);
+            page
+        });
+        assert_eq!(classify_annotations(&doc, p), Some((true, false)));
+        // dangling ref -> counts as annotated (copy_annots later forces fallback), no widget
         let (d, p) = page_with_annots(vec![lopdf::Object::Reference((99999, 0))]);
-        let (has, dicts) = classify_annotations(&d, p).unwrap();
-        assert!(has && dicts.is_empty());
+        assert_eq!(classify_annotations(&d, p), Some((true, false)));
         // /Annots present but not an array -> malformed -> None (fall back)
         let mut doc = lopdf::Document::with_version("1.5");
-        let mut page = lopdf::Dictionary::new();
-        page.set("Annots", lopdf::Object::Integer(5));
-        let pid = doc.add_object(page);
+        let pid = doc.add_object({
+            let mut page = lopdf::Dictionary::new();
+            page.set("Annots", lopdf::Object::Integer(5));
+            page
+        });
         assert_eq!(classify_annotations(&doc, pid), None);
     }
 }
