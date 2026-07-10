@@ -1,6 +1,6 @@
 // Split an image-scan page that also carries visible marks (OCR text, annotations): build a
 // single-page PDF holding everything except the background image's paint op, so poppler renders
-// the cheap marks while we blit the expensive image ourselves. PoC for scrolex issue #5.
+// the cheap marks while we blit the expensive image ourselves.
 
 use std::collections::{HashMap, HashSet};
 
@@ -10,7 +10,7 @@ use lopdf::{Dictionary, Document, Object, ObjectId, Stream};
 // Single-page PDF bytes for `page_id` with its image XObjects' `Do` ops removed, or None if the
 // page has no image to strip or can't be rebuilt. Poppler renders these (text, annotations) on top
 // of the image we blit ourselves.
-pub fn overlay_pdf(src: &Document, page_id: ObjectId) -> Option<Vec<u8>> {
+pub(crate) fn overlay_pdf(src: &Document, page_id: ObjectId) -> Option<Vec<u8>> {
     let resources = effective_resources(src, page_id)?;
     let image_names = image_xobject_names(src, &resources);
     if image_names.is_empty() {
@@ -134,6 +134,7 @@ fn copy_annots(src: &Document, dst: &mut Document, page_id: ObjectId, map: &mut 
                 }
             },
             Object::Dictionary(d) => (None, d.clone()),
+            Object::Null => continue, // deleted-annotation placeholder, not a mark
             _ => {
                 *broken = true;
                 return None;
@@ -393,5 +394,31 @@ mod tests {
         let mut broken = false;
         assert!(copy_annots(&src, &mut dst, page_id, &mut HashMap::new(), &mut broken).is_none());
         assert!(!broken);
+    }
+
+    #[test]
+    fn copy_annots_falls_back_on_non_array() {
+        let mut src = Document::with_version("1.5");
+        let mut page = Dictionary::new();
+        page.set("Annots", 5); // present but not an array
+        let page_id = src.add_object(page);
+        let mut dst = Document::with_version("1.5");
+        let mut broken = false;
+        copy_annots(&src, &mut dst, page_id, &mut HashMap::new(), &mut broken);
+        assert!(broken);
+    }
+
+    #[test]
+    fn copy_annots_handles_inline_and_null_entries() {
+        let mut src = Document::with_version("1.5");
+        let mut page = Dictionary::new();
+        // an inline-dictionary annotation and a null (deleted) placeholder
+        page.set("Annots", vec![Object::Dictionary(annot("Highlight")), Object::Null]);
+        let page_id = src.add_object(page);
+        let mut dst = Document::with_version("1.5");
+        let mut broken = false;
+        let result = copy_annots(&src, &mut dst, page_id, &mut HashMap::new(), &mut broken);
+        assert!(!broken, "inline dict + null must not force fallback");
+        assert!(result.is_some());
     }
 }
