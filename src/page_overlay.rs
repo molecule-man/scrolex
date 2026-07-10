@@ -108,14 +108,36 @@ fn copy_dict(src: &Document, dst: &mut Document, dict: &Dictionary, map: &mut Ha
 // source annotation id is registered in `map` before copying so any surviving cross-reference
 // reuses the sanitized copy rather than re-cloning the original (with its /P) unsanitized.
 fn copy_annots(src: &Document, dst: &mut Document, page_id: ObjectId, map: &mut HashMap<ObjectId, ObjectId>, broken: &mut bool) -> Option<Object> {
-    let page = src.get_dictionary(page_id).ok()?;
-    let entries = src.dereference(page.get(b"Annots").ok()?).ok()?.1.as_array().ok()?.clone();
+    let Ok(page) = src.get_dictionary(page_id) else {
+        *broken = true;
+        return None;
+    };
+    // No /Annots at all is legitimately "no annotations"; a present-but-unresolvable array is not.
+    let Ok(annots) = page.get(b"Annots") else {
+        return None;
+    };
+    let entries = match src.dereference(annots) {
+        Ok((_, Object::Array(a))) => a.clone(),
+        _ => {
+            *broken = true;
+            return None;
+        }
+    };
     let mut refs = Vec::new();
     for entry in &entries {
         let (src_id, annot) = match entry {
-            Object::Reference(id) => (Some(*id), src.get_dictionary(*id).ok()?.clone()),
+            Object::Reference(id) => match src.get_dictionary(*id) {
+                Ok(d) => (Some(*id), d.clone()),
+                Err(_) => {
+                    *broken = true; // dangling annotation -> fall back, don't drop the marks
+                    return None;
+                }
+            },
             Object::Dictionary(d) => (None, d.clone()),
-            _ => continue,
+            _ => {
+                *broken = true;
+                return None;
+            }
         };
         let mut sanitized = Dictionary::new();
         for (key, value) in annot.iter() {
@@ -323,5 +345,53 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         None
+    }
+
+    fn annot(subtype: &str) -> Dictionary {
+        let mut d = Dictionary::new();
+        d.set("Subtype", subtype);
+        d
+    }
+
+    #[test]
+    fn copy_annots_falls_back_on_dangling_ref() {
+        // A present /Annots with one unresolvable entry must set broken (fall back), not silently
+        // drop the resolvable marks.
+        let mut src = Document::with_version("1.5");
+        let good = src.add_object(annot("Highlight"));
+        let mut page = Dictionary::new();
+        page.set("Annots", vec![Object::Reference(good), Object::Reference((99999, 0))]);
+        let page_id = src.add_object(page);
+
+        let mut dst = Document::with_version("1.5");
+        let mut broken = false;
+        copy_annots(&src, &mut dst, page_id, &mut HashMap::new(), &mut broken);
+        assert!(broken, "dangling annotation ref must trigger fallback");
+    }
+
+    #[test]
+    fn copy_annots_copies_valid_array() {
+        let mut src = Document::with_version("1.5");
+        let good = src.add_object(annot("Highlight"));
+        let mut page = Dictionary::new();
+        page.set("Annots", vec![Object::Reference(good)]);
+        let page_id = src.add_object(page);
+
+        let mut dst = Document::with_version("1.5");
+        let mut broken = false;
+        let result = copy_annots(&src, &mut dst, page_id, &mut HashMap::new(), &mut broken);
+        assert!(!broken);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn copy_annots_none_without_annots() {
+        // No /Annots at all is legitimately "no annotations", not a failure.
+        let mut src = Document::with_version("1.5");
+        let page_id = src.add_object(Dictionary::new());
+        let mut dst = Document::with_version("1.5");
+        let mut broken = false;
+        assert!(copy_annots(&src, &mut dst, page_id, &mut HashMap::new(), &mut broken).is_none());
+        assert!(!broken);
     }
 }

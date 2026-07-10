@@ -171,7 +171,9 @@ fn page_entry(
     if effective_rotate(doc, page) != 0 || !mediabox_origin_zero(doc, page) || !cropbox_matches_mediabox(doc, page) {
         return None;
     }
-    let annotations = doc.get_page_annotations(pid).unwrap_or_default();
+    // A malformed annotation array must fall back to full poppler, not be read as "no annotations"
+    // (which would fast-path and drop the marks). Absent /Annots resolves to an empty list.
+    let annotations = doc.get_page_annotations(pid).ok()?;
     // Widget/form annotations need AcroForm and field-hierarchy state the overlay can't carry;
     // such pages fall back to full poppler.
     if annotations.iter().any(|a| is_widget(a)) {
