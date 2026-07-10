@@ -171,7 +171,13 @@ fn page_entry(
     if effective_rotate(doc, page) != 0 || !mediabox_origin_zero(doc, page) || !cropbox_matches_mediabox(doc, page) {
         return None;
     }
-    let has_annotations = doc.get_page_annotations(pid).is_ok_and(|a| !a.is_empty());
+    let annotations = doc.get_page_annotations(pid).unwrap_or_default();
+    // Widget/form annotations need AcroForm and field-hierarchy state the overlay can't carry;
+    // such pages fall back to full poppler.
+    if annotations.iter().any(|a| is_widget(a)) {
+        return None;
+    }
+    let has_annotations = !annotations.is_empty();
 
     let resources = deref_dict(doc, page.get(b"Resources").ok()?)?;
     let xobjects = deref_dict(doc, resources.get(b"XObject").ok()?)?;
@@ -229,6 +235,15 @@ fn page_entry(
 // Object id the XObject `name` references.
 fn deref_ref(xobjects: &lopdf::Dictionary, name: &[u8]) -> Option<lopdf::ObjectId> {
     xobjects.get(name).ok()?.as_reference().ok()
+}
+
+// A form-field widget annotation, which we don't overlay (needs AcroForm/field-tree state).
+fn is_widget(annot: &lopdf::Dictionary) -> bool {
+    annot
+        .get(b"Subtype")
+        .ok()
+        .and_then(|o| o.as_name().ok())
+        .is_some_and(|n| n == b"Widget")
 }
 
 // Effective page rotation in degrees, honoring /Rotate inherited from the page tree (nearest wins).
@@ -955,5 +970,55 @@ mod tests {
         assert_eq!(cmyk_to_rgb(&[255, 255, 255, 0]), vec![0, 0, 0]);
         // k=255, no ink => white.
         assert_eq!(cmyk_to_rgb(&[255, 255, 255, 255]), vec![255, 255, 255]);
+    }
+
+    fn rect(x0: i64, y0: i64, x1: i64, y1: i64) -> lopdf::Object {
+        lopdf::Object::Array(vec![x0.into(), y0.into(), x1.into(), y1.into()])
+    }
+
+    #[test]
+    fn cropbox_guard() {
+        let mut doc = lopdf::Document::with_version("1.5");
+        let mut page = lopdf::Dictionary::new();
+        page.set("MediaBox", rect(0, 0, 100, 200));
+        assert!(cropbox_matches_mediabox(&doc, &page)); // no CropBox
+        page.set("CropBox", rect(0, 0, 100, 200));
+        assert!(cropbox_matches_mediabox(&doc, &page)); // equal
+        page.set("CropBox", rect(10, 10, 90, 190));
+        assert!(!cropbox_matches_mediabox(&doc, &page)); // smaller
+
+        // inherited from the parent page-tree node
+        let mut parent = lopdf::Dictionary::new();
+        parent.set("MediaBox", rect(0, 0, 100, 200));
+        parent.set("CropBox", rect(0, 0, 100, 200));
+        let pid = doc.add_object(parent);
+        let mut child = lopdf::Dictionary::new();
+        child.set("Parent", pid);
+        assert!(cropbox_matches_mediabox(&doc, &child));
+    }
+
+    #[test]
+    fn inherited_rect_rejects_malformed() {
+        let doc = lopdf::Document::with_version("1.5");
+        assert_eq!(inherited_rect(&doc, &lopdf::Dictionary::new(), b"MediaBox"), None); // absent
+        let mut page = lopdf::Dictionary::new();
+        page.set("MediaBox", lopdf::Object::Integer(5));
+        assert_eq!(inherited_rect(&doc, &page, b"MediaBox"), None); // not an array
+        page.set(
+            "MediaBox",
+            lopdf::Object::Array(vec![0.into(), lopdf::Object::Name(b"x".to_vec()), 1.into(), 1.into()]),
+        );
+        assert_eq!(inherited_rect(&doc, &page, b"MediaBox"), None); // non-numeric component
+    }
+
+    #[test]
+    fn detects_widget_annotation() {
+        let mut widget = lopdf::Dictionary::new();
+        widget.set("Subtype", "Widget");
+        assert!(is_widget(&widget));
+        let mut highlight = lopdf::Dictionary::new();
+        highlight.set("Subtype", "Highlight");
+        assert!(!is_widget(&highlight));
+        assert!(!is_widget(&lopdf::Dictionary::new()));
     }
 }

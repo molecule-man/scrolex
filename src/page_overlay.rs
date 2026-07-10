@@ -104,22 +104,35 @@ fn copy_dict(src: &Document, dst: &mut Document, dict: &Dictionary, map: &mut Ha
 }
 
 // Rebuild the annotation array, dropping the back-references (/P, /Popup, /IRT, /Parent) that would
-// otherwise drag the original page (and its image), or the AcroForm tree, into the copy.
+// otherwise drag the original page (and its image), or the AcroForm tree, into the copy. Each
+// source annotation id is registered in `map` before copying so any surviving cross-reference
+// reuses the sanitized copy rather than re-cloning the original (with its /P) unsanitized.
 fn copy_annots(src: &Document, dst: &mut Document, page_id: ObjectId, map: &mut HashMap<ObjectId, ObjectId>, broken: &mut bool) -> Option<Object> {
-    let annots = src.get_page_annotations(page_id).ok()?;
-    if annots.is_empty() {
-        return None;
-    }
+    let page = src.get_dictionary(page_id).ok()?;
+    let entries = src.dereference(page.get(b"Annots").ok()?).ok()?.1.as_array().ok()?.clone();
     let mut refs = Vec::new();
-    for annot in annots {
-        let mut dict = Dictionary::new();
+    for entry in &entries {
+        let (src_id, annot) = match entry {
+            Object::Reference(id) => (Some(*id), src.get_dictionary(*id).ok()?.clone()),
+            Object::Dictionary(d) => (None, d.clone()),
+            _ => continue,
+        };
+        let mut sanitized = Dictionary::new();
         for (key, value) in annot.iter() {
             if !matches!(key.as_slice(), b"P" | b"Popup" | b"IRT" | b"Parent") {
-                dict.set(key.clone(), value.clone());
+                sanitized.set(key.clone(), value.clone());
             }
         }
-        let copied = copy(src, dst, &Object::Dictionary(dict), map, broken);
-        refs.push(Object::Reference(dst.add_object(copied)));
+        let new_id = dst.new_object_id();
+        if let Some(id) = src_id {
+            map.insert(id, new_id);
+        }
+        let copied = copy(src, dst, &Object::Dictionary(sanitized), map, broken);
+        dst.set_object(new_id, copied);
+        refs.push(Object::Reference(new_id));
+    }
+    if refs.is_empty() {
+        return None;
     }
     Some(Object::Array(refs))
 }
