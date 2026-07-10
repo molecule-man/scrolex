@@ -21,6 +21,9 @@ struct ImageEntry {
     place: (f64, f64, f64, f64),
     // stream is FlateDecode-wrapped around the JPEG (filter chain [FlateDecode, DCTDecode])
     flate: bool,
+    // single-page PDF of the page's marks (text, annotations) minus the image, drawn by poppler
+    // over the blitted image; None when the page is image-only.
+    overlay: Option<Vec<u8>>,
 }
 
 // Per-document map of qualifying image-only pages (0-based index). Small and immutable once built,
@@ -65,8 +68,29 @@ pub fn render_image_page(
         .round()
         .clamp(1.0, f64::from(u16::MAX)) as u16;
     let img = decode(&jpeg, target_w, target_h)?;
+    let surface = compose(page_w, page_h, place, &img, scale, dsf);
 
-    Some(compose(page_w, page_h, place, &img, scale, dsf))
+    match &entry.overlay {
+        Some(bytes) => draw_overlay(&surface, bytes, scale).then_some(surface),
+        None => Some(surface),
+    }
+}
+
+// Draw the overlay PDF's marks over the blitted image (compose's coordinate space). False if it
+// can't render, so the caller falls back to full poppler rather than drop the marks.
+fn draw_overlay(surface: &ImageSurface, bytes: &[u8], scale: f64) -> bool {
+    let Ok(doc) = poppler::Document::from_data(bytes, None) else {
+        return false;
+    };
+    let Some(page) = doc.page(0) else {
+        return false;
+    };
+    let Ok(cr) = Context::new(surface) else {
+        return false;
+    };
+    cr.scale(scale, scale);
+    page.render(&cr);
+    true
 }
 
 // Convert a placement rect from PDF's bottom-left origin to the top-left render space.
@@ -132,20 +156,27 @@ fn build_index(uri: &str) -> Option<ImageIndex> {
     Some(ImageIndex { path, pages })
 }
 
-// A page qualifies only if it is upright, unannotated, and its content stream paints nothing but a
-// single lone DCTDecode image (invisible OCR text is fine; visible text/vector/overlay is not) with
-// a handled colorspace, no mask and no /Decode. Anything else falls back to poppler's render.
+// A page qualifies only if it is upright and its content stream paints a single lone DCTDecode
+// image (with a handled colorspace, no mask, no /Decode) as a background. Visible text and
+// annotations are allowed: poppler paints them over the blitted image via an overlay PDF. Vector
+// paint, shading, transparency and extra XObjects still fall back to poppler's full render.
 fn page_entry(
     doc: &lopdf::Document,
     pid: lopdf::ObjectId,
     file: &mut std::fs::File,
 ) -> Option<ImageEntry> {
     let page = doc.get_dictionary(pid).ok()?;
-    if effective_rotate(doc, page) != 0 || !mediabox_origin_zero(doc, page) {
+    // Placement and the composed surface work in MediaBox (origin-zero) space; a differing CropBox
+    // would shift poppler's page.size() and misalign both the blit and the overlay.
+    if effective_rotate(doc, page) != 0 || !mediabox_origin_zero(doc, page) || !cropbox_matches_mediabox(doc, page) {
         return None;
     }
-    // Any annotation (stamp, signature, widget, ...) is painted by poppler but not by us.
-    if doc.get_page_annotations(pid).is_ok_and(|a| !a.is_empty()) {
+    // Classify /Annots the same way the overlay builder does (lopdf's get_page_annotations drops
+    // inline dictionaries, which the overlay does render); a malformed array falls back to poppler.
+    let (has_annotations, has_widget) = classify_annotations(doc, pid)?;
+    // Widget/form annotations need AcroForm and field-hierarchy state the overlay can't carry;
+    // such pages fall back to full poppler.
+    if has_widget {
         return None;
     }
 
@@ -173,9 +204,19 @@ fn page_entry(
         return None;
     }
 
-    // Content stream must draw only this image, and give its placement (upright, unrotated).
+    // The image must be the sole/background paint; placement is upright and unrotated.
     let content = Content::decode(&doc.get_page_content(pid).ok()?).ok()?;
-    let place = image_placement(&content.operations, &name)?;
+    let (place, has_visible_text) = image_placement(&content.operations, &name)?;
+
+    // Marks over the image (visible text, annotations) go to a poppler overlay; bail to full
+    // poppler if we can't build one poppler can render, rather than drop the marks.
+    let overlay = if has_annotations || has_visible_text {
+        let bytes = crate::page_overlay::overlay_pdf(doc, pid)?;
+        poppler::Document::from_data(&bytes, None).ok()?.page(0)?;
+        Some(bytes)
+    } else {
+        None
+    };
 
     let id = deref_ref(&xobjects, &name)?;
     let offset = match doc.reference_table.get(id.0)? {
@@ -188,12 +229,51 @@ fn page_entry(
         length: stream.content.len(),
         place,
         flate,
+        overlay,
     })
 }
 
 // Object id the XObject `name` references.
 fn deref_ref(xobjects: &lopdf::Dictionary, name: &[u8]) -> Option<lopdf::ObjectId> {
     xobjects.get(name).ok()?.as_reference().ok()
+}
+
+// A form-field widget annotation, which we don't overlay (needs AcroForm/field-tree state).
+fn is_widget(annot: &lopdf::Dictionary) -> bool {
+    annot
+        .get(b"Subtype")
+        .ok()
+        .and_then(|o| o.as_name().ok())
+        .is_some_and(|n| n == b"Widget")
+}
+
+// (has_annotation, has_widget) for the page, classifying /Annots the same way copy_annots does
+// (resolved references and inline dicts count; nulls skip). None if /Annots is present but not a
+// resolvable array, so the page falls back to full poppler.
+fn classify_annotations(doc: &lopdf::Document, pid: lopdf::ObjectId) -> Option<(bool, bool)> {
+    let page = doc.get_dictionary(pid).ok()?;
+    let Ok(annots) = page.get(b"Annots") else {
+        return Some((false, false)); // no /Annots
+    };
+    let lopdf::Object::Array(entries) = doc.dereference(annots).ok()?.1 else {
+        return None; // present but not an array
+    };
+    let (mut any, mut widget) = (false, false);
+    for entry in entries {
+        match entry {
+            lopdf::Object::Null => {}
+            lopdf::Object::Reference(id) => {
+                any = true;
+                widget |= doc.get_dictionary(*id).is_ok_and(is_widget);
+            }
+            lopdf::Object::Dictionary(d) => {
+                any = true;
+                widget |= is_widget(d);
+            }
+            _ => any = true,
+        }
+    }
+    Some((any, widget))
 }
 
 // Effective page rotation in degrees, honoring /Rotate inherited from the page tree (nearest wins).
@@ -244,6 +324,38 @@ fn mediabox_origin_zero(doc: &lopdf::Document, page: &lopdf::Dictionary) -> bool
         dict = pd.clone();
     }
     false
+}
+
+// Whether the page's effective CropBox equals its MediaBox (or there is none). page.size() follows
+// the CropBox while placement assumes MediaBox, so a differing CropBox would misalign the render.
+fn cropbox_matches_mediabox(doc: &lopdf::Document, page: &lopdf::Dictionary) -> bool {
+    let Some(crop) = inherited_rect(doc, page, b"CropBox") else {
+        return true;
+    };
+    match inherited_rect(doc, page, b"MediaBox") {
+        Some(media) => crop.iter().zip(&media).all(|(a, b)| (a - b).abs() < 1.0),
+        None => false,
+    }
+}
+
+// Resolve a rectangle attribute (4 numbers), honoring page-tree inheritance. None if absent/invalid.
+fn inherited_rect(doc: &lopdf::Document, page: &lopdf::Dictionary, key: &[u8]) -> Option<[f64; 4]> {
+    let mut dict = page.clone();
+    for _ in 0..32 {
+        if let Ok(v) = dict.get(key) {
+            let (_, lopdf::Object::Array(a)) = doc.dereference(v).ok()? else {
+                return None;
+            };
+            let mut rect = [0.0; 4];
+            for (i, slot) in rect.iter_mut().enumerate() {
+                *slot = a.get(i).and_then(num)?;
+            }
+            return Some(rect);
+        }
+        let parent = dict.get(b"Parent").and_then(lopdf::Object::as_reference).ok()?;
+        dict = doc.get_dictionary(parent).ok()?.clone();
+    }
+    None
 }
 
 // Numeric value of an Integer or Real object.
@@ -323,17 +435,18 @@ fn colorspace_supported(doc: &lopdf::Document, dict: &lopdf::Dictionary) -> bool
     )
 }
 
-// Placement (x, y_bottom, w, h) in PDF bottom-left page-point space for a page whose content stream
-// draws exactly one image (`Do` of `image`) and nothing else visible, or None otherwise. Invisible
-// OCR text (render mode 3) is allowed - poppler paints no marks for it, so output still matches.
-// Visible text, vector paint, clipping, shading, inline images, transparency (`gs`) and other
-// XObjects all disqualify the page, as does a rotated/skewed/flipped placement.
-fn image_placement(ops: &[Operation], image: &[u8]) -> Option<(f64, f64, f64, f64)> {
+// For a page drawing exactly one image (`Do` of `image`) as its background, returns its placement
+// (x, y_bottom, w, h) in PDF bottom-left page-point space plus whether visible text was drawn over
+// it. Visible text is allowed only after the image is placed (poppler overlays it); before, it
+// would sit behind an opaque scan, so it disqualifies. Vector paint, clipping, shading, inline
+// images, transparency (`gs`), other XObjects and a rotated/skewed/flipped placement all disqualify.
+fn image_placement(ops: &[Operation], image: &[u8]) -> Option<((f64, f64, f64, f64), bool)> {
     const ID: [f64; 6] = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
     let mut ctm = ID;
     let mut tr = 0i64; // text render mode; 3 = invisible
     let mut stack: Vec<([f64; 6], i64)> = Vec::new();
     let mut placed: Option<[f64; 6]> = None;
+    let mut has_visible_text = false;
 
     for op in ops {
         match op.operator.as_str() {
@@ -347,9 +460,11 @@ fn image_placement(ops: &[Operation], image: &[u8]) -> Option<(f64, f64, f64, f6
                 }
                 placed = Some(ctm);
             }
-            // Text shows marks unless it is invisible (render mode 3).
-            "Tj" | "TJ" | "'" | "\"" if tr != 3 => return None,
-            // Anything that paints, clips or changes compositing breaks output parity with poppler.
+            "Tj" | "TJ" | "'" | "\"" if tr != 3 => {
+                placed?; // visible text before the image would sit behind it
+                has_visible_text = true;
+            }
+            // Anything that paints, clips or changes compositing can't be reproduced by us.
             "S" | "s" | "f" | "F" | "f*" | "B" | "B*" | "b" | "b*" | "W" | "W*" | "sh" | "BI"
             | "gs" => return None,
             _ => {}
@@ -360,7 +475,7 @@ fn image_placement(ops: &[Operation], image: &[u8]) -> Option<(f64, f64, f64, f6
     if m[1].abs() > 0.01 || m[2].abs() > 0.01 || m[0] <= 0.0 || m[3] <= 0.0 {
         return None; // rotated, skewed, or flipped placement
     }
-    Some((m[4], m[5], m[0], m[3])) // e, f, w, h
+    Some(((m[4], m[5], m[0], m[3]), has_visible_text)) // e, f, w, h
 }
 
 // 2x3 affine [a b c d e f] from the operands of a `cm`.
@@ -593,6 +708,79 @@ mod tests {
         assert!(colored, "surface is blank white");
     }
 
+    // True if any pixel (Rgb24 B,G,R,x) satisfies `pred`.
+    fn any_pixel(surface: &ImageSurface, pred: impl Fn(&[u8]) -> bool) -> bool {
+        let mut found = false;
+        surface
+            .with_data(|d| found = d.chunks_exact(4).any(&pred))
+            .unwrap();
+        found
+    }
+
+    // The fixtures' scan is a uniform ~205 gray; a pixel in that range is the untouched background.
+    fn is_scan_gray(p: &[u8]) -> bool {
+        p[..3].iter().all(|&c| (190..=220).contains(&c))
+    }
+
+    #[gtk::test]
+    fn overlay_renders_on_worker_thread() {
+        // The real render path runs draw_overlay's poppler from_data + render on a background
+        // worker thread, not the GTK main thread; guard against that path hanging.
+        let uri = fixture_uri("image_scan_visible_text.pdf");
+        {
+            let doc = poppler::Document::from_file(&uri, None).unwrap();
+            let page = doc.page(0).unwrap();
+            render_when_ready(&uri, &page).expect("build index on main first");
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let doc = poppler::Document::from_file(&uri, None).unwrap();
+            let page = doc.page(0).unwrap();
+            let ok = render_image_page(&uri, &page, 2.0, 1.0).is_some();
+            let _ = tx.send(ok);
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(ok) => assert!(ok, "worker render returned None"),
+            Err(_) => panic!("worker overlay render HUNG (>5s)"),
+        }
+    }
+
+    #[gtk::test]
+    fn renders_scan_with_visible_text_overlay() {
+        // Image + visible OCR text: fast path blits the image, poppler overlays the black text.
+        let uri = fixture_uri("image_scan_visible_text.pdf");
+        let doc = poppler::Document::from_file(&uri, None).unwrap();
+        let page = doc.page(0).unwrap();
+        let (w, h) = page.size();
+
+        let surface = render_when_ready(&uri, &page).expect("visible-text scan should render");
+        assert_eq!((surface.width(), surface.height()), (w as i32, h as i32));
+        // The gray scan is ~205; near-black pixels can only be the overlaid text.
+        assert!(
+            any_pixel(&surface, |p| p[0] < 120 && p[1] < 120 && p[2] < 120),
+            "overlay text not painted"
+        );
+        // The scan must show through: poppler overlays marks, it must not blank the background.
+        assert!(any_pixel(&surface, is_scan_gray), "scan background not preserved");
+    }
+
+    #[gtk::test]
+    fn renders_scan_with_annotation_overlay() {
+        // Image + annotations: poppler overlays the blue ink and yellow highlight on the scan.
+        let uri = fixture_uri("image_scan_annotated.pdf");
+        let doc = poppler::Document::from_file(&uri, None).unwrap();
+        let page = doc.page(0).unwrap();
+        let (w, h) = page.size();
+
+        let surface = render_when_ready(&uri, &page).expect("annotated scan should render");
+        assert_eq!((surface.width(), surface.height()), (w as i32, h as i32));
+        assert!(
+            any_pixel(&surface, |p| p[0] > 180 && p[1] < 90 && p[2] < 90),
+            "blue ink annotation not painted"
+        );
+        assert!(any_pixel(&surface, is_scan_gray), "scan background not preserved");
+    }
+
     #[gtk::test]
     fn falls_back_for_non_image_page() {
         let uri = fixture_uri("outline.pdf");
@@ -639,13 +827,19 @@ mod tests {
             do_("Im0"),
             op("Q", vec![]),
         ];
-        assert_eq!(image_placement(&ops, b"Im0"), Some((0.0, 0.0, 48.0, 36.0)));
+        assert_eq!(
+            image_placement(&ops, b"Im0"),
+            Some(((0.0, 0.0, 48.0, 36.0), false))
+        );
     }
 
     #[test]
     fn placement_partial_image() {
         let ops = [cm(10.0, 0.0, 0.0, 20.0, 5.0, 6.0), do_("Im0")];
-        assert_eq!(image_placement(&ops, b"Im0"), Some((5.0, 6.0, 10.0, 20.0)));
+        assert_eq!(
+            image_placement(&ops, b"Im0"),
+            Some(((5.0, 6.0, 10.0, 20.0), false))
+        );
     }
 
     #[test]
@@ -661,7 +855,7 @@ mod tests {
 
     #[test]
     fn accepts_invisible_ocr_text() {
-        // full-page image plus an invisible (render mode 3) OCR text layer: still image-only visually.
+        // full-page image plus an invisible (render mode 3) OCR text layer: no visible marks.
         let ops = [
             cm(48.0, 0.0, 0.0, 36.0, 0.0, 0.0),
             do_("Im0"),
@@ -670,7 +864,34 @@ mod tests {
             tj(),
             op("ET", vec![]),
         ];
-        assert_eq!(image_placement(&ops, b"Im0"), Some((0.0, 0.0, 48.0, 36.0)));
+        assert_eq!(
+            image_placement(&ops, b"Im0"),
+            Some(((0.0, 0.0, 48.0, 36.0), false))
+        );
+    }
+
+    #[test]
+    fn accepts_visible_text_after_image() {
+        // visible OCR text drawn over the placed image: allowed, flagged for a poppler overlay.
+        let ops = [
+            cm(48.0, 0.0, 0.0, 36.0, 0.0, 0.0),
+            do_("Im0"),
+            op("BT", vec![]),
+            tr(0),
+            tj(),
+            op("ET", vec![]),
+        ];
+        assert_eq!(
+            image_placement(&ops, b"Im0"),
+            Some(((0.0, 0.0, 48.0, 36.0), true))
+        );
+    }
+
+    #[test]
+    fn rejects_visible_text_before_image() {
+        // visible text before the image would sit behind an opaque scan; disqualify.
+        let ops = [tr(0), tj(), cm(48.0, 0.0, 0.0, 36.0, 0.0, 0.0), do_("Im0")];
+        assert!(image_placement(&ops, b"Im0").is_none());
     }
 
     #[test]
@@ -679,12 +900,13 @@ mod tests {
         let reject = |extra: Operation| {
             image_placement(&[base.clone(), extra, do_("Im0")], b"Im0").is_none()
         };
-        assert!(reject(tj())); // visible text (default render mode 0)
+        // `reject` puts the op before the image `Do`, so visible text here is behind the scan.
+        assert!(reject(tj())); // visible text before the image (see accepts_visible_text_after_image)
         assert!(image_placement(
             &[base.clone(), tr(3), tj(), tr(0), tj(), do_("Im0")],
             b"Im0"
         )
-        .is_none()); // becomes visible again
+        .is_none()); // visible again, still before the image
         assert!(reject(op("f", vec![]))); // filled path
         assert!(reject(op("W", vec![]))); // clipping
         assert!(reject(op("gs", vec![lopdf::Object::Name(b"GS1".into())]))); // transparency/blend
@@ -778,5 +1000,115 @@ mod tests {
         assert_eq!(cmyk_to_rgb(&[255, 255, 255, 0]), vec![0, 0, 0]);
         // k=255, no ink => white.
         assert_eq!(cmyk_to_rgb(&[255, 255, 255, 255]), vec![255, 255, 255]);
+    }
+
+    fn rect(x0: i64, y0: i64, x1: i64, y1: i64) -> lopdf::Object {
+        lopdf::Object::Array(vec![x0.into(), y0.into(), x1.into(), y1.into()])
+    }
+
+    #[test]
+    fn cropbox_guard() {
+        let mut doc = lopdf::Document::with_version("1.5");
+        let mut page = lopdf::Dictionary::new();
+        page.set("MediaBox", rect(0, 0, 100, 200));
+        assert!(cropbox_matches_mediabox(&doc, &page)); // no CropBox
+        page.set("CropBox", rect(0, 0, 100, 200));
+        assert!(cropbox_matches_mediabox(&doc, &page)); // equal
+        page.set("CropBox", rect(10, 10, 90, 190));
+        assert!(!cropbox_matches_mediabox(&doc, &page)); // smaller
+
+        // inherited from the parent page-tree node
+        let mut parent = lopdf::Dictionary::new();
+        parent.set("MediaBox", rect(0, 0, 100, 200));
+        parent.set("CropBox", rect(0, 0, 100, 200));
+        let pid = doc.add_object(parent);
+        let mut child = lopdf::Dictionary::new();
+        child.set("Parent", pid);
+        assert!(cropbox_matches_mediabox(&doc, &child));
+    }
+
+    #[test]
+    fn inherited_rect_rejects_malformed() {
+        let doc = lopdf::Document::with_version("1.5");
+        assert_eq!(inherited_rect(&doc, &lopdf::Dictionary::new(), b"MediaBox"), None); // absent
+        let mut page = lopdf::Dictionary::new();
+        page.set("MediaBox", lopdf::Object::Integer(5));
+        assert_eq!(inherited_rect(&doc, &page, b"MediaBox"), None); // not an array
+        page.set(
+            "MediaBox",
+            lopdf::Object::Array(vec![0.into(), lopdf::Object::Name(b"x".to_vec()), 1.into(), 1.into()]),
+        );
+        assert_eq!(inherited_rect(&doc, &page, b"MediaBox"), None); // non-numeric component
+    }
+
+    #[test]
+    fn detects_widget_annotation() {
+        let mut widget = lopdf::Dictionary::new();
+        widget.set("Subtype", "Widget");
+        assert!(is_widget(&widget));
+        let mut highlight = lopdf::Dictionary::new();
+        highlight.set("Subtype", "Highlight");
+        assert!(!is_widget(&highlight));
+        assert!(!is_widget(&lopdf::Dictionary::new()));
+    }
+
+    fn page_with_annots(entries: Vec<lopdf::Object>) -> (lopdf::Document, lopdf::ObjectId) {
+        let mut doc = lopdf::Document::with_version("1.5");
+        let mut page = lopdf::Dictionary::new();
+        page.set("Annots", lopdf::Object::Array(entries));
+        let pid = doc.add_object(page);
+        (doc, pid)
+    }
+
+    fn inline(subtype: &str) -> lopdf::Object {
+        let mut d = lopdf::Dictionary::new();
+        d.set("Subtype", subtype);
+        lopdf::Object::Dictionary(d)
+    }
+
+    #[test]
+    fn classify_annotations_counts_inline_dicts() {
+        // A page with only an inline annotation dict must register as annotated (not scan-only), so
+        // it takes the overlay path — get_page_annotations would have dropped it.
+        let (doc, pid) = page_with_annots(vec![inline("Highlight"), lopdf::Object::Null]);
+        assert_eq!(classify_annotations(&doc, pid), Some((true, false)));
+        // an inline widget is detected too
+        let (doc, pid) = page_with_annots(vec![inline("Widget")]);
+        assert_eq!(classify_annotations(&doc, pid), Some((true, true)));
+    }
+
+    #[test]
+    fn classify_annotations_edge_cases() {
+        // absent /Annots
+        let mut doc = lopdf::Document::with_version("1.5");
+        let empty = doc.add_object(lopdf::Dictionary::new());
+        assert_eq!(classify_annotations(&doc, empty), Some((false, false)));
+        // null-only -> not annotated
+        let (d, p) = page_with_annots(vec![lopdf::Object::Null]);
+        assert_eq!(classify_annotations(&d, p), Some((false, false)));
+        // resolvable reference (the common path) -> annotated, no widget
+        let mut doc = lopdf::Document::with_version("1.5");
+        let a = doc.add_object({
+            let mut d = lopdf::Dictionary::new();
+            d.set("Subtype", "Highlight");
+            d
+        });
+        let p = doc.add_object({
+            let mut page = lopdf::Dictionary::new();
+            page.set("Annots", vec![lopdf::Object::Reference(a)]);
+            page
+        });
+        assert_eq!(classify_annotations(&doc, p), Some((true, false)));
+        // dangling ref -> counts as annotated (copy_annots later forces fallback), no widget
+        let (d, p) = page_with_annots(vec![lopdf::Object::Reference((99999, 0))]);
+        assert_eq!(classify_annotations(&d, p), Some((true, false)));
+        // /Annots present but not an array -> malformed -> None (fall back)
+        let mut doc = lopdf::Document::with_version("1.5");
+        let pid = doc.add_object({
+            let mut page = lopdf::Dictionary::new();
+            page.set("Annots", lopdf::Object::Integer(5));
+            page
+        });
+        assert_eq!(classify_annotations(&doc, pid), None);
     }
 }
