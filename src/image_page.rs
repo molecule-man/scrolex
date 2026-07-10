@@ -21,6 +21,9 @@ struct ImageEntry {
     place: (f64, f64, f64, f64),
     // stream is FlateDecode-wrapped around the JPEG (filter chain [FlateDecode, DCTDecode])
     flate: bool,
+    // single-page PDF of the page's marks (text, annotations) minus the image, drawn by poppler
+    // over the blitted image; None when the page is image-only.
+    overlay: Option<Vec<u8>>,
 }
 
 // Per-document map of qualifying image-only pages (0-based index). Small and immutable once built,
@@ -65,8 +68,29 @@ pub fn render_image_page(
         .round()
         .clamp(1.0, f64::from(u16::MAX)) as u16;
     let img = decode(&jpeg, target_w, target_h)?;
+    let surface = compose(page_w, page_h, place, &img, scale, dsf);
 
-    Some(compose(page_w, page_h, place, &img, scale, dsf))
+    match &entry.overlay {
+        Some(bytes) => draw_overlay(&surface, bytes, scale).then_some(surface),
+        None => Some(surface),
+    }
+}
+
+// Draw the overlay PDF's marks over the blitted image (compose's coordinate space). False if it
+// can't render, so the caller falls back to full poppler rather than drop the marks.
+fn draw_overlay(surface: &ImageSurface, bytes: &[u8], scale: f64) -> bool {
+    let Ok(doc) = poppler::Document::from_data(bytes, None) else {
+        return false;
+    };
+    let Some(page) = doc.page(0) else {
+        return false;
+    };
+    let Ok(cr) = Context::new(surface) else {
+        return false;
+    };
+    cr.scale(scale, scale);
+    page.render(&cr);
+    true
 }
 
 // Convert a placement rect from PDF's bottom-left origin to the top-left render space.
@@ -132,9 +156,10 @@ fn build_index(uri: &str) -> Option<ImageIndex> {
     Some(ImageIndex { path, pages })
 }
 
-// A page qualifies only if it is upright, unannotated, and its content stream paints nothing but a
-// single lone DCTDecode image (invisible OCR text is fine; visible text/vector/overlay is not) with
-// a handled colorspace, no mask and no /Decode. Anything else falls back to poppler's render.
+// A page qualifies only if it is upright and its content stream paints a single lone DCTDecode
+// image (with a handled colorspace, no mask, no /Decode) as a background. Visible text and
+// annotations are allowed: poppler paints them over the blitted image via an overlay PDF. Vector
+// paint, shading, transparency and extra XObjects still fall back to poppler's full render.
 fn page_entry(
     doc: &lopdf::Document,
     pid: lopdf::ObjectId,
@@ -144,10 +169,7 @@ fn page_entry(
     if effective_rotate(doc, page) != 0 || !mediabox_origin_zero(doc, page) {
         return None;
     }
-    // Any annotation (stamp, signature, widget, ...) is painted by poppler but not by us.
-    if doc.get_page_annotations(pid).is_ok_and(|a| !a.is_empty()) {
-        return None;
-    }
+    let has_annotations = doc.get_page_annotations(pid).is_ok_and(|a| !a.is_empty());
 
     let resources = deref_dict(doc, page.get(b"Resources").ok()?)?;
     let xobjects = deref_dict(doc, resources.get(b"XObject").ok()?)?;
@@ -173,9 +195,17 @@ fn page_entry(
         return None;
     }
 
-    // Content stream must draw only this image, and give its placement (upright, unrotated).
+    // The image must be the sole/background paint; placement is upright and unrotated.
     let content = Content::decode(&doc.get_page_content(pid).ok()?).ok()?;
-    let place = image_placement(&content.operations, &name)?;
+    let (place, has_visible_text) = image_placement(&content.operations, &name)?;
+
+    // Marks over the image (visible text, annotations) go to a poppler overlay; bail to full
+    // poppler if we can't build it rather than drop them.
+    let overlay = if has_annotations || has_visible_text {
+        Some(crate::page_overlay::overlay_pdf(doc, pid)?)
+    } else {
+        None
+    };
 
     let id = deref_ref(&xobjects, &name)?;
     let offset = match doc.reference_table.get(id.0)? {
@@ -188,6 +218,7 @@ fn page_entry(
         length: stream.content.len(),
         place,
         flate,
+        overlay,
     })
 }
 
@@ -323,17 +354,18 @@ fn colorspace_supported(doc: &lopdf::Document, dict: &lopdf::Dictionary) -> bool
     )
 }
 
-// Placement (x, y_bottom, w, h) in PDF bottom-left page-point space for a page whose content stream
-// draws exactly one image (`Do` of `image`) and nothing else visible, or None otherwise. Invisible
-// OCR text (render mode 3) is allowed - poppler paints no marks for it, so output still matches.
-// Visible text, vector paint, clipping, shading, inline images, transparency (`gs`) and other
-// XObjects all disqualify the page, as does a rotated/skewed/flipped placement.
-fn image_placement(ops: &[Operation], image: &[u8]) -> Option<(f64, f64, f64, f64)> {
+// For a page drawing exactly one image (`Do` of `image`) as its background, returns its placement
+// (x, y_bottom, w, h) in PDF bottom-left page-point space plus whether visible text was drawn over
+// it. Visible text is allowed only after the image is placed (poppler overlays it); before, it
+// would sit behind an opaque scan, so it disqualifies. Vector paint, clipping, shading, inline
+// images, transparency (`gs`), other XObjects and a rotated/skewed/flipped placement all disqualify.
+fn image_placement(ops: &[Operation], image: &[u8]) -> Option<((f64, f64, f64, f64), bool)> {
     const ID: [f64; 6] = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
     let mut ctm = ID;
     let mut tr = 0i64; // text render mode; 3 = invisible
     let mut stack: Vec<([f64; 6], i64)> = Vec::new();
     let mut placed: Option<[f64; 6]> = None;
+    let mut has_visible_text = false;
 
     for op in ops {
         match op.operator.as_str() {
@@ -347,9 +379,11 @@ fn image_placement(ops: &[Operation], image: &[u8]) -> Option<(f64, f64, f64, f6
                 }
                 placed = Some(ctm);
             }
-            // Text shows marks unless it is invisible (render mode 3).
-            "Tj" | "TJ" | "'" | "\"" if tr != 3 => return None,
-            // Anything that paints, clips or changes compositing breaks output parity with poppler.
+            "Tj" | "TJ" | "'" | "\"" if tr != 3 => {
+                placed?; // visible text before the image would sit behind it
+                has_visible_text = true;
+            }
+            // Anything that paints, clips or changes compositing can't be reproduced by us.
             "S" | "s" | "f" | "F" | "f*" | "B" | "B*" | "b" | "b*" | "W" | "W*" | "sh" | "BI"
             | "gs" => return None,
             _ => {}
@@ -360,7 +394,7 @@ fn image_placement(ops: &[Operation], image: &[u8]) -> Option<(f64, f64, f64, f6
     if m[1].abs() > 0.01 || m[2].abs() > 0.01 || m[0] <= 0.0 || m[3] <= 0.0 {
         return None; // rotated, skewed, or flipped placement
     }
-    Some((m[4], m[5], m[0], m[3])) // e, f, w, h
+    Some(((m[4], m[5], m[0], m[3]), has_visible_text)) // e, f, w, h
 }
 
 // 2x3 affine [a b c d e f] from the operands of a `cm`.
@@ -593,6 +627,71 @@ mod tests {
         assert!(colored, "surface is blank white");
     }
 
+    // True if any pixel (Rgb24 B,G,R,x) satisfies `pred`.
+    fn any_pixel(surface: &ImageSurface, pred: impl Fn(&[u8]) -> bool) -> bool {
+        let mut found = false;
+        surface
+            .with_data(|d| found = d.chunks_exact(4).any(&pred))
+            .unwrap();
+        found
+    }
+
+    #[gtk::test]
+    fn overlay_renders_on_worker_thread() {
+        // The real render path runs draw_overlay's poppler from_data + render on a background
+        // worker thread, not the GTK main thread; guard against that path hanging.
+        let uri = fixture_uri("image_scan_visible_text.pdf");
+        {
+            let doc = poppler::Document::from_file(&uri, None).unwrap();
+            let page = doc.page(0).unwrap();
+            render_when_ready(&uri, &page).expect("build index on main first");
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let doc = poppler::Document::from_file(&uri, None).unwrap();
+            let page = doc.page(0).unwrap();
+            let ok = render_image_page(&uri, &page, 2.0, 1.0).is_some();
+            let _ = tx.send(ok);
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(ok) => assert!(ok, "worker render returned None"),
+            Err(_) => panic!("worker overlay render HUNG (>5s)"),
+        }
+    }
+
+    #[gtk::test]
+    fn renders_scan_with_visible_text_overlay() {
+        // Image + visible OCR text: fast path blits the image, poppler overlays the black text.
+        let uri = fixture_uri("image_scan_visible_text.pdf");
+        let doc = poppler::Document::from_file(&uri, None).unwrap();
+        let page = doc.page(0).unwrap();
+        let (w, h) = page.size();
+
+        let surface = render_when_ready(&uri, &page).expect("visible-text scan should render");
+        assert_eq!((surface.width(), surface.height()), (w as i32, h as i32));
+        // The gray scan is ~205; near-black pixels can only be the overlaid text.
+        assert!(
+            any_pixel(&surface, |p| p[0] < 120 && p[1] < 120 && p[2] < 120),
+            "overlay text not painted"
+        );
+    }
+
+    #[gtk::test]
+    fn renders_scan_with_annotation_overlay() {
+        // Image + annotations: poppler overlays the blue ink and yellow highlight on the scan.
+        let uri = fixture_uri("image_scan_annotated.pdf");
+        let doc = poppler::Document::from_file(&uri, None).unwrap();
+        let page = doc.page(0).unwrap();
+        let (w, h) = page.size();
+
+        let surface = render_when_ready(&uri, &page).expect("annotated scan should render");
+        assert_eq!((surface.width(), surface.height()), (w as i32, h as i32));
+        assert!(
+            any_pixel(&surface, |p| p[0] > 180 && p[1] < 90 && p[2] < 90),
+            "blue ink annotation not painted"
+        );
+    }
+
     #[gtk::test]
     fn falls_back_for_non_image_page() {
         let uri = fixture_uri("outline.pdf");
@@ -639,13 +738,19 @@ mod tests {
             do_("Im0"),
             op("Q", vec![]),
         ];
-        assert_eq!(image_placement(&ops, b"Im0"), Some((0.0, 0.0, 48.0, 36.0)));
+        assert_eq!(
+            image_placement(&ops, b"Im0"),
+            Some(((0.0, 0.0, 48.0, 36.0), false))
+        );
     }
 
     #[test]
     fn placement_partial_image() {
         let ops = [cm(10.0, 0.0, 0.0, 20.0, 5.0, 6.0), do_("Im0")];
-        assert_eq!(image_placement(&ops, b"Im0"), Some((5.0, 6.0, 10.0, 20.0)));
+        assert_eq!(
+            image_placement(&ops, b"Im0"),
+            Some(((5.0, 6.0, 10.0, 20.0), false))
+        );
     }
 
     #[test]
@@ -661,7 +766,7 @@ mod tests {
 
     #[test]
     fn accepts_invisible_ocr_text() {
-        // full-page image plus an invisible (render mode 3) OCR text layer: still image-only visually.
+        // full-page image plus an invisible (render mode 3) OCR text layer: no visible marks.
         let ops = [
             cm(48.0, 0.0, 0.0, 36.0, 0.0, 0.0),
             do_("Im0"),
@@ -670,7 +775,34 @@ mod tests {
             tj(),
             op("ET", vec![]),
         ];
-        assert_eq!(image_placement(&ops, b"Im0"), Some((0.0, 0.0, 48.0, 36.0)));
+        assert_eq!(
+            image_placement(&ops, b"Im0"),
+            Some(((0.0, 0.0, 48.0, 36.0), false))
+        );
+    }
+
+    #[test]
+    fn accepts_visible_text_after_image() {
+        // visible OCR text drawn over the placed image: allowed, flagged for a poppler overlay.
+        let ops = [
+            cm(48.0, 0.0, 0.0, 36.0, 0.0, 0.0),
+            do_("Im0"),
+            op("BT", vec![]),
+            tr(0),
+            tj(),
+            op("ET", vec![]),
+        ];
+        assert_eq!(
+            image_placement(&ops, b"Im0"),
+            Some(((0.0, 0.0, 48.0, 36.0), true))
+        );
+    }
+
+    #[test]
+    fn rejects_visible_text_before_image() {
+        // visible text before the image would sit behind an opaque scan; disqualify.
+        let ops = [tr(0), tj(), cm(48.0, 0.0, 0.0, 36.0, 0.0, 0.0), do_("Im0")];
+        assert!(image_placement(&ops, b"Im0").is_none());
     }
 
     #[test]
