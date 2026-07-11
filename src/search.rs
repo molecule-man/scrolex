@@ -73,7 +73,10 @@ impl Search {
     // 1-based position of the current match, for the counter.
     pub fn current_ordinal(&self) -> Option<usize> {
         let current = self.current?;
-        self.ordered().iter().position(|&m| m == current).map(|i| i + 1)
+        self.ordered()
+            .iter()
+            .position(|&m| m == current)
+            .map(|i| i + 1)
     }
 
     // The match after/before the current one, wrapping. Without a current match, the first/last.
@@ -83,7 +86,11 @@ impl Search {
             return None;
         }
         let Some(current) = self.current else {
-            return Some(if forward { order[0] } else { order[order.len() - 1] });
+            return Some(if forward {
+                order[0]
+            } else {
+                order[order.len() - 1]
+            });
         };
         let pos = order.iter().position(|&m| m == current).unwrap_or(0);
         let next = if forward {
@@ -240,7 +247,10 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         // two occurrences => two matches, each a single line (one rect) - NOT one match per quad
         let hits = search_page(&doc, 0, "Hello");
         assert_eq!(hits.len(), 2, "expected 2 matches, got {}", hits.len());
-        assert!(hits.iter().all(|m| m.len() == 1), "single-line hits should be one rect each");
+        assert!(
+            hits.iter().all(|m| m.len() == 1),
+            "single-line hits should be one rect each"
+        );
         // a phrase within a line is a single match
         assert_eq!(search_page(&doc, 0, "Hello Hello").len(), 1);
         // no match

@@ -399,14 +399,12 @@ impl Page {
             move |gc, _n_press, x, y| {
                 let Point { x, y } = undo_zoom_and_crop(&obj, x, y);
 
-                if let Some(link_target) =
-                    imp.state
-                        .borrow()
-                        .imp()
-                        .links
-                        .borrow_mut()
-                        .get_link(&obj.uri(), obj.index(), x, y)
-                {
+                if let Some(link_target) = imp.state.borrow().imp().links.borrow_mut().get_link(
+                    &obj.uri(),
+                    obj.index(),
+                    x,
+                    y,
+                ) {
                     match link_target {
                         LinkTarget::Page(page_num) => {
                             gc.set_state(gtk::EventSequenceState::Claimed); // stop the event from propagating
@@ -906,12 +904,19 @@ impl Page {
                 &uri,
                 priority,
                 Box::new(move || {
-                    request_render(&uri_job, scale, 1.0, page_num, priority, page_pt, resp_sender);
+                    request_render(
+                        &uri_job,
+                        scale,
+                        1.0,
+                        page_num,
+                        priority,
+                        page_pt,
+                        resp_sender,
+                    );
                 }),
             );
         });
     }
-
 }
 
 pub fn draw_surface(cr: &Context, surface: &ImageSurface, bbox: &Rectangle, scale: f64) {
@@ -1150,7 +1155,9 @@ fn get_bbox(uri: &str, page: &PageInfo, crop: bool) -> Rectangle {
     // MuPDF's content bbox is page-local top-left points, same convention as our Rectangle. Fall
     // back to the full page if it can't be resolved.
     match crate::mupdf_render::content_bbox(uri, page.index) {
-        Some((x1, y1, x2, y2)) => apply_crop(Rectangle::new(x1, y1, x2, y2), page.width, page.height),
+        Some((x1, y1, x2, y2)) => {
+            apply_crop(Rectangle::new(x1, y1, x2, y2), page.width, page.height)
+        }
         None => Rectangle::new(0.0, 0.0, page.width, page.height),
     }
 }
@@ -1378,7 +1385,6 @@ startxref
             );
         }
     }
-
 
     #[test]
     fn preview_scale_shrinks_for_slow_renders() {

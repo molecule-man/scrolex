@@ -101,7 +101,8 @@ impl ObjectImpl for State {
             crate::render_cache::RenderCache::new(super::PREVIEW_CACHE_BUDGET);
         self.preview_scale.set(crate::page::PREVIEW_INITIAL_SCALE);
         self.scroll_forward.set(true);
-        self.render_threads.set(crate::config::DEFAULT_RENDER_THREADS);
+        self.render_threads
+            .set(crate::config::DEFAULT_RENDER_THREADS);
 
         // Zooming could have made the cache entries inaccurate. Drop them. This must live here
         // rather than in State::new: the builder-created instance the window uses doesn't run

@@ -209,7 +209,8 @@ pub fn render_page_surface(
 ) -> Option<ImageSurface> {
     let px = render_page_pixels(uri, page_num, scale, dsf, page_pt)?;
     let surface =
-        ImageSurface::create_for_data(px.data, Format::Rgb24, px.width, px.height, px.stride).ok()?;
+        ImageSurface::create_for_data(px.data, Format::Rgb24, px.width, px.height, px.stride)
+            .ok()?;
     surface.set_device_scale(dsf, dsf);
     Some(surface)
 }
@@ -301,7 +302,10 @@ mod tests {
     fn bench() {
         let path = std::env::var("PDF_PATH").expect("PDF_PATH not set");
         let uri = format!("file://{path}");
-        let scale: f64 = std::env::var("SCALE").ok().and_then(|s| s.parse().ok()).unwrap_or(0.25);
+        let scale: f64 = std::env::var("SCALE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.25);
 
         let t = std::time::Instant::now();
         let s = render_page_surface(&uri, 0, scale, 1.0, None).expect("mupdf render");

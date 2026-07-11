@@ -53,8 +53,12 @@ impl Links {
                     None => continue,
                 };
                 let b = link.bounds;
-                self.rects
-                    .push(Rectangle::new(b.x0 as f64, b.y0 as f64, b.x1 as f64, b.y1 as f64));
+                self.rects.push(Rectangle::new(
+                    b.x0 as f64,
+                    b.y0 as f64,
+                    b.x1 as f64,
+                    b.y1 as f64,
+                ));
                 self.targets.push(target);
             }
             Some(())
