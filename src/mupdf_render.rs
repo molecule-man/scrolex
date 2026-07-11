@@ -206,6 +206,58 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         assert_eq!(page_count("file:///no/such/file.pdf"), 0);
     }
 
+    // A 300x200 page with /Rotate 90 (displayed 200x300) and the word "Hello" near the top-left of
+    // the unrotated page, for checking rotation-frame consistency across providers.
+    const ROTATED_TEXT_PDF: &[u8] = b"%PDF-1.4\n\
+1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n\
+2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 300 200] >>\nendobj\n\
+3 0 obj\n<< /Type /Page /Parent 2 0 R /Rotate 90 /Resources << /Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> >> >> /Contents 4 0 R >>\nendobj\n\
+4 0 obj\n<< /Length 34 >>\nstream\nBT /F1 24 Tf 40 150 Td (Hello) Tj ET\nendstream\nendobj\n\
+trailer\n<< /Root 1 0 R >>\n%%EOF";
+
+    // /Rotate 90 on a 300x200 page must present as 200x300, and every provider (render→content_bbox,
+    // and text search) must report in that same rotated display frame so overlays land on the render.
+    #[gtk::test]
+    fn rotated_page_consistent_across_providers() {
+        let dir = std::env::temp_dir().join("scrolex_rot");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rot.pdf");
+        std::fs::write(&path, ROTATED_TEXT_PDF).unwrap();
+        let uri = format!("file://{}", path.display());
+
+        // rotation applied: displayed dimensions are swapped
+        assert_eq!(page_size(&uri, 0), Some((200.0, 300.0)));
+
+        let (cx1, cy1, cx2, cy2) = content_bbox(&uri, 0).expect("content_bbox");
+        assert!(
+            cx1 >= 0.0 && cy1 >= 0.0 && cx2 <= 200.0 && cy2 <= 300.0,
+            "content bbox outside rotated page: {:?}",
+            (cx1, cy1, cx2, cy2)
+        );
+
+        // the "Hello" search hit must fall in the same frame - overlapping the content bbox, not in
+        // an unrotated frame (which would mean overlays are misplaced on rotated pages).
+        let quad = with_doc(&uri, |doc| {
+            let quads = doc.load_page(0).ok()?.search("Hello", 4).ok()?;
+            quads.iter().next().map(|q| {
+                let xs = [q.ul.x, q.ur.x, q.ll.x, q.lr.x];
+                let ys = [q.ul.y, q.ur.y, q.ll.y, q.lr.y];
+                (
+                    xs.iter().cloned().fold(f32::INFINITY, f32::min) as f64,
+                    ys.iter().cloned().fold(f32::INFINITY, f32::min) as f64,
+                    xs.iter().cloned().fold(f32::NEG_INFINITY, f32::max) as f64,
+                    ys.iter().cloned().fold(f32::NEG_INFINITY, f32::max) as f64,
+                )
+            })
+        })
+        .expect("search found 'Hello'");
+
+        assert!(
+            quad.0 < cx2 && quad.2 > cx1 && quad.1 < cy2 && quad.3 > cy1,
+            "search hit {quad:?} does not overlap content bbox ({cx1},{cy1},{cx2},{cy2}) - frame mismatch"
+        );
+    }
+
     #[test]
     fn scan_bbox_finds_non_white_block() {
         // 10x10 white buffer with a black block at x 3..=6, y 2..=5
