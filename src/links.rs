@@ -61,3 +61,34 @@ impl Links {
         });
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A 200x200 page with a URI link over PDF rect [50 60 150 90].
+    const LINK_PDF: &[u8] = b"%PDF-1.4\n\
+1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n\
+2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 200 200] >>\nendobj\n\
+3 0 obj\n<< /Type /Page /Parent 2 0 R /Annots [4 0 R] >>\nendobj\n\
+4 0 obj\n<< /Type /Annot /Subtype /Link /Rect [50 60 150 90] /A << /S /URI /URI (https://example.com) >> >>\nendobj\n\
+trailer\n<< /Root 1 0 R >>\n%%EOF";
+
+    #[gtk::test]
+    fn get_link_hits_uri_annotation() {
+        let dir = std::env::temp_dir().join("scrolex_links_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("link.pdf");
+        std::fs::write(&path, LINK_PDF).unwrap();
+        let uri = format!("file://{}", path.display());
+
+        let mut links = Links::default();
+        // PDF rect [50 60 150 90] flips to top-left y (50,110)-(150,140) on a 200-tall page.
+        match links.get_link(&uri, 0, 100.0, 125.0) {
+            Some(LinkTarget::Uri(u)) => assert_eq!(u, "https://example.com"),
+            other => panic!("expected a URI link, got {other:?}"),
+        }
+        // a point outside the link rect resolves to nothing
+        assert!(links.get_link(&uri, 0, 10.0, 10.0).is_none());
+    }
+}

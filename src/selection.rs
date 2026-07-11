@@ -150,3 +150,52 @@ fn nearest(glyphs: &[Glyph], p: (f64, f64)) -> usize {
     }
     best
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A glyph 10 wide, 10 tall, centred at (x, y) on `line`.
+    fn glyph(ch: char, x: f64, y: f64, line: usize) -> Glyph {
+        Glyph {
+            ch,
+            cx: x,
+            cy: y,
+            bbox: (x - 5.0, y - 5.0, x + 5.0, y + 5.0),
+            line,
+        }
+    }
+
+    #[test]
+    fn select_between_picks_reading_order_run() {
+        // "abc" on one line at x = 10, 20, 30
+        let glyphs = [
+            glyph('a', 10.0, 5.0, 0),
+            glyph('b', 20.0, 5.0, 0),
+            glyph('c', 30.0, 5.0, 0),
+        ];
+        // drag from near 'a' to near 'c' selects the whole run; endpoints may be given either way
+        let sel = select_between(&glyphs, (32.0, 5.0), (8.0, 5.0)).unwrap();
+        assert_eq!(sel.text, "abc");
+        assert_eq!(sel.rects.len(), 1, "single line => one rect");
+    }
+
+    #[test]
+    fn select_between_spans_lines_with_a_rect_each() {
+        // "ab" on line 0, "cd" on line 1
+        let glyphs = [
+            glyph('a', 10.0, 5.0, 0),
+            glyph('b', 20.0, 5.0, 0),
+            glyph('c', 10.0, 25.0, 1),
+            glyph('d', 20.0, 25.0, 1),
+        ];
+        let sel = select_between(&glyphs, (8.0, 5.0), (22.0, 25.0)).unwrap();
+        assert_eq!(sel.text, "ab\ncd");
+        assert_eq!(sel.rects.len(), 2, "two lines => a rect each");
+    }
+
+    #[test]
+    fn select_between_empty_is_none() {
+        assert!(select_between(&[], (0.0, 0.0), (1.0, 1.0)).is_none());
+    }
+}
