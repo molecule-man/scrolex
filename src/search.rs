@@ -8,7 +8,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use futures::channel::mpsc;
-use gtk::prelude::FileExt;
 use mupdf::text_page::SearchHitResponse;
 use mupdf::TextPageFlags;
 
@@ -119,8 +118,8 @@ pub fn spawn_search(
 
     std::thread::spawn(move || {
         // Own MuPDF Document on this short-lived thread (dropped at scope end, before the thread's
-        // context TLS teardown, so no drop-order issue).
-        let Some(path) = gtk::gio::File::for_uri(&uri).path() else {
+        // context TLS teardown, so no drop-order issue). local_path stages non-local files.
+        let Some(path) = crate::mupdf_render::local_path(&uri) else {
             return;
         };
         let Ok(doc) = mupdf::Document::open(path.as_path()) else {

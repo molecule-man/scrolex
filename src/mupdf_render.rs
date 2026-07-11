@@ -2,15 +2,26 @@
 // requested resolution - scanned pages render at fit-to-page cost, not poppler's full-res decode.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 use gtk::cairo::{Format, ImageSurface};
+use gtk::gio::prelude::FileExtManual;
 use gtk::prelude::FileExt;
 use mupdf::{Colorspace, Document, Matrix};
+use once_cell::sync::Lazy;
 
 // Bumped on document load so every thread's cached Document is reopened - otherwise reloading the
 // same path after the file changed on disk would keep serving the stale document.
 static GENERATION: AtomicU64 = AtomicU64::new(0);
+
+// Non-local GFiles (smb://, sftp://, GVfs mounts) have no local path, and MuPDF opens by path only.
+// Stage their bytes to a temp file once, keyed by uri; cleared on invalidate() so a changed remote
+// file re-stages.
+static STAGED: Lazy<Mutex<HashMap<String, PathBuf>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
 thread_local! {
     // (uri, generation-at-open, Document). One Document per thread: it's bound to the thread's
@@ -19,9 +30,35 @@ thread_local! {
 }
 
 // Invalidate every thread's cached Document (call on document load). The next `with_doc` on each
-// thread reopens against the current bytes.
+// thread reopens against the current bytes, and any staged remote copies are re-fetched.
 pub fn invalidate() {
     GENERATION.fetch_add(1, Ordering::Relaxed);
+    let mut staged = STAGED.lock().unwrap();
+    for path in staged.values() {
+        let _ = std::fs::remove_file(path);
+    }
+    staged.clear();
+}
+
+// Local filesystem path for `uri`: the file's own path when local, else a staged temp copy of a
+// non-local GFile's bytes (fetched once, then reused). None if it can't be read.
+pub(crate) fn local_path(uri: &str) -> Option<PathBuf> {
+    let file = gtk::gio::File::for_uri(uri);
+    if let Some(path) = file.path() {
+        return Some(path);
+    }
+    let mut staged = STAGED.lock().unwrap();
+    if let Some(path) = staged.get(uri) {
+        return Some(path.clone());
+    }
+    let (bytes, _etag) = file.load_contents(gtk::gio::Cancellable::NONE).ok()?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    uri.hash(&mut hasher);
+    let mut path = std::env::temp_dir();
+    path.push(format!("scrolex-staged-{:016x}.pdf", hasher.finish()));
+    std::fs::write(&path, &bytes).ok()?;
+    staged.insert(uri.to_string(), path.clone());
+    Some(path)
 }
 
 // Full-page surface for `page_num` at `scale` * `dsf`, or None if MuPDF can't open/render it (caller
@@ -42,7 +79,7 @@ pub fn with_doc<T>(uri: &str, f: impl FnOnce(&Document) -> Option<T>) -> Option<
             .as_ref()
             .is_some_and(|(u, g, _)| u == uri && *g == generation);
         if !fresh {
-            let path = gtk::gio::File::for_uri(uri).path()?;
+            let path = local_path(uri)?;
             let doc = Document::open(path.as_path()).ok()?;
             *slot = Some((uri.to_string(), generation, doc));
         }
