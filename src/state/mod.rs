@@ -50,15 +50,22 @@ impl State {
         }
 
         let uri = f.uri();
-        // Validate the candidate before touching the active document, so a failed load leaves the
-        // current document (and its in-flight render markers) intact.
-        let n_pages = crate::mupdf_render::probe_page_count(&uri);
+        // Stage and validate the candidate before touching the active document, so a failed load
+        // leaves the current document (and its in-flight render markers) intact. Staging fetches a
+        // remote file exactly once; the same bytes are validated here and committed for rendering
+        // below - no re-fetch, and no risk of validating different bytes than we render.
+        let Some(candidate) = crate::mupdf_render::stage_candidate(&uri) else {
+            return Err(io::Error::other("could not open document"));
+        };
+        let n_pages = candidate.page_count();
         if n_pages == 0 {
             return Err(io::Error::other("could not open document"));
         }
         // Committed to the new document: force every thread to reopen (the same path may have
-        // changed on disk), then reset per-document state.
+        // changed on disk), publish the validated bytes for the render workers, then reset
+        // per-document state.
         crate::mupdf_render::invalidate();
+        candidate.commit();
         self.imp().bbox_cache.borrow_mut().clear();
         self.imp().links.borrow_mut().clear();
         self.imp().search.borrow_mut().clear();

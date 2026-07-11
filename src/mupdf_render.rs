@@ -2,7 +2,7 @@
 // requested resolution - scanned pages render at fit-to-page cost, not poppler's full-res decode.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{hash_map::Entry, HashMap};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -47,8 +47,82 @@ pub fn invalidate() {
     staged.clear();
 }
 
+// Fetch a non-local GFile's bytes into a securely-created temp copy (random name, O_EXCL, mode 600 -
+// not a predictable path a symlink or another process could hijack or truncate). Returns a
+// self-deleting handle: the caller keep()s it to retain the copy, or drops it to remove it. None if
+// the read or write fails.
+fn fetch_to_temp(file: &gtk::gio::File) -> Option<tempfile::TempPath> {
+    let (bytes, _etag) = file.load_contents(gtk::gio::Cancellable::NONE).ok()?;
+    let mut tmp = tempfile::Builder::new()
+        .prefix("scrolex-staged-")
+        .suffix(".pdf")
+        .tempfile()
+        .ok()?;
+    tmp.write_all(&bytes).ok()?;
+    Some(tmp.into_temp_path())
+}
+
+// A document to be loaded, prepared before the active document is disturbed. `path` is what MuPDF
+// opens: a local file's own path, or a temp copy of a non-local GFile's bytes fetched exactly once.
+// The same artifact is validated (page_count) and then commit()ted for every render worker, so
+// validation and rendering always see identical bytes - no re-fetch, no time-of-check/time-of-use
+// gap. Dropped without commit (a failed load), an owned temp copy is removed.
+pub(crate) struct Candidate {
+    uri: String,
+    path: PathBuf,
+    // Some(_) when `path` is a temp copy we own; keep()d on commit, deleted on drop otherwise.
+    temp: Option<tempfile::TempPath>,
+}
+
+// Prepare a candidate for `uri`: its own path when local, else a temp copy of the non-local bytes
+// (fetched once). None if it can't be read.
+pub(crate) fn stage_candidate(uri: &str) -> Option<Candidate> {
+    let file = gtk::gio::File::for_uri(uri);
+    if let Some(path) = file.path() {
+        return Some(Candidate {
+            uri: uri.to_string(),
+            path,
+            temp: None,
+        });
+    }
+    let temp = fetch_to_temp(&file)?;
+    let path = temp.to_path_buf();
+    Some(Candidate {
+        uri: uri.to_string(),
+        path,
+        temp: Some(temp),
+    })
+}
+
+impl Candidate {
+    // Page count of the candidate, opened fresh by path with no caching side effects (no thread-local
+    // reuse, no generation bump, no STAGED entry). 0 if it can't be opened - the caller treats that as
+    // a failed load and leaves the active document intact.
+    pub(crate) fn page_count(&self) -> i32 {
+        Document::open(self.path.as_path())
+            .and_then(|d| d.page_count())
+            .unwrap_or(0)
+    }
+
+    // Publish the validated bytes so render workers reuse this exact artifact. Call AFTER invalidate()
+    // (which clears STAGED): a staged temp is persisted and registered under its uri; a local file
+    // needs no registration. Overwrites any copy a worker's racing miss-fetch published for the same
+    // uri, so the rendered bytes are exactly the validated ones.
+    pub(crate) fn commit(mut self) {
+        if let Some(temp) = self.temp.take() {
+            if let Ok(path) = temp.keep() {
+                if let Some(orphan) = STAGED.lock().unwrap().insert(self.uri.clone(), path) {
+                    let _ = std::fs::remove_file(orphan);
+                }
+            }
+        }
+    }
+}
+
 // Local filesystem path for `uri`: the file's own path when local, else a staged temp copy of a
-// non-local GFile's bytes (fetched once, then reused). None if it can't be read.
+// non-local GFile's bytes (fetched once, then reused). A committed load pre-stages this, so callers
+// here (search's own thread, a worker racing a reload) normally hit the cache; a genuine miss fetches
+// as a fallback. None if it can't be read.
 pub(crate) fn local_path(uri: &str) -> Option<PathBuf> {
     let file = gtk::gio::File::for_uri(uri);
     if let Some(path) = file.path() {
@@ -57,43 +131,25 @@ pub(crate) fn local_path(uri: &str) -> Option<PathBuf> {
     if let Some(path) = STAGED.lock().unwrap().get(uri).cloned() {
         return Some(path);
     }
-    // Fetch and write WITHOUT holding the lock: blocking network I/O must not stall invalidate()
-    // (called from load() on the main thread). Write to a securely-created unique temp file (random
-    // name, O_EXCL, mode 600) rather than a predictable path, so a symlink or another process can't
-    // hijack or truncate it.
+    // Fetch WITHOUT holding the lock: blocking network I/O must not stall invalidate() (called from
+    // load() on the main thread).
     let generation_at_fetch = generation();
-    let (bytes, _etag) = file.load_contents(gtk::gio::Cancellable::NONE).ok()?;
-    let mut tmp = tempfile::Builder::new()
-        .prefix("scrolex-staged-")
-        .suffix(".pdf")
-        .tempfile()
-        .ok()?;
-    tmp.write_all(&bytes).ok()?;
-    let (_f, path) = tmp.keep().ok()?;
+    let temp = fetch_to_temp(&file)?;
 
     let mut staged = STAGED.lock().unwrap();
     // A reload during the fetch (invalidate bumped the generation and cleared the map) means these
-    // bytes are from the pre-reload file - drop them so the stale copy can't be published or reused.
+    // bytes are from the pre-reload file - drop them (temp deletes here) so the stale copy can't be
+    // published or reused.
     if generation() != generation_at_fetch {
-        let _ = std::fs::remove_file(&path);
         return None;
     }
-    let chosen = staged
-        .entry(uri.to_string())
-        .or_insert_with(|| path.clone())
-        .clone();
-    if chosen != path {
-        // lost a concurrent staging race for the same uri; drop our orphan copy
-        let _ = std::fs::remove_file(&path);
+    match staged.entry(uri.to_string()) {
+        // lost a concurrent staging race for the same uri; our temp drops here as an orphan
+        Entry::Occupied(e) => Some(e.get().clone()),
+        Entry::Vacant(e) => Some(e.insert(temp.keep().ok()?).clone()),
     }
-    Some(chosen)
 }
 
-// Full-page surface for `page_num` at `scale` * `dsf`, or None if MuPDF can't open/render it (caller
-// shows a blank page). `page_pt` (the page size in points) sizes the surface at exactly
-// (page_pt * scale * dsf) truncated so it matches the render cache's dimension check; MuPDF's own
-// pixmap rounding differs by ~1px, which would make every render look stale (endless re-render).
-// None derives the size from MuPDF's bounds (bench only).
 // Run `f` with this thread's MuPDF Document for `uri`, opening it (or reusing the cached one,
 // reopening on a uri change). Touches the TLS fz_context before the DOC thread-local so its
 // destructor registers first and runs last: our Document's Drop needs a live context, else it aborts
@@ -115,6 +171,11 @@ pub fn with_doc<T>(uri: &str, f: impl FnOnce(&Document) -> Option<T>) -> Option<
     })
 }
 
+// Full-page surface for `page_num` at `scale` * `dsf`, or None if MuPDF can't open/render it (caller
+// shows a blank page). `page_pt` (the page size in points) sizes the surface at exactly
+// (page_pt * scale * dsf) truncated so it matches the render cache's dimension check; MuPDF's own
+// pixmap rounding differs by ~1px, which would make every render look stale (endless re-render).
+// None derives the size from MuPDF's bounds (bench only).
 pub fn render_page_surface(
     uri: &str,
     page_num: i32,
@@ -141,23 +202,6 @@ pub fn render_page_surface(
         let target_h = ((ph * scale * dsf) as i32).max(1);
         surface_from_pixmap(&pixmap, dsf, target_w, target_h)
     })
-}
-
-// Page count of a candidate document, opened fresh with no caching side effects: no thread-local
-// reuse, no generation bump, no staging into STAGED. This lets load() validate a candidate before
-// disturbing the active document, so a failed load leaves the current document (and its in-flight
-// renders) intact. A non-local file is read into memory just for the check; the subsequent load
-// re-fetches it. Returns 0 if it can't be opened.
-pub fn probe_page_count(uri: &str) -> i32 {
-    let file = gtk::gio::File::for_uri(uri);
-    let doc = match file.path() {
-        Some(path) => Document::open(path.as_path()),
-        None => match file.load_contents(gtk::gio::Cancellable::NONE) {
-            Ok((bytes, _etag)) => Document::from_bytes(&bytes, "pdf"),
-            Err(_) => return 0,
-        },
-    };
-    doc.and_then(|d| d.page_count()).unwrap_or(0)
 }
 
 // Page size in points (width, height), or None.
@@ -291,11 +335,17 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
     #[test]
     fn page_count_and_size_read_the_document() {
         let uri = margin_pdf_uri();
-        assert_eq!(probe_page_count(&uri), 1);
+        assert_eq!(stage_candidate(&uri).unwrap().page_count(), 1);
         assert_eq!(page_size(&uri, 0), Some((200.0, 200.0)));
         // out-of-range / unopenable degrade rather than panic
         assert_eq!(page_size(&uri, 99), None);
-        assert_eq!(probe_page_count("file:///no/such/file.pdf"), 0);
+        // a local uri always stages (the path exists as a value); an unopenable file counts 0
+        assert_eq!(
+            stage_candidate("file:///no/such/file.pdf")
+                .unwrap()
+                .page_count(),
+            0
+        );
     }
 
     // A 300x200 page with /Rotate 90 (displayed 200x300) and the word "Hello" near the top-left of
