@@ -3,13 +3,12 @@
 
 use std::cell::RefCell;
 use std::collections::{hash_map::Entry, HashMap};
-use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use gtk::cairo::{Format, ImageSurface};
-use gtk::gio::prelude::FileExtManual;
+use gtk::gio::prelude::InputStreamExtManual;
 use gtk::prelude::FileExt;
 use mupdf::{Colorspace, Document, Matrix};
 use once_cell::sync::Lazy;
@@ -47,31 +46,29 @@ pub fn invalidate() {
     staged.clear();
 }
 
-// A non-local GFile's bytes in a secure temp copy (O_EXCL, mode 600: no symlink/truncation hijack).
-// The handle deletes on drop unless keep()d. None if read or write fails.
+// Stream a non-local GFile into a secure temp copy (O_EXCL, mode 600): peak memory is one buffer,
+// not the whole file. Deletes on drop unless keep()d.
 fn fetch_to_temp(file: &gtk::gio::File) -> Option<tempfile::TempPath> {
-    let (bytes, _etag) = file.load_contents(gtk::gio::Cancellable::NONE).ok()?;
+    let mut reader = file.read(gtk::gio::Cancellable::NONE).ok()?.into_read();
     let mut tmp = tempfile::Builder::new()
         .prefix("scrolex-staged-")
         .suffix(".pdf")
         .tempfile()
         .ok()?;
-    tmp.write_all(&bytes).ok()?;
+    std::io::copy(&mut reader, &mut tmp).ok()?;
     Some(tmp.into_temp_path())
 }
 
-// A document to load, prepared before the active one is disturbed. `path` (a local file, or a temp
-// copy of a non-local GFile fetched once) is validated then commit()ted for the workers, so
-// validation and rendering see identical bytes - no TOCTOU gap. Dropped without commit, an owned
-// temp is removed.
+// A document staged for load: `path` is validated then commit()ted, so validation and render see
+// identical bytes (no TOCTOU gap). Dropped uncommitted, an owned temp copy is removed.
 pub(crate) struct Candidate {
     uri: String,
     path: PathBuf,
-    // Some when `path` is a temp copy we own: keep()d on commit, else deleted on drop.
+    // Some for a temp copy we own: kept on commit, else deleted on drop.
     temp: Option<tempfile::TempPath>,
 }
 
-// Candidate for `uri`: its own path when local, else a temp copy of the non-local bytes. None if unreadable.
+// Stage `uri`: own path if local, else a temp copy of the bytes.
 pub(crate) fn stage_candidate(uri: &str) -> Option<Candidate> {
     let file = gtk::gio::File::for_uri(uri);
     if let Some(path) = file.path() {
@@ -91,16 +88,14 @@ pub(crate) fn stage_candidate(uri: &str) -> Option<Candidate> {
 }
 
 impl Candidate {
-    // Page count, opened fresh with no caching side effects (no TLS reuse, generation bump, or STAGED
-    // entry). 0 if unopenable - the caller treats that as a failed load.
+    // Page count of a fresh, side-effect-free open; 0 if unopenable (a failed load).
     pub(crate) fn page_count(&self) -> i32 {
         Document::open(self.path.as_path())
             .and_then(|d| d.page_count())
             .unwrap_or(0)
     }
 
-    // Publish the validated temp under its uri so workers render these exact bytes. Call AFTER
-    // invalidate() clears STAGED; overwrites any copy a racing miss-fetch staged. Local files need none.
+    // Publish the validated temp so workers render these exact bytes. Call after invalidate().
     pub(crate) fn commit(mut self) {
         if let Some(temp) = self.temp.take() {
             if let Ok(path) = temp.keep() {
@@ -112,9 +107,7 @@ impl Candidate {
     }
 }
 
-// Local path for `uri`: its own path when local, else a staged temp copy of the non-local bytes.
-// A committed load pre-stages this, so callers here normally hit the cache; a genuine miss fetches
-// as a fallback. None if unreadable.
+// Local path for `uri`: own path if local, else the staged temp copy (miss → fetch as fallback).
 pub(crate) fn local_path(uri: &str) -> Option<PathBuf> {
     let file = gtk::gio::File::for_uri(uri);
     if let Some(path) = file.path() {
@@ -123,14 +116,12 @@ pub(crate) fn local_path(uri: &str) -> Option<PathBuf> {
     if let Some(path) = STAGED.lock().unwrap().get(uri).cloned() {
         return Some(path);
     }
-    // Fetch WITHOUT holding the lock: blocking network I/O must not stall invalidate() (called from
-    // load() on the main thread).
+    // Fetch off-lock: network I/O must not stall invalidate() on the main thread.
     let generation_at_fetch = generation();
     let temp = fetch_to_temp(&file)?;
 
     let mut staged = STAGED.lock().unwrap();
-    // A reload during the fetch (generation bumped) means these bytes are pre-reload - drop them
-    // (temp deletes here) so the stale copy isn't published.
+    // Reload during the fetch (generation bumped) → these bytes are stale; drop (temp deletes here).
     if generation() != generation_at_fetch {
         return None;
     }
@@ -162,8 +153,7 @@ pub fn with_doc<T>(uri: &str, f: impl FnOnce(&Document) -> Option<T>) -> Option<
     })
 }
 
-// One page's raw pixels, cairo Rgb24 (BGRx). ImageSurface isn't Send, so workers cross the thread
-// boundary as this plain buffer and the surface is assembled where consumed - no page-sized copy.
+// One page's raw pixels (cairo Rgb24/BGRx) — shipped from a worker since ImageSurface isn't Send.
 pub struct PagePixels {
     pub data: Vec<u8>,
     pub width: i32,
@@ -171,10 +161,9 @@ pub struct PagePixels {
     pub stride: i32,
 }
 
-// Full-page pixels for `page_num` at `scale` * `dsf`; None if MuPDF can't render it (caller shows
-// blank). `page_pt` sizes the buffer at (page_pt * scale * dsf) truncated to match the render
-// cache's dimension check - MuPDF's own pixmap rounding differs by ~1px, which would look endlessly
-// stale. None derives the size from MuPDF's bounds (bench only).
+// Page pixels at `scale`*`dsf`, or None if unrenderable. `page_pt` sizes the buffer to match the
+// render cache's check — MuPDF's pixmap rounding differs ~1px, which would look endlessly stale.
+// None → size from MuPDF bounds (bench only).
 pub fn render_page_pixels(
     uri: &str,
     page_num: i32,
@@ -209,8 +198,8 @@ pub fn render_page_pixels(
     })
 }
 
-// `render_page_pixels` assembled into an ImageSurface, for callers that draw directly (sync paint,
-// thumbnails) or scan pixels (content_bbox).
+// `render_page_pixels` as an ImageSurface, for callers that draw it (sync paint, thumbnails) or scan
+// it (content_bbox).
 pub fn render_page_surface(
     uri: &str,
     page_num: i32,
