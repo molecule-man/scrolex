@@ -698,6 +698,10 @@ impl Page {
         let (resp_sender, resp_receiver) = oneshot::channel::<RenderedPage>();
         let obj_clone = obj.clone();
         let uri_check = uri.clone();
+        // Document generation at schedule time: a same-path reload bumps it, so a render that was
+        // in flight over the old file contents (with old page size) is dropped instead of caching a
+        // stale surface.
+        let generation = crate::mupdf_render::generation();
         glib::spawn_future_local(async move {
             let result = resp_receiver.await;
             let state = obj_clone.state();
@@ -722,8 +726,9 @@ impl Page {
                 return;
             };
 
-            // the document may have changed while the render was in flight
-            if obj_clone.uri() != uri_check {
+            // the document may have changed (different file, or same path reloaded) while the render
+            // was in flight
+            if obj_clone.uri() != uri_check || crate::mupdf_render::generation() != generation {
                 return;
             }
 
@@ -826,6 +831,8 @@ impl Page {
         let (resp_sender, resp_receiver) = oneshot::channel::<RenderedPage>();
         let obj_clone = obj.clone();
         let uri_check = uri.clone();
+        // See schedule_render: drop previews rendered over stale (pre-reload) contents.
+        let generation = crate::mupdf_render::generation();
         glib::spawn_future_local(async move {
             let result = resp_receiver.await;
             let state = obj_clone.state();
@@ -834,7 +841,7 @@ impl Page {
             let Ok(rendered) = result else {
                 return;
             };
-            if obj_clone.uri() != uri_check {
+            if obj_clone.uri() != uri_check || crate::mupdf_render::generation() != generation {
                 return;
             }
 
