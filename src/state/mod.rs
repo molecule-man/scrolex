@@ -50,12 +50,15 @@ impl State {
         }
 
         let uri = f.uri();
-        // Force every thread to reopen: the same path may have changed on disk since last load.
-        crate::mupdf_render::invalidate();
-        let n_pages = crate::mupdf_render::page_count(&uri);
+        // Validate the candidate before touching the active document, so a failed load leaves the
+        // current document (and its in-flight render markers) intact.
+        let n_pages = crate::mupdf_render::probe_page_count(&uri);
         if n_pages == 0 {
             return Err(io::Error::other("could not open document"));
         }
+        // Committed to the new document: force every thread to reopen (the same path may have
+        // changed on disk), then reset per-document state.
+        crate::mupdf_render::invalidate();
         self.imp().bbox_cache.borrow_mut().clear();
         self.imp().links.borrow_mut().clear();
         self.imp().search.borrow_mut().clear();

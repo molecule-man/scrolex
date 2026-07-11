@@ -143,9 +143,21 @@ pub fn render_page_surface(
     })
 }
 
-// Number of pages, or 0 if the document can't be opened.
-pub fn page_count(uri: &str) -> i32 {
-    with_doc(uri, |doc| doc.page_count().ok()).unwrap_or(0)
+// Page count of a candidate document, opened fresh with no caching side effects: no thread-local
+// reuse, no generation bump, no staging into STAGED. This lets load() validate a candidate before
+// disturbing the active document, so a failed load leaves the current document (and its in-flight
+// renders) intact. A non-local file is read into memory just for the check; the subsequent load
+// re-fetches it. Returns 0 if it can't be opened.
+pub fn probe_page_count(uri: &str) -> i32 {
+    let file = gtk::gio::File::for_uri(uri);
+    let doc = match file.path() {
+        Some(path) => Document::open(path.as_path()),
+        None => match file.load_contents(gtk::gio::Cancellable::NONE) {
+            Ok((bytes, _etag)) => Document::from_bytes(&bytes, "pdf"),
+            Err(_) => return 0,
+        },
+    };
+    doc.and_then(|d| d.page_count()).unwrap_or(0)
 }
 
 // Page size in points (width, height), or None.
@@ -279,11 +291,11 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
     #[test]
     fn page_count_and_size_read_the_document() {
         let uri = margin_pdf_uri();
-        assert_eq!(page_count(&uri), 1);
+        assert_eq!(probe_page_count(&uri), 1);
         assert_eq!(page_size(&uri, 0), Some((200.0, 200.0)));
         // out-of-range / unopenable degrade rather than panic
         assert_eq!(page_size(&uri, 99), None);
-        assert_eq!(page_count("file:///no/such/file.pdf"), 0);
+        assert_eq!(probe_page_count("file:///no/such/file.pdf"), 0);
     }
 
     // A 300x200 page with /Rotate 90 (displayed 200x300) and the word "Hello" near the top-left of
