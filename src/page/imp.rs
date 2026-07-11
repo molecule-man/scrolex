@@ -705,6 +705,13 @@ impl Page {
         glib::spawn_future_local(async move {
             let result = resp_receiver.await;
             let state = obj_clone.state();
+
+            // Stale completion (different doc, or the same path reloaded)? load() already cleared the
+            // old inflight/waiter entries, so bail before touching the new generation's - removing
+            // its inflight marker here would let a duplicate render be queued.
+            if obj_clone.uri() != uri_check || crate::mupdf_render::generation() != generation {
+                return;
+            }
             state.render_inflight().borrow_mut().remove(&page_num);
 
             // Request was dropped (evicted from the queue as over-cap). Once settled, redraw any
@@ -725,12 +732,6 @@ impl Page {
                 }
                 return;
             };
-
-            // the document may have changed (different file, or same path reloaded) while the render
-            // was in flight
-            if obj_clone.uri() != uri_check || crate::mupdf_render::generation() != generation {
-                return;
-            }
 
             let surface = rendered.into_surface(scale_factor);
             state.render_cache().borrow_mut().insert(page_num, surface);
@@ -836,14 +837,17 @@ impl Page {
         glib::spawn_future_local(async move {
             let result = resp_receiver.await;
             let state = obj_clone.state();
+
+            // See schedule_render: bail on a stale completion before clearing the new generation's
+            // inflight marker.
+            if obj_clone.uri() != uri_check || crate::mupdf_render::generation() != generation {
+                return;
+            }
             state.preview_inflight().borrow_mut().remove(&page_num);
 
             let Ok(rendered) = result else {
                 return;
             };
-            if obj_clone.uri() != uri_check || crate::mupdf_render::generation() != generation {
-                return;
-            }
 
             // decode-bound documents (e.g. scanned images) don't get cheaper as the scale shrinks:
             // once several previews in a row are slow at the floor they never will pay off - stop
