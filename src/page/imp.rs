@@ -447,10 +447,10 @@ impl Page {
         Rectangle::new(0.0, 0.0, page.width, page.height)
     }
 
-    // Resolve the page's bounding box and hand it to `cb`. Computed on the main thread: the layout
-    // is far cheaper than a full render, and resolving it inline sizes the widget at once. A pooled
-    // job would lag behind the renders during a fast scroll, leaving the page stuck at its stale
-    // size until the box arrived.
+    // Resolve the page's bounding box and hand it to `cb`. Computed inline on the main thread and
+    // cached per page: crop resolves it from a low-res render (cheaper than a full render, and it
+    // sizes the widget at once). A pooled job would lag behind the renders during a fast scroll,
+    // leaving the page stuck at its stale size until the box arrived.
     fn resolve_bbox<F>(&self, page: &PageInfo, crop: bool, cb: F)
     where
         F: FnOnce(&Rectangle) + 'static,
