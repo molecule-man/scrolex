@@ -1,6 +1,7 @@
 // Full-document text search. A background thread walks pages outward from the current page, runs
 // MuPDF's per-page search, and streams matches back. An epoch counter cancels a superseded sweep.
-// MuPDF search is case-insensitive.
+// MuPDF search is case-insensitive. A match is a single logical hit and carries one rect per line it
+// spans, so a phrase wrapping across lines still counts as one match (and highlights every line).
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -8,17 +9,19 @@ use std::sync::Arc;
 
 use futures::channel::mpsc;
 use gtk::prelude::FileExt;
+use mupdf::text_page::SearchHitResponse;
+use mupdf::TextPageFlags;
 
 use crate::page::Rectangle;
 
-// Cap on match rects reported per page (MuPDF requires a hit limit).
-const MAX_HITS_PER_PAGE: u32 = 500;
+// One match's highlight rects (one per line the hit spans), in page coords (top-left origin).
+pub type Match = Vec<Rectangle>;
 
 // Matches on one page, tagged with the sweep epoch so stale results can be dropped.
 pub struct PageMatches {
     pub epoch: u64,
     pub page: i32,
-    pub rects: Vec<Rectangle>,
+    pub matches: Vec<Match>,
 }
 
 pub type MatchReceiver = mpsc::UnboundedReceiver<PageMatches>;
@@ -27,9 +30,9 @@ pub type MatchReceiver = mpsc::UnboundedReceiver<PageMatches>;
 #[derive(Default, Debug)]
 pub struct Search {
     pub query: String,
-    // page -> match rects, in page coords (top-left origin)
-    pub results: BTreeMap<i32, Vec<Rectangle>>,
-    // the highlighted match: (page, index within that page's rects)
+    // page -> matches, in page coords (top-left origin)
+    pub results: BTreeMap<i32, Vec<Match>>,
+    // the highlighted match: (page, index within that page's matches)
     pub current: Option<(i32, usize)>,
     // bumped per sweep; the background thread stops once it no longer matches
     epoch: Arc<AtomicU64>,
@@ -60,11 +63,11 @@ impl Search {
         self.epoch.load(Ordering::Relaxed)
     }
 
-    // Matches in global reading order: (page, index-within-page) for every rect.
+    // Matches in global reading order: (page, index-within-page) for every match.
     fn ordered(&self) -> Vec<(i32, usize)> {
         self.results
             .iter()
-            .flat_map(|(&page, rects)| (0..rects.len()).map(move |i| (page, i)))
+            .flat_map(|(&page, matches)| (0..matches.len()).map(move |i| (page, i)))
             .collect()
     }
 
@@ -92,8 +95,13 @@ impl Search {
         Some(order[next])
     }
 
+    // Representative rect of a match (its first line), for scrolling the match into view.
     pub fn rect(&self, page: i32, idx: usize) -> Option<Rectangle> {
-        self.results.get(&page).and_then(|r| r.get(idx)).copied()
+        self.results
+            .get(&page)
+            .and_then(|matches| matches.get(idx))
+            .and_then(|m| m.first())
+            .copied()
     }
 }
 
@@ -123,20 +131,13 @@ pub fn spawn_search(
             if shared_epoch.load(Ordering::Relaxed) != epoch {
                 return; // superseded by a newer query
             }
-            let Ok(page) = doc.load_page(page_num) else {
-                continue;
-            };
-            // MuPDF quads are already page-local top-left, so no origin flip.
-            let Ok(quads) = page.search(&query, MAX_HITS_PER_PAGE) else {
-                continue;
-            };
-            let rects: Vec<Rectangle> = quads.iter().map(quad_rect).collect();
-            if !rects.is_empty()
+            let matches = search_page(&doc, page_num, &query);
+            if !matches.is_empty()
                 && tx
                     .unbounded_send(PageMatches {
                         epoch,
                         page: page_num,
-                        rects,
+                        matches,
                     })
                     .is_err()
             {
@@ -146,6 +147,24 @@ pub fn spawn_search(
     });
 
     rx
+}
+
+// All matches of `query` on one page. MuPDF's callback fires once per logical hit with that hit's
+// quads (one per line it spans), so a match becomes one rect per line and streams with no fixed cap.
+// Quads are already page-local top-left, so no origin flip.
+fn search_page(doc: &mupdf::Document, page_num: i32, query: &str) -> Vec<Match> {
+    let mut matches: Vec<Match> = Vec::new();
+    let Ok(page) = doc.load_page(page_num) else {
+        return matches;
+    };
+    let Ok(text_page) = page.to_text_page(TextPageFlags::empty()) else {
+        return matches;
+    };
+    let _ = text_page.search_cb(query, &mut matches, |matches, quads| {
+        matches.push(quads.iter().map(quad_rect).collect());
+        SearchHitResponse::ContinueSearch
+    });
+    matches
 }
 
 // Axis-aligned bounding rect of a MuPDF quad (its four corners), in page-local top-left points.
@@ -208,10 +227,32 @@ mod tests {
         assert!(search_order(0, 0).is_empty());
     }
 
+    // One line of text, the word "Hello" twice, for search-counting assertions.
+    const TWO_HELLO_PDF: &[u8] = b"%PDF-1.4\n\
+1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n\
+2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 300 100] >>\nendobj\n\
+3 0 obj\n<< /Type /Page /Parent 2 0 R /Resources << /Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> >> >> /Contents 4 0 R >>\nendobj\n\
+4 0 obj\n<< /Length 36 >>\nstream\nBT /F1 24 Tf 20 40 Td (Hello Hello) Tj ET\nendstream\nendobj\n\
+trailer\n<< /Root 1 0 R >>\n%%EOF";
+
+    #[test]
+    fn search_page_counts_and_groups_hits() {
+        let doc = mupdf::Document::from_bytes(TWO_HELLO_PDF, "pdf").unwrap();
+        // two occurrences => two matches, each a single line (one rect) - NOT one match per quad
+        let hits = search_page(&doc, 0, "Hello");
+        assert_eq!(hits.len(), 2, "expected 2 matches, got {}", hits.len());
+        assert!(hits.iter().all(|m| m.len() == 1), "single-line hits should be one rect each");
+        // a phrase within a line is a single match
+        assert_eq!(search_page(&doc, 0, "Hello Hello").len(), 1);
+        // no match
+        assert!(search_page(&doc, 0, "zzz").is_empty());
+    }
+
     fn search_with(pages: &[(i32, usize)]) -> Search {
         let mut s = Search::default();
         for &(page, n) in pages {
-            s.results.insert(page, vec![Rectangle::default(); n]);
+            // n matches, each a single-line hit
+            s.results.insert(page, vec![vec![Rectangle::default()]; n]);
         }
         s
     }

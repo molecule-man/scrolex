@@ -540,10 +540,10 @@ impl Page {
         let index = obj.index();
         let search = obj.state().search();
         let search = search.borrow();
-        let Some(rects) = search.results.get(&index) else {
+        let Some(matches) = search.results.get(&index) else {
             return;
         };
-        if rects.is_empty() {
+        if matches.is_empty() {
             return;
         }
 
@@ -556,13 +556,17 @@ impl Page {
         }
         cr.scale(scale, scale);
 
-        for (i, rect) in rects.iter().enumerate() {
-            let (w, h) = rect.size();
-            cr.rectangle(rect.x1, rect.y1, w, h);
+        // Each match may span multiple lines (one rect each); the current match is orange, others
+        // yellow. Fill per match so a multi-line match shares one colour.
+        for (i, rects) in matches.iter().enumerate() {
             if search.current == Some((index, i)) {
                 cr.set_source_rgba(1.0, 0.55, 0.0, 0.45);
             } else {
                 cr.set_source_rgba(1.0, 0.9, 0.0, 0.4);
+            }
+            for rect in rects {
+                let (w, h) = rect.size();
+                cr.rectangle(rect.x1, rect.y1, w, h);
             }
             cr.fill().expect("Failed to fill");
         }

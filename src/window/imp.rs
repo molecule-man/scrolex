@@ -1298,7 +1298,7 @@ impl Window {
                             continue; // superseded
                         }
                         let first = search.current.is_none();
-                        search.results.insert(update.page, update.rects);
+                        search.results.insert(update.page, update.matches);
                         if first {
                             // outward order => first arrival is the nearest match
                             search.current = Some((update.page, 0));
