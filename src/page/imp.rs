@@ -18,7 +18,7 @@ use once_cell::sync::Lazy;
 
 use super::Rectangle;
 use crate::bg_job::{RenderPool, RenderPriority};
-use crate::poppler::{Dest, DestExt, LinkType};
+use crate::links::LinkTarget;
 
 // Low-resolution previews rendered ahead of the visible page and shown (upscaled) while the full
 // render is pending, so aggressive scrolling shows blurry pages rather than blank ones. The render
@@ -100,7 +100,8 @@ pub struct Page {
     #[property(get, set)]
     index: Cell<i32>,
 
-    highlighted: RefCell<Rectangle>,
+    // per-line highlight rects of the current text selection (page-local top-left points)
+    selection_rects: RefCell<Vec<Rectangle>>,
     bbox: RefCell<Rectangle>,
     cursor_guard: Cell<bool>,
 
@@ -155,8 +156,7 @@ impl Page {
             #[weak(rename_to = imp)]
             self,
             move |_, cr, _width, _height| {
-                let Some(poppler_page) = obj.state().doc().and_then(|doc| doc.page(obj.index()))
-                else {
+                let Some(page) = imp.page_info() else {
                     return;
                 };
 
@@ -173,21 +173,19 @@ impl Page {
                 cr.save().expect("Failed to save");
 
                 if obj.state().multithread_rendering() {
-                    imp.multithread_render_to_cairo(cr, &poppler_page);
+                    imp.multithread_render_to_cairo(cr, &page);
                 } else {
-                    imp.render_to_cairo(cr, &poppler_page);
+                    imp.render_to_cairo(cr, &page);
                 }
 
                 cr.restore().expect("Failed to restore");
 
-                let highlighted = &imp.highlighted.borrow();
-                let (w, h) = highlighted.size();
-
-                if w * w > 0.0 && h * h > 0.0 {
-                    imp.render_selection_overlay(cr, &poppler_page, highlighted);
+                let selection = imp.selection_rects.borrow();
+                if !selection.is_empty() {
+                    imp.render_selection_overlay(cr, &page, &selection);
                 }
 
-                imp.render_search_overlay(cr, &poppler_page);
+                imp.render_search_overlay(cr, &page);
             }
         ));
     }
@@ -239,14 +237,14 @@ impl Page {
     }
 
     pub(super) fn resize(&self) {
-        let Some(poppler_page) = self.poppler_page() else {
+        let Some(info) = self.page_info() else {
             return;
         };
         let page = self.obj().clone();
-        let (w, h) = poppler_page.size();
+        let (w, h) = (info.width, info.height);
 
         self.resolve_bbox(
-            &poppler_page,
+            &info,
             page.crop(),
             clone!(
                 #[weak(rename_to = imp)]
@@ -266,12 +264,16 @@ impl Page {
         );
     }
 
-    fn poppler_page(&self) -> Option<poppler::Page> {
-        let obj = self.obj();
-        self.obj()
-            .state()
-            .doc()
-            .and_then(|doc| doc.page(obj.index()))
+    // This widget's page index and size (points), from MuPDF. None until a document is loaded or if
+    // the page can't be read.
+    fn page_info(&self) -> Option<PageInfo> {
+        let index = self.obj().index();
+        let (width, height) = crate::mupdf_render::page_size(&self.obj().uri(), index)?;
+        Some(PageInfo {
+            index,
+            width,
+            height,
+        })
     }
 
     fn setup_text_selection(&self) {
@@ -314,22 +316,21 @@ impl Page {
                 let Some((end_x, end_y)) = gc.point(seq) else {
                     return;
                 };
-                let Some(poppler_page) = imp.poppler_page() else {
-                    return;
-                };
 
                 let Point { x: x1, y: y1 } = undo_zoom_and_crop(&obj, start_x, start_y);
                 let Point { x: x2, y: y2 } = undo_zoom_and_crop(&obj, end_x, end_y);
-                let highlighted = Rectangle::new(x1, y1, x2, y2);
-                imp.highlighted.replace(highlighted);
 
-                let selected = &poppler_page.selected_text(
-                    poppler::SelectionStyle::Glyph,
-                    &mut highlighted.as_poppler(),
-                );
-
-                if let Some(selected) = selected {
-                    obj.clipboard().set_text(selected);
+                let selection =
+                    crate::selection::selection(&obj.uri(), obj.index(), (x1, y1), (x2, y2));
+                match selection {
+                    Some(sel) => {
+                        if !sel.text.is_empty() {
+                            obj.clipboard().set_text(&sel.text);
+                        }
+                        imp.selection_rects
+                            .replace(sel.rects.into_iter().map(Rectangle::from).collect());
+                    }
+                    None => imp.selection_rects.borrow_mut().clear(),
                 }
 
                 obj.queue_draw();
@@ -361,10 +362,6 @@ impl Page {
             #[weak(rename_to = imp)]
             self,
             move |_, x, y| {
-                let Some(poppler_page) = imp.poppler_page() else {
-                    return;
-                };
-
                 let Point { x, y } = undo_zoom_and_crop(&obj, x, y);
                 if imp
                     .state
@@ -372,7 +369,7 @@ impl Page {
                     .imp()
                     .links
                     .borrow_mut()
-                    .get_link(&poppler_page, x, y)
+                    .get_link(&obj.uri(), obj.index(), x, y)
                     .is_some()
                 {
                     if !imp.cursor_guard.get() {
@@ -400,46 +397,26 @@ impl Page {
             #[weak(rename_to = imp)]
             self,
             move |gc, _n_press, x, y| {
-                let Some(poppler_page) = imp.poppler_page() else {
-                    return;
-                };
-
                 let Point { x, y } = undo_zoom_and_crop(&obj, x, y);
 
-                if let Some(link_type) =
+                if let Some(link_target) =
                     imp.state
                         .borrow()
                         .imp()
                         .links
                         .borrow_mut()
-                        .get_link(&poppler_page, x, y)
+                        .get_link(&obj.uri(), obj.index(), x, y)
                 {
-                    match link_type {
-                        LinkType::GotoNamedDest(name) => {
-                            if let Some(doc) = obj.state().doc() {
-                                let Some(dest) = doc.find_dest(name) else {
-                                    return;
-                                };
-
-                                let Dest::Xyz(page_num) = dest.to_dest() else {
-                                    return;
-                                };
-
-                                gc.set_state(gtk::EventSequenceState::Claimed); // stop the event from propagating
-                                obj.emit_by_name::<()>("named-link-clicked", &[&page_num]);
-                            }
+                    match link_target {
+                        LinkTarget::Page(page_num) => {
+                            gc.set_state(gtk::EventSequenceState::Claimed); // stop the event from propagating
+                            obj.emit_by_name::<()>("named-link-clicked", &[page_num]);
                         }
-                        LinkType::Uri(uri) => {
+                        LinkTarget::Uri(uri) => {
                             let _ = gtk::gio::AppInfo::launch_default_for_uri(
                                 uri,
                                 gtk::gio::AppLaunchContext::NONE,
                             );
-                        }
-                        LinkType::Unknown(msg) => {
-                            log::warn!("unhandled link: {msg:?}");
-                        }
-                        LinkType::Invalid => {
-                            log::warn!("invalid link: {link_type:?}");
                         }
                     }
                 };
@@ -448,34 +425,33 @@ impl Page {
         obj.add_controller(gc);
     }
 
-    fn get_bbox(&self, page: &poppler::Page, crop: bool) -> Rectangle {
+    fn get_bbox(&self, page: &PageInfo, crop: bool) -> Rectangle {
         if let Some(bbox) = self.lookup_bbox(page, crop) {
             return bbox;
         }
 
-        let bbox = get_bbox(page, true);
+        let bbox = get_bbox(&self.obj().uri(), page, true);
         self.state
             .borrow()
             .bbox_cache()
             .borrow_mut()
-            .insert(page.index(), bbox);
+            .insert(page.index, bbox);
         bbox
     }
 
-    fn get_cached_bbox(&self, page: &poppler::Page, crop: bool) -> Rectangle {
+    fn get_cached_bbox(&self, page: &PageInfo, crop: bool) -> Rectangle {
         if let Some(bbox) = self.lookup_bbox(page, crop) {
             return bbox;
         }
 
-        let (w, h) = page.size();
-        Rectangle::new(0.0, 0.0, w, h)
+        Rectangle::new(0.0, 0.0, page.width, page.height)
     }
 
-    // Resolve the page's bounding box and hand it to `cb`. Computed on the main thread from the
-    // page we already hold: the layout is far cheaper than a full render, and resolving it inline
-    // sizes the widget at once. A pooled job would lag behind the renders during a fast scroll,
-    // leaving the page stuck at its stale size until the box arrived.
-    fn resolve_bbox<F>(&self, page: &poppler::Page, crop: bool, cb: F)
+    // Resolve the page's bounding box and hand it to `cb`. Computed on the main thread: the layout
+    // is far cheaper than a full render, and resolving it inline sizes the widget at once. A pooled
+    // job would lag behind the renders during a fast scroll, leaving the page stuck at its stale
+    // size until the box arrived.
+    fn resolve_bbox<F>(&self, page: &PageInfo, crop: bool, cb: F)
     where
         F: FnOnce(&Rectangle) + 'static,
     {
@@ -484,62 +460,49 @@ impl Page {
             return;
         }
 
-        let bbox = get_bbox(page, true);
+        let bbox = get_bbox(&self.obj().uri(), page, true);
         self.state
             .borrow()
             .bbox_cache()
             .borrow_mut()
-            .insert(page.index(), bbox);
+            .insert(page.index, bbox);
         cb(&bbox);
     }
 
-    fn lookup_bbox(&self, page: &poppler::Page, crop: bool) -> Option<Rectangle> {
+    fn lookup_bbox(&self, page: &PageInfo, crop: bool) -> Option<Rectangle> {
         if !crop {
-            let (w, h) = page.size();
-            return Some(Rectangle::new(0.0, 0.0, w, h));
+            return Some(Rectangle::new(0.0, 0.0, page.width, page.height));
         }
         self.state
             .borrow()
             .bbox_cache()
             .borrow()
-            .get(&page.index())
+            .get(&page.index)
             .copied()
     }
 
-    fn render_to_cairo(&self, cr: &Context, poppler_page: &poppler::Page) {
+    fn render_to_cairo(&self, cr: &Context, page: &PageInfo) {
         let start = std::time::Instant::now();
         let obj = self.obj();
-        let (width, height) = poppler_page.size();
         let scale_factor = obj.scale_factor() as f64;
 
-        let bbox = self.get_bbox(poppler_page, obj.crop());
+        let bbox = self.get_bbox(page, obj.crop());
         let scale = obj.zoom();
 
-        let uri = obj.uri();
-        if let Some(surface) = crate::mupdf_render::render_page_surface(
-            &uri,
-            poppler_page.index(),
+        let surface = crate::mupdf_render::render_page_surface(
+            &obj.uri(),
+            page.index,
             scale,
             scale_factor,
-            Some((width, height)),
-        ) {
-            draw_surface(cr, &surface, &bbox, scale);
-        } else {
-            // poppler fallback: render vectors straight into the device-scaled context
-            if bbox.x1 != 0.0 || bbox.y1 != 0.0 {
-                cr.translate(-bbox.x1 * scale, -bbox.y1 * scale);
-            }
-            cr.rectangle(0.0, 0.0, width * scale, height * scale);
-            cr.set_source_rgb(1.0, 1.0, 1.0);
-            cr.fill().expect("Failed to fill");
-            cr.scale(scale, scale);
-            poppler_page.render(cr);
-        }
+            Some((page.width, page.height)),
+        )
+        .unwrap_or_else(|| white_surface(Some((page.width, page.height)), scale, scale_factor));
+        draw_surface(cr, &surface, &bbox, scale);
 
         let elapsed = start.elapsed();
         log::debug!(
             "Rendered page {} [on-demand (visible), sync] on main thread in {elapsed:?} (scale_factor={scale_factor})",
-            poppler_page.index()
+            page.index
         );
 
         if elapsed > std::time::Duration::from_millis(100) {
@@ -548,45 +511,31 @@ impl Page {
         }
     }
 
-    fn render_selection_overlay(
-        &self,
-        cr: &Context,
-        poppler_page: &poppler::Page,
-        rect: &Rectangle,
-    ) {
-        let start = std::time::Instant::now();
-
-        let bbox = self.get_bbox(poppler_page, self.obj().crop());
+    // Fill the selection's per-line highlight rects, using the same zoom/crop transform as the page
+    // render so they land on the words.
+    fn render_selection_overlay(&self, cr: &Context, page: &PageInfo, rects: &[Rectangle]) {
+        let bbox = self.get_bbox(page, self.obj().crop());
         let scale = self.obj().zoom();
 
-        let (w, h) = poppler_page.size();
-        let mask = ImageSurface::create(gtk::cairo::Format::ARgb32, w as i32, h as i32)
-            .expect("Failed to create mask surface");
-        let mask_cr = Context::new(&mask).expect("Failed to create mask context");
-        poppler_page.render_selection(
-            &mask_cr,
-            &mut rect.as_poppler(),
-            &mut poppler::Rectangle::new(),
-            poppler::SelectionStyle::Glyph,
-            &mut poppler::Color::new(),
-            &mut poppler::Color::new(),
-        );
-
+        cr.save().expect("Failed to save");
         if bbox.x1 != 0.0 || bbox.y1 != 0.0 {
             cr.translate(-bbox.x1 * scale, -bbox.y1 * scale);
         }
         cr.scale(scale, scale);
-        cr.set_source_rgba(0.5, 0.8, 0.9, 0.7);
-        cr.mask_surface(&mask, 0.0, 0.0)
-            .expect("Failed to mask surface");
-
-        let elapsed = start.elapsed();
-        log::trace!("Rendered selection {} in {elapsed:?}", poppler_page.index());
+        cr.set_source_rgba(0.5, 0.8, 0.9, 0.5);
+        for rect in rects {
+            let (w, h) = rect.size();
+            cr.rectangle(rect.x1, rect.y1, w, h);
+        }
+        cr.fill().expect("Failed to fill selection");
+        cr.restore().expect("Failed to restore");
+        // reset to opaque black so a later fill/mask on this context isn't tinted
+        cr.set_source_rgb(0.0, 0.0, 0.0);
     }
 
     // Paint match rects for this page: matches yellow, the current match orange. Same zoom/crop
     // transform as the page render, so highlights land on the words.
-    fn render_search_overlay(&self, cr: &Context, poppler_page: &poppler::Page) {
+    fn render_search_overlay(&self, cr: &Context, page: &PageInfo) {
         let obj = self.obj();
         let index = obj.index();
         let search = obj.state().search();
@@ -598,7 +547,7 @@ impl Page {
             return;
         }
 
-        let bbox = self.get_bbox(poppler_page, obj.crop());
+        let bbox = self.get_bbox(page, obj.crop());
         let scale = obj.zoom();
 
         cr.save().expect("Failed to save");
@@ -622,11 +571,11 @@ impl Page {
         cr.set_source_rgb(0.0, 0.0, 0.0);
     }
 
-    fn multithread_render_to_cairo(&self, cr: &Context, poppler_page: &poppler::Page) {
+    fn multithread_render_to_cairo(&self, cr: &Context, page: &PageInfo) {
         let obj = self.obj();
-        let page_num = poppler_page.index();
+        let page_num = page.index;
 
-        let (width, height) = poppler_page.size();
+        let (width, height) = (page.width, page.height);
         let scale = obj.zoom();
         let scale_factor = obj.scale_factor() as f64;
         let (canvas_width, canvas_height) =
@@ -638,7 +587,7 @@ impl Page {
         if let Some(surface) = cached {
             if (surface.width(), surface.height()) == expected {
                 log::debug!("draw page {page_num}: cache hit");
-                let bbox = self.get_bbox(poppler_page, obj.crop());
+                let bbox = self.get_bbox(page, obj.crop());
                 draw_surface(cr, &surface, &bbox, scale);
                 self.prefetch_previews(page_num);
                 self.prefetch_next(page_num);
@@ -669,7 +618,7 @@ impl Page {
             .insert(page_num, obj.downgrade());
 
         // show a low-res preview (upscaled) if we have one, otherwise white
-        let bbox = self.get_cached_bbox(poppler_page, obj.crop());
+        let bbox = self.get_cached_bbox(page, obj.crop());
         let preview = obj.state().preview_cache().borrow_mut().get(page_num);
         if let Some(preview) = preview {
             log::debug!("draw page {page_num}: cache miss, showing preview");
@@ -699,10 +648,10 @@ impl Page {
         if state.scrolling() {
             return;
         }
-        let Some(doc) = state.doc() else {
+        let n_pages = state.n_pages();
+        if n_pages == 0 {
             return;
-        };
-        let n_pages = doc.n_pages();
+        }
         let dir = if state.scroll_forward() { 1 } else { -1 };
         let scale = obj.zoom();
         let scale_factor = obj.scale_factor() as f64;
@@ -737,6 +686,9 @@ impl Page {
     ) {
         let obj = self.obj();
         let uri = obj.uri();
+        // Page size (points) from the main-thread doc, so the worker sizes its surface to exactly
+        // what the render cache expects (see mupdf_render::render_page_surface).
+        let page_pt = crate::mupdf_render::page_size(&uri, page_num);
         log::trace!("Scheduling render of page {page_num}");
 
         let (resp_sender, resp_receiver) = oneshot::channel::<RenderedPage>();
@@ -801,14 +753,14 @@ impl Page {
             queue.submit(
                 &uri,
                 priority,
-                Box::new(move |doc| {
+                Box::new(move || {
                     request_render(
-                        doc,
                         &uri_job,
                         scale,
                         scale_factor,
                         page_num,
                         priority,
+                        page_pt,
                         resp_sender,
                     );
                 }),
@@ -823,10 +775,10 @@ impl Page {
         if !obj.state().preview_enabled() {
             return;
         }
-        let Some(doc) = obj.state().doc() else {
+        let n_pages = obj.state().n_pages();
+        if n_pages == 0 {
             return;
-        };
-        let n_pages = doc.n_pages();
+        }
         let window = preview_window(obj.state().preview_cache().borrow().page_capacity());
 
         // Walk outward from the visible page, interleaving both directions, and push so the nearest
@@ -865,6 +817,7 @@ impl Page {
         let obj = self.obj();
         let uri = obj.uri();
         let scale = obj.state().preview_scale();
+        let page_pt = crate::mupdf_render::page_size(&uri, page_num);
 
         let (resp_sender, resp_receiver) = oneshot::channel::<RenderedPage>();
         let obj_clone = obj.clone();
@@ -937,8 +890,8 @@ impl Page {
             queue.submit(
                 &uri,
                 priority,
-                Box::new(move |doc| {
-                    request_render(doc, &uri_job, scale, 1.0, page_num, priority, resp_sender);
+                Box::new(move || {
+                    request_render(&uri_job, scale, 1.0, page_num, priority, page_pt, resp_sender);
                 }),
             );
         });
@@ -1061,24 +1014,36 @@ impl RenderedPage {
     }
 }
 
+// White page-sized surface for when MuPDF can't render a page: keeps the pipeline fed with a
+// correctly-sized surface (so the render cache's dimension check passes) instead of looping on a miss.
+fn white_surface(page_pt: Option<(f64, f64)>, scale: f64, dsf: f64) -> ImageSurface {
+    let (w, h) = page_pt.unwrap_or((1.0, 1.0));
+    let cw = ((w * scale * dsf) as i32).max(1);
+    let ch = ((h * scale * dsf) as i32).max(1);
+    let surface = ImageSurface::create(gtk::cairo::Format::Rgb24, cw, ch).expect("surface");
+    surface.set_device_scale(dsf, dsf);
+    let cr = Context::new(&surface).expect("context");
+    cr.set_source_rgb(1.0, 1.0, 1.0);
+    cr.paint().expect("paint");
+    surface
+}
+
 fn request_render(
-    doc: &poppler::Document,
     uri: &str,
     scale: f64,
     device_scale_factor: f64,
     page_num: i32,
     priority: RenderPriority,
+    page_pt: Option<(f64, f64)>,
     resp_sender: oneshot::Sender<RenderedPage>,
 ) {
-    let Some(page) = doc.page(page_num) else {
-        log::warn!("render skipped: page {page_num} not found in document");
-        return;
-    };
-
     let start = std::time::Instant::now();
     let surface =
-        crate::mupdf_render::render_page_surface(uri, page_num, scale, device_scale_factor, Some(page.size()))
-            .unwrap_or_else(|| render_surface(&page, scale, device_scale_factor));
+        crate::mupdf_render::render_page_surface(uri, page_num, scale, device_scale_factor, page_pt)
+            .unwrap_or_else(|| {
+                log::warn!("mupdf render failed for page {page_num}; showing blank");
+                white_surface(page_pt, scale, device_scale_factor)
+            });
     let (width, height, stride) = (surface.width(), surface.height(), surface.stride());
     let render_ms = start.elapsed().as_millis();
     log::debug!(
@@ -1120,44 +1085,6 @@ fn current_rss_mb() -> f64 {
     0.0
 }
 
-pub fn render_surface(page: &poppler::Page, scale: f64, device_scale_factor: f64) -> ImageSurface {
-    let (width, height) = page.size();
-    let scale_factor = device_scale_factor * scale;
-    let (canvas_width, canvas_height) = (width * scale_factor, height * scale_factor);
-
-    let surface = ImageSurface::create(
-        gtk::cairo::Format::Rgb24,
-        //gtk::cairo::Format::ARgb32,
-        canvas_width as i32,
-        canvas_height as i32,
-    )
-    .expect("Couldn't create a surface!");
-    surface.set_device_scale(device_scale_factor, device_scale_factor);
-    let cr = Context::new(&surface).expect("Couldn't create a context!");
-    cr.rectangle(0.0, 0.0, canvas_width, canvas_height);
-    cr.scale(scale, scale);
-    cr.set_source_rgb(1.0, 1.0, 1.0);
-    cr.fill().expect("Failed to fill");
-    page.render(&cr);
-
-    //let mut old_rect = poppler::Rectangle::new();
-    //let mut rect = poppler::Rectangle::new();
-    //rect.set_x1(0.0);
-    //rect.set_y1(0.0);
-    //rect.set_x2(width);
-    //rect.set_y2(height / 2.0);
-    //page.render_selection(
-    //    &cr,
-    //    &mut rect,
-    //    &mut old_rect,
-    //    poppler::SelectionStyle::Glyph,
-    //    &mut poppler::Color::new(),
-    //    &mut poppler::Color::new(),
-    //);
-
-    surface
-}
-
 struct Point {
     x: f64,
     y: f64,
@@ -1175,51 +1102,46 @@ fn undo_zoom_and_crop(page: &super::Page, x: f64, y: f64) -> Point {
     Point { x, y }
 }
 
-fn get_bbox(page: &poppler::Page, crop: bool) -> Rectangle {
-    let (width, height) = page.size();
-    let mut bbox = poppler::Rectangle::default();
-    bbox.set_x1(0.0);
-    bbox.set_y1(0.0);
-    bbox.set_x2(width);
-    bbox.set_y2(height);
+// A page's index and size in points - the page facts the widget needs, sourced from MuPDF instead
+// of holding a live page object.
+struct PageInfo {
+    index: i32,
+    width: f64,
+    height: f64,
+}
 
-    if crop {
-        let mut poppler_bbox = poppler::Rectangle::default();
-        page.get_bounding_box(&mut poppler_bbox);
-
-        bbox.set_x1(poppler_bbox.x1() - 5.0);
-        bbox.set_x2(poppler_bbox.x2() + 5.0);
-
-        bbox.set_y1(poppler_bbox.y1() - 5.0);
-        bbox.set_y2(poppler_bbox.y2() + 5.0);
-
-        if bbox.x2() - bbox.x1() < width / 2.0 {
-            bbox.set_x2(bbox.x1() + width / 2.0);
-        }
-        if bbox.y2() - bbox.y1() < height / 2.0 {
-            bbox.set_y2(bbox.y1() + height / 2.0);
-        }
-
-        bbox.set_x1(bbox.x1().max(0.0));
-        bbox.set_y1(bbox.y1().max(0.0));
-        bbox.set_x2(bbox.x2().min(width));
-        bbox.set_y2(bbox.y2().min(height));
+fn get_bbox(uri: &str, page: &PageInfo, crop: bool) -> Rectangle {
+    if !crop {
+        return Rectangle::new(0.0, 0.0, page.width, page.height);
     }
+    // MuPDF's content bbox is page-local top-left points, same convention as our Rectangle. Fall
+    // back to the full page if it can't be resolved.
+    match crate::mupdf_render::content_bbox(uri, page.index) {
+        Some((x1, y1, x2, y2)) => apply_crop(Rectangle::new(x1, y1, x2, y2), page.width, page.height),
+        None => Rectangle::new(0.0, 0.0, page.width, page.height),
+    }
+}
 
-    //Rectangle::from_poppler(&bbox, height)
-    Rectangle::new(bbox.x1(), bbox.y1(), bbox.x2(), bbox.y2())
+// Grow the content box by a 5pt margin, enforce a half-page minimum in each axis, and clamp to the
+// page. Pure geometry so the crop behaviour is tested without a rendering backend.
+fn apply_crop(content: Rectangle, width: f64, height: f64) -> Rectangle {
+    let x1 = content.x1 - 5.0;
+    let y1 = content.y1 - 5.0;
+    let mut x2 = content.x2 + 5.0;
+    let mut y2 = content.y2 + 5.0;
+    if x2 - x1 < width / 2.0 {
+        x2 = x1 + width / 2.0;
+    }
+    if y2 - y1 < height / 2.0 {
+        y2 = y1 + height / 2.0;
+    }
+    Rectangle::new(x1.max(0.0), y1.max(0.0), x2.min(width), y2.min(height))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use flate2::read::GzDecoder;
-    use flate2::write::GzEncoder;
-    use flate2::Compression;
     use std::env;
-    use std::fs;
-    use std::io::{Read, Write};
-    use std::path::Path;
 
     #[test]
     fn prefetch_depth_bounds() {
@@ -1241,15 +1163,6 @@ mod tests {
     }
 
     const EPSILON: f64 = 0.0001;
-    const SMALL_PDF: &[u8] = b"%PDF-1.2 \n\
-9 0 obj\n<<\n>>\nstream\nBT/ 32 Tf(  YOUR TEXT HERE   )' ET\nendstream\nendobj\n\
-10 0 obj\n<<\n/Subtype /Link\n/Rect [ {BBOX} ]\n/Contents (Your Annotation Text)\n\
-/C [ 1 1 0 ]\n>>\nendobj\n\
-4 0 obj\n<<\n/Type /Page\n/Parent 5 0 R\n/Contents 9 0 R\n/Annots [10 0 R ]\n>>\nendobj\n\
-5 0 obj\n<<\n/Kids [4 0 R ]\n/Count 1\n/Type /Pages\n/MediaBox [ 0 0 250 50 ]\n>>\nendobj\n\
-3 0 obj\n<<\n/Pages 5 0 R\n/Type /Catalog\n>>\nendobj\n\
-trailer\n<<\n/Root 3 0 R\n>>\n\
-%%EOF";
 
     const SMALL_RENDERABLE_PDF: &[u8] = b"%PDF-1.1
 %\xc2\xa5\xc2\xb1\xc3\xab
@@ -1312,70 +1225,73 @@ startxref
 
     #[test]
     fn test_get_bbox_no_crop() {
-        let content = String::from_utf8_lossy(SMALL_PDF).replace("{BBOX}", "0 0 240 40");
-        let doc = poppler::Document::from_data(content.as_bytes(), None).unwrap();
-        let page = doc.page(0).unwrap();
-        let bbox = get_bbox(&page, false);
+        // crop=false returns the full page without consulting the render backend (uri unused).
+        let page = PageInfo {
+            index: 0,
+            width: 250.0,
+            height: 50.0,
+        };
+        let bbox = get_bbox("", &page, false);
         assert!((bbox.x1 - 0.0).abs() < EPSILON);
         assert!((bbox.y1 - 0.0).abs() < EPSILON);
         assert!((bbox.x2 - 250.0).abs() < EPSILON);
         assert!((bbox.y2 - 50.0).abs() < EPSILON);
     }
 
+    // The crop math is pure geometry over a content box (whatever backend produced it), so it's
+    // tested directly. Page is 250x50.
     #[test]
-    fn test_get_bbox_with_crop() {
-        let content = String::from_utf8_lossy(SMALL_PDF).replace("{BBOX}", "10 6.5 238 41.5");
-        let doc = poppler::Document::from_data(content.as_bytes(), None).unwrap();
-        let page = doc.page(0).unwrap();
-        let bbox = get_bbox(&page, true);
-
-        // [ 10 6.5 238 41.5 ]
-        // corresponds to this bbox in poppler:
-        // { x1: 9.5, y1: 8.0, x2: 238.5, y2: 44.0}
-        // notice strange y2 and y1. Poppler uses left-bottom as origin.
-        // 0.5 pixels for the border I guess.
-
-        assert!((bbox.x1 - 4.5).abs() < EPSILON); // 10.0 - 0.5 - 5
-        assert!((bbox.y1 - 3.0).abs() < EPSILON); // 50 - (41.5 + 0.5 + 5)
-        assert!((bbox.x2 - 243.5).abs() < EPSILON); // 238.0 + 0.5 + 5
-        assert!((bbox.y2 - 49.0).abs() < EPSILON); // 50 - (6.5 - 0.5 - 5)
+    fn apply_crop_adds_margin() {
+        let r = apply_crop(Rectangle::new(50.0, 15.0, 200.0, 40.0), 250.0, 50.0);
+        assert!((r.x1 - 45.0).abs() < EPSILON);
+        assert!((r.y1 - 10.0).abs() < EPSILON);
+        assert!((r.x2 - 205.0).abs() < EPSILON);
+        assert!((r.y2 - 45.0).abs() < EPSILON);
     }
 
     #[test]
-    fn test_get_bbox_with_big_margins() {
-        let content = String::from_utf8_lossy(SMALL_PDF).replace("{BBOX}", "10 34 20 43.5");
-        let doc = poppler::Document::from_data(content.as_bytes(), None).unwrap();
-        let page = doc.page(0).unwrap();
-        let bbox = get_bbox(&page, true);
+    fn apply_crop_enforces_half_page_min() {
+        // tiny content grows to at least half the page in each axis
+        let r = apply_crop(Rectangle::new(9.5, 6.0, 20.0, 8.0), 250.0, 50.0);
+        assert!((r.x1 - 4.5).abs() < EPSILON);
+        assert!((r.y1 - 1.0).abs() < EPSILON);
+        assert!((r.x2 - 129.5).abs() < EPSILON); // 4.5 + 250/2
+        assert!((r.y2 - 26.0).abs() < EPSILON); // 1.0 + 50/2
+    }
 
-        assert!((bbox.x1 - 4.5).abs() < EPSILON); // 10.0 - 0.5 - 5
-        assert!((bbox.y1 - 1.0).abs() < EPSILON);
-        assert!((bbox.x2 - 129.5).abs() < EPSILON); // 4.5 + 250 / 2
-        assert!((bbox.y2 - 26.0).abs() < EPSILON);
+    #[test]
+    fn apply_crop_clamps_to_page() {
+        // margins pushing past the edges clamp back to [0,w] x [0,h]
+        let r = apply_crop(Rectangle::new(2.0, 2.0, 248.0, 48.0), 250.0, 50.0);
+        assert!((r.x1 - 0.0).abs() < EPSILON);
+        assert!((r.y1 - 0.0).abs() < EPSILON);
+        assert!((r.x2 - 250.0).abs() < EPSILON);
+        assert!((r.y2 - 50.0).abs() < EPSILON);
     }
 
     #[gtk::test]
     fn test_render() {
-        let doc = poppler::Document::from_data(SMALL_RENDERABLE_PDF, None).unwrap();
+        // MuPDF opens by path, so write the fixture to a temp file, then render page 0 and assert
+        // it produced a non-blank surface (exact pixels are backend-specific, so no snapshot).
+        let dir = std::env::temp_dir().join("scrolex_test_render");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("small.pdf");
+        std::fs::write(&path, SMALL_RENDERABLE_PDF).unwrap();
+        let uri = format!("file://{}", path.display());
 
-        let state = crate::state::State::new();
-        let page = crate::page::Page::new(&state);
-        page.state().set_doc(&doc);
-        page.bind(&crate::page::PageNumber::new(0));
+        let surface = crate::mupdf_render::render_page_surface(&uri, 0, 1.0, 1.0, None)
+            .expect("mupdf should render the fixture");
+        assert!(surface.width() > 0 && surface.height() > 0);
 
-        let surface = gtk::cairo::ImageSurface::create(gtk::cairo::Format::Rgb24, 80, 12).unwrap();
-        let cr = gtk::cairo::Context::new(&surface).unwrap();
-
-        page.imp().render_to_cairo(&cr, &doc.page(0).unwrap());
-        let mut buffer = vec![0u8; (surface.stride() * surface.height()) as usize];
+        let mut colored = false;
         surface
-            .with_data(|data| {
-                buffer.copy_from_slice(data);
+            .with_data(|d| {
+                colored = d
+                    .chunks_exact(4)
+                    .any(|p| p[0] != 255 || p[1] != 255 || p[2] != 255)
             })
-            .expect("Failed to extract surface data");
-        surface.finish();
-
-        assert_snapshot("test_render", &buffer);
+            .unwrap();
+        assert!(colored, "rendered surface is blank white");
     }
 
     // Throughput probe: measures how many pages/sec the renderer sustains at
@@ -1411,10 +1327,11 @@ startxref
                         continue;
                     }
                     s.spawn(move || {
-                        let doc = poppler::Document::from_file(&uri, None).unwrap();
                         for p in chunk {
-                            if let Some(page) = doc.page(p) {
-                                std::hint::black_box(render_surface(&page, scale, 1.0));
+                            if let Some(surface) =
+                                crate::mupdf_render::render_page_surface(&uri, p, scale, 1.0, None)
+                            {
+                                std::hint::black_box(surface);
                             }
                         }
                     });
@@ -1429,155 +1346,6 @@ startxref
         }
     }
 
-    // Memory probe: isolates the two costs of the N-threads/N-documents render pool - the resident
-    // poppler Documents (one per thread) versus the glibc malloc arena high-water mark left by
-    // transient render allocations. For a given THREADS it renders PAGES across that many threads
-    // (each with its own Document, matching the real pool), keeps all threads/documents alive, and
-    // reports VmRSS after rendering and again after malloc_trim(0). The gap that malloc_trim
-    // reclaims is the arena bloat (fixable without dropping parallelism); the residual scaling with
-    // THREADS is the per-document cost. Run per thread count in separate processes so arenas don't
-    // carry over:
-    //   PDF_PATH=/abs/file.pdf THREADS=4 cargo test --release bench_render_memory -- --ignored --nocapture
-    // Optional env: PAGE_NUMBER, PAGES, MALLOC_ARENA_MAX (set before running).
-    #[test]
-    #[ignore]
-    fn bench_render_memory() {
-        use std::sync::{mpsc, Arc, Mutex};
-
-        extern "C" {
-            fn malloc_trim(pad: usize) -> i32;
-        }
-        let rss_mb = current_rss_mb;
-
-        let path = env::var("PDF_PATH").expect("PDF_PATH not set");
-        let uri = format!("file://{path}");
-        let start: i32 = env::var("PAGE_NUMBER")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
-        let count: i32 = env::var("PAGES")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(40);
-        let threads: usize = env::var("THREADS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(4);
-        // re-render the same pages this many times to imitate a long scrolling
-        // session churning allocations, so growth-with-churn (a leak) shows up
-        // distinct from the one-pass working set
-        let passes: usize = env::var("PASSES")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(1);
-        let pages: Vec<i32> = (start..start + count).collect();
-
-        let baseline = rss_mb();
-
-        let (done_tx, done_rx) = mpsc::channel::<()>();
-        let (exit_tx, exit_rx) = mpsc::channel::<()>();
-        let exit_rx = Arc::new(Mutex::new(exit_rx));
-
-        std::thread::scope(|s| {
-            for t in 0..threads {
-                let uri = uri.clone();
-                let chunk: Vec<i32> = pages.iter().copied().skip(t).step_by(threads).collect();
-                let done_tx = done_tx.clone();
-                let exit_rx = exit_rx.clone();
-                s.spawn(move || {
-                    // each thread keeps its own Document, like the real pool
-                    let doc = poppler::Document::from_file(&uri, None).unwrap();
-                    for _ in 0..passes {
-                        for p in &chunk {
-                            if let Some(page) = doc.page(*p) {
-                                std::hint::black_box(render_surface(&page, 1.0, 1.0));
-                            }
-                        }
-                    }
-                    // report done, then hold the Document resident until released
-                    done_tx.send(()).unwrap();
-                    let _ = exit_rx.lock().unwrap().recv();
-                    std::hint::black_box(&doc);
-                });
-            }
-
-            for _ in 0..threads {
-                done_rx.recv().unwrap();
-            }
-
-            let after_render = rss_mb();
-            unsafe { malloc_trim(0) };
-            let after_trim = rss_mb();
-
-            println!(
-                "threads={threads:<2} passes={passes} pages={} baseline={baseline:.0}MB after_render={after_render:.0}MB \
-                 after_trim={after_trim:.0}MB reclaimed_by_trim={:.0}MB resident_over_baseline={:.0}MB",
-                pages.len(),
-                after_render - after_trim,
-                after_trim - baseline,
-            );
-
-            for _ in 0..threads {
-                exit_tx.send(()).unwrap();
-            }
-        });
-    }
-
-    #[test]
-    fn test_render_surface() {
-        let doc = poppler::Document::from_data(SMALL_RENDERABLE_PDF, None).unwrap();
-        let surface = render_surface(&doc.page(0).unwrap(), 1.0, 1.0);
-
-        let mut buffer = vec![0u8; (surface.stride() * surface.height()) as usize];
-        surface
-            .with_data(|data| {
-                buffer.copy_from_slice(data);
-            })
-            .expect("Failed to extract surface data");
-        surface.finish();
-
-        assert_snapshot("test_render_surface", &buffer);
-    }
-
-    fn assert_snapshot(snapshot_name: &str, data: &[u8]) {
-        let snapshot_dir = Path::new(".snapshots");
-        let snapshot_file_path = snapshot_dir.join(format!("{snapshot_name}.snap"));
-
-        if env::var("UPDATE_SNAP").is_ok() {
-            let compressed_data = compress_data(data);
-
-            fs::create_dir_all(snapshot_dir).expect("Failed to create snapshot directory");
-            fs::write(&snapshot_file_path, compressed_data).expect("Failed to write snapshot file");
-
-            println!("Snapshot updated.");
-        } else {
-            let compressed_snapshot =
-                fs::read(&snapshot_file_path).expect("Failed to read snapshot file");
-
-            let decompressed_snapshot =
-                decompress_data(&compressed_snapshot).expect("Failed to decompress snapshot");
-
-            let diff = decompressed_snapshot
-                .iter()
-                .zip(data.iter())
-                .fold(0, |acc, (a, b)| acc + (*a as i32 - *b as i32).abs());
-
-            assert_eq!(diff, 0)
-        }
-    }
-
-    fn compress_data(data: &[u8]) -> Vec<u8> {
-        let mut encoder = GzEncoder::new(Vec::new(), Compression::new(9));
-        encoder.write_all(data).expect("Failed to compress data");
-        encoder.finish().expect("Failed to finish compression")
-    }
-
-    fn decompress_data(compressed_data: &[u8]) -> Result<Vec<u8>, std::io::Error> {
-        let mut decoder = GzDecoder::new(compressed_data);
-        let mut decompressed_data = Vec::new();
-        decoder.read_to_end(&mut decompressed_data)?;
-        Ok(decompressed_data)
-    }
 
     #[test]
     fn preview_scale_shrinks_for_slow_renders() {

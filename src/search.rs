@@ -1,14 +1,18 @@
 // Full-document text search. A background thread walks pages outward from the current page, runs
-// poppler's per-page find_text, and streams matches back. An epoch counter cancels a superseded sweep.
+// MuPDF's per-page search, and streams matches back. An epoch counter cancels a superseded sweep.
+// MuPDF search is case-insensitive.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use futures::channel::mpsc;
-use poppler::FindFlags;
+use gtk::prelude::FileExt;
 
 use crate::page::Rectangle;
+
+// Cap on match rects reported per page (MuPDF requires a hit limit).
+const MAX_HITS_PER_PAGE: u32 = 500;
 
 // Matches on one page, tagged with the sweep epoch so stale results can be dropped.
 pub struct PageMatches {
@@ -23,7 +27,6 @@ pub type MatchReceiver = mpsc::UnboundedReceiver<PageMatches>;
 #[derive(Default, Debug)]
 pub struct Search {
     pub query: String,
-    pub case_sensitive: bool,
     // page -> match rects, in page coords (top-left origin)
     pub results: BTreeMap<i32, Vec<Rectangle>>,
     // the highlighted match: (page, index within that page's rects)
@@ -39,14 +42,6 @@ impl Search {
         self.current = None;
         // abandon any in-flight sweep
         self.epoch.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn flags(&self) -> FindFlags {
-        if self.case_sensitive {
-            FindFlags::CASE_SENSITIVE
-        } else {
-            FindFlags::DEFAULT
-        }
     }
 
     pub fn total(&self) -> usize {
@@ -107,7 +102,6 @@ impl Search {
 pub fn spawn_search(
     uri: String,
     query: String,
-    flags: FindFlags,
     n_pages: i32,
     start_page: i32,
     epoch: u64,
@@ -116,8 +110,12 @@ pub fn spawn_search(
     let (tx, rx) = mpsc::unbounded();
 
     std::thread::spawn(move || {
-        let file = gtk::gio::File::for_uri(&uri);
-        let Ok(doc) = poppler::Document::from_gfile(&file, None, gtk::gio::Cancellable::NONE) else {
+        // Own MuPDF Document on this short-lived thread (dropped at scope end, before the thread's
+        // context TLS teardown, so no drop-order issue).
+        let Some(path) = gtk::gio::File::for_uri(&uri).path() else {
+            return;
+        };
+        let Ok(doc) = mupdf::Document::open(path.as_path()) else {
             return;
         };
 
@@ -125,16 +123,14 @@ pub fn spawn_search(
             if shared_epoch.load(Ordering::Relaxed) != epoch {
                 return; // superseded by a newer query
             }
-            let Some(page) = doc.page(page_num) else {
+            let Ok(page) = doc.load_page(page_num) else {
                 continue;
             };
-            let (_, height) = page.size();
-            // find_text uses a bottom-left origin (like link mapping); flip into our top-left space.
-            let rects: Vec<Rectangle> = page
-                .find_text_with_options(&query, flags)
-                .iter()
-                .map(|r| Rectangle::from_poppler(r, height))
-                .collect();
+            // MuPDF quads are already page-local top-left, so no origin flip.
+            let Ok(quads) = page.search(&query, MAX_HITS_PER_PAGE) else {
+                continue;
+            };
+            let rects: Vec<Rectangle> = quads.iter().map(quad_rect).collect();
             if !rects.is_empty()
                 && tx
                     .unbounded_send(PageMatches {
@@ -150,6 +146,17 @@ pub fn spawn_search(
     });
 
     rx
+}
+
+// Axis-aligned bounding rect of a MuPDF quad (its four corners), in page-local top-left points.
+fn quad_rect(q: &mupdf::Quad) -> Rectangle {
+    let xs = [q.ul.x, q.ur.x, q.ll.x, q.lr.x];
+    let ys = [q.ul.y, q.ur.y, q.ll.y, q.lr.y];
+    let x1 = xs.iter().copied().fold(f32::INFINITY, f32::min) as f64;
+    let x2 = xs.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+    let y1 = ys.iter().copied().fold(f32::INFINITY, f32::min) as f64;
+    let y2 = ys.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+    Rectangle::new(x1, y1, x2, y2)
 }
 
 // Page order for a sweep: start page, then outward (start±1, start±2, …), clamped. Nearest matches
@@ -177,50 +184,6 @@ fn search_order(n_pages: i32, start_page: i32) -> Vec<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // "Hello" sits near the bottom of a 300pt page. find_text reports a bottom-left origin, so the
-    // flip must land it in the lower half. Pins the flip against a poppler convention change.
-    const BOTTOM_TEXT_PDF: &[u8] = b"%PDF-1.4\n\
-1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n\
-2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 300 300] >>\nendobj\n\
-3 0 obj\n<< /Type /Page /Parent 2 0 R /Resources << /Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> >> >> /Contents 4 0 R >>\nendobj\n\
-4 0 obj\n<< /Length 36 >>\nstream\nBT\n/F1 24 Tf\n40 30 Td\n(Hello) Tj\nET\nendstream\nendobj\n\
-trailer\n<< /Size 5 /Root 1 0 R >>\n%%EOF";
-
-    #[test]
-    fn find_text_matches_flip_into_top_left_space() {
-        let doc = poppler::Document::from_data(BOTTOM_TEXT_PDF, None).unwrap();
-        let page = doc.page(0).unwrap();
-        let (_, height) = page.size();
-        assert!((height - 300.0).abs() < 0.001, "unexpected page height {height}");
-
-        // DEFAULT is case-insensitive
-        let raw = page.find_text_with_options("hello", FindFlags::DEFAULT);
-        assert_eq!(raw.len(), 1, "expected exactly one match");
-
-        let flipped = Rectangle::from_poppler(&raw[0], height);
-        assert!(flipped.y1 < flipped.y2, "y1 must be the top edge, got {flipped:?}");
-        assert!(
-            flipped.y1 > height / 2.0,
-            "bottom-of-page text must flip into the lower half, got y1={}",
-            flipped.y1
-        );
-    }
-
-    #[test]
-    fn case_sensitive_flag_excludes_wrong_case() {
-        let doc = poppler::Document::from_data(BOTTOM_TEXT_PDF, None).unwrap();
-        let page = doc.page(0).unwrap();
-        assert_eq!(
-            page.find_text_with_options("hello", FindFlags::CASE_SENSITIVE).len(),
-            0,
-            "case-sensitive search must not match the wrong case"
-        );
-        assert_eq!(
-            page.find_text_with_options("Hello", FindFlags::CASE_SENSITIVE).len(),
-            1,
-        );
-    }
 
     #[test]
     fn search_order_walks_outward_from_start() {

@@ -23,7 +23,7 @@ pub struct State {
     animate_scroll: Cell<bool>,
 
     #[property(get, set)]
-    doc: RefCell<Option<poppler::Document>>,
+    n_pages: Cell<i32>,
 
     #[property(get, set)]
     uri: RefCell<String>,

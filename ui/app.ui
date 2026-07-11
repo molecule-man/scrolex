@@ -274,18 +274,6 @@
 										</property>
 									</object>
 								</child>
-								<child>
-									<object class="GtkToggleButton" id="btn_search_case">
-										<signal name="toggled" handler="search_case_toggled" swapped="true"/>
-										<property name="label">Aa</property>
-										<property name="tooltip-text">Case sensitive</property>
-										<property name="cursor">
-											<object class="GdkCursor">
-												<property name="name">pointer</property>
-											</object>
-										</property>
-									</object>
-								</child>
 							</object>
 						</child>
 					</object>

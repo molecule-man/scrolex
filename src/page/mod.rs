@@ -2,7 +2,6 @@ mod imp;
 mod page_number_imp;
 
 pub use imp::draw_surface;
-pub use imp::render_surface;
 pub(crate) use imp::set_render_threads;
 pub(crate) use imp::PREVIEW_INITIAL_SCALE;
 
@@ -21,24 +20,6 @@ pub struct Rectangle {
 impl Rectangle {
     pub fn new(x1: f64, y1: f64, x2: f64, y2: f64) -> Self {
         Self { x1, y1, x2, y2 }
-    }
-
-    pub(crate) fn as_poppler(&self) -> poppler::Rectangle {
-        let mut rect = poppler::Rectangle::new();
-        rect.set_x1(self.x1);
-        rect.set_y1(self.y1);
-        rect.set_x2(self.x2);
-        rect.set_y2(self.y2);
-        rect
-    }
-
-    pub(crate) fn from_poppler(rect: &poppler::Rectangle, height: f64) -> Self {
-        Self {
-            x1: rect.x1(),
-            y1: height - rect.y2(),
-            x2: rect.x2(),
-            y2: height - rect.y1(),
-        }
     }
 
     fn size(&self) -> (f64, f64) {
