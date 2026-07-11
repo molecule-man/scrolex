@@ -50,6 +50,8 @@ impl State {
         }
 
         let uri = f.uri();
+        // Force every thread to reopen: the same path may have changed on disk since last load.
+        crate::mupdf_render::invalidate();
         let n_pages = crate::mupdf_render::page_count(&uri);
         if n_pages == 0 {
             return Err(io::Error::other("could not open document"));

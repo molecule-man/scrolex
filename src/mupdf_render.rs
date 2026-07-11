@@ -2,15 +2,26 @@
 // requested resolution - scanned pages render at fit-to-page cost, not poppler's full-res decode.
 
 use std::cell::RefCell;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use gtk::cairo::{Format, ImageSurface};
 use gtk::prelude::FileExt;
 use mupdf::{Colorspace, Document, Matrix};
 
+// Bumped on document load so every thread's cached Document is reopened - otherwise reloading the
+// same path after the file changed on disk would keep serving the stale document.
+static GENERATION: AtomicU64 = AtomicU64::new(0);
+
 thread_local! {
-    // One Document per thread: it's bound to the thread's fz_context, so it can't cross threads.
-    // Reused across renders, reopened only when the uri changes.
-    static DOC: RefCell<Option<(String, Document)>> = const { RefCell::new(None) };
+    // (uri, generation-at-open, Document). One Document per thread: it's bound to the thread's
+    // fz_context, so it can't cross threads. Reopened when the uri or the generation changes.
+    static DOC: RefCell<Option<(String, u64, Document)>> = const { RefCell::new(None) };
+}
+
+// Invalidate every thread's cached Document (call on document load). The next `with_doc` on each
+// thread reopens against the current bytes.
+pub fn invalidate() {
+    GENERATION.fetch_add(1, Ordering::Relaxed);
 }
 
 // Full-page surface for `page_num` at `scale` * `dsf`, or None if MuPDF can't open/render it (caller
@@ -24,14 +35,18 @@ thread_local! {
 // ("thread local panicked on drop") when a pool worker exits.
 pub fn with_doc<T>(uri: &str, f: impl FnOnce(&Document) -> Option<T>) -> Option<T> {
     let _ctx = Colorspace::device_bgr();
+    let generation = GENERATION.load(Ordering::Relaxed);
     DOC.with(|cell| {
         let mut slot = cell.borrow_mut();
-        if slot.as_ref().map(|(u, _)| u.as_str()) != Some(uri) {
+        let fresh = slot
+            .as_ref()
+            .is_some_and(|(u, g, _)| u == uri && *g == generation);
+        if !fresh {
             let path = gtk::gio::File::for_uri(uri).path()?;
             let doc = Document::open(path.as_path()).ok()?;
-            *slot = Some((uri.to_string(), doc));
+            *slot = Some((uri.to_string(), generation, doc));
         }
-        f(&slot.as_ref().unwrap().1)
+        f(&slot.as_ref().unwrap().2)
     })
 }
 
