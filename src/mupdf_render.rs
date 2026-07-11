@@ -3,7 +3,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -20,7 +20,8 @@ static GENERATION: AtomicU64 = AtomicU64::new(0);
 
 // Non-local GFiles (smb://, sftp://, GVfs mounts) have no local path, and MuPDF opens by path only.
 // Stage their bytes to a temp file once, keyed by uri; cleared on invalidate() so a changed remote
-// file re-stages.
+// file re-stages. Shutdown skips destructors (main.rs _exit), so the last session's staged file
+// lingers in the temp dir - harmless, and left for the OS temp cleaner.
 static STAGED: Lazy<Mutex<HashMap<String, PathBuf>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
 thread_local! {
@@ -53,18 +54,32 @@ pub(crate) fn local_path(uri: &str) -> Option<PathBuf> {
     if let Some(path) = file.path() {
         return Some(path);
     }
-    let mut staged = STAGED.lock().unwrap();
-    if let Some(path) = staged.get(uri) {
-        return Some(path.clone());
+    if let Some(path) = STAGED.lock().unwrap().get(uri).cloned() {
+        return Some(path);
     }
+    // Fetch and write WITHOUT holding the lock: blocking network I/O must not stall invalidate()
+    // (called from load() on the main thread). Write to a securely-created unique temp file (random
+    // name, O_EXCL, mode 600) rather than a predictable path, so a symlink or another process can't
+    // hijack or truncate it.
     let (bytes, _etag) = file.load_contents(gtk::gio::Cancellable::NONE).ok()?;
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    uri.hash(&mut hasher);
-    let mut path = std::env::temp_dir();
-    path.push(format!("scrolex-staged-{:016x}.pdf", hasher.finish()));
-    std::fs::write(&path, &bytes).ok()?;
-    staged.insert(uri.to_string(), path.clone());
-    Some(path)
+    let mut tmp = tempfile::Builder::new()
+        .prefix("scrolex-staged-")
+        .suffix(".pdf")
+        .tempfile()
+        .ok()?;
+    tmp.write_all(&bytes).ok()?;
+    let (_f, path) = tmp.keep().ok()?;
+
+    let mut staged = STAGED.lock().unwrap();
+    let chosen = staged
+        .entry(uri.to_string())
+        .or_insert_with(|| path.clone())
+        .clone();
+    if chosen != path {
+        // lost a concurrent staging race for the same uri; drop our orphan copy
+        let _ = std::fs::remove_file(&path);
+    }
+    Some(chosen)
 }
 
 // Full-page surface for `page_num` at `scale` * `dsf`, or None if MuPDF can't open/render it (caller
