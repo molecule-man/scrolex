@@ -897,9 +897,6 @@ impl Page {
         });
     }
 
-    pub fn render_surface(&self, cr: &Context, surface: &ImageSurface, bbox: &Rectangle) {
-        draw_surface(cr, surface, bbox, self.obj().zoom());
-    }
 }
 
 pub fn draw_surface(cr: &Context, surface: &ImageSurface, bbox: &Rectangle, scale: f64) {
