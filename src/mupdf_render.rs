@@ -29,6 +29,12 @@ thread_local! {
     static DOC: RefCell<Option<(String, u64, Document)>> = const { RefCell::new(None) };
 }
 
+// Current document generation, bumped by invalidate(). Callers that cache derived data (e.g. the
+// selection glyph list) can key on it so a reload rebuilds.
+pub(crate) fn generation() -> u64 {
+    GENERATION.load(Ordering::Relaxed)
+}
+
 // Invalidate every thread's cached Document (call on document load). The next `with_doc` on each
 // thread reopens against the current bytes, and any staged remote copies are re-fetched.
 pub fn invalidate() {
