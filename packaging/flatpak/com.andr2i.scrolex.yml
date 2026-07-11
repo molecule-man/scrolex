@@ -4,7 +4,7 @@ runtime-version: '49'
 sdk: org.gnome.Sdk
 sdk-extensions:
   - org.freedesktop.Sdk.Extension.rust-stable
-  - org.freedesktop.Sdk.Extension.llvm18
+  - org.freedesktop.Sdk.Extension.llvm20
 command: scrolex
 
 finish-args:
@@ -18,12 +18,12 @@ modules:
   - name: scrolex
     buildsystem: simple
     build-options:
-      append-path: /usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/llvm18/bin
+      append-path: /usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/llvm20/bin
       env:
         CARGO_HOME: /run/build/scrolex/cargo
         # mupdf-sys compiles its bundled C library and runs bindgen, which
         # needs libclang from the llvm SDK extension.
-        LIBCLANG_PATH: /usr/lib/sdk/llvm18/lib
+        LIBCLANG_PATH: /usr/lib/sdk/llvm20/lib
       build-args:
         - --share=network
     build-commands:

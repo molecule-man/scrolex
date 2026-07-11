@@ -7,7 +7,7 @@ Local/CI Flatpak build for scrolex. Not published to Flathub.
 ```sh
 flatpak install flathub org.gnome.Platform//49 org.gnome.Sdk//49 \
     org.freedesktop.Sdk.Extension.rust-stable//25.08 \
-    org.freedesktop.Sdk.Extension.llvm18//25.08
+    org.freedesktop.Sdk.Extension.llvm20//25.08
 ```
 
 `flatpak-builder` is also required (e.g. `pacman -S flatpak-builder`).
@@ -27,7 +27,7 @@ flatpak run com.andr2i.scrolex
 
 - The PDF engine (mupdf) is vendored and statically linked by the `mupdf`
   crate, so no PDF library is built as a separate module. Its build compiles C
-  and runs bindgen, hence the `llvm18` SDK extension for libclang.
+  and runs bindgen, hence the `llvm20` SDK extension for libclang.
 - The cargo build fetches crates over the network (`--share=network`).
 
 ## Gaps to close before Flathub
