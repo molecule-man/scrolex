@@ -515,18 +515,26 @@ impl Page {
         let bbox = self.get_bbox(poppler_page, obj.crop());
         let scale = obj.zoom();
 
-        if bbox.x1 != 0.0 || bbox.y1 != 0.0 {
-            cr.translate(-bbox.x1 * scale, -bbox.y1 * scale);
+        let uri = obj.uri();
+        if let Some(surface) = crate::mupdf_render::render_page_surface(
+            &uri,
+            poppler_page.index(),
+            scale,
+            scale_factor,
+            Some((width, height)),
+        ) {
+            draw_surface(cr, &surface, &bbox, scale);
+        } else {
+            // poppler fallback: render vectors straight into the device-scaled context
+            if bbox.x1 != 0.0 || bbox.y1 != 0.0 {
+                cr.translate(-bbox.x1 * scale, -bbox.y1 * scale);
+            }
+            cr.rectangle(0.0, 0.0, width * scale, height * scale);
+            cr.set_source_rgb(1.0, 1.0, 1.0);
+            cr.fill().expect("Failed to fill");
+            cr.scale(scale, scale);
+            poppler_page.render(cr);
         }
-
-        cr.rectangle(0.0, 0.0, width * scale, height * scale);
-        //cr.set_source_rgba(1.0, 1.0, 1.0, 1.0);
-        cr.set_source_rgb(1.0, 1.0, 1.0);
-        cr.fill().expect("Failed to fill");
-
-        cr.scale(scale, scale);
-
-        poppler_page.render(cr);
 
         let elapsed = start.elapsed();
         log::debug!(
@@ -1068,8 +1076,9 @@ fn request_render(
     };
 
     let start = std::time::Instant::now();
-    let surface = crate::image_page::render_image_page(uri, &page, scale, device_scale_factor)
-        .unwrap_or_else(|| render_surface(&page, scale, device_scale_factor));
+    let surface =
+        crate::mupdf_render::render_page_surface(uri, page_num, scale, device_scale_factor, Some(page.size()))
+            .unwrap_or_else(|| render_surface(&page, scale, device_scale_factor));
     let (width, height, stride) = (surface.width(), surface.height(), surface.stride());
     let render_ms = start.elapsed().as_millis();
     log::debug!(

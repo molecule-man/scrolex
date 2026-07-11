@@ -1,10 +1,9 @@
 pub mod bg_job;
 pub mod config;
-pub mod image_page;
 pub mod jump_stack;
 pub mod links;
+pub mod mupdf_render;
 pub mod page;
-pub(crate) mod page_overlay;
 pub mod poppler;
 pub mod render_cache;
 pub mod search;
