@@ -1050,35 +1050,56 @@ fn request_render(
     resp_sender: oneshot::Sender<RenderedPage>,
 ) {
     let start = std::time::Instant::now();
-    let surface =
-        crate::mupdf_render::render_page_surface(uri, page_num, scale, device_scale_factor, page_pt)
-            .unwrap_or_else(|| {
-                log::warn!("mupdf render failed for page {page_num}; showing blank");
-                white_surface(page_pt, scale, device_scale_factor)
-            });
-    let (width, height, stride) = (surface.width(), surface.height(), surface.stride());
+    let pixels =
+        crate::mupdf_render::render_page_pixels(uri, page_num, scale, device_scale_factor, page_pt);
     let render_ms = start.elapsed().as_millis();
     log::debug!(
         "Rendered page {page_num} [{}] on background thread in {render_ms}ms (scale_factor={device_scale_factor})",
         priority.label()
     );
 
-    let mut buffer = vec![0u8; (stride * height) as usize];
-    surface
-        .with_data(|data| {
-            buffer.copy_from_slice(data);
-        })
-        .expect("Failed to extract surface data");
-    surface.finish();
+    // Send the raw buffer; the ImageSurface is rebuilt from it on the main thread.
+    let rendered = match pixels {
+        Some(px) => RenderedPage {
+            data: px.data.into_boxed_slice(),
+            width: px.width,
+            height: px.height,
+            stride: px.stride,
+            render_ms,
+        },
+        None => {
+            log::warn!("mupdf render failed for page {page_num}; showing blank");
+            white_rendered_page(page_pt, scale, device_scale_factor, render_ms)
+        }
+    };
     // ignore send failure: the receiver is gone if the page's widget was
     // dropped or its render superseded
-    let _ = resp_sender.send(RenderedPage {
-        data: buffer.into_boxed_slice(),
+    let _ = resp_sender.send(rendered);
+}
+
+// Blank white page for a failed render: dimensions and stride match a real render at this scale, so
+// the render cache's dimension check passes instead of looping on the miss.
+fn white_rendered_page(
+    page_pt: Option<(f64, f64)>,
+    scale: f64,
+    dsf: f64,
+    render_ms: u128,
+) -> RenderedPage {
+    let (w, h) = page_pt.unwrap_or((1.0, 1.0));
+    let width = ((w * scale * dsf) as i32).max(1);
+    let height = ((h * scale * dsf) as i32).max(1);
+    let stride = gtk::cairo::Format::Rgb24
+        .stride_for_width(width as u32)
+        .expect("stride");
+    // Rgb24 with every byte 0xff is white (BGRx: B=G=R=255).
+    let data = vec![0xffu8; (stride * height) as usize].into_boxed_slice();
+    RenderedPage {
+        data,
         width,
         height,
         stride,
         render_ms,
-    });
+    }
 }
 
 // Resident set size in MB, read from /proc (Linux). Used only for diagnostic logging, so a read

@@ -47,10 +47,8 @@ pub fn invalidate() {
     staged.clear();
 }
 
-// Fetch a non-local GFile's bytes into a securely-created temp copy (random name, O_EXCL, mode 600 -
-// not a predictable path a symlink or another process could hijack or truncate). Returns a
-// self-deleting handle: the caller keep()s it to retain the copy, or drops it to remove it. None if
-// the read or write fails.
+// A non-local GFile's bytes in a secure temp copy (O_EXCL, mode 600: no symlink/truncation hijack).
+// The handle deletes on drop unless keep()d. None if read or write fails.
 fn fetch_to_temp(file: &gtk::gio::File) -> Option<tempfile::TempPath> {
     let (bytes, _etag) = file.load_contents(gtk::gio::Cancellable::NONE).ok()?;
     let mut tmp = tempfile::Builder::new()
@@ -62,20 +60,18 @@ fn fetch_to_temp(file: &gtk::gio::File) -> Option<tempfile::TempPath> {
     Some(tmp.into_temp_path())
 }
 
-// A document to be loaded, prepared before the active document is disturbed. `path` is what MuPDF
-// opens: a local file's own path, or a temp copy of a non-local GFile's bytes fetched exactly once.
-// The same artifact is validated (page_count) and then commit()ted for every render worker, so
-// validation and rendering always see identical bytes - no re-fetch, no time-of-check/time-of-use
-// gap. Dropped without commit (a failed load), an owned temp copy is removed.
+// A document to load, prepared before the active one is disturbed. `path` (a local file, or a temp
+// copy of a non-local GFile fetched once) is validated then commit()ted for the workers, so
+// validation and rendering see identical bytes - no TOCTOU gap. Dropped without commit, an owned
+// temp is removed.
 pub(crate) struct Candidate {
     uri: String,
     path: PathBuf,
-    // Some(_) when `path` is a temp copy we own; keep()d on commit, deleted on drop otherwise.
+    // Some when `path` is a temp copy we own: keep()d on commit, else deleted on drop.
     temp: Option<tempfile::TempPath>,
 }
 
-// Prepare a candidate for `uri`: its own path when local, else a temp copy of the non-local bytes
-// (fetched once). None if it can't be read.
+// Candidate for `uri`: its own path when local, else a temp copy of the non-local bytes. None if unreadable.
 pub(crate) fn stage_candidate(uri: &str) -> Option<Candidate> {
     let file = gtk::gio::File::for_uri(uri);
     if let Some(path) = file.path() {
@@ -95,19 +91,16 @@ pub(crate) fn stage_candidate(uri: &str) -> Option<Candidate> {
 }
 
 impl Candidate {
-    // Page count of the candidate, opened fresh by path with no caching side effects (no thread-local
-    // reuse, no generation bump, no STAGED entry). 0 if it can't be opened - the caller treats that as
-    // a failed load and leaves the active document intact.
+    // Page count, opened fresh with no caching side effects (no TLS reuse, generation bump, or STAGED
+    // entry). 0 if unopenable - the caller treats that as a failed load.
     pub(crate) fn page_count(&self) -> i32 {
         Document::open(self.path.as_path())
             .and_then(|d| d.page_count())
             .unwrap_or(0)
     }
 
-    // Publish the validated bytes so render workers reuse this exact artifact. Call AFTER invalidate()
-    // (which clears STAGED): a staged temp is persisted and registered under its uri; a local file
-    // needs no registration. Overwrites any copy a worker's racing miss-fetch published for the same
-    // uri, so the rendered bytes are exactly the validated ones.
+    // Publish the validated temp under its uri so workers render these exact bytes. Call AFTER
+    // invalidate() clears STAGED; overwrites any copy a racing miss-fetch staged. Local files need none.
     pub(crate) fn commit(mut self) {
         if let Some(temp) = self.temp.take() {
             if let Ok(path) = temp.keep() {
@@ -119,10 +112,9 @@ impl Candidate {
     }
 }
 
-// Local filesystem path for `uri`: the file's own path when local, else a staged temp copy of a
-// non-local GFile's bytes (fetched once, then reused). A committed load pre-stages this, so callers
-// here (search's own thread, a worker racing a reload) normally hit the cache; a genuine miss fetches
-// as a fallback. None if it can't be read.
+// Local path for `uri`: its own path when local, else a staged temp copy of the non-local bytes.
+// A committed load pre-stages this, so callers here normally hit the cache; a genuine miss fetches
+// as a fallback. None if unreadable.
 pub(crate) fn local_path(uri: &str) -> Option<PathBuf> {
     let file = gtk::gio::File::for_uri(uri);
     if let Some(path) = file.path() {
@@ -137,9 +129,8 @@ pub(crate) fn local_path(uri: &str) -> Option<PathBuf> {
     let temp = fetch_to_temp(&file)?;
 
     let mut staged = STAGED.lock().unwrap();
-    // A reload during the fetch (invalidate bumped the generation and cleared the map) means these
-    // bytes are from the pre-reload file - drop them (temp deletes here) so the stale copy can't be
-    // published or reused.
+    // A reload during the fetch (generation bumped) means these bytes are pre-reload - drop them
+    // (temp deletes here) so the stale copy isn't published.
     if generation() != generation_at_fetch {
         return None;
     }
@@ -171,18 +162,26 @@ pub fn with_doc<T>(uri: &str, f: impl FnOnce(&Document) -> Option<T>) -> Option<
     })
 }
 
-// Full-page surface for `page_num` at `scale` * `dsf`, or None if MuPDF can't open/render it (caller
-// shows a blank page). `page_pt` (the page size in points) sizes the surface at exactly
-// (page_pt * scale * dsf) truncated so it matches the render cache's dimension check; MuPDF's own
-// pixmap rounding differs by ~1px, which would make every render look stale (endless re-render).
-// None derives the size from MuPDF's bounds (bench only).
-pub fn render_page_surface(
+// One page's raw pixels, cairo Rgb24 (BGRx). ImageSurface isn't Send, so workers cross the thread
+// boundary as this plain buffer and the surface is assembled where consumed - no page-sized copy.
+pub struct PagePixels {
+    pub data: Vec<u8>,
+    pub width: i32,
+    pub height: i32,
+    pub stride: i32,
+}
+
+// Full-page pixels for `page_num` at `scale` * `dsf`; None if MuPDF can't render it (caller shows
+// blank). `page_pt` sizes the buffer at (page_pt * scale * dsf) truncated to match the render
+// cache's dimension check - MuPDF's own pixmap rounding differs by ~1px, which would look endlessly
+// stale. None derives the size from MuPDF's bounds (bench only).
+pub fn render_page_pixels(
     uri: &str,
     page_num: i32,
     scale: f64,
     dsf: f64,
     page_pt: Option<(f64, f64)>,
-) -> Option<ImageSurface> {
+) -> Option<PagePixels> {
     with_doc(uri, |doc| {
         // device_bgr + no alpha yields B,G,R samples, matching cairo Rgb24's byte order.
         let colorspace = Colorspace::device_bgr();
@@ -198,10 +197,32 @@ pub fn render_page_surface(
                 ((b.x1 - b.x0) as f64, (b.y1 - b.y0) as f64)
             }
         };
-        let target_w = ((pw * scale * dsf) as i32).max(1);
-        let target_h = ((ph * scale * dsf) as i32).max(1);
-        surface_from_pixmap(&pixmap, dsf, target_w, target_h)
+        let width = ((pw * scale * dsf) as i32).max(1);
+        let height = ((ph * scale * dsf) as i32).max(1);
+        let (data, stride) = pack_pixmap(&pixmap, width, height)?;
+        Some(PagePixels {
+            data,
+            width,
+            height,
+            stride,
+        })
     })
+}
+
+// `render_page_pixels` assembled into an ImageSurface, for callers that draw directly (sync paint,
+// thumbnails) or scan pixels (content_bbox).
+pub fn render_page_surface(
+    uri: &str,
+    page_num: i32,
+    scale: f64,
+    dsf: f64,
+    page_pt: Option<(f64, f64)>,
+) -> Option<ImageSurface> {
+    let px = render_page_pixels(uri, page_num, scale, dsf, page_pt)?;
+    let surface =
+        ImageSurface::create_for_data(px.data, Format::Rgb24, px.width, px.height, px.stride).ok()?;
+    surface.set_device_scale(dsf, dsf);
+    Some(surface)
 }
 
 // Page size in points (width, height), or None.
@@ -254,9 +275,9 @@ fn scan_bbox(data: &[u8], w: i32, h: i32, stride: usize) -> Option<(i32, i32, i3
     (max_x >= min_x && max_y >= min_y).then_some((min_x, min_y, max_x, max_y))
 }
 
-// Pack a MuPDF BGR pixmap into a cairo Rgb24 (BGRx) surface of exactly (target_w, target_h). The
-// pixmap is within ~1px of the target; copy the overlap, leave padding white so no black seam shows.
-fn surface_from_pixmap(pix: &mupdf::Pixmap, dsf: f64, target_w: i32, target_h: i32) -> Option<ImageSurface> {
+// Pack a MuPDF BGR pixmap into a Rgb24 (BGRx) buffer of exactly (target_w, target_h) plus its stride.
+// The pixmap is within ~1px; copy the overlap, leave padding white so no black seam shows.
+fn pack_pixmap(pix: &mupdf::Pixmap, target_w: i32, target_h: i32) -> Option<(Vec<u8>, i32)> {
     let n = pix.n() as usize; // 3 for device_bgr without alpha
     let src = pix.samples();
     let src_stride = pix.stride() as usize;
@@ -276,10 +297,7 @@ fn surface_from_pixmap(pix: &mupdf::Pixmap, dsf: f64, target_w: i32, target_h: i
         }
     }
 
-    let surface =
-        ImageSurface::create_for_data(data, Format::Rgb24, target_w, target_h, dst_stride as i32).ok()?;
-    surface.set_device_scale(dsf, dsf);
-    Some(surface)
+    Some((data, dst_stride as i32))
 }
 
 #[cfg(test)]
