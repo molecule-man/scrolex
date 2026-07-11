@@ -61,6 +61,7 @@ pub(crate) fn local_path(uri: &str) -> Option<PathBuf> {
     // (called from load() on the main thread). Write to a securely-created unique temp file (random
     // name, O_EXCL, mode 600) rather than a predictable path, so a symlink or another process can't
     // hijack or truncate it.
+    let generation_at_fetch = generation();
     let (bytes, _etag) = file.load_contents(gtk::gio::Cancellable::NONE).ok()?;
     let mut tmp = tempfile::Builder::new()
         .prefix("scrolex-staged-")
@@ -71,6 +72,12 @@ pub(crate) fn local_path(uri: &str) -> Option<PathBuf> {
     let (_f, path) = tmp.keep().ok()?;
 
     let mut staged = STAGED.lock().unwrap();
+    // A reload during the fetch (invalidate bumped the generation and cleared the map) means these
+    // bytes are from the pre-reload file - drop them so the stale copy can't be published or reused.
+    if generation() != generation_at_fetch {
+        let _ = std::fs::remove_file(&path);
+        return None;
+    }
     let chosen = staged
         .entry(uri.to_string())
         .or_insert_with(|| path.clone())
