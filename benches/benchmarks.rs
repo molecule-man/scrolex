@@ -14,7 +14,11 @@ pub fn bench_render_surface(c: &mut Criterion) {
     let mut group = c.benchmark_group("render_surface");
     group.throughput(Throughput::Elements(1));
 
-    for (label, scale) in [("full", 1.0), ("downscaled 1/4", 0.25), ("upscaled x4", 4.0)] {
+    for (label, scale) in [
+        ("full", 1.0),
+        ("downscaled 1/4", 0.25),
+        ("upscaled x4", 4.0),
+    ] {
         group.bench_function(format!("{label} {pdf_path} page {page_number}"), |b| {
             b.iter(|| {
                 black_box(scrolex::mupdf_render::render_page_surface(
@@ -34,11 +38,14 @@ pub fn bench_render_surface(c: &mut Criterion) {
     let bbox = scrolex::page::Rectangle::from(cr.clip_extents().unwrap());
     cr.set_source_rgb(1.0, 1.0, 1.0);
 
-    group.bench_function(format!("draw pre-rendered {pdf_path} page {page_number}"), |b| {
-        b.iter(|| {
-            scrolex::page::draw_surface(&cr, &surface, &bbox, 1.0);
-        })
-    });
+    group.bench_function(
+        format!("draw pre-rendered {pdf_path} page {page_number}"),
+        |b| {
+            b.iter(|| {
+                scrolex::page::draw_surface(&cr, &surface, &bbox, 1.0);
+            })
+        },
+    );
 
     group.finish();
 }
