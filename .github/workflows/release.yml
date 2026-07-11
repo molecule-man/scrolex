@@ -38,6 +38,8 @@ jobs:
 
   build-release:
     name: build-release
+    # disabled for now to conserve CI minutes
+    if: false
     needs: ['create-release']
     runs-on: ${{ matrix.os }}
     env:
@@ -233,6 +235,8 @@ jobs:
 
   build-release-deb:
     name: build-release-deb
+    # disabled for now to conserve CI minutes
+    if: false
     needs: ['create-release']
     runs-on: ubuntu-24.04
     env:
