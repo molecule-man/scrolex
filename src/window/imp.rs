@@ -116,8 +116,6 @@ pub struct Window {
     #[template_child]
     pub search_status: TemplateChild<Label>,
     #[template_child]
-    pub btn_search_case: TemplateChild<ToggleButton>,
-    #[template_child]
     pub btn_toc: TemplateChild<ToggleButton>,
     #[template_child]
     pub toc_revealer: TemplateChild<gtk::Revealer>,
@@ -763,9 +761,9 @@ impl Window {
         self.model.remove_all();
     }
 
-    fn populate_toc(&self, doc: &poppler::Document) {
+    fn populate_toc(&self) {
         self.toc_list.remove_all();
-        let items = crate::poppler::outline(doc);
+        let items = crate::outline::entries(&self.state.uri());
         let mut pages = Vec::with_capacity(items.len());
         for item in &items {
             let label = gtk::Label::new(Some(&item.title));
@@ -889,16 +887,16 @@ impl Window {
 
     #[template_callback]
     fn handle_document_load(&self, state: &State) {
-        let Some(doc) = state.doc() else {
+        let n_pages = state.n_pages() as u32;
+        if n_pages == 0 {
             return;
-        };
+        }
 
-        self.populate_toc(&doc);
+        self.populate_toc();
 
         let model = self.model.clone();
         let selection = self.selection.clone();
 
-        let n_pages = doc.n_pages() as u32;
         let scroll_to = state.page().min(n_pages - 1);
         let init_load_from = scroll_to.saturating_sub(1);
         let init_load_till = (scroll_to + 10).min(n_pages - 1);
@@ -1227,13 +1225,6 @@ impl Window {
         self.prev_match();
     }
 
-    #[template_callback]
-    fn search_case_toggled(&self, btn: &ToggleButton) {
-        self.state.search().borrow_mut().case_sensitive = btn.is_active();
-        // deliberate action, no debounce
-        self.run_search(self.search_entry.text().to_string());
-    }
-
     fn schedule_search(&self, query: String) {
         if let Some(source) = self.search_debounce.take() {
             source.remove();
@@ -1269,12 +1260,11 @@ impl Window {
             .copied()
             .collect();
 
-        let (epoch, shared_epoch, flags) = {
+        let (epoch, shared_epoch) = {
             let search = self.state.search();
             let mut search = search.borrow_mut();
             search.query = query.clone();
-            let (epoch, shared) = search.begin_sweep();
-            (epoch, shared, search.flags())
+            search.begin_sweep()
         };
 
         for page in old_pages {
@@ -1282,18 +1272,15 @@ impl Window {
         }
         self.update_search_status();
 
-        let Some(doc) = self.state.doc() else {
-            return;
-        };
-        if query.is_empty() {
+        let n_pages = self.state.n_pages();
+        if n_pages == 0 || query.is_empty() {
             return;
         }
 
         let mut rx = crate::search::spawn_search(
             self.state.uri(),
             query,
-            flags,
-            doc.n_pages(),
+            n_pages,
             self.selection.selected() as i32,
             epoch,
             shared_epoch,
@@ -1311,7 +1298,7 @@ impl Window {
                             continue; // superseded
                         }
                         let first = search.current.is_none();
-                        search.results.insert(update.page, update.rects);
+                        search.results.insert(update.page, update.matches);
                         if first {
                             // outward order => first arrival is the nearest match
                             search.current = Some((update.page, 0));

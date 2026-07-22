@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::{env, fs, thread};
 
-// Render threads = resident poppler Documents (one per thread), each accruing an unreclaimable
+// Render threads = resident MuPDF Documents (one per thread), each accruing an unreclaimable
 // per-page cache, so this dial trades memory for parallelism. Rendering scales near-linearly to ~4
 // threads before going memory-bandwidth bound; beyond that, more threads mainly buy prefetch depth.
 pub const DEFAULT_RENDER_THREADS: usize = 4;
@@ -18,7 +18,7 @@ fn config_file_path() -> Option<PathBuf> {
     Some(path)
 }
 
-// Upper bound on render threads: reserve one core for the UI thread, since uninterruptible poppler
+// Upper bound on render threads: reserve one core for the UI thread, since uninterruptible MuPDF
 // renders on every core make the UI janky.
 pub fn max_render_threads() -> usize {
     thread::available_parallelism()

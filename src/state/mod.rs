@@ -3,7 +3,6 @@ use gtk::gio::prelude::*;
 use gtk::glib;
 use gtk::prelude::ObjectExt;
 use gtk::subclass::prelude::*;
-use poppler::Document;
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -46,12 +45,27 @@ impl State {
     }
 
     pub fn load(&self, f: &gtk::gio::File) -> io::Result<()> {
-        if self.doc().is_some() {
+        if self.n_pages() > 0 {
             self.save()?;
         }
 
-        let doc =
-            Document::from_gfile(f, None, gtk::gio::Cancellable::NONE).map_err(io::Error::other)?;
+        let uri = f.uri();
+        // Stage and validate the candidate before touching the active document, so a failed load
+        // leaves the current document (and its in-flight render markers) intact. Staging fetches a
+        // remote file exactly once; the same bytes are validated here and committed for rendering
+        // below - no re-fetch, and no risk of validating different bytes than we render.
+        let Some(candidate) = crate::mupdf_render::stage_candidate(&uri) else {
+            return Err(io::Error::other("could not open document"));
+        };
+        let n_pages = candidate.page_count();
+        if n_pages == 0 {
+            return Err(io::Error::other("could not open document"));
+        }
+        // Committed to the new document: force every thread to reopen (the same path may have
+        // changed on disk), publish the validated bytes for the render workers, then reset
+        // per-document state.
+        crate::mupdf_render::invalidate();
+        candidate.commit();
         self.imp().bbox_cache.borrow_mut().clear();
         self.imp().links.borrow_mut().clear();
         self.imp().search.borrow_mut().clear();
@@ -68,15 +82,12 @@ impl State {
 
         self.emit_by_name::<()>("before-load", &[]);
 
-        let uri = f.uri();
         let state_path = get_state_file_path(&uri).unwrap();
 
         self.imp().jump_stack.borrow_mut().reset();
         self.set_prev_page(0);
         self.set_uri(uri);
-        crate::image_page::invalidate(&self.uri());
-        crate::image_page::prewarm(&self.uri());
-        self.set_doc(doc);
+        self.set_n_pages(n_pages);
         self.set_zoom(1.0);
         self.set_crop(false);
         self.set_page(0);
@@ -112,10 +123,6 @@ impl State {
     }
 
     fn log_document_info(&self, f: &gtk::gio::File) {
-        let Some(doc) = self.doc() else {
-            return;
-        };
-
         let size_bytes = f
             .query_info(
                 "standard::size",
@@ -125,8 +132,8 @@ impl State {
             .map(|info| info.size())
             .unwrap_or(-1);
 
-        let n_pages = doc.n_pages();
-        let first_page_size = doc.page(0).map(|p| p.size());
+        let n_pages = self.n_pages();
+        let first_page_size = crate::mupdf_render::page_size(&self.uri(), 0);
 
         log::info!(
             "Loaded document: {n_pages} pages, {size_bytes} bytes, first page {first_page_size:?} pt, \

@@ -80,13 +80,21 @@ https://github.com/user-attachments/assets/225c4b69-eb15-48d0-b978-f7bd747d463e
 Packaged installs bundle everything they need, so **no manual dependency
 installation is required** for the Flatpak, AUR, or `.deb` methods below.
 
-You only need to install `gtk4` and `poppler` yourself when running the raw
-pre-built binary or building from source.
+The raw pre-built binary needs `gtk4` at runtime; the PDF engine (mupdf) is
+statically linked, so there's nothing else to install.
 
-On arch, you can install these dependencies with:
+On arch:
 
 ```bash
-sudo pacman -S gtk4 poppler
+sudo pacman -S gtk4
+```
+
+Building from source additionally needs a C/C++ toolchain and `clang`, since
+the `mupdf` crate compiles its bundled C library and generates bindings with
+bindgen:
+
+```bash
+sudo pacman -S gtk4 clang base-devel
 ```
 
 ### 1. Install the Flatpak bundle

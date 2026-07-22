@@ -1,20 +1,26 @@
 // Full-document text search. A background thread walks pages outward from the current page, runs
-// poppler's per-page find_text, and streams matches back. An epoch counter cancels a superseded sweep.
+// MuPDF's per-page search, and streams matches back. An epoch counter cancels a superseded sweep.
+// MuPDF search is case-insensitive. A match is a single logical hit and carries one rect per line it
+// spans, so a phrase wrapping across lines still counts as one match (and highlights every line).
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use futures::channel::mpsc;
-use poppler::FindFlags;
+use mupdf::text_page::SearchHitResponse;
+use mupdf::TextPageFlags;
 
 use crate::page::Rectangle;
+
+// One match's highlight rects (one per line the hit spans), in page coords (top-left origin).
+pub type Match = Vec<Rectangle>;
 
 // Matches on one page, tagged with the sweep epoch so stale results can be dropped.
 pub struct PageMatches {
     pub epoch: u64,
     pub page: i32,
-    pub rects: Vec<Rectangle>,
+    pub matches: Vec<Match>,
 }
 
 pub type MatchReceiver = mpsc::UnboundedReceiver<PageMatches>;
@@ -23,10 +29,9 @@ pub type MatchReceiver = mpsc::UnboundedReceiver<PageMatches>;
 #[derive(Default, Debug)]
 pub struct Search {
     pub query: String,
-    pub case_sensitive: bool,
-    // page -> match rects, in page coords (top-left origin)
-    pub results: BTreeMap<i32, Vec<Rectangle>>,
-    // the highlighted match: (page, index within that page's rects)
+    // page -> matches, in page coords (top-left origin)
+    pub results: BTreeMap<i32, Vec<Match>>,
+    // the highlighted match: (page, index within that page's matches)
     pub current: Option<(i32, usize)>,
     // bumped per sweep; the background thread stops once it no longer matches
     epoch: Arc<AtomicU64>,
@@ -39,14 +44,6 @@ impl Search {
         self.current = None;
         // abandon any in-flight sweep
         self.epoch.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn flags(&self) -> FindFlags {
-        if self.case_sensitive {
-            FindFlags::CASE_SENSITIVE
-        } else {
-            FindFlags::DEFAULT
-        }
     }
 
     pub fn total(&self) -> usize {
@@ -65,18 +62,21 @@ impl Search {
         self.epoch.load(Ordering::Relaxed)
     }
 
-    // Matches in global reading order: (page, index-within-page) for every rect.
+    // Matches in global reading order: (page, index-within-page) for every match.
     fn ordered(&self) -> Vec<(i32, usize)> {
         self.results
             .iter()
-            .flat_map(|(&page, rects)| (0..rects.len()).map(move |i| (page, i)))
+            .flat_map(|(&page, matches)| (0..matches.len()).map(move |i| (page, i)))
             .collect()
     }
 
     // 1-based position of the current match, for the counter.
     pub fn current_ordinal(&self) -> Option<usize> {
         let current = self.current?;
-        self.ordered().iter().position(|&m| m == current).map(|i| i + 1)
+        self.ordered()
+            .iter()
+            .position(|&m| m == current)
+            .map(|i| i + 1)
     }
 
     // The match after/before the current one, wrapping. Without a current match, the first/last.
@@ -86,7 +86,11 @@ impl Search {
             return None;
         }
         let Some(current) = self.current else {
-            return Some(if forward { order[0] } else { order[order.len() - 1] });
+            return Some(if forward {
+                order[0]
+            } else {
+                order[order.len() - 1]
+            });
         };
         let pos = order.iter().position(|&m| m == current).unwrap_or(0);
         let next = if forward {
@@ -97,8 +101,13 @@ impl Search {
         Some(order[next])
     }
 
+    // Representative rect of a match (its first line), for scrolling the match into view.
     pub fn rect(&self, page: i32, idx: usize) -> Option<Rectangle> {
-        self.results.get(&page).and_then(|r| r.get(idx)).copied()
+        self.results
+            .get(&page)
+            .and_then(|matches| matches.get(idx))
+            .and_then(|m| m.first())
+            .copied()
     }
 }
 
@@ -107,7 +116,6 @@ impl Search {
 pub fn spawn_search(
     uri: String,
     query: String,
-    flags: FindFlags,
     n_pages: i32,
     start_page: i32,
     epoch: u64,
@@ -116,8 +124,12 @@ pub fn spawn_search(
     let (tx, rx) = mpsc::unbounded();
 
     std::thread::spawn(move || {
-        let file = gtk::gio::File::for_uri(&uri);
-        let Ok(doc) = poppler::Document::from_gfile(&file, None, gtk::gio::Cancellable::NONE) else {
+        // Own MuPDF Document on this short-lived thread (dropped at scope end, before the thread's
+        // context TLS teardown, so no drop-order issue). local_path stages non-local files.
+        let Some(path) = crate::mupdf_render::local_path(&uri) else {
+            return;
+        };
+        let Ok(doc) = mupdf::Document::open(path.as_path()) else {
             return;
         };
 
@@ -125,22 +137,13 @@ pub fn spawn_search(
             if shared_epoch.load(Ordering::Relaxed) != epoch {
                 return; // superseded by a newer query
             }
-            let Some(page) = doc.page(page_num) else {
-                continue;
-            };
-            let (_, height) = page.size();
-            // find_text uses a bottom-left origin (like link mapping); flip into our top-left space.
-            let rects: Vec<Rectangle> = page
-                .find_text_with_options(&query, flags)
-                .iter()
-                .map(|r| Rectangle::from_poppler(r, height))
-                .collect();
-            if !rects.is_empty()
+            let matches = search_page(&doc, page_num, &query);
+            if !matches.is_empty()
                 && tx
                     .unbounded_send(PageMatches {
                         epoch,
                         page: page_num,
-                        rects,
+                        matches,
                     })
                     .is_err()
             {
@@ -150,6 +153,35 @@ pub fn spawn_search(
     });
 
     rx
+}
+
+// All matches of `query` on one page. MuPDF's callback fires once per logical hit with that hit's
+// quads (one per line it spans), so a match becomes one rect per line and streams with no fixed cap.
+// Quads are already page-local top-left, so no origin flip.
+fn search_page(doc: &mupdf::Document, page_num: i32, query: &str) -> Vec<Match> {
+    let mut matches: Vec<Match> = Vec::new();
+    let Ok(page) = doc.load_page(page_num) else {
+        return matches;
+    };
+    let Ok(text_page) = page.to_text_page(TextPageFlags::empty()) else {
+        return matches;
+    };
+    let _ = text_page.search_cb(query, &mut matches, |matches, quads| {
+        matches.push(quads.iter().map(quad_rect).collect());
+        SearchHitResponse::ContinueSearch
+    });
+    matches
+}
+
+// Axis-aligned bounding rect of a MuPDF quad (its four corners), in page-local top-left points.
+fn quad_rect(q: &mupdf::Quad) -> Rectangle {
+    let xs = [q.ul.x, q.ur.x, q.ll.x, q.lr.x];
+    let ys = [q.ul.y, q.ur.y, q.ll.y, q.lr.y];
+    let x1 = xs.iter().copied().fold(f32::INFINITY, f32::min) as f64;
+    let x2 = xs.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+    let y1 = ys.iter().copied().fold(f32::INFINITY, f32::min) as f64;
+    let y2 = ys.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+    Rectangle::new(x1, y1, x2, y2)
 }
 
 // Page order for a sweep: start page, then outward (start±1, start±2, …), clamped. Nearest matches
@@ -178,50 +210,6 @@ fn search_order(n_pages: i32, start_page: i32) -> Vec<i32> {
 mod tests {
     use super::*;
 
-    // "Hello" sits near the bottom of a 300pt page. find_text reports a bottom-left origin, so the
-    // flip must land it in the lower half. Pins the flip against a poppler convention change.
-    const BOTTOM_TEXT_PDF: &[u8] = b"%PDF-1.4\n\
-1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n\
-2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 300 300] >>\nendobj\n\
-3 0 obj\n<< /Type /Page /Parent 2 0 R /Resources << /Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> >> >> /Contents 4 0 R >>\nendobj\n\
-4 0 obj\n<< /Length 36 >>\nstream\nBT\n/F1 24 Tf\n40 30 Td\n(Hello) Tj\nET\nendstream\nendobj\n\
-trailer\n<< /Size 5 /Root 1 0 R >>\n%%EOF";
-
-    #[test]
-    fn find_text_matches_flip_into_top_left_space() {
-        let doc = poppler::Document::from_data(BOTTOM_TEXT_PDF, None).unwrap();
-        let page = doc.page(0).unwrap();
-        let (_, height) = page.size();
-        assert!((height - 300.0).abs() < 0.001, "unexpected page height {height}");
-
-        // DEFAULT is case-insensitive
-        let raw = page.find_text_with_options("hello", FindFlags::DEFAULT);
-        assert_eq!(raw.len(), 1, "expected exactly one match");
-
-        let flipped = Rectangle::from_poppler(&raw[0], height);
-        assert!(flipped.y1 < flipped.y2, "y1 must be the top edge, got {flipped:?}");
-        assert!(
-            flipped.y1 > height / 2.0,
-            "bottom-of-page text must flip into the lower half, got y1={}",
-            flipped.y1
-        );
-    }
-
-    #[test]
-    fn case_sensitive_flag_excludes_wrong_case() {
-        let doc = poppler::Document::from_data(BOTTOM_TEXT_PDF, None).unwrap();
-        let page = doc.page(0).unwrap();
-        assert_eq!(
-            page.find_text_with_options("hello", FindFlags::CASE_SENSITIVE).len(),
-            0,
-            "case-sensitive search must not match the wrong case"
-        );
-        assert_eq!(
-            page.find_text_with_options("Hello", FindFlags::CASE_SENSITIVE).len(),
-            1,
-        );
-    }
-
     #[test]
     fn search_order_walks_outward_from_start() {
         assert_eq!(search_order(6, 2), vec![2, 3, 1, 4, 0, 5]);
@@ -245,10 +233,35 @@ trailer\n<< /Size 5 /Root 1 0 R >>\n%%EOF";
         assert!(search_order(0, 0).is_empty());
     }
 
+    // One line of text, the word "Hello" twice, for search-counting assertions.
+    const TWO_HELLO_PDF: &[u8] = b"%PDF-1.4\n\
+1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n\
+2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 300 100] >>\nendobj\n\
+3 0 obj\n<< /Type /Page /Parent 2 0 R /Resources << /Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> >> >> /Contents 4 0 R >>\nendobj\n\
+4 0 obj\n<< /Length 36 >>\nstream\nBT /F1 24 Tf 20 40 Td (Hello Hello) Tj ET\nendstream\nendobj\n\
+trailer\n<< /Root 1 0 R >>\n%%EOF";
+
+    #[test]
+    fn search_page_counts_and_groups_hits() {
+        let doc = mupdf::Document::from_bytes(TWO_HELLO_PDF, "pdf").unwrap();
+        // two occurrences => two matches, each a single line (one rect) - NOT one match per quad
+        let hits = search_page(&doc, 0, "Hello");
+        assert_eq!(hits.len(), 2, "expected 2 matches, got {}", hits.len());
+        assert!(
+            hits.iter().all(|m| m.len() == 1),
+            "single-line hits should be one rect each"
+        );
+        // a phrase within a line is a single match
+        assert_eq!(search_page(&doc, 0, "Hello Hello").len(), 1);
+        // no match
+        assert!(search_page(&doc, 0, "zzz").is_empty());
+    }
+
     fn search_with(pages: &[(i32, usize)]) -> Search {
         let mut s = Search::default();
         for &(page, n) in pages {
-            s.results.insert(page, vec![Rectangle::default(); n]);
+            // n matches, each a single-line hit
+            s.results.insert(page, vec![vec![Rectangle::default()]; n]);
         }
         s
     }

@@ -1,8 +1,6 @@
-// Background worker pool that runs jobs against a poppler Document. Each worker
-// keeps its own Document open (Document is not Send), reopening only when the
-// requested uri changes. One pool serves every kind of job - visible-page
-// renders and low-res previews - so the number of resident Documents equals the
-// pool size, independent of how many job kinds exist.
+// Background worker pool for page rendering. Jobs are self-contained closures (each opens/reuses its
+// own MuPDF Document via the renderer's thread-local), so the pool holds no document itself. One
+// pool serves every kind of job - visible-page renders and low-res previews.
 
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
@@ -32,7 +30,7 @@ impl RenderPriority {
     }
 }
 
-type Job = Box<dyn FnOnce(&poppler::Document) + Send + 'static>;
+type Job = Box<dyn FnOnce() + Send + 'static>;
 
 struct RenderRequest {
     uri: String,
@@ -103,7 +101,7 @@ impl RenderQueue {
     }
 }
 
-// Thread pool serving all background poppler work. Prioritises layout and the visible page over
+// Thread pool serving all background render work. Prioritises layout and the visible page over
 // previews, and bounds how many requests wait so a fast scroll can't build an unbounded backlog
 // ahead of the page being viewed.
 pub(crate) struct RenderPool {
@@ -133,7 +131,7 @@ impl RenderPool {
     }
 
     // Grow or shrink the worker pool. Growing spawns threads; shrinking asks surplus workers to exit
-    // after their current job, dropping their resident poppler Document and freeing its memory.
+    // after their current job, dropping their resident MuPDF Document and freeing its memory.
     pub(crate) fn set_size(&self, n: usize) {
         let (lock, cvar) = &*self.inner;
         let mut queue = lock.lock().unwrap();
@@ -164,9 +162,6 @@ impl RenderPool {
 
     fn spawn_bg_thread(inner: Arc<(Mutex<RenderQueue>, Condvar)>) {
         thread::spawn(move || {
-            let mut doc = None;
-            let mut doc_uri = String::new();
-
             loop {
                 let req = {
                     let (lock, cvar) = &*inner;
@@ -174,7 +169,7 @@ impl RenderPool {
                     loop {
                         if queue.stop_requested > 0 {
                             queue.stop_requested -= 1;
-                            return; // pool shrank: exit and drop this thread's Document
+                            return; // pool shrank: exit and drop this thread's render document
                         }
                         if let Some(req) = queue.pop() {
                             break req;
@@ -183,16 +178,8 @@ impl RenderPool {
                     }
                 };
 
-                if doc.is_none() || doc_uri != req.uri {
-                    let f = gtk::gio::File::for_uri(&req.uri);
-                    doc = Some(
-                        poppler::Document::from_gfile(&f, None, gtk::gio::Cancellable::NONE)
-                            .expect("Couldn't open the file!"),
-                    );
-                    doc_uri.clone_from(&req.uri);
-                }
-
-                (req.job)(doc.as_ref().unwrap());
+                log::trace!("render job: {}", req.uri);
+                (req.job)();
             }
         });
     }
@@ -231,7 +218,7 @@ mod tests {
     fn req(tag: &str) -> RenderRequest {
         RenderRequest {
             uri: tag.to_string(),
-            job: Box::new(|_| {}),
+            job: Box::new(|| {}),
         }
     }
 

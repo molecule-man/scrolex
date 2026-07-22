@@ -19,7 +19,6 @@ use gtk::{prelude::*, CssProvider};
 //mod jump_stack;
 //mod links;
 //mod page;
-//mod poppler;
 //mod state;
 //mod window;
 use scrolex::page;
@@ -105,9 +104,9 @@ fn build_ui(app: &Application, args: &[OsString]) {
                 eprintln!("Error saving state: {err}");
             }
 
-            // The background render threads (bg_job) are detached and may be mid poppler render at
-            // this point; a poppler render can't be interrupted. Terminating normally would let the
-            // C library destructors free poppler/cairo/pixman globals out from under a
+            // The background render threads (bg_job) are detached and may be mid MuPDF render at
+            // this point; a MuPDF render can't be interrupted. Terminating normally would let the
+            // C library destructors free MuPDF/cairo/pixman globals out from under a
             // still-running render thread, which segfaults. State is saved above, so exit
             // immediately without running those destructors and let the OS reclaim everything.
             unsafe { libc_exit(0) };
