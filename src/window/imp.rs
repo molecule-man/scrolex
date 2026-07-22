@@ -23,10 +23,10 @@ use crate::state::State;
 // mid-slide, so the page settles instead of vibrating.
 const SCROLL_ANIM_TAU_US: f64 = 130_000.0;
 
-// Per-frame dt is clamped to this. When the frame clock stalls and resumes (or crop relayout
-// delays a frame) a huge dt drives the glide gain toward 1, which turns the live-target follow into
-// a sustained oscillation instead of a decaying one; clamping keeps it contractive.
-const SCROLL_ANIM_MAX_DT_US: i64 = 32_000;
+// Ceiling on the per-frame glide gain. A stalled-then-resumed clock's huge dt would drive the gain
+// toward 1 and snap onto a re-anchoring target; capping keeps the follow contractive. Above the
+// 10fps gain, so it only engages on pathological stalls, not in the normal 10-60fps range.
+const SCROLL_ANIM_MAX_GAIN: f64 = 0.7;
 // Hard ceiling on a single glide. The live target is read from page geometry that crop relayout can
 // keep nudging, so bound the glide so it can't chase a moving target forever; snap and stop.
 const SCROLL_ANIM_MAX_US: i64 = 2_000_000;
@@ -72,6 +72,9 @@ struct ScrollAnim {
     start_frame: i64,
     // travel direction (+1 forward, -1 back); the glide never moves against it
     dir: f64,
+    // value written to hadjustment last tick (NaN until first write); a gap vs. this tick's read is
+    // external motion injected between our frames (GtkListView re-anchor, kinetic scroll).
+    last_next: f64,
 }
 
 // Object holding the state
@@ -637,7 +640,8 @@ impl Window {
         let last_target =
             live.unwrap_or_else(|| self.clamp_scroll(prev_target.unwrap_or(hadj.value()) + delta));
         log::debug!(
-            "slide arm: anchor_x={anchor_x:?} target={last_target:.2} live={} fresh={} hadj={:.2}",
+            target: "scrolex::scroll",
+            "arm: anchor_x={anchor_x:?} target={last_target:.2} live={} fresh={} hadj={:.2}",
             live.is_some(),
             anim.is_none(),
             hadj.value(),
@@ -649,6 +653,7 @@ impl Window {
             last_frame,
             start_frame,
             dir: delta.signum(),
+            last_next: f64::NAN,
         });
         drop(anim);
 
@@ -671,7 +676,9 @@ impl Window {
         // Chase the selected page's live resting position; when it isn't realised yet (selection
         // raced ahead in a burst) hold the last known one. Real page positions only advance as
         // selection advances, so the target never jumps behind us and the slide never reverses.
-        let target = self.live_target(anim.anchor_x).unwrap_or(anim.last_target);
+        let live = self.live_target(anim.anchor_x);
+        let prev_target = anim.last_target;
+        let target = live.unwrap_or(anim.last_target);
         anim.last_target = target;
 
         let now = clock.frame_time();
@@ -688,13 +695,29 @@ impl Window {
         let hadj = self.scrolledwindow.hadjustment();
         let value = hadj.value();
         let (next, settled) = glide_step(value, target, raw_dt, now - anim.start_frame, anim.dir);
+
+        // Per-frame trace (RUST_LOG=scrolex::scroll=trace). drift = external hadj motion since our
+        // last write; dtgt = live-target jitter from crop relayout; vel = px/ms. Smooth = regular
+        // dt, drift~0, dtgt~0, decaying vel.
+        let drift = value - anim.last_next; // NaN on the first frame
+        let dt_ms = raw_dt as f64 / 1000.0;
+        log::trace!(
+            target: "scrolex::scroll",
+            "frame: dt={dt_ms:5.1}ms v={value:9.2} drift={drift:+7.2} tgt={target:9.2} dtgt={:+7.2} live={} step={:+7.2} vel={:5.2}px/ms",
+            target - prev_target,
+            live.is_some(),
+            next - value,
+            if dt_ms > 0.0 { (next - value).abs() / dt_ms } else { 0.0 },
+        );
+        anim.last_next = next;
         if settled {
             // land at the eased position (within sub-pixel of target) and let the normal sync
             // reconcile selection; never jump to a distant target - that snap is the visible jerk
             *self.scroll_anim.borrow_mut() = None;
             hadj.set_value(next);
             log::debug!(
-                "slide settle: target={target:.2} value={next:.2} short={:.2} left_x={:?}",
+                target: "scrolex::scroll",
+                "settle: target={target:.2} value={next:.2} short={:.2} left_x={:?}",
                 target - next,
                 self.selected_page_left_x(),
             );
@@ -1517,18 +1540,17 @@ fn accumulate_step(accum: f64, prev: f64, delta: f64, notch: f64, trigger: f64) 
 // into a sustained oscillation; the glide settles on arrival, on a sub-pixel step, or once
 // `elapsed_us` passes the ceiling (bounding a target that relayout keeps nudging).
 fn glide_step(value: f64, target: f64, dt_us: i64, elapsed_us: i64, dir: f64) -> (f64, bool) {
-    let dt = dt_us.min(SCROLL_ANIM_MAX_DT_US);
-    let k = if dt <= 0 {
+    let k = if dt_us <= 0 {
         0.0
     } else {
-        1.0 - (-(dt as f64) / SCROLL_ANIM_TAU_US).exp()
+        (1.0 - (-(dt_us as f64) / SCROLL_ANIM_TAU_US).exp()).min(SCROLL_ANIM_MAX_GAIN)
     };
     let remaining = target - value;
     let mut step = remaining * k;
     // Floor the approach speed so the exponential tail closes in a few frames rather than crawling
     // toward a target it never reaches (which forced a settle-and-snap a few pixels short). Never
     // overshoot the target.
-    if dt > 0 && step.abs() < SCROLL_ANIM_MIN_STEP {
+    if dt_us > 0 && step.abs() < SCROLL_ANIM_MIN_STEP {
         step = SCROLL_ANIM_MIN_STEP.copysign(remaining);
     }
     if step.abs() > remaining.abs() {
@@ -1592,11 +1614,34 @@ mod tests {
 
     #[test]
     fn glide_settles_even_with_huge_dt() {
-        // a stalled-then-resumed clock delivers a 1s dt; clamping keeps the step bounded (no wild
-        // overshoot) and it still converges
+        // a 1s dt from a stalled clock; the gain cap bounds the step and it still converges
         let (next, _) = glide_step(0.0, 500.0, 1_000_000, 0, 1.0);
-        assert!(next < 500.0, "clamped step overshot: {next}");
+        assert!(next < 500.0, "capped step overshot: {next}");
         glide_frames(0.0, 500.0, 1_000_000);
+    }
+
+    // Total wall-clock time for the glide to settle, driven at a steady frame rate.
+    fn glide_duration_us(target: f64, dt_us: i64) -> i64 {
+        glide_frames(0.0, target, dt_us) as i64 * dt_us
+    }
+
+    #[test]
+    fn glide_duration_is_frame_rate_independent() {
+        // Gain tracks real elapsed time, so the slide lasts about the same wall-clock at 60fps and
+        // at 10fps. Not exact (a 10fps frame quantizes the tail in 100ms chunks), but both land in
+        // the same sub-second band rather than diverging.
+        let fast = glide_duration_us(500.0, 16_667); // ~60fps
+        let slow = glide_duration_us(500.0, 100_000); // ~10fps
+        assert!(
+            (fast - slow).abs() < 350_000,
+            "durations diverged beyond frame quantization: 60fps={fast}us 10fps={slow}us"
+        );
+        for (label, d) in [("60fps", fast), ("10fps", slow)] {
+            assert!(
+                (500_000..=1_100_000).contains(&d),
+                "{label} settled in {d}us, outside the expected sub-second band"
+            );
+        }
     }
 
     #[test]
