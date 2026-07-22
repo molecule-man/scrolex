@@ -34,6 +34,11 @@ extern "C" {
 }
 
 fn main() -> glib::ExitCode {
+    if std::env::args().any(|a| a == "-V" || a == "--version") {
+        println!("scrolex {}", env!("CARGO_PKG_VERSION"));
+        return glib::ExitCode::SUCCESS;
+    }
+
     init_logging();
 
     // register types for usage in templates
