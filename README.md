@@ -158,5 +158,16 @@ After building, you will find the binary at the location
 `target/release/scrolex`. You can move the binary to a directory in your
 `$PATH`.
 
+## License
+
+Scrolex is licensed under the [GNU Affero General Public License v3.0 or
+later](LICENSE) (AGPL-3.0-or-later).
+
+The PDF engine, [MuPDF](https://mupdf.com/), is vendored and statically linked.
+MuPDF is dual-licensed by Artifex Software under the AGPL v3 or a commercial
+license; because it is statically linked, distributed Scrolex binaries are
+covered by the AGPL. If you need to distribute Scrolex under different terms,
+you must obtain a commercial MuPDF license from Artifex.
+
 
 [1]: https://github.com/molecule-man/scrolex/releases/latest
