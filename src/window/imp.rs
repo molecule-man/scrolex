@@ -198,6 +198,7 @@ impl ObjectImpl for Window {
 
         self.setup_scroll_selection_sync();
         self.setup_thread_setting();
+        self.setup_animate_scroll();
         self.setup_search();
         self.setup_toc();
 
@@ -1005,7 +1006,7 @@ impl Window {
     // Load the render-thread setting into the spin button and pool, and persist any user change.
     fn setup_thread_setting(&self) {
         let max = crate::config::max_render_threads();
-        let threads = crate::config::load_render_threads();
+        let threads = crate::config::load_config().render_threads;
         self.spin_threads.set_range(1.0, max as f64);
         self.spin_threads.set_increments(1.0, 1.0);
         self.spin_threads.set_value(threads as f64);
@@ -1017,9 +1018,27 @@ impl Window {
             move |spin| {
                 let n = spin.value() as usize;
                 imp.apply_render_threads(n);
-                crate::config::save_render_threads(n);
+                let mut config = crate::config::load_config();
+                config.render_threads = n;
+                if let Err(e) = crate::config::save_config(&config) {
+                    eprintln!("Error saving config: {e}");
+                }
             }
         ));
+    }
+
+    fn setup_animate_scroll(&self) {
+        self.state
+            .set_animate_scroll(crate::config::load_config().animate_scroll);
+
+        self.state
+            .connect_notify_local(Some("animate-scroll"), |state, _| {
+                let mut config = crate::config::load_config();
+                config.animate_scroll = state.animate_scroll();
+                if let Err(e) = crate::config::save_config(&config) {
+                    eprintln!("Error saving config: {e}");
+                }
+            });
     }
 
     fn apply_render_threads(&self, n: usize) {

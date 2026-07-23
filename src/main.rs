@@ -21,6 +21,7 @@ use gtk::{prelude::*, CssProvider};
 //mod page;
 //mod state;
 //mod window;
+use scrolex::config;
 use scrolex::page;
 use scrolex::window;
 
@@ -104,7 +105,19 @@ fn build_ui(app: &Application, args: &[OsString]) {
     app.connect_shutdown(clone!(
         #[strong]
         state,
+        #[strong]
+        window,
         move |_| {
+            let mut config = config::load_config();
+            config.geometry = Some(config::Geometry {
+                width: window.default_width(),
+                height: window.default_height(),
+                maximized: window.is_maximized(),
+            });
+            if let Err(err) = config::save_config(&config) {
+                eprintln!("Error saving config: {err}");
+            }
+
             if let Err(err) = state.save() {
                 eprintln!("Error saving state: {err}");
             }
@@ -137,6 +150,13 @@ fn build_ui(app: &Application, args: &[OsString]) {
                     fname.display()
                 ));
             }
+        }
+    }
+
+    if let Some(geometry) = config::load_config().geometry {
+        window.set_default_size(geometry.width, geometry.height);
+        if geometry.maximized {
+            window.maximize();
         }
     }
 
