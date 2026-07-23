@@ -201,6 +201,7 @@ impl ObjectImpl for Window {
         self.setup_animate_scroll();
         self.setup_search();
         self.setup_toc();
+        self.setup_drop_target();
 
         // Give keyboard focus to the scroll area rather than the header entry
         self.scrolledwindow.set_focusable(true);
@@ -871,6 +872,34 @@ impl Window {
             }
         ));
         self.scrolledwindow.add_controller(click);
+    }
+
+    fn setup_drop_target(&self) {
+        let drop_target =
+            gtk::DropTarget::new(gtk::gdk::FileList::static_type(), gtk::gdk::DragAction::COPY);
+
+        drop_target.connect_drop(clone!(
+            #[weak(rename_to = imp)]
+            self,
+            #[upgrade_or]
+            false,
+            move |_, value, _, _| {
+                let Ok(files) = value.get::<gtk::gdk::FileList>() else {
+                    return false;
+                };
+                let Some(file) = files.files().into_iter().next() else {
+                    return false;
+                };
+
+                let obj = imp.obj();
+                imp.state.load(&file).unwrap_or_else(|err| {
+                    obj.show_error_dialog(&format!("Error loading file: {err}"));
+                });
+                true
+            }
+        ));
+
+        self.obj().add_controller(drop_target);
     }
 
     #[template_callback]
