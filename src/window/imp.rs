@@ -875,8 +875,10 @@ impl Window {
     }
 
     fn setup_drop_target(&self) {
-        let drop_target =
-            gtk::DropTarget::new(gtk::gdk::FileList::static_type(), gtk::gdk::DragAction::COPY);
+        let drop_target = gtk::DropTarget::new(
+            gtk::gdk::FileList::static_type(),
+            gtk::gdk::DragAction::COPY,
+        );
 
         drop_target.connect_drop(clone!(
             #[weak(rename_to = imp)]
@@ -904,15 +906,27 @@ impl Window {
 
     #[template_callback]
     fn open_document(&self) {
-        let filter = gtk::FileFilter::new();
-        filter.add_mime_type("application/pdf");
+        const SUPPORTED_SUFFIXES: &[&str] = &[
+            "pdf", "xps", "oxps", "epub", "mobi", "fb2", "cbz", "svg", "txt", "png", "jpg", "jpeg",
+            "jp2", "jpx", "gif", "tif", "tiff", "bmp", "pnm", "pgm", "ppm", "pbm", "pam",
+        ];
+        let supported = gtk::FileFilter::new();
+        supported.set_name(Some("Supported documents"));
+        for suffix in SUPPORTED_SUFFIXES {
+            supported.add_suffix(suffix);
+        }
+        let all = gtk::FileFilter::new();
+        all.set_name(Some("All files"));
+        all.add_pattern("*");
         let filters = gtk::gio::ListStore::new::<gtk::FileFilter>();
-        filters.append(&filter);
+        filters.append(&supported);
+        filters.append(&all);
 
         let dialog = gtk::FileDialog::builder()
-            .title("Open PDF File")
+            .title("Open Document")
             .modal(true)
             .filters(&filters)
+            .default_filter(&supported)
             .build();
 
         let obj = self.obj();

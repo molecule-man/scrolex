@@ -1,4 +1,4 @@
-# Scrolex - A Horizontally Scrolled PDF Viewer
+# Scrolex - A Horizontally Scrolled Document Viewer
 
 > \- Scroll along the x coordinate  
 > \- Scroll along the x  
@@ -14,7 +14,7 @@ at your own discretion, and check back for updates as the app evolves.
 
 ---
 
-Scrolex is a high-performance PDF viewer specifically optimized for HiDPI
+Scrolex is a high-performance document viewer specifically optimized for HiDPI
 displays and designed for distraction-free, efficient reading. With its
 horizontal scrolling layout, Scrolex lets you see more pages at once, making it
 ideal for large monitors and wide screens.
@@ -50,6 +50,21 @@ https://github.com/user-attachments/assets/225c4b69-eb15-48d0-b978-f7bd747d463e
     Linux systems. Whether you're using X11 or Wayland, Scrolex will run
     smoothly.
 
+## Supported Formats
+
+Scrolex renders every format its bundled MuPDF engine handles. The most common
+multipage document formats are:
+
+- **PDF**
+- **EPUB** (unencrypted)
+- **MOBI**
+- **FB2**
+- **XPS / OpenXPS**
+- **CBZ** (comic book archives)
+
+Single-page formats such as SVG, plain text, and common raster images (PNG,
+JPEG, TIFF, …) open as well. DjVu is not supported.
+
 ## Shortcuts
 
 | Key / Action    | Description                              |
@@ -80,8 +95,8 @@ https://github.com/user-attachments/assets/225c4b69-eb15-48d0-b978-f7bd747d463e
 Packaged installs bundle everything they need, so **no manual dependency
 installation is required** for the Flatpak, AUR, or `.deb` methods below.
 
-The raw pre-built binary needs `gtk4` at runtime; the PDF engine (mupdf) is
-statically linked, so there's nothing else to install.
+The raw pre-built binary needs `gtk4` at runtime; the document engine (mupdf)
+is statically linked, so there's nothing else to install.
 
 On arch:
 
@@ -163,7 +178,7 @@ After building, you will find the binary at the location
 Scrolex is licensed under the [GNU Affero General Public License v3.0 or
 later](LICENSE) (AGPL-3.0-or-later).
 
-The PDF engine, [MuPDF](https://mupdf.com/), is vendored and statically linked.
+The document engine, [MuPDF](https://mupdf.com/), is vendored and statically linked.
 MuPDF is dual-licensed by Artifex Software under the AGPL v3 or a commercial
 license; because it is statically linked, distributed Scrolex binaries are
 covered by the AGPL. If you need to distribute Scrolex under different terms,
