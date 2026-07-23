@@ -49,10 +49,17 @@ pub fn invalidate() {
 // Stream a non-local GFile into a secure temp copy (O_EXCL, mode 600): peak memory is one buffer,
 // not the whole file. Deletes on drop unless keep()d.
 fn fetch_to_temp(file: &gtk::gio::File) -> Option<tempfile::TempPath> {
+    let suffix = file
+        .basename()
+        .and_then(|name| {
+            name.extension()
+                .map(|ext| format!(".{}", ext.to_string_lossy()))
+        })
+        .unwrap_or_default();
     let mut reader = file.read(gtk::gio::Cancellable::NONE).ok()?.into_read();
     let mut tmp = tempfile::Builder::new()
         .prefix("scrolex-staged-")
-        .suffix(".pdf")
+        .suffix(&suffix)
         .tempfile()
         .ok()?;
     std::io::copy(&mut reader, &mut tmp).ok()?;
