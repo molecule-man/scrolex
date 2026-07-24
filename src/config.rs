@@ -11,6 +11,8 @@ pub const DEFAULT_RENDER_THREADS: usize = 4;
 pub const DEFAULT_PREVIEW_CACHE_PAGES: usize = 65;
 
 pub const DEFAULT_RENDER_CACHE_MB: usize = 64;
+pub const MIN_RENDER_CACHE_MB: usize = 32;
+pub const MAX_RENDER_CACHE_MB: usize = 512;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Config {
@@ -87,7 +89,7 @@ pub fn load_config() -> Config {
             }
             Some(("render_cache_mb", v)) => {
                 if let Ok(n) = v.trim().parse::<usize>() {
-                    render_cache_mb = n.max(1);
+                    render_cache_mb = n;
                 }
             }
             Some(("animate_scroll", v)) => animate_scroll = v.trim().parse().unwrap_or(true),
@@ -110,7 +112,7 @@ pub fn load_config() -> Config {
     Config {
         render_threads: render_threads.clamp(1, max_render_threads()),
         preview_cache_pages,
-        render_cache_mb,
+        render_cache_mb: render_cache_mb.clamp(MIN_RENDER_CACHE_MB, MAX_RENDER_CACHE_MB),
         animate_scroll,
         geometry,
     }

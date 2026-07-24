@@ -96,6 +96,8 @@ pub struct Window {
     #[template_child]
     pub spin_threads: TemplateChild<gtk::SpinButton>,
     #[template_child]
+    pub spin_cache: TemplateChild<gtk::SpinButton>,
+    #[template_child]
     pub btn_jump_back: TemplateChild<Button>,
     #[template_child]
     pub scrolledwindow: TemplateChild<ScrolledWindow>,
@@ -193,9 +195,9 @@ impl ObjectImpl for Window {
 
         self.setup_scroll_selection_sync();
         self.setup_thread_setting();
+        self.setup_cache_setting();
         let cfg = crate::config::load_config();
         self.state.set_preview_cache_pages(cfg.preview_cache_pages);
-        self.state.set_render_cache_mb(cfg.render_cache_mb);
         self.setup_animate_scroll();
         self.setup_search();
         self.setup_toc();
@@ -1075,6 +1077,31 @@ impl Window {
                 imp.apply_render_threads(n);
                 let mut config = crate::config::load_config();
                 config.render_threads = n;
+                if let Err(e) = crate::config::save_config(&config) {
+                    eprintln!("Error saving config: {e}");
+                }
+            }
+        ));
+    }
+
+    fn setup_cache_setting(&self) {
+        let mb = crate::config::load_config().render_cache_mb;
+        self.spin_cache.set_range(
+            crate::config::MIN_RENDER_CACHE_MB as f64,
+            crate::config::MAX_RENDER_CACHE_MB as f64,
+        );
+        self.spin_cache.set_increments(32.0, 64.0);
+        self.spin_cache.set_value(mb as f64);
+        self.state.set_render_cache_mb(mb);
+
+        self.spin_cache.connect_value_changed(clone!(
+            #[weak(rename_to = imp)]
+            self,
+            move |spin| {
+                let mb = spin.value() as usize;
+                imp.state.set_render_cache_mb(mb);
+                let mut config = crate::config::load_config();
+                config.render_cache_mb = mb;
                 if let Err(e) = crate::config::save_config(&config) {
                     eprintln!("Error saving config: {e}");
                 }
