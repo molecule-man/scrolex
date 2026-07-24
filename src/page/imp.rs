@@ -42,12 +42,8 @@ const PREVIEW_SLOW_MS: u128 = 250;
 const PREVIEW_SLOW_STREAK_LIMIT: u32 = 5;
 
 thread_local!(
-    // Pool caps: bbox, visible-preview, visible, preview, prefetch. The visible cap must exceed the
-    // number of pages that can be on screen at once: the settle pass queues a visible render for
-    // every visible page in one go, and any dropped past the cap would never reschedule (nothing
-    // redraws them) and stay stuck in low-res. Fast-scroll flooding, the reason this was once small,
-    // is now prevented by the settle-debounce (no visible renders scheduled while scrolling), so a
-    // generous cap is safe.
+    // Pool caps: visible-preview, visible, preview, prefetch. Fast-scroll flooding is bounded by the
+    // wanted-range filter (out-of-view full renders dropped on pop), so caps can be generous.
     static RENDER_QUEUE: Lazy<RenderPool> = Lazy::new(|| {
         RenderPool::new(
             crate::config::DEFAULT_RENDER_THREADS,
@@ -63,6 +59,20 @@ thread_local!(
 // configured count at startup and whenever the setting changes.
 pub(crate) fn set_render_threads(n: usize) {
     RENDER_QUEUE.with(|queue| queue.set_size(n));
+}
+
+pub(crate) fn set_wanted_pages(client: u64, range: Option<(i32, i32)>) {
+    RENDER_QUEUE.with(|queue| queue.set_wanted(client, range));
+}
+
+// Drop a window's queued full renders (zoom invalidates their scale; previews survive).
+pub(crate) fn clear_full_renders(client: u64) {
+    RENDER_QUEUE.with(|queue| queue.clear_full(client));
+}
+
+// Drop all of a window's queued renders, previews included (document switch / window close).
+pub(crate) fn clear_all_renders(client: u64) {
+    RENDER_QUEUE.with(|queue| queue.clear_all(client));
 }
 
 // How many pages to prefetch ahead: the threads not busy on visible pages, but never more full
@@ -600,16 +610,11 @@ impl Page {
             cache.borrow_mut().remove(page_num);
         }
 
-        // While scrolling, defer the full render: it's slow and uninterruptible, so rendering pages
-        // that are flying past would saturate the workers and starve the previews. The preview
-        // below stands in; the settle refresh redraws the visible pages once motion stops, and this
-        // path then schedules their full renders.
-        if !obj.state().scrolling() {
-            // schedule the full render unless one is already queued for this page
-            let is_new = obj.state().render_inflight().borrow_mut().insert(page_num);
-            if is_new {
-                self.schedule_render(page_num, scale, scale_factor, RenderPriority::Visible);
-            }
+        // Schedule the full render unless one is already queued. Flung-past pages are dropped at the
+        // queue (see set_wanted_pages), so this doesn't saturate the workers mid-scroll.
+        let is_new = obj.state().render_inflight().borrow_mut().insert(page_num);
+        if is_new {
+            self.schedule_render(page_num, scale, scale_factor, RenderPriority::Visible);
         }
 
         // remember that this widget is the one waiting for page_num, so the
@@ -639,17 +644,11 @@ impl Page {
         self.prefetch_next(page_num);
     }
 
-    // Full-render the next pages in the scroll direction, so reading on lands on a cached page. A
-    // no-op while scrolling (a fling would only pile up soon-stale prefetch) and skips pages already
-    // cached or queued - so from a screenful of visible pages this reaches just past the last one in
-    // the direction of travel. Nice-to-have: the lowest render priority, run only once everything on
-    // screen is done.
+    // Full-render pages ahead in the scroll direction so reading on lands on a cached page. Skips
+    // cached/queued pages; lowest priority, dropped at the queue if the scroll leaves its range.
     fn prefetch_next(&self, current: i32) {
         let obj = self.obj();
         let state = obj.state();
-        if state.scrolling() {
-            return;
-        }
         let n_pages = state.n_pages();
         if n_pages == 0 {
             return;
@@ -688,6 +687,7 @@ impl Page {
     ) {
         let obj = self.obj();
         let uri = obj.uri();
+        let client = obj.state().render_client_id();
         // Page size (points) from the main-thread doc, so the worker sizes its surface to exactly
         // what the render cache expects (see mupdf_render::render_page_surface).
         let page_pt = crate::mupdf_render::page_size(&uri, page_num);
@@ -695,37 +695,33 @@ impl Page {
 
         let (resp_sender, resp_receiver) = oneshot::channel::<RenderedPage>();
         let obj_clone = obj.clone();
-        let uri_check = uri.clone();
-        // Document generation at schedule time: a same-path reload bumps it, so a render that was
-        // in flight over the old file contents (with old page size) is dropped instead of caching a
-        // stale surface.
-        let generation = crate::mupdf_render::generation();
+        let doc_epoch = obj.state().doc_epoch();
+        let epoch = obj.state().render_epoch();
         glib::spawn_future_local(async move {
             let result = resp_receiver.await;
             let state = obj_clone.state();
 
-            // Stale completion (different doc, or the same path reloaded)? load() already cleared the
-            // old inflight/waiter entries, so bail before touching the new generation's - removing
-            // its inflight marker here would let a duplicate render be queued.
-            if obj_clone.uri() != uri_check || crate::mupdf_render::generation() != generation {
+            // Stale completion - this window loaded/reloaded a document, or its scale changed (zoom),
+            // since this was scheduled? Those paths already cleared this window's inflight/waiter
+            // entries, so bail before touching the current ones: mutating them here would drop the
+            // live render's marker/waiter and cache an obsolete surface. Both epochs are per-window,
+            // so another window's load or zoom never invalidates this render.
+            if state.doc_epoch() != doc_epoch || state.render_epoch() != epoch {
                 return;
             }
             state.render_inflight().borrow_mut().remove(&page_num);
 
-            // Request was dropped (evicted from the queue as over-cap). Once settled, redraw any
-            // widget still waiting for this page so it reschedules - otherwise a page whose render
-            // was dropped stays stuck on its preview with nothing to trigger a retry.
+            // Request dropped (over-cap, or out of the wanted range). Redraw the widget still on this
+            // page so it reschedules; the index check means a scrolled-off page stays dropped.
             let Ok(rendered) = result else {
-                if !state.scrolling() {
-                    if let Some(widget) = state
-                        .render_waiters()
-                        .borrow()
-                        .get(&page_num)
-                        .and_then(glib::WeakRef::upgrade)
-                    {
-                        if widget.index() == page_num {
-                            widget.queue_draw();
-                        }
+                if let Some(widget) = state
+                    .render_waiters()
+                    .borrow()
+                    .get(&page_num)
+                    .and_then(glib::WeakRef::upgrade)
+                {
+                    if widget.index() == page_num {
+                        widget.queue_draw();
                     }
                 }
                 return;
@@ -760,6 +756,8 @@ impl Page {
         RENDER_QUEUE.with(move |queue| {
             queue.submit(
                 &uri,
+                client,
+                page_num,
                 priority,
                 Box::new(move || {
                     request_render(
@@ -824,21 +822,21 @@ impl Page {
     fn schedule_preview(&self, page_num: i32, priority: RenderPriority) {
         let obj = self.obj();
         let uri = obj.uri();
+        let client = obj.state().render_client_id();
         let scale = obj.state().preview_scale();
         let page_pt = crate::mupdf_render::page_size(&uri, page_num);
 
         let (resp_sender, resp_receiver) = oneshot::channel::<RenderedPage>();
         let obj_clone = obj.clone();
-        let uri_check = uri.clone();
-        // See schedule_render: drop previews rendered over stale (pre-reload) contents.
-        let generation = crate::mupdf_render::generation();
+        // Previews survive a zoom (they're rescaled at draw), so only a document load invalidates
+        // them - check doc_epoch, not render_epoch. Per-window, so another window's load can't wedge
+        // this preview's inflight marker.
+        let doc_epoch = obj.state().doc_epoch();
         glib::spawn_future_local(async move {
             let result = resp_receiver.await;
             let state = obj_clone.state();
 
-            // See schedule_render: bail on a stale completion before clearing the new generation's
-            // inflight marker.
-            if obj_clone.uri() != uri_check || crate::mupdf_render::generation() != generation {
+            if state.doc_epoch() != doc_epoch {
                 return;
             }
             state.preview_inflight().borrow_mut().remove(&page_num);
@@ -902,6 +900,8 @@ impl Page {
         RENDER_QUEUE.with(move |queue| {
             queue.submit(
                 &uri,
+                client,
+                page_num,
                 priority,
                 Box::new(move || {
                     request_render(
@@ -966,11 +966,9 @@ fn draw_preview(
 // grow ~scale^2, so each budget maps to a scale by the same square-root correction; we take the
 // tighter of the two and clamp to the usable range.
 fn adapt_preview_scale(cur_scale: f64, render_ms: u128, bytes: usize) -> f64 {
-    // Pages we want kept warm at once: the full symmetric window plus the visible page. The cache
-    // budget divided by this is the per-preview size ceiling; tying it to the budget and window
-    // keeps a single source of truth if either changes.
-    const RESIDENT_PREVIEWS: usize = (2 * PREVIEW_WINDOW + 1) as usize;
-    let target_bytes = (crate::state::PREVIEW_CACHE_BUDGET / RESIDENT_PREVIEWS) as f64;
+    // Per-preview size ceiling: the cache budget is this times the resident-preview count, so
+    // steering each preview toward this size keeps that many resident.
+    let target_bytes = crate::state::PREVIEW_TARGET_BYTES as f64;
 
     let render_ms = render_ms.max(1) as f64;
     let bytes = bytes.max(1) as f64;
@@ -1055,6 +1053,28 @@ fn request_render(
     resp_sender: oneshot::Sender<RenderedPage>,
 ) {
     let start = std::time::Instant::now();
+    if let Some(cfg) = crate::emulate::config() {
+        let (data, width, height, stride) = crate::emulate::pixels(
+            cfg,
+            page_num,
+            scale,
+            device_scale_factor,
+            priority.is_preview(),
+        );
+        let render_ms = start.elapsed().as_millis();
+        log::debug!(
+            "Rendered page {page_num} [{}] on background thread in {render_ms}ms (scale_factor={device_scale_factor})",
+            priority.label()
+        );
+        let _ = resp_sender.send(RenderedPage {
+            data: data.into_boxed_slice(),
+            width,
+            height,
+            stride,
+            render_ms,
+        });
+        return;
+    }
     let pixels =
         crate::mupdf_render::render_page_pixels(uri, page_num, scale, device_scale_factor, page_pt);
     let render_ms = start.elapsed().as_millis();

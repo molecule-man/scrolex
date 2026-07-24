@@ -131,7 +131,13 @@ fn build_ui(app: &Application, args: &[OsString]) {
         }
     ));
 
-    if let Some(fname) = args
+    if scrolex::emulate::config().is_some() {
+        state
+            .load(&gtk::gio::File::for_uri(scrolex::emulate::URI))
+            .unwrap_or_else(|err| {
+                window.show_error_dialog(&format!("Error loading emulated document: {err}"));
+            });
+    } else if let Some(fname) = args
         .iter()
         .skip(1)
         .find(|a| !a.to_string_lossy().starts_with('-'))

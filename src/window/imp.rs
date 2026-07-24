@@ -45,11 +45,6 @@ const TOUCHPAD_NOTCH: f64 = 40.0;
 // Multiplicative zoom step per notch.
 const ZOOM_STEP: f64 = 1.1;
 
-// Quiet period after the last scroll motion before the view is treated as settled and its pages are
-// full-rendered. Long enough that a continuous scroll doesn't repeatedly arm it, short enough that
-// stopping feels immediate.
-const SETTLE_MS: u64 = 150;
-
 // Quiet period after the last keystroke before a search sweep launches, coalescing a burst of typing.
 const SEARCH_DEBOUNCE_MS: u64 = 100;
 
@@ -142,13 +137,13 @@ pub struct Window {
     // in-flight animated one-page scroll; None when no slide is running
     scroll_anim: RefCell<Option<ScrollAnim>>,
 
-    // fires once scrolling has been quiet for SETTLE_MS, to flip State::scrolling back off and
-    // full-render the pages that came to rest on screen; reset on every scroll motion
-    settle_source: RefCell<Option<glib::SourceId>>,
+    // last horizontal scroll position, to derive travel direction (prefetch reads toward it) from
+    // any scroll path - free-scroll included, not just page steps
+    last_hadj: Cell<f64>,
 
-    // accumulates hi-res mouse-wheel deltas: libinput splits one physical notch into several
-    // sub-events that sum to 1.0, so we advance a page only when the running total crosses a whole
-    // notch, keeping the remainder
+    // accumulates hi-res mouse-wheel deltas (libinput splits one notch into sub-events summing to
+    // 1.0); a page advances when the total crosses a notch, keeping the remainder. Not reset between
+    // gestures, so a reverse after a pause can need up to ~0.8 notch - accepted.
     wheel_accum: Cell<f64>,
     // the previous wheel delta, to detect a direction reversal and reset the accumulator so
     // reversing doesn't over-step
@@ -198,6 +193,9 @@ impl ObjectImpl for Window {
 
         self.setup_scroll_selection_sync();
         self.setup_thread_setting();
+        let cfg = crate::config::load_config();
+        self.state.set_preview_cache_pages(cfg.preview_cache_pages);
+        self.state.set_render_cache_mb(cfg.render_cache_mb);
         self.setup_animate_scroll();
         self.setup_search();
         self.setup_toc();
@@ -210,6 +208,20 @@ impl ObjectImpl for Window {
         self.obj().connect_map(move |_| {
             scrolledwindow.grab_focus();
         });
+
+        // Drop this window's render-pool state when it closes, so its entries don't linger.
+        self.obj().connect_close_request(clone!(
+            #[weak(rename_to = imp)]
+            self,
+            #[upgrade_or]
+            glib::Propagation::Proceed,
+            move |_| {
+                let client = imp.state.render_client_id();
+                crate::page::clear_all_renders(client);
+                crate::page::set_wanted_pages(client, None);
+                glib::Propagation::Proceed
+            }
+        ));
     }
 }
 
@@ -268,14 +280,11 @@ impl Window {
                     gtk::gdk::ScrollUnit::Wheel => dy,
                     _ => dy / TOUCHPAD_NOTCH,
                 };
-                self.note_scroll_activity();
                 self.state
                     .set_zoom(self.state.zoom() * ZOOM_STEP.powf(-notches));
             }
             return glib::Propagation::Stop;
         }
-
-        self.note_scroll_activity();
 
         match unit {
             // Mouse wheel: hi-res wheels split one notch into several sub-events summing to 1.0.
@@ -353,7 +362,6 @@ impl Window {
             return;
         };
         if let Some((prev_x, prev_y)) = *self.drag_coords.borrow() {
-            self.note_scroll_activity();
             let hadjustment = self.scrolledwindow.hadjustment();
             hadjustment.set_value(hadjustment.value() - (x - prev_x));
             let vadjustment = self.vscrolledwindow.vadjustment();
@@ -403,9 +411,6 @@ impl Window {
         if scale <= 0.0 {
             return;
         }
-        // A pinch rescales the cheap previews live; defer the slow full re-renders until the gesture
-        // settles, the same way scrolling does.
-        self.note_scroll_activity();
         self.state.set_zoom(self.zoom_gesture_base.get() * scale);
     }
 
@@ -466,7 +471,6 @@ impl Window {
                 // in-flight page slide; otherwise scroll_tick would overwrite the nudge each frame.
                 // (h/l intentionally keep the slide running - they step pages and retarget it.)
                 *self.scroll_anim.borrow_mut() = None;
-                self.note_scroll_activity();
                 let hadj = self.scrolledwindow.hadjustment();
                 let step = if hadj.step_increment() > 0.0 {
                     hadj.step_increment()
@@ -479,7 +483,6 @@ impl Window {
             Key::Up | Key::Down | Key::k | Key::j => {
                 // vertical pan of a zoomed-in page. The outer scroller owns the vertical axis (the
                 // horizontal listview doesn't scroll its cross axis); k/Up pan up, j/Down pan down.
-                self.note_scroll_activity();
                 let vadj = self.vscrolledwindow.vadjustment();
                 let step = if vadj.step_increment() > 0.0 {
                     vadj.step_increment()
@@ -610,10 +613,6 @@ impl Window {
     // stays smooth. `delta` seeds a resting position only for the degenerate case where the
     // selected page's live geometry can't be read at all.
     fn animate_scroll(&self, anchor_x: Option<f64>, delta: f64) {
-        // Keyboard/step navigation reaches the view here (not through the scroll controller), so
-        // arm the settle timer here too - full renders wait until the stepping stops.
-        self.note_scroll_activity();
-
         // Cancel any kinetic deceleration the GTK is doing to the scrolled window. Why calling it
         // two times? The Api is a bit strange: its cancel only runs on a real property change.
         self.scrolledwindow.set_kinetic_scrolling(true);
@@ -1009,41 +1008,54 @@ impl Window {
     }
 
     fn setup_scroll_selection_sync(&self) {
-        self.scrolledwindow
-            .hadjustment()
-            .connect_value_changed(clone!(
-                #[weak(rename_to = imp)]
-                self,
-                move |_| imp.schedule_selection_sync()
-            ));
+        let hadj = self.scrolledwindow.hadjustment();
+        // value-changed: the position moved (any scroll path). Track travel direction for prefetch,
+        // refresh the wanted range, sync the selection.
+        hadj.connect_value_changed(clone!(
+            #[weak(rename_to = imp)]
+            self,
+            move |adj| {
+                let prev = imp.last_hadj.replace(adj.value());
+                if (adj.value() - prev).abs() > f64::EPSILON {
+                    imp.state.set_scroll_forward(adj.value() > prev);
+                }
+                imp.update_wanted_render_range();
+                imp.schedule_selection_sync();
+            }
+        ));
+        // changed: bounds/page-size moved without the value (e.g. zoom-out at the start), which can
+        // remap the visible pages - refresh the range so newly-shown pages aren't dropped.
+        hadj.connect_changed(clone!(
+            #[weak(rename_to = imp)]
+            self,
+            move |_| imp.update_wanted_render_range()
+        ));
     }
 
-    // Mark the view as scrolling and (re)arm the settle timer. Driven by user scroll input (wheel,
-    // touchpad, page steps) - deliberately NOT by the hadjustment, whose animation frames would keep
-    // resetting the timer for the whole glide and hold full renders hostage until the slide settled.
-    // When the timer fires (input has been quiet for SETTLE_MS), drop the scrolling flag and redraw
-    // the on-screen pages so their full renders get scheduled.
-    fn note_scroll_activity(&self) {
-        self.state.set_scrolling(true);
-        if let Some(source) = self.settle_source.take() {
-            source.remove();
-        }
-        let source = glib::timeout_add_local_once(
-            std::time::Duration::from_millis(SETTLE_MS),
-            clone!(
-                #[weak(rename_to = imp)]
-                self,
-                move || {
-                    imp.settle_source.replace(None);
-                    imp.state.set_scrolling(false);
-                    // Clear accumulators so the next gesture starts fresh in either direction.
-                    imp.wheel_accum.set(0.0);
-                    imp.wheel_last_dy.set(0.0);
-                    imp.refresh_visible_renders();
+    // Track the page range worth a full render as the viewport moves; flung-past pages drop at the
+    // queue. Spans the mapped page widgets plus a prefetch margin. A briefly-excluded visible page
+    // reschedules via the render-waiter redraw, so the range only needs to be roughly right.
+    fn update_wanted_render_range(&self) {
+        let mut lo = i32::MAX;
+        let mut hi = i32::MIN;
+        let mut child = self.listview.first_child();
+        while let Some(c) = child {
+            if let Some(page) = descendant_page(&c) {
+                if page.is_mapped() {
+                    let idx = page.index();
+                    lo = lo.min(idx);
+                    hi = hi.max(idx);
                 }
-            ),
-        );
-        self.settle_source.replace(Some(source));
+            }
+            child = c.next_sibling();
+        }
+        let range = if lo <= hi {
+            let margin = self.state.render_threads() as i32 + 4;
+            Some((lo - margin, hi + margin))
+        } else {
+            None
+        };
+        crate::page::set_wanted_pages(self.state.render_client_id(), range);
     }
 
     // Load the render-thread setting into the spin button and pool, and persist any user change.
@@ -1115,21 +1127,6 @@ impl Window {
             child = c.next_sibling();
         }
         self.state.set_visible_page_count(count);
-    }
-
-    // Redraw every page widget currently laid out in the viewport. With scrolling now off, each
-    // one's draw schedules its full render (and prefetch), so the settled pages sharpen.
-    fn refresh_visible_renders(&self) {
-        self.update_visible_page_count();
-        let mut child = self.listview.first_child();
-        while let Some(c) = child {
-            if let Some(page) = descendant_page(&c) {
-                if page.is_mapped() {
-                    page.queue_draw();
-                }
-            }
-            child = c.next_sibling();
-        }
     }
 
     // Coalesce a burst of scroll events into a single sync run on idle, after the list view has
@@ -1581,7 +1578,7 @@ impl ApplicationWindowImpl for Window {}
 fn accumulate_step(accum: f64, prev: f64, delta: f64, notch: f64, trigger: f64) -> (f64, i32) {
     // On a mid-gesture reversal, seed against the new direction so the first reverse step needs
     // nearly a full notch of travel, not the eager `trigger` (stops an accidental back-nudge from
-    // firing a page back). A reversal after settling starts fresh (see `note_scroll_activity`).
+    // firing a page back).
     let base = if delta * prev < 0.0 {
         (notch - 2.0 * trigger).copysign(prev)
     } else {
