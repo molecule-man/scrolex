@@ -36,5 +36,5 @@ debug = false
 assets = [
 	["target/release/scrolex", "usr/bin/", "755"],
 	["resources/scrolex.desktop", "usr/share/applications/", "644"],
-	["resources/icon.png", "usr/share/icons/scrolex.png", "644"]
+	["resources/icon.png", "usr/share/icons/hicolor/64x64/apps/scrolex.png", "644"]
 ]

@@ -1,8 +1,11 @@
+// Criterion benchmarks for document rendering and cached-surface drawing.
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use std::hint::black_box;
 
 pub fn bench_render_surface(c: &mut Criterion) {
-    let pdf_path = std::env::var("PDF_PATH").expect("Environment variable PDF_PATH is not set");
+    let Ok(pdf_path) = std::env::var("PDF_PATH") else {
+        return;
+    };
 
     let page_number: i32 = std::env::var("PAGE_NUMBER")
         .expect("Environment variable PAGE_NUMBER is not set")

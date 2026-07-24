@@ -193,7 +193,14 @@ impl RenderPool {
         }
     }
 
-    pub(crate) fn submit(&self, uri: &str, client: u64, page: i32, priority: RenderPriority, job: Job) {
+    pub(crate) fn submit(
+        &self,
+        uri: &str,
+        client: u64,
+        page: i32,
+        priority: RenderPriority,
+        job: Job,
+    ) {
         let (lock, cvar) = &*self.inner;
         let mut queue = lock.lock().unwrap();
         queue.push(

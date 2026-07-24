@@ -1,9 +1,10 @@
+// Page widgets and shared rendering controls.
 mod imp;
 mod page_number_imp;
 
-pub use imp::draw_surface;
 pub(crate) use imp::clear_all_renders;
 pub(crate) use imp::clear_full_renders;
+pub use imp::draw_surface;
 pub(crate) use imp::set_render_threads;
 pub(crate) use imp::set_wanted_pages;
 pub(crate) use imp::PREVIEW_INITIAL_SCALE;

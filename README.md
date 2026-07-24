@@ -5,19 +5,10 @@
 > \- Scroll the x  
 > \- **Scrolex**
 
-🚧 **Under Heavy Development** 🚧
-
-This project is still under active development and may contain bugs or
-incomplete features. While it is functional and can be used, please be aware
-that certain aspects might change rapidly, and stability is not guaranteed. Use
-at your own discretion, and check back for updates as the app evolves.
-
----
-
-Scrolex is a high-performance document viewer specifically optimized for HiDPI
-displays and designed for distraction-free, efficient reading. With its
-horizontal scrolling layout, Scrolex lets you see more pages at once, making it
-ideal for large monitors and wide screens.
+Scrolex is a document viewer optimized for HiDPI displays and designed for
+distraction-free, efficient reading. With its horizontal scrolling layout,
+Scrolex lets you see more pages at once, making it ideal for large monitors and
+wide screens.
 
 https://github.com/user-attachments/assets/225c4b69-eb15-48d0-b978-f7bd747d463e
 
@@ -46,9 +37,7 @@ https://github.com/user-attachments/assets/225c4b69-eb15-48d0-b978-f7bd747d463e
 
 4. Wayland Support
 
-    Scrolex offers full Wayland support, ensuring compatibility with modern
-    Linux systems. Whether you're using X11 or Wayland, Scrolex will run
-    smoothly.
+    Scrolex supports both Wayland and X11 sessions.
 
 ## Supported Formats
 
@@ -92,11 +81,13 @@ JPEG, TIFF, …) open as well. DjVu is not supported.
 
 ### 0. Dependencies
 
-Packaged installs bundle everything they need, so **no manual dependency
-installation is required** for the Flatpak, AUR, or `.deb` methods below.
+The Flatpak bundle includes the application dependencies and downloads its
+GNOME runtime from Flathub. The AUR and `.deb` packages declare their system
+dependencies so their package managers can install them.
 
-The raw pre-built binary needs `gtk4` at runtime; the document engine (mupdf)
-is statically linked, so there's nothing else to install.
+The release artifacts currently support x86-64 Linux. The raw pre-built binary
+needs GTK 4.12 or newer at runtime; the document engine (MuPDF) is statically
+linked.
 
 On arch:
 
@@ -137,8 +128,9 @@ root).
 
 ### 2. Download from GitHub Releases
 
-You can download the latest pre-built binary directly from the [GitHub releases
-page][1].
+You can download the latest x86-64 pre-built binary archive directly from the
+[GitHub releases page][1]. Extract it and run the `scrolex` executable. GTK
+4.12 or newer must already be installed.
 
 ### 3. Install from AUR (Arch Linux)
 
@@ -151,12 +143,14 @@ yay -S scrolex-bin
 
 ### 4. Download and install .deb package from GitHub Releases
 
-If you are Debian (or Ubuntu) user, then you can download a `.deb` file directly from the [GitHub releases
-page][1] and install it. Replace `<version>` with the release you want to install.
+The `.deb` package supports Debian 13 or newer and Ubuntu 24.04 or newer.
+Download it from the [GitHub releases page][1], then install it with APT so its
+dependencies are resolved. Replace `<version>` with the release you want to
+install.
 
 ```bash
 curl -LO "https://github.com/molecule-man/scrolex/releases/download/<version>/scrolex_<version>.deb"
-sudo dpkg -i scrolex_<version>.deb
+sudo apt install ./scrolex_<version>.deb
 ```
 
 ### 5. Build from source
