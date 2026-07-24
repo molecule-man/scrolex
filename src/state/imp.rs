@@ -6,9 +6,13 @@ use gtk::{gio::prelude::*, glib::subclass::Signal};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
 use crate::jump_stack;
+
+// Source of per-window render-client ids, assigned to each State on construction.
+static NEXT_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Default, glib::Properties)]
 #[properties(wrapper_type = super::State)]
@@ -65,14 +69,19 @@ pub struct State {
     // render scale for previews, adapted per document toward the time and memory budgets. Defaults
     // to 0.0 (Cell); set to the initial scale in constructed and on load.
     pub(crate) preview_scale: Cell<f64>,
-    // true while the view is scrolling (reset shortly after motion stops). Full renders are 1.3s
-    // and can't be interrupted, so scheduling them for pages flying past would saturate the workers
-    // and starve the cheap previews that keep pages from flashing white. While scrolling we render
-    // only previews and defer full renders until the view settles.
-    pub(crate) scrolling: Cell<bool>,
     // direction of travel, used to prefetch the pages being read toward: true = forward (higher page
     // numbers), the default; flipped when the user scrolls back.
     pub(crate) scroll_forward: Cell<bool>,
+    // bumped on zoom (alongside the inflight/waiter clears); a render captures it at schedule and
+    // drops out on completion if it changed, so an old-scale render can't cache/rebook. Per-State so
+    // one window's zoom never invalidates another's in-flight renders.
+    pub(crate) render_epoch: Cell<u64>,
+    // this window's id in the render pool's wanted-range filter, so windows don't filter each other
+    pub(crate) render_client_id: Cell<u64>,
+    // bumped when this window loads/reloads a document; a render captures it at schedule and drops
+    // out on completion if it changed (catches same-path reload, where the uri is unchanged).
+    // Per-State so one window's load never invalidates another's in-flight renders.
+    pub(crate) doc_epoch: Cell<u64>,
 
     // global render-thread count (user setting) and how many pages fully fit across the viewport;
     // together they set prefetch depth. Set in constructed / by the window.
@@ -90,6 +99,8 @@ impl ObjectSubclass for State {
 impl ObjectImpl for State {
     fn constructed(&self) {
         self.parent_constructed();
+        self.render_client_id
+            .set(NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed));
         // animated scrolling is on by default; the builder-created instance doesn't run State::new,
         // so set it here
         self.obj().set_animate_scroll(true);
@@ -106,14 +117,17 @@ impl ObjectImpl for State {
         self.render_threads
             .set(crate::config::DEFAULT_RENDER_THREADS);
 
-        // Zooming could have made the cache entries inaccurate. Drop them. This must live here
-        // rather than in State::new: the builder-created instance the window uses doesn't run
-        // State::new.
+        // Zoom changes every page's render scale: drop the now-wrong-scale cache entries and queued
+        // renders. Must live here, not State::new: the builder-created instance skips it.
         self.obj().connect_notify_local(Some("zoom"), |state, _| {
             let imp = state.imp();
             imp.render_cache.borrow_mut().clear();
             imp.render_inflight.borrow_mut().clear();
             imp.render_waiters.borrow_mut().clear();
+            crate::page::clear_full_renders(imp.render_client_id.get());
+            // in-flight renders started at the old scale are now stale; bump so their completion
+            // drops out instead of caching an obsolete-scale surface
+            imp.render_epoch.set(imp.render_epoch.get().wrapping_add(1));
         });
     }
 

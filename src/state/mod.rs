@@ -70,8 +70,19 @@ impl State {
         // Committed to the new document: force every thread to reopen (the same path may have
         // changed on disk), publish the validated bytes for the render workers, then reset
         // per-document state.
+        // Reloads are process-wide for a URI. Multiple windows displaying the same URI are not
+        // version-isolated if that file changes on disk.
         crate::mupdf_render::invalidate();
         candidate.commit();
+        // Drop this window's queued renders and wanted-range entry for the outgoing document so they
+        // neither run stale nor linger in the shared pool.
+        let client = self.render_client_id();
+        crate::page::clear_all_renders(client);
+        crate::page::set_wanted_pages(client, None);
+        // invalidate this window's in-flight renders (their content/scale is about to change)
+        self.imp()
+            .doc_epoch
+            .set(self.imp().doc_epoch.get().wrapping_add(1));
         self.imp().bbox_cache.borrow_mut().clear();
         self.imp().links.borrow_mut().clear();
         self.imp().search.borrow_mut().clear();
@@ -202,6 +213,18 @@ impl State {
             .set_budget(preview_cache_budget(pages));
     }
 
+    pub(crate) fn render_epoch(&self) -> u64 {
+        self.imp().render_epoch.get()
+    }
+
+    pub(crate) fn render_client_id(&self) -> u64 {
+        self.imp().render_client_id.get()
+    }
+
+    pub(crate) fn doc_epoch(&self) -> u64 {
+        self.imp().doc_epoch.get()
+    }
+
     pub(crate) fn set_render_cache_mb(&self, mb: usize) {
         self.imp()
             .render_cache
@@ -235,14 +258,6 @@ impl State {
 
     pub(crate) fn set_preview_scale(&self, scale: f64) {
         self.imp().preview_scale.set(scale);
-    }
-
-    pub(crate) fn scrolling(&self) -> bool {
-        self.imp().scrolling.get()
-    }
-
-    pub(crate) fn set_scrolling(&self, scrolling: bool) {
-        self.imp().scrolling.set(scrolling);
     }
 
     pub(crate) fn scroll_forward(&self) -> bool {
