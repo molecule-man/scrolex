@@ -49,6 +49,11 @@ impl RenderCache {
         }
     }
 
+    pub fn set_budget(&mut self, budget_bytes: usize) {
+        self.budget_bytes = budget_bytes;
+        self.evict();
+    }
+
     pub fn get(&mut self, page: i32) -> Option<ImageSurface> {
         let surface = self.entries.get(&page)?.surface.clone();
         self.touch(page);

@@ -8,9 +8,15 @@ use std::{env, fs, io, thread};
 // threads before going memory-bandwidth bound; beyond that, more threads mainly buy prefetch depth.
 pub const DEFAULT_RENDER_THREADS: usize = 4;
 
+pub const DEFAULT_PREVIEW_CACHE_PAGES: usize = 65;
+
+pub const DEFAULT_RENDER_CACHE_MB: usize = 64;
+
 #[derive(Debug, Clone, Copy)]
 pub struct Config {
     pub render_threads: usize,
+    pub preview_cache_pages: usize,
+    pub render_cache_mb: usize,
     pub animate_scroll: bool,
     pub geometry: Option<Geometry>,
 }
@@ -27,6 +33,8 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             render_threads: DEFAULT_RENDER_THREADS,
+            preview_cache_pages: DEFAULT_PREVIEW_CACHE_PAGES,
+            render_cache_mb: DEFAULT_RENDER_CACHE_MB,
             animate_scroll: true,
             geometry: None,
         }
@@ -58,6 +66,8 @@ pub fn load_config() -> Config {
         .unwrap_or_default();
 
     let mut render_threads = DEFAULT_RENDER_THREADS;
+    let mut preview_cache_pages = DEFAULT_PREVIEW_CACHE_PAGES;
+    let mut render_cache_mb = DEFAULT_RENDER_CACHE_MB;
     let mut animate_scroll = true;
     let mut width = None;
     let mut height = None;
@@ -68,6 +78,16 @@ pub fn load_config() -> Config {
             Some(("render_threads", v)) => {
                 if let Ok(n) = v.trim().parse() {
                     render_threads = n;
+                }
+            }
+            Some(("preview_cache_pages", v)) => {
+                if let Ok(n) = v.trim().parse::<usize>() {
+                    preview_cache_pages = n.max(1);
+                }
+            }
+            Some(("render_cache_mb", v)) => {
+                if let Ok(n) = v.trim().parse::<usize>() {
+                    render_cache_mb = n.max(1);
                 }
             }
             Some(("animate_scroll", v)) => animate_scroll = v.trim().parse().unwrap_or(true),
@@ -89,6 +109,8 @@ pub fn load_config() -> Config {
 
     Config {
         render_threads: render_threads.clamp(1, max_render_threads()),
+        preview_cache_pages,
+        render_cache_mb,
         animate_scroll,
         geometry,
     }
@@ -101,6 +123,11 @@ pub fn save_config(config: &Config) -> io::Result<()> {
     }
 
     let mut out = format!("render_threads={}\n", config.render_threads);
+    out.push_str(&format!(
+        "preview_cache_pages={}\n",
+        config.preview_cache_pages
+    ));
+    out.push_str(&format!("render_cache_mb={}\n", config.render_cache_mb));
     out.push_str(&format!("animate_scroll={}\n", config.animate_scroll));
     if let Some(g) = config.geometry {
         out.push_str(&format!("width={}\n", g.width));
@@ -122,6 +149,8 @@ mod tests {
 
         save_config(&Config {
             render_threads: 1,
+            preview_cache_pages: 120,
+            render_cache_mb: 256,
             animate_scroll: false,
             geometry: Some(Geometry {
                 width: 1000,
@@ -132,6 +161,8 @@ mod tests {
         .unwrap();
         let loaded = load_config();
         assert_eq!(loaded.render_threads, 1);
+        assert_eq!(loaded.preview_cache_pages, 120);
+        assert_eq!(loaded.render_cache_mb, 256);
         assert!(!loaded.animate_scroll);
         let g = loaded.geometry.expect("geometry persisted");
         assert_eq!((g.width, g.height, g.maximized), (1000, 700, true));
@@ -139,6 +170,8 @@ mod tests {
         // an over-large value is clamped down to the machine's cap, and omitting geometry clears it
         save_config(&Config {
             render_threads: 9999,
+            preview_cache_pages: DEFAULT_PREVIEW_CACHE_PAGES,
+            render_cache_mb: DEFAULT_RENDER_CACHE_MB,
             animate_scroll: true,
             geometry: None,
         })

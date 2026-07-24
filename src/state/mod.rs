@@ -13,9 +13,15 @@ use std::{env, fs};
 
 use crate::page;
 
-// Memory budget for the low-resolution preview cache. Spread over the resident preview window this
-// also bounds the adaptive preview scale, so it holds a wide scroll window without thrashing.
-pub(crate) const PREVIEW_CACHE_BUDGET: usize = 20 * 1024 * 1024;
+// Per-preview size the adaptive preview scaler steers toward. The preview cache's byte budget is
+// this times the configured number of resident previews (config::preview_cache_pages), so the cache
+// holds about that many previews regardless of the adaptive scale.
+pub(crate) const PREVIEW_TARGET_BYTES: usize = 20 * 1024 * 1024 / 65;
+
+// Preview cache byte budget for a given number of resident previews.
+pub(crate) fn preview_cache_budget(pages: usize) -> usize {
+    pages * PREVIEW_TARGET_BYTES
+}
 
 glib::wrapper! {
     pub struct State(ObjectSubclass<imp::State>);
@@ -187,6 +193,20 @@ impl State {
 
     pub(crate) fn preview_cache(&self) -> Rc<RefCell<crate::render_cache::RenderCache>> {
         self.imp().preview_cache.clone()
+    }
+
+    pub(crate) fn set_preview_cache_pages(&self, pages: usize) {
+        self.imp()
+            .preview_cache
+            .borrow_mut()
+            .set_budget(preview_cache_budget(pages));
+    }
+
+    pub(crate) fn set_render_cache_mb(&self, mb: usize) {
+        self.imp()
+            .render_cache
+            .borrow_mut()
+            .set_budget(mb * 1024 * 1024);
     }
 
     pub(crate) fn preview_inflight(&self) -> Rc<RefCell<HashSet<i32>>> {

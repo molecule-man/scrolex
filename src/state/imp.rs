@@ -95,10 +95,12 @@ impl ObjectImpl for State {
         self.obj().set_animate_scroll(true);
 
         // Previews are tiny; give their cache its own small budget rather than the default
-        // (full-render) one. Must live here, not in State::new: the builder-created instance the
-        // window uses doesn't run State::new.
-        *self.preview_cache.borrow_mut() =
-            crate::render_cache::RenderCache::new(super::PREVIEW_CACHE_BUDGET);
+        // (full-render) one. Sized for the default resident-preview count; the window resizes it
+        // from config. Must live here, not in State::new: the builder-created instance the window
+        // uses doesn't run State::new.
+        *self.preview_cache.borrow_mut() = crate::render_cache::RenderCache::new(
+            super::preview_cache_budget(crate::config::DEFAULT_PREVIEW_CACHE_PAGES),
+        );
         self.preview_scale.set(crate::page::PREVIEW_INITIAL_SCALE);
         self.scroll_forward.set(true);
         self.render_threads

@@ -966,11 +966,9 @@ fn draw_preview(
 // grow ~scale^2, so each budget maps to a scale by the same square-root correction; we take the
 // tighter of the two and clamp to the usable range.
 fn adapt_preview_scale(cur_scale: f64, render_ms: u128, bytes: usize) -> f64 {
-    // Pages we want kept warm at once: the full symmetric window plus the visible page. The cache
-    // budget divided by this is the per-preview size ceiling; tying it to the budget and window
-    // keeps a single source of truth if either changes.
-    const RESIDENT_PREVIEWS: usize = (2 * PREVIEW_WINDOW + 1) as usize;
-    let target_bytes = (crate::state::PREVIEW_CACHE_BUDGET / RESIDENT_PREVIEWS) as f64;
+    // Per-preview size ceiling: the cache budget is this times the resident-preview count, so
+    // steering each preview toward this size keeps that many resident.
+    let target_bytes = crate::state::PREVIEW_TARGET_BYTES as f64;
 
     let render_ms = render_ms.max(1) as f64;
     let bytes = bytes.max(1) as f64;
@@ -1055,6 +1053,23 @@ fn request_render(
     resp_sender: oneshot::Sender<RenderedPage>,
 ) {
     let start = std::time::Instant::now();
+    if let Some(cfg) = crate::emulate::config() {
+        let (data, width, height, stride) =
+            crate::emulate::pixels(cfg, page_num, scale, device_scale_factor, priority.is_preview());
+        let render_ms = start.elapsed().as_millis();
+        log::debug!(
+            "Rendered page {page_num} [{}] on background thread in {render_ms}ms (scale_factor={device_scale_factor})",
+            priority.label()
+        );
+        let _ = resp_sender.send(RenderedPage {
+            data: data.into_boxed_slice(),
+            width,
+            height,
+            stride,
+            render_ms,
+        });
+        return;
+    }
     let pixels =
         crate::mupdf_render::render_page_pixels(uri, page_num, scale, device_scale_factor, page_pt);
     let render_ms = start.elapsed().as_millis();

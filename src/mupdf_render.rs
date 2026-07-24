@@ -77,6 +77,14 @@ pub(crate) struct Candidate {
 
 // Stage `uri`: own path if local, else a temp copy of the bytes.
 pub(crate) fn stage_candidate(uri: &str) -> Option<Candidate> {
+    // Emulate mode has no real file to stage; hand back a placeholder candidate.
+    if crate::emulate::config().is_some() {
+        return Some(Candidate {
+            uri: uri.to_string(),
+            path: PathBuf::new(),
+            temp: None,
+        });
+    }
     let file = gtk::gio::File::for_uri(uri);
     if let Some(path) = file.path() {
         return Some(Candidate {
@@ -97,6 +105,9 @@ pub(crate) fn stage_candidate(uri: &str) -> Option<Candidate> {
 impl Candidate {
     // Page count of a fresh, side-effect-free open; 0 if unopenable (a failed load).
     pub(crate) fn page_count(&self) -> i32 {
+        if let Some(cfg) = crate::emulate::config() {
+            return cfg.pages;
+        }
         Document::open(self.path.as_path())
             .and_then(|d| d.page_count())
             .unwrap_or(0)
@@ -214,6 +225,9 @@ pub fn render_page_surface(
     dsf: f64,
     page_pt: Option<(f64, f64)>,
 ) -> Option<ImageSurface> {
+    if let Some(cfg) = crate::emulate::config() {
+        return Some(crate::emulate::full_surface(cfg, page_num, scale, dsf));
+    }
     let px = render_page_pixels(uri, page_num, scale, dsf, page_pt)?;
     let surface =
         ImageSurface::create_for_data(px.data, Format::Rgb24, px.width, px.height, px.stride)
@@ -224,6 +238,10 @@ pub fn render_page_surface(
 
 // Page size in points (width, height), or None.
 pub fn page_size(uri: &str, page_num: i32) -> Option<(f64, f64)> {
+    if let Some(cfg) = crate::emulate::config() {
+        let _ = page_num;
+        return Some(cfg.page_pt);
+    }
     with_doc(uri, |doc| {
         let b = doc.load_page(page_num).ok()?.bounds().ok()?;
         Some(((b.x1 - b.x0) as f64, (b.y1 - b.y0) as f64))

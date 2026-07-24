@@ -198,6 +198,9 @@ impl ObjectImpl for Window {
 
         self.setup_scroll_selection_sync();
         self.setup_thread_setting();
+        let cfg = crate::config::load_config();
+        self.state.set_preview_cache_pages(cfg.preview_cache_pages);
+        self.state.set_render_cache_mb(cfg.render_cache_mb);
         self.setup_animate_scroll();
         self.setup_search();
         self.setup_toc();

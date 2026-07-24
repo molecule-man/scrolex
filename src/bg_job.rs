@@ -19,6 +19,13 @@ pub(crate) enum RenderPriority {
 }
 
 impl RenderPriority {
+    pub(crate) fn is_preview(self) -> bool {
+        matches!(
+            self,
+            RenderPriority::VisiblePreview | RenderPriority::Preview
+        )
+    }
+
     // Short tag for logging what kind of work a render was.
     pub(crate) fn label(self) -> &'static str {
         match self {
