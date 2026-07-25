@@ -88,6 +88,10 @@ pub struct State {
     // together they set prefetch depth. Set in constructed / by the window.
     pub(crate) render_threads: Cell<usize>,
     pub(crate) visible_page_count: Cell<i32>,
+
+    // bumped on each load; the async open's completion drops out if it changed, so a load started
+    // while an earlier one is still opening supersedes it.
+    pub(crate) load_seq: Cell<u64>,
 }
 
 #[glib::object_subclass]
@@ -136,6 +140,10 @@ impl ObjectImpl for State {
         static SIGNALS: OnceLock<Vec<Signal>> = OnceLock::new();
         SIGNALS.get_or_init(|| {
             vec![
+                Signal::builder("load-started").build(),
+                Signal::builder("load-failed")
+                    .param_types([String::static_type()])
+                    .build(),
                 Signal::builder("before-load").build(),
                 Signal::builder("loaded").build(),
             ]

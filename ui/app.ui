@@ -1,6 +1,8 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <interface>
 	<object class="DocState" id="state">
+		<signal name="load-started" handler="on_load_started" swapped="true"/>
+		<signal name="load-failed" handler="on_load_failed" swapped="true"/>
 		<signal name="before-load" handler="clear_model" swapped="true"/>
 		<signal name="loaded" handler="handle_document_load" swapped="true"/>
 		<binding name="page">
@@ -407,6 +409,30 @@
 			</child>
 		</object>
 				</property>
+				<child type="overlay">
+					<object class="GtkBox" id="loading_overlay">
+						<property name="visible">false</property>
+						<property name="can-target">false</property>
+						<property name="halign">center</property>
+						<property name="valign">center</property>
+						<property name="orientation">vertical</property>
+						<property name="spacing">12</property>
+						<style>
+							<class name="loading-overlay"/>
+						</style>
+						<child>
+							<object class="GtkSpinner" id="loading_spinner">
+								<property name="width-request">40</property>
+								<property name="height-request">40</property>
+							</object>
+						</child>
+						<child>
+							<object class="GtkLabel">
+								<property name="label">Loading…</property>
+							</object>
+						</child>
+					</object>
+				</child>
 				<child type="overlay">
 					<object class="GtkRevealer" id="toc_revealer">
 						<property name="halign">start</property>
