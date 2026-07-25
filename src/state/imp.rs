@@ -1,3 +1,4 @@
+// Per-window document state and render lifecycle bookkeeping.
 #![expect(unused_lifetimes)]
 
 use gtk::glib;
@@ -47,7 +48,7 @@ pub struct State {
     pub(crate) search: Rc<RefCell<crate::search::Search>>,
 
     // rendered pages keyed by page index, kept so scrolling back to an already seen page reuses the
-    // surface instead of re-rendering (and flashing white)
+    // texture instead of re-rendering (and flashing white)
     pub(crate) render_cache: Rc<RefCell<crate::render_cache::RenderCache>>,
     // page indices with a render currently queued, to avoid scheduling duplicates
     pub(crate) render_inflight: Rc<RefCell<HashSet<i32>>>,
@@ -126,7 +127,7 @@ impl ObjectImpl for State {
             imp.render_waiters.borrow_mut().clear();
             crate::page::clear_full_renders(imp.render_client_id.get());
             // in-flight renders started at the old scale are now stale; bump so their completion
-            // drops out instead of caching an obsolete-scale surface
+            // drops out instead of caching an obsolete-scale texture
             imp.render_epoch.set(imp.render_epoch.get().wrapping_add(1));
         });
     }

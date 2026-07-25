@@ -1,3 +1,4 @@
+// Public state API for document loading, persistence, and rendering coordination.
 mod imp;
 use gtk::gio::prelude::*;
 use gtk::glib;

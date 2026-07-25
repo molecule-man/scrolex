@@ -1,17 +1,17 @@
-// Bounded, least-recently-used cache of rendered page surfaces. Capped by total
+// Bounded, least-recently-used cache of rendered page textures. Capped by total
 // pixel-buffer bytes so documents with very large pages can't exhaust memory.
 
 use std::collections::HashMap;
 
-use gtk::cairo::ImageSurface;
+use gtk::gdk;
+use gtk::prelude::TextureExt;
 
-// Default memory budget for cached full-resolution page surfaces. This tracks the resident-memory
-// plateau almost 1:1, so it's the main memory dial. It only needs to cover the active scrolling
-// working set (visible page plus prefetched neighbours).
+// Budget for the CPU-side texture buffers (GSK holds its own GPU copy). Covers the active scrolling
+// working set: visible page plus prefetched neighbours.
 const DEFAULT_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 
 struct Entry {
-    surface: ImageSurface,
+    texture: gdk::Texture,
     bytes: usize,
 }
 
@@ -54,10 +54,10 @@ impl RenderCache {
         self.evict();
     }
 
-    pub fn get(&mut self, page: i32) -> Option<ImageSurface> {
-        let surface = self.entries.get(&page)?.surface.clone();
+    pub fn get(&mut self, page: i32) -> Option<gdk::Texture> {
+        let texture = self.entries.get(&page)?.texture.clone();
         self.touch(page);
-        Some(surface)
+        Some(texture)
     }
 
     // Whether a page is cached, without affecting recency (used by prefetch to
@@ -76,10 +76,11 @@ impl RenderCache {
         self.budget_bytes.checked_div(avg).unwrap_or(0)
     }
 
-    pub fn insert(&mut self, page: i32, surface: ImageSurface) {
-        let bytes = (surface.stride() as usize) * (surface.height() as usize);
+    pub fn insert(&mut self, page: i32, texture: gdk::Texture) {
+        // 4 bytes/pixel (BGRx) - close enough to the resident buffer for the budget.
+        let bytes = (texture.width() as usize) * (texture.height() as usize) * 4;
         self.remove(page);
-        self.entries.insert(page, Entry { surface, bytes });
+        self.entries.insert(page, Entry { texture, bytes });
         self.order.push(page);
         self.total_bytes += bytes;
         self.evict();
@@ -120,43 +121,52 @@ impl RenderCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gtk::prelude::Cast;
 
-    fn surface(bytes_target: usize) -> ImageSurface {
-        // Rgb24 stride is 4 bytes/pixel; height 1 keeps stride == total bytes.
+    fn texture(bytes_target: usize) -> gdk::Texture {
+        // 4 bytes/pixel; height 1 keeps the tracked byte size == width * 4.
         let width = (bytes_target / 4) as i32;
-        ImageSurface::create(gtk::cairo::Format::Rgb24, width, 1).unwrap()
+        let bytes = gtk::glib::Bytes::from_owned(vec![0u8; (width * 4) as usize]);
+        gdk::MemoryTexture::new(
+            width,
+            1,
+            gdk::MemoryFormat::B8g8r8x8,
+            &bytes,
+            (width * 4) as usize,
+        )
+        .upcast()
     }
 
-    #[test]
+    #[gtk::test]
     fn evicts_least_recently_used_over_budget() {
         let mut cache = RenderCache::new(100);
-        cache.insert(1, surface(40));
-        cache.insert(2, surface(40));
+        cache.insert(1, texture(40));
+        cache.insert(2, texture(40));
         // 80 bytes used; inserting another 40 exceeds 100 and evicts page 1
-        cache.insert(3, surface(40));
+        cache.insert(3, texture(40));
 
         assert!(cache.get(1).is_none());
         assert!(cache.get(2).is_some());
         assert!(cache.get(3).is_some());
     }
 
-    #[test]
+    #[gtk::test]
     fn touch_on_get_protects_from_eviction() {
         let mut cache = RenderCache::new(100);
-        cache.insert(1, surface(40));
-        cache.insert(2, surface(40));
+        cache.insert(1, texture(40));
+        cache.insert(2, texture(40));
         // touch page 1 so page 2 becomes least-recently-used
         assert!(cache.get(1).is_some());
-        cache.insert(3, surface(40));
+        cache.insert(3, texture(40));
 
         assert!(cache.get(1).is_some());
         assert!(cache.get(2).is_none());
     }
 
-    #[test]
+    #[gtk::test]
     fn always_keeps_most_recent_even_if_over_budget() {
         let mut cache = RenderCache::new(10);
-        cache.insert(1, surface(40));
+        cache.insert(1, texture(40));
         assert!(cache.get(1).is_some());
     }
 }

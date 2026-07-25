@@ -1,3 +1,4 @@
+// Application window behavior, navigation, and viewport/render coordination.
 use std::cell::{Cell, RefCell};
 
 use futures::StreamExt;
