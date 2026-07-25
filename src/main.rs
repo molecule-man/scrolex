@@ -132,24 +132,14 @@ fn build_ui(app: &Application, args: &[OsString]) {
     ));
 
     if scrolex::emulate::config().is_some() {
-        state
-            .load(&gtk::gio::File::for_uri(scrolex::emulate::URI))
-            .unwrap_or_else(|err| {
-                window.show_error_dialog(&format!("Error loading emulated document: {err}"));
-            });
+        state.load(&gtk::gio::File::for_uri(scrolex::emulate::URI));
     } else if let Some(fname) = args
         .iter()
         .skip(1)
         .find(|a| !a.to_string_lossy().starts_with('-'))
     {
         match from_str_to_uri(fname) {
-            Ok(uri) => {
-                state
-                    .load(&gtk::gio::File::for_uri(&uri))
-                    .unwrap_or_else(|err| {
-                        window.show_error_dialog(&format!("Error loading file: {err}"));
-                    });
-            }
+            Ok(uri) => state.load(&gtk::gio::File::for_uri(&uri)),
             Err(err) => {
                 window.show_error_dialog(&format!(
                     "Invalid file name: {}. Error: {err}",

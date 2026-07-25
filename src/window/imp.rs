@@ -122,6 +122,10 @@ pub struct Window {
     pub toc_revealer: TemplateChild<gtk::Revealer>,
     #[template_child]
     pub toc_list: TemplateChild<gtk::ListBox>,
+    #[template_child]
+    pub loading_overlay: TemplateChild<gtk::Box>,
+    #[template_child]
+    pub loading_spinner: TemplateChild<gtk::Spinner>,
 
     // target page per outline row (index-aligned), None for non-navigable entries
     toc_pages: RefCell<Vec<Option<i32>>>,
@@ -895,10 +899,7 @@ impl Window {
                     return false;
                 };
 
-                let obj = imp.obj();
-                imp.state.load(&file).unwrap_or_else(|err| {
-                    obj.show_error_dialog(&format!("Error loading file: {err}"));
-                });
+                imp.state.load(&file);
                 true
             }
         ));
@@ -941,11 +942,7 @@ impl Window {
                 #[strong]
                 obj,
                 move |file| match file {
-                    Ok(file) => {
-                        state.load(&file).unwrap_or_else(|err| {
-                            obj.show_error_dialog(&format!("Error loading file: {err}"));
-                        });
-                    }
+                    Ok(file) => state.load(&file),
                     Err(err) => {
                         obj.show_error_dialog(&format!("Error opening file: {err}"));
                     }
@@ -955,7 +952,27 @@ impl Window {
     }
 
     #[template_callback]
+    fn on_load_started(&self) {
+        self.loading_spinner.start();
+        self.loading_overlay.set_visible(true);
+    }
+
+    fn hide_loading(&self) {
+        self.loading_overlay.set_visible(false);
+        self.loading_spinner.stop();
+    }
+
+    #[template_callback]
+    fn on_load_failed(&self, message: &str) {
+        self.hide_loading();
+        self.obj()
+            .show_error_dialog(&format!("Error loading file: {message}"));
+    }
+
+    #[template_callback]
     fn handle_document_load(&self, state: &State) {
+        self.hide_loading();
+
         let n_pages = state.n_pages() as u32;
         if n_pages == 0 {
             return;

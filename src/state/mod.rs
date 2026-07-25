@@ -1,7 +1,9 @@
 // Public state API for document loading, persistence, and rendering coordination.
 mod imp;
+use futures::channel::oneshot;
 use gtk::gio::prelude::*;
 use gtk::glib;
+use gtk::glib::clone;
 use gtk::prelude::ObjectExt;
 use gtk::subclass::prelude::*;
 
@@ -22,6 +24,18 @@ pub(crate) const PREVIEW_TARGET_BYTES: usize = 20 * 1024 * 1024 / 65;
 // Preview cache byte budget for a given number of resident previews.
 pub(crate) fn preview_cache_budget(pages: usize) -> usize {
     pages * PREVIEW_TARGET_BYTES
+}
+
+type FirstPageSize = Option<(f64, f64)>;
+
+fn document_size_bytes(f: &gtk::gio::File) -> i64 {
+    f.query_info(
+        "standard::size",
+        gtk::gio::FileQueryInfoFlags::NONE,
+        gtk::gio::Cancellable::NONE,
+    )
+    .map(|info| info.size())
+    .unwrap_or(-1)
 }
 
 glib::wrapper! {
@@ -51,23 +65,67 @@ impl State {
         page
     }
 
-    pub fn load(&self, f: &gtk::gio::File) -> io::Result<()> {
+    pub fn load(&self, f: &gtk::gio::File) {
         if self.n_pages() > 0 {
-            self.save()?;
+            if let Err(err) = self.save() {
+                log::warn!("could not save state before load: {err}");
+            }
         }
 
+        let seq = self.imp().load_seq.get().wrapping_add(1);
+        self.imp().load_seq.set(seq);
+
         let uri = f.uri();
-        // Stage and validate the candidate before touching the active document, so a failed load
-        // leaves the current document (and its in-flight render markers) intact. Staging fetches a
-        // remote file exactly once; the same bytes are validated here and committed for rendering
-        // below - no re-fetch, and no risk of validating different bytes than we render.
-        let Some(candidate) = crate::mupdf_render::stage_candidate(&uri) else {
-            return Err(io::Error::other("could not open document"));
-        };
-        let n_pages = candidate.page_count();
-        if n_pages == 0 {
-            return Err(io::Error::other("could not open document"));
-        }
+        let size_bytes = document_size_bytes(f);
+        self.emit_by_name::<()>("load-started", &[]);
+
+        // Stage and open the document off the main thread so a heavy file doesn't freeze the UI.
+        // A failed open leaves the current document (and its in-flight render markers) intact,
+        // since nothing below the commit runs until the open succeeds. Staging fetches a remote
+        // file exactly once; those bytes are the ones committed for rendering - no re-fetch.
+        let (tx, rx) =
+            oneshot::channel::<Option<(crate::mupdf_render::Candidate, i32, FirstPageSize)>>();
+        let uri_probe = uri.clone();
+        std::thread::spawn(move || {
+            let probed = crate::mupdf_render::stage_candidate(&uri_probe).and_then(|candidate| {
+                match candidate.probe() {
+                    Some((n_pages, first_page_size)) if n_pages > 0 => {
+                        Some((candidate, n_pages, first_page_size))
+                    }
+                    _ => None,
+                }
+            });
+            let _ = tx.send(probed);
+        });
+
+        glib::spawn_future_local(clone!(
+            #[weak(rename_to = state)]
+            self,
+            async move {
+                let probed = rx.await.ok().flatten();
+                if state.imp().load_seq.get() != seq {
+                    return; // a newer load superseded this one
+                }
+                let Some((candidate, n_pages, first_page_size)) = probed else {
+                    state.emit_by_name::<()>(
+                        "load-failed",
+                        &[&"could not open document".to_string()],
+                    );
+                    return;
+                };
+                state.commit_load(&uri, candidate, n_pages, first_page_size, size_bytes);
+            }
+        ));
+    }
+
+    fn commit_load(
+        &self,
+        uri: &str,
+        candidate: crate::mupdf_render::Candidate,
+        n_pages: i32,
+        first_page_size: FirstPageSize,
+        size_bytes: i64,
+    ) {
         // Committed to the new document: force every thread to reopen (the same path may have
         // changed on disk), publish the validated bytes for the render workers, then reset
         // per-document state.
@@ -100,7 +158,7 @@ impl State {
 
         self.emit_by_name::<()>("before-load", &[]);
 
-        let state_path = get_state_file_path(&uri).unwrap();
+        let state_path = get_state_file_path(uri).unwrap();
 
         self.imp().jump_stack.borrow_mut().reset();
         self.set_prev_page(0);
@@ -133,26 +191,6 @@ impl State {
             }
         }
 
-        self.log_document_info(f);
-
-        self.emit_by_name::<()>("loaded", &[]);
-
-        Ok(())
-    }
-
-    fn log_document_info(&self, f: &gtk::gio::File) {
-        let size_bytes = f
-            .query_info(
-                "standard::size",
-                gtk::gio::FileQueryInfoFlags::NONE,
-                gtk::gio::Cancellable::NONE,
-            )
-            .map(|info| info.size())
-            .unwrap_or(-1);
-
-        let n_pages = self.n_pages();
-        let first_page_size = crate::mupdf_render::page_size(&self.uri(), 0);
-
         log::info!(
             "Loaded document: {n_pages} pages, {size_bytes} bytes, first page {first_page_size:?} pt, \
              start page {}, zoom {}, crop {}",
@@ -160,6 +198,8 @@ impl State {
             self.zoom(),
             self.crop(),
         );
+
+        self.emit_by_name::<()>("loaded", &[]);
     }
 
     pub fn save(&self) -> io::Result<()> {

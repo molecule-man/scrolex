@@ -103,14 +103,21 @@ pub(crate) fn stage_candidate(uri: &str) -> Option<Candidate> {
 }
 
 impl Candidate {
-    // Page count of a fresh, side-effect-free open; 0 if unopenable (a failed load).
-    pub(crate) fn page_count(&self) -> i32 {
+    // One open reading both the page count and the first page's size, so a load needs a single
+    // document open (safe to run off the main thread). None if unopenable.
+    pub(crate) fn probe(&self) -> Option<(i32, Option<(f64, f64)>)> {
         if let Some(cfg) = crate::emulate::config() {
-            return cfg.pages;
+            return Some((cfg.pages, Some(cfg.page_pt)));
         }
-        Document::open(self.path.as_path())
-            .and_then(|d| d.page_count())
-            .unwrap_or(0)
+        let _ctx = Colorspace::device_bgr();
+        let doc = Document::open(self.path.as_path()).ok()?;
+        let n_pages = doc.page_count().ok()?;
+        let first_page_size = doc
+            .load_page(0)
+            .ok()
+            .and_then(|page| page.bounds().ok())
+            .map(|b| ((b.x1 - b.x0) as f64, (b.y1 - b.y0) as f64));
+        Some((n_pages, first_page_size))
     }
 
     // Publish the validated temp so workers render these exact bytes. Call after invalidate().
@@ -370,16 +377,17 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
     #[test]
     fn page_count_and_size_read_the_document() {
         let uri = margin_pdf_uri();
-        assert_eq!(stage_candidate(&uri).unwrap().page_count(), 1);
+        assert_eq!(
+            stage_candidate(&uri).unwrap().probe(),
+            Some((1, Some((200.0, 200.0))))
+        );
         assert_eq!(page_size(&uri, 0), Some((200.0, 200.0)));
         // out-of-range / unopenable degrade rather than panic
         assert_eq!(page_size(&uri, 99), None);
-        // a local uri always stages (the path exists as a value); an unopenable file counts 0
+        // a local uri always stages (the path exists as a value); an unopenable file fails to probe
         assert_eq!(
-            stage_candidate("file:///no/such/file.pdf")
-                .unwrap()
-                .page_count(),
-            0
+            stage_candidate("file:///no/such/file.pdf").unwrap().probe(),
+            None
         );
     }
 

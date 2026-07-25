@@ -28,6 +28,13 @@
 	min-height: 1px;
 }
 
+.loading-overlay {
+	padding: 24px 32px;
+	border-radius: 12px;
+	background-color: alpha(@window_bg_color, 0.9);
+	box-shadow: 0 2px 12px alpha(black, 0.3);
+}
+
 .toc-panel {
 	background-color: @window_bg_color;
 	border-right: 1px solid @borders;
