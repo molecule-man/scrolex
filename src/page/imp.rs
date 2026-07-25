@@ -1,3 +1,4 @@
+// Page widget rendering, preview scheduling, and document interaction.
 #![expect(unused_lifetimes)]
 
 use std::cell::{Cell, RefCell};
@@ -5,15 +6,15 @@ use std::rc::Rc;
 use std::sync::OnceLock;
 
 use futures::channel::oneshot;
-use gtk::cairo::{Context, FontSlant, FontWeight, ImageSurface};
+use gtk::cairo::{FontSlant, FontWeight};
 use gtk::gdk::prelude::*;
-use gtk::gdk::BUTTON_PRIMARY;
+use gtk::gdk::{MemoryFormat, MemoryTexture, BUTTON_PRIMARY, RGBA};
 use gtk::glib;
 use gtk::glib::clone;
 use gtk::glib::subclass::{prelude::*, Signal};
+use gtk::graphene;
 use gtk::prelude::*;
 use gtk::subclass::prelude::*;
-use gtk::DrawingArea;
 use once_cell::sync::Lazy;
 
 use super::Rectangle;
@@ -126,7 +127,7 @@ pub struct Page {
 impl ObjectSubclass for Page {
     const NAME: &'static str = "Page";
     type Type = super::Page;
-    type ParentType = DrawingArea;
+    type ParentType = gtk::Widget;
 }
 
 #[glib::derived_properties]
@@ -134,7 +135,6 @@ impl ObjectImpl for Page {
     fn constructed(&self) {
         self.parent_constructed();
 
-        self.setup_draw_function();
         self.setup_scale_tracking();
         self.setup_state_listeners();
         self.setup_text_selection();
@@ -153,55 +153,41 @@ impl ObjectImpl for Page {
     }
 }
 
-impl WidgetImpl for Page {}
-impl DrawingAreaImpl for Page {}
+impl WidgetImpl for Page {
+    fn snapshot(&self, snapshot: &gtk::Snapshot) {
+        let Some(page) = self.page_info() else {
+            return;
+        };
+
+        // Hold off rendering until the final device scale factor is known (set just after map);
+        // otherwise the first render uses a provisional scale and is immediately re-rendered. Paint
+        // blank meanwhile - the deferred redraw renders at the real scale.
+        if !self.scale_known.get() {
+            let obj = self.obj();
+            let (w, h) = (obj.width() as f32, obj.height() as f32);
+            if w > 0.0 && h > 0.0 {
+                snapshot.append_color(&white(), &graphene::Rect::new(0.0, 0.0, w, h));
+            }
+            return;
+        }
+
+        if self.obj().state().multithread_rendering() {
+            self.multithread_snapshot(snapshot, &page);
+        } else {
+            self.render_snapshot(snapshot, &page);
+        }
+
+        let selection = self.selection_rects.borrow();
+        if !selection.is_empty() {
+            self.snapshot_selection_overlay(snapshot, &page, &selection);
+        }
+        self.snapshot_search_overlay(snapshot, &page);
+    }
+}
 
 impl Page {
-    fn setup_draw_function(&self) {
-        let obj = self.obj();
-
-        obj.set_draw_func(clone!(
-            #[strong]
-            obj,
-            #[weak(rename_to = imp)]
-            self,
-            move |_, cr, _width, _height| {
-                let Some(page) = imp.page_info() else {
-                    return;
-                };
-
-                // Hold off rendering until the final device scale factor is known (set just after
-                // map); otherwise the first render uses a provisional scale and is immediately
-                // re-rendered. Paint blank meanwhile - the deferred redraw renders at the real
-                // scale.
-                if !imp.scale_known.get() {
-                    cr.set_source_rgb(1.0, 1.0, 1.0);
-                    cr.paint().expect("Failed to fill");
-                    return;
-                }
-
-                cr.save().expect("Failed to save");
-
-                if obj.state().multithread_rendering() {
-                    imp.multithread_render_to_cairo(cr, &page);
-                } else {
-                    imp.render_to_cairo(cr, &page);
-                }
-
-                cr.restore().expect("Failed to restore");
-
-                let selection = imp.selection_rects.borrow();
-                if !selection.is_empty() {
-                    imp.render_selection_overlay(cr, &page, &selection);
-                }
-
-                imp.render_search_overlay(cr, &page);
-            }
-        ));
-    }
-
-    // Mark the device scale factor as known once it has settled after map, so the draw function can
-    // start rendering at the final scale.
+    // Mark the device scale factor as known once it has settled after map, so rendering starts at
+    // the final scale.
     fn setup_scale_tracking(&self) {
         let obj = self.obj();
 
@@ -226,8 +212,8 @@ impl Page {
         });
 
         // A scale-factor change (e.g. moving to a monitor with a different
-        // scale) is authoritative: the current cached surface is now stale, and
-        // the draw's dimension check re-renders it at the new scale.
+        // scale) is authoritative: the current cached texture is now stale, and
+        // the snapshot's dimension check re-renders it at the new scale.
         obj.connect_scale_factor_notify(|page| {
             page.imp().scale_known.set(true);
             page.queue_draw();
@@ -489,7 +475,7 @@ impl Page {
             .copied()
     }
 
-    fn render_to_cairo(&self, cr: &Context, page: &PageInfo) {
+    fn render_snapshot(&self, snapshot: &gtk::Snapshot, page: &PageInfo) {
         let start = std::time::Instant::now();
         let obj = self.obj();
         let scale_factor = obj.scale_factor() as f64;
@@ -497,15 +483,16 @@ impl Page {
         let bbox = self.get_bbox(page, obj.crop());
         let scale = obj.zoom();
 
-        let surface = crate::mupdf_render::render_page_surface(
+        match render_page_texture(
             &obj.uri(),
             page.index,
             scale,
             scale_factor,
             Some((page.width, page.height)),
-        )
-        .unwrap_or_else(|| white_surface(Some((page.width, page.height)), scale, scale_factor));
-        draw_surface(cr, &surface, &bbox, scale);
+        ) {
+            Some(texture) => self.append_page_texture(snapshot, texture.upcast_ref(), &bbox, scale),
+            None => append_white(snapshot, &bbox, scale),
+        }
 
         let elapsed = start.elapsed();
         log::debug!(
@@ -519,31 +506,90 @@ impl Page {
         }
     }
 
+    // Present the page texture 1:1 with device pixels, cropped to `bbox` (see page_footprint).
+    fn append_page_texture(
+        &self,
+        snapshot: &gtk::Snapshot,
+        texture: &gtk::gdk::Texture,
+        bbox: &Rectangle,
+        scale: f64,
+    ) {
+        let dsf = self.obj().scale_factor().max(1) as f64;
+        let ((ox, oy), (fw, fh)) =
+            page_footprint((texture.width(), texture.height()), bbox, scale, dsf);
+        let (bw, bh) = bbox.size();
+        snapshot.push_clip(&graphene::Rect::new(
+            0.0,
+            0.0,
+            (bw * scale) as f32,
+            (bh * scale) as f32,
+        ));
+        snapshot.save();
+        snapshot.translate(&graphene::Point::new(ox as f32, oy as f32));
+        snapshot.append_texture(
+            texture,
+            &graphene::Rect::new(0.0, 0.0, fw as f32, fh as f32),
+        );
+        snapshot.restore();
+        snapshot.pop();
+    }
+
+    // Blurry stand-in while the full render lands: a low-res preview stretched over the page.
+    // Deliberately upscaled, so no 1:1 snapping.
+    fn append_preview_texture(
+        &self,
+        snapshot: &gtk::Snapshot,
+        texture: &gtk::gdk::Texture,
+        page: &PageInfo,
+        bbox: &Rectangle,
+        scale: f64,
+    ) {
+        let (bw, bh) = bbox.size();
+        let clip = graphene::Rect::new(0.0, 0.0, (bw * scale) as f32, (bh * scale) as f32);
+        snapshot.push_clip(&clip);
+        snapshot.save();
+        snapshot.translate(&graphene::Point::new(
+            (-bbox.x1 * scale) as f32,
+            (-bbox.y1 * scale) as f32,
+        ));
+        let full = graphene::Rect::new(
+            0.0,
+            0.0,
+            (page.width * scale) as f32,
+            (page.height * scale) as f32,
+        );
+        snapshot.append_texture(texture, &full);
+        snapshot.restore();
+        snapshot.pop();
+    }
+
     // Fill the selection's per-line highlight rects, using the same zoom/crop transform as the page
     // render so they land on the words.
-    fn render_selection_overlay(&self, cr: &Context, page: &PageInfo, rects: &[Rectangle]) {
+    fn snapshot_selection_overlay(
+        &self,
+        snapshot: &gtk::Snapshot,
+        page: &PageInfo,
+        rects: &[Rectangle],
+    ) {
         let bbox = self.get_bbox(page, self.obj().crop());
         let scale = self.obj().zoom();
 
-        cr.save().expect("Failed to save");
-        if bbox.x1 != 0.0 || bbox.y1 != 0.0 {
-            cr.translate(-bbox.x1 * scale, -bbox.y1 * scale);
-        }
-        cr.scale(scale, scale);
-        cr.set_source_rgba(0.5, 0.8, 0.9, 0.5);
+        snapshot.save();
+        overlay_transform(snapshot, &bbox, scale);
+        let color = RGBA::new(0.5, 0.8, 0.9, 0.5);
         for rect in rects {
             let (w, h) = rect.size();
-            cr.rectangle(rect.x1, rect.y1, w, h);
+            snapshot.append_color(
+                &color,
+                &graphene::Rect::new(rect.x1 as f32, rect.y1 as f32, w as f32, h as f32),
+            );
         }
-        cr.fill().expect("Failed to fill selection");
-        cr.restore().expect("Failed to restore");
-        // reset to opaque black so a later fill/mask on this context isn't tinted
-        cr.set_source_rgb(0.0, 0.0, 0.0);
+        snapshot.restore();
     }
 
     // Paint match rects for this page: matches yellow, the current match orange. Same zoom/crop
     // transform as the page render, so highlights land on the words.
-    fn render_search_overlay(&self, cr: &Context, page: &PageInfo) {
+    fn snapshot_search_overlay(&self, snapshot: &gtk::Snapshot, page: &PageInfo) {
         let obj = self.obj();
         let index = obj.index();
         let search = obj.state().search();
@@ -558,32 +604,29 @@ impl Page {
         let bbox = self.get_bbox(page, obj.crop());
         let scale = obj.zoom();
 
-        cr.save().expect("Failed to save");
-        if bbox.x1 != 0.0 || bbox.y1 != 0.0 {
-            cr.translate(-bbox.x1 * scale, -bbox.y1 * scale);
-        }
-        cr.scale(scale, scale);
+        snapshot.save();
+        overlay_transform(snapshot, &bbox, scale);
 
         // Each match may span multiple lines (one rect each); the current match is orange, others
-        // yellow. Fill per match so a multi-line match shares one colour.
+        // yellow.
         for (i, rects) in matches.iter().enumerate() {
-            if search.current == Some((index, i)) {
-                cr.set_source_rgba(1.0, 0.55, 0.0, 0.45);
+            let color = if search.current == Some((index, i)) {
+                RGBA::new(1.0, 0.55, 0.0, 0.45)
             } else {
-                cr.set_source_rgba(1.0, 0.9, 0.0, 0.4);
-            }
+                RGBA::new(1.0, 0.9, 0.0, 0.4)
+            };
             for rect in rects {
                 let (w, h) = rect.size();
-                cr.rectangle(rect.x1, rect.y1, w, h);
+                snapshot.append_color(
+                    &color,
+                    &graphene::Rect::new(rect.x1 as f32, rect.y1 as f32, w as f32, h as f32),
+                );
             }
-            cr.fill().expect("Failed to fill");
         }
-        cr.restore().expect("Failed to restore");
-        // reset to opaque black so a later fill/mask on this context isn't tinted
-        cr.set_source_rgb(0.0, 0.0, 0.0);
+        snapshot.restore();
     }
 
-    fn multithread_render_to_cairo(&self, cr: &Context, page: &PageInfo) {
+    fn multithread_snapshot(&self, snapshot: &gtk::Snapshot, page: &PageInfo) {
         let obj = self.obj();
         let page_num = page.index;
 
@@ -596,16 +639,16 @@ impl Page {
 
         let cache = obj.state().render_cache();
         let cached = cache.borrow_mut().get(page_num);
-        if let Some(surface) = cached {
-            if (surface.width(), surface.height()) == expected {
+        if let Some(texture) = cached {
+            if (texture.width(), texture.height()) == expected {
                 log::debug!("draw page {page_num}: cache hit");
                 let bbox = self.get_bbox(page, obj.crop());
-                draw_surface(cr, &surface, &bbox, scale);
+                self.append_page_texture(snapshot, &texture, &bbox, scale);
                 self.prefetch_previews(page_num);
                 self.prefetch_next(page_num);
                 return;
             }
-            // dimensions changed (e.g. zoom), the cached surface is stale
+            // dimensions changed (e.g. zoom), the cached texture is stale
             log::debug!("draw page {page_num}: cache stale (zoom/scale changed)");
             cache.borrow_mut().remove(page_num);
         }
@@ -624,16 +667,16 @@ impl Page {
             .borrow_mut()
             .insert(page_num, obj.downgrade());
 
-        // show a low-res preview (upscaled) if we have one, otherwise white
+        // show a low-res preview (upscaled) if we have one, otherwise a loading placeholder
         let bbox = self.get_cached_bbox(page, obj.crop());
         let preview = obj.state().preview_cache().borrow_mut().get(page_num);
         if let Some(preview) = preview {
             log::debug!("draw page {page_num}: cache miss, showing preview");
-            draw_preview(cr, &preview, &bbox, scale, width);
+            self.append_preview_texture(snapshot, &preview, page, &bbox, scale);
         } else {
             log::debug!("draw page {page_num}: cache miss (loading placeholder)");
             let (w, h) = bbox.size();
-            draw_loading_placeholder(cr, w * scale, h * scale);
+            append_loading_placeholder(snapshot, w * scale, h * scale);
         }
 
         // prefetch a wider window of previews and queue this page's own preview at the highest
@@ -688,8 +731,8 @@ impl Page {
         let obj = self.obj();
         let uri = obj.uri();
         let client = obj.state().render_client_id();
-        // Page size (points) from the main-thread doc, so the worker sizes its surface to exactly
-        // what the render cache expects (see mupdf_render::render_page_surface).
+        // Page size (points) from the main-thread doc, so the worker sizes its pixel buffer to
+        // exactly what the render cache expects (see mupdf_render::render_page_pixels).
         let page_pt = crate::mupdf_render::page_size(&uri, page_num);
         log::trace!("Scheduling render of page {page_num}");
 
@@ -704,7 +747,7 @@ impl Page {
             // Stale completion - this window loaded/reloaded a document, or its scale changed (zoom),
             // since this was scheduled? Those paths already cleared this window's inflight/waiter
             // entries, so bail before touching the current ones: mutating them here would drop the
-            // live render's marker/waiter and cache an obsolete surface. Both epochs are per-window,
+            // live render's marker/waiter and cache an obsolete texture. Both epochs are per-window,
             // so another window's load or zoom never invalidates this render.
             if state.doc_epoch() != doc_epoch || state.render_epoch() != epoch {
                 return;
@@ -727,8 +770,11 @@ impl Page {
                 return;
             };
 
-            let surface = rendered.into_surface(scale_factor);
-            state.render_cache().borrow_mut().insert(page_num, surface);
+            let texture = rendered.into_texture();
+            state
+                .render_cache()
+                .borrow_mut()
+                .insert(page_num, texture.upcast());
 
             log::debug!(
                 "memory: rss={:.0}MB preview_scale={:.3} render_cache={:?} preview_cache={:?}",
@@ -879,8 +925,11 @@ impl Page {
                 state.set_preview_scale(new_scale);
             }
 
-            let surface = rendered.into_surface(1.0);
-            state.preview_cache().borrow_mut().insert(page_num, surface);
+            let texture = rendered.into_texture();
+            state
+                .preview_cache()
+                .borrow_mut()
+                .insert(page_num, texture.upcast());
 
             // repaint the waiting widget, but leave the waiter registered so the
             // full render still repaints it when it lands
@@ -919,45 +968,72 @@ impl Page {
     }
 }
 
-pub fn draw_surface(cr: &Context, surface: &ImageSurface, bbox: &Rectangle, scale: f64) {
-    // Snap the paste position to a whole device pixel; a fractional offset resamples and blurs the
-    // 1:1 surface (crop's bbox margins would otherwise land it off-grid).
-    let (device_scale, _) = surface.device_scale();
-    let snap = |v: f64| (v * device_scale).round() / device_scale;
-    cr.set_source_surface(surface, snap(-bbox.x1 * scale), snap(-bbox.y1 * scale))
-        .unwrap();
-    let (w, h) = bbox.size();
-    cr.rectangle(0.0, 0.0, w * scale, h * scale);
-    cr.clip();
-    cr.paint().unwrap();
-
-    // Release the surface data
-    cr.set_source_rgb(0.0, 0.0, 0.0);
+fn white() -> RGBA {
+    RGBA::new(1.0, 1.0, 1.0, 1.0)
 }
 
-// Draw a low-res preview surface upscaled to fill the same area a full render at `scale` would
-// occupy (blurry stand-in while the full render lands). The preview is a full-page render, so its
-// render scale is recovered from the full page width (not the cropped bbox) and its device scale;
-// a cache holding previews rendered at different (adaptive) scales still upscales each correctly.
-fn draw_preview(
-    cr: &Context,
-    preview: &ImageSurface,
+// Fallback when a page can't be rendered.
+fn append_white(snapshot: &gtk::Snapshot, bbox: &Rectangle, scale: f64) {
+    let (w, h) = bbox.size();
+    snapshot.append_color(
+        &white(),
+        &graphene::Rect::new(0.0, 0.0, (w * scale) as f32, (h * scale) as f32),
+    );
+}
+
+// Crop offset snapped to the device-pixel grid + 1:1 logical footprint (texture px / device scale).
+// Off-grid or scaled placement makes the GPU resample the texture and blur it.
+fn page_footprint(
+    tex_px: (i32, i32),
     bbox: &Rectangle,
     scale: f64,
-    page_width: f64,
-) {
-    let (device_scale, _) = preview.device_scale();
-    let preview_scale = if page_width > 0.0 {
-        preview.width() as f64 / (page_width * device_scale)
-    } else {
-        scale
-    };
-    let upscale = scale / preview_scale;
-    cr.save().unwrap();
-    cr.scale(upscale, upscale);
-    draw_surface(cr, preview, bbox, preview_scale);
-    cr.restore().unwrap();
-    cr.set_source_rgb(0.0, 0.0, 0.0);
+    dsf: f64,
+) -> ((f64, f64), (f64, f64)) {
+    let snap = |v: f64| (v * dsf).round() / dsf;
+    (
+        (snap(-bbox.x1 * scale), snap(-bbox.y1 * scale)),
+        (tex_px.0 as f64 / dsf, tex_px.1 as f64 / dsf),
+    )
+}
+
+// Zoom + crop offset, so overlay rects in page points land on the render.
+fn overlay_transform(snapshot: &gtk::Snapshot, bbox: &Rectangle, scale: f64) {
+    if bbox.x1 != 0.0 || bbox.y1 != 0.0 {
+        snapshot.translate(&graphene::Point::new(
+            (-bbox.x1 * scale) as f32,
+            (-bbox.y1 * scale) as f32,
+        ));
+    }
+    snapshot.scale(scale as f32, scale as f32);
+}
+
+// Synchronous main-thread render, used before the background pipeline engages.
+fn render_page_texture(
+    uri: &str,
+    page_num: i32,
+    scale: f64,
+    dsf: f64,
+    page_pt: Option<(f64, f64)>,
+) -> Option<MemoryTexture> {
+    if let Some(cfg) = crate::emulate::config() {
+        let (data, width, height, stride) =
+            crate::emulate::pixels(cfg, page_num, scale, dsf, false);
+        return Some(texture_from_raw(data, width, height, stride));
+    }
+    let px = crate::mupdf_render::render_page_pixels(uri, page_num, scale, dsf, page_pt)?;
+    Some(texture_from_raw(px.data, px.width, px.height, px.stride))
+}
+
+// Pixels are cairo Rgb24 (BGRx); the x8 format ignores the padding byte.
+fn texture_from_raw(data: Vec<u8>, width: i32, height: i32, stride: i32) -> MemoryTexture {
+    let bytes = glib::Bytes::from_owned(data);
+    MemoryTexture::new(
+        width,
+        height,
+        MemoryFormat::B8g8r8x8,
+        &bytes,
+        stride as usize,
+    )
 }
 
 // Steer the preview render scale toward two budgets at once, from what the last preview render (at
@@ -981,7 +1057,9 @@ fn adapt_preview_scale(cur_scale: f64, render_ms: u128, bytes: usize) -> f64 {
         .clamp(PREVIEW_MIN_SCALE, PREVIEW_MAX_SCALE)
 }
 
-fn draw_loading_placeholder(cr: &Context, width: f64, height: f64) {
+// Cairo node because it draws text; rare enough to stay off the scroll hot path.
+fn append_loading_placeholder(snapshot: &gtk::Snapshot, width: f64, height: f64) {
+    let cr = snapshot.append_cairo(&graphene::Rect::new(0.0, 0.0, width as f32, height as f32));
     cr.rectangle(0.0, 0.0, width, height);
     cr.set_source_rgb(1.0, 1.0, 1.0);
     cr.fill().expect("Failed to fill");
@@ -997,14 +1075,11 @@ fn draw_loading_placeholder(cr: &Context, width: f64, height: f64) {
         cr.set_source_rgb(0.6, 0.6, 0.6);
         let _ = cr.show_text(label);
     }
-
-    // reset to opaque black so a later fill/mask on this context isn't tinted grey
-    cr.set_source_rgb(0.0, 0.0, 0.0);
 }
 
-// A rendered page as raw pixels. Rendering happens on a background thread, and
-// `ImageSurface` is not `Send`, so the pixels cross the thread boundary as a
-// plain buffer and the surface is rebuilt on the main thread.
+// A rendered page as raw pixels. Rendering happens on a background thread, and GDK textures aren't
+// `Send`, so the pixels cross the thread boundary as a plain buffer and the texture is built on the
+// main thread.
 #[derive(Debug)]
 struct RenderedPage {
     data: Box<[u8]>,
@@ -1015,32 +1090,9 @@ struct RenderedPage {
 }
 
 impl RenderedPage {
-    fn into_surface(self, device_scale_factor: f64) -> ImageSurface {
-        let surface = ImageSurface::create_for_data(
-            self.data,
-            gtk::cairo::Format::Rgb24,
-            self.width,
-            self.height,
-            self.stride,
-        )
-        .expect("Failed to create image surface");
-        surface.set_device_scale(device_scale_factor, device_scale_factor);
-        surface
+    fn into_texture(self) -> MemoryTexture {
+        texture_from_raw(self.data.into_vec(), self.width, self.height, self.stride)
     }
-}
-
-// White page-sized surface for when MuPDF can't render a page: keeps the pipeline fed with a
-// correctly-sized surface (so the render cache's dimension check passes) instead of looping on a miss.
-fn white_surface(page_pt: Option<(f64, f64)>, scale: f64, dsf: f64) -> ImageSurface {
-    let (w, h) = page_pt.unwrap_or((1.0, 1.0));
-    let cw = ((w * scale * dsf) as i32).max(1);
-    let ch = ((h * scale * dsf) as i32).max(1);
-    let surface = ImageSurface::create(gtk::cairo::Format::Rgb24, cw, ch).expect("surface");
-    surface.set_device_scale(dsf, dsf);
-    let cr = Context::new(&surface).expect("context");
-    cr.set_source_rgb(1.0, 1.0, 1.0);
-    cr.paint().expect("paint");
-    surface
 }
 
 fn request_render(
@@ -1083,7 +1135,7 @@ fn request_render(
         priority.label()
     );
 
-    // Send the raw buffer; the ImageSurface is rebuilt from it on the main thread.
+    // Send the raw buffer; the texture is built from it on the main thread.
     let rendered = match pixels {
         Some(px) => RenderedPage {
             data: px.data.into_boxed_slice(),
@@ -1220,6 +1272,32 @@ mod tests {
         assert_eq!(preview_window(43), 21); // big pages: clamp to capacity/2 (no thrash)
         assert_eq!(preview_window(1), 1); // room for almost nothing, still make progress
         assert_eq!(preview_window(1000), PREVIEW_WINDOW); // tiny pages: capped at full window
+    }
+
+    #[test]
+    fn page_footprint_maps_texture_1to1_at_integer_scale() {
+        // dsf=1, no crop: origin at 0, footprint == texture pixels (the 1:1 sharpness invariant)
+        let full = Rectangle::new(0.0, 0.0, 400.0, 600.0);
+        assert_eq!(
+            page_footprint((800, 1200), &full, 1.0, 1.0),
+            ((0.0, 0.0), (800.0, 1200.0))
+        );
+    }
+
+    #[test]
+    fn page_footprint_snaps_crop_offset_to_device_grid() {
+        // fractional crop margins would land the 1:1 texture off-grid and blur it; snap them
+        let cropped = Rectangle::new(3.3, 2.6, 400.0, 600.0);
+        // dsf=1 -> whole-pixel grid
+        assert_eq!(
+            page_footprint((800, 1200), &cropped, 1.0, 1.0).0,
+            (-3.0, -3.0)
+        );
+        // dsf=2 -> half-pixel grid, footprint halves
+        assert_eq!(
+            page_footprint((800, 1200), &cropped, 1.0, 2.0),
+            ((-3.5, -2.5), (400.0, 600.0))
+        );
     }
 
     const EPSILON: f64 = 0.0001;

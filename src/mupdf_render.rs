@@ -171,7 +171,7 @@ pub fn with_doc<T>(uri: &str, f: impl FnOnce(&Document) -> Option<T>) -> Option<
     })
 }
 
-// One page's raw pixels (cairo Rgb24/BGRx) — shipped from a worker since ImageSurface isn't Send.
+// One page's raw pixels (cairo Rgb24/BGRx). Shipped from a worker since ImageSurface isn't Send.
 pub struct PagePixels {
     pub data: Vec<u8>,
     pub width: i32,
@@ -180,7 +180,7 @@ pub struct PagePixels {
 }
 
 // Page pixels at `scale`*`dsf`, or None if unrenderable. `page_pt` sizes the buffer to match the
-// render cache's check — MuPDF's pixmap rounding differs ~1px, which would look endlessly stale.
+// render cache's check - MuPDF's pixmap rounding differs ~1px, which would look endlessly stale.
 // None → size from MuPDF bounds (bench only).
 pub fn render_page_pixels(
     uri: &str,
@@ -216,8 +216,7 @@ pub fn render_page_pixels(
     })
 }
 
-// `render_page_pixels` as an ImageSurface, for callers that draw it (sync paint, thumbnails) or scan
-// it (content_bbox).
+// `render_page_pixels` as an ImageSurface, for scanning its pixels (content_bbox).
 pub fn render_page_surface(
     uri: &str,
     page_num: i32,

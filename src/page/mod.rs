@@ -4,7 +4,6 @@ mod page_number_imp;
 
 pub(crate) use imp::clear_all_renders;
 pub(crate) use imp::clear_full_renders;
-pub use imp::draw_surface;
 pub(crate) use imp::set_render_threads;
 pub(crate) use imp::set_wanted_pages;
 pub(crate) use imp::PREVIEW_INITIAL_SCALE;
@@ -56,7 +55,7 @@ impl PageNumber {
 
 glib::wrapper! {
     pub struct Page(ObjectSubclass<imp::Page>)
-        @extends gtk::DrawingArea, gtk::Widget,
+        @extends gtk::Widget,
         @implements gtk::Accessible, gtk::Buildable, gtk::ConstraintTarget;
 }
 

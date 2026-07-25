@@ -1,4 +1,4 @@
-// Criterion benchmarks for document rendering and cached-surface drawing.
+// Criterion benchmarks for document rendering.
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use std::hint::black_box;
 
@@ -34,21 +34,6 @@ pub fn bench_render_surface(c: &mut Criterion) {
             })
         });
     }
-
-    let surface =
-        scrolex::mupdf_render::render_page_surface(&uri, page_number, 1.0, 1.0, None).unwrap();
-    let cr = gtk::cairo::Context::new(&surface).unwrap();
-    let bbox = scrolex::page::Rectangle::from(cr.clip_extents().unwrap());
-    cr.set_source_rgb(1.0, 1.0, 1.0);
-
-    group.bench_function(
-        format!("draw pre-rendered {pdf_path} page {page_number}"),
-        |b| {
-            b.iter(|| {
-                scrolex::page::draw_surface(&cr, &surface, &bbox, 1.0);
-            })
-        },
-    );
 
     group.finish();
 }
