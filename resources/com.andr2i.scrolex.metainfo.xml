@@ -20,6 +20,20 @@
   </developer>
   <content_rating type="oars-1.1"/>
   <releases>
-    <release version="@VERSION@" date="@DATE@"/>
+    <release version="0.7.1" date="2026-07-25">
+      <url>https://github.com/molecule-man/scrolex/releases/tag/0.7.1</url>
+    </release>
+    <release version="0.7.0" date="2026-07-24">
+      <url>https://github.com/molecule-man/scrolex/releases/tag/0.7.0</url>
+    </release>
+    <release version="0.6.0" date="2026-07-22">
+      <url>https://github.com/molecule-man/scrolex/releases/tag/0.6.0</url>
+    </release>
+    <release version="0.5.1" date="2026-07-10">
+      <url>https://github.com/molecule-man/scrolex/releases/tag/0.5.1</url>
+    </release>
+    <release version="0.5.0" date="2026-07-09">
+      <url>https://github.com/molecule-man/scrolex/releases/tag/0.5.0</url>
+    </release>
   </releases>
 </component>
