@@ -33,10 +33,17 @@ jobs:
         shell: bash
         run: |
           metainfo=resources/com.andr2i.scrolex.metainfo.xml
-          if ! grep -q "<release version=\"$VERSION\"" "$metainfo"; then
-            echo "$metainfo has no <release version=\"$VERSION\"> entry" >&2
-            exit 1
-          fi
+          case "$VERSION" in
+            *-*)
+              echo "$VERSION is a pre-release; not expected in the metainfo"
+              ;;
+            *)
+              if ! grep -q "<release version=\"$VERSION\"" "$metainfo"; then
+                echo "$metainfo has no <release version=\"$VERSION\"> entry" >&2
+                exit 1
+              fi
+              ;;
+          esac
       - name: Create GitHub release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
