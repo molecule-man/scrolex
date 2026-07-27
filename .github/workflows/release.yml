@@ -29,6 +29,14 @@ jobs:
             echo "Cargo.toml version ($VERSION) does not match tag (${{ github.ref_name }})" >&2
             exit 1
           fi
+      - name: Check that the metainfo has a release entry for this version
+        shell: bash
+        run: |
+          metainfo=resources/com.andr2i.scrolex.metainfo.xml
+          if ! grep -q "<release version=\"$VERSION\"" "$metainfo"; then
+            echo "$metainfo has no <release version=\"$VERSION\"> entry" >&2
+            exit 1
+          fi
       - name: Create GitHub release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

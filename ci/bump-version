@@ -1,0 +1,68 @@
+#!/bin/sh
+set -eu
+
+usage() {
+	cat >&2 <<'EOF'
+usage: ci/bump-version <version> [date]
+
+  version  MAJOR.MINOR.PATCH, optionally with a pre-release suffix (0.8.0-rc1)
+  date     release date for the metainfo entry, YYYY-MM-DD (default: today)
+EOF
+	exit 2
+}
+
+[ $# -ge 1 ] && [ $# -le 2 ] || usage
+version=$1
+date=${2:-$(date +%F)}
+
+if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'; then
+	echo "bump-version: '$version' is not a valid version" >&2
+	exit 1
+fi
+if [ "$(date -d "$date" +%F 2>/dev/null)" != "$date" ]; then
+	echo "bump-version: '$date' is not a valid YYYY-MM-DD date" >&2
+	exit 1
+fi
+
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+cd "$root"
+
+metainfo=resources/com.andr2i.scrolex.metainfo.xml
+for f in Cargo.toml Cargo.lock "$metainfo"; do
+	[ -f "$f" ] || { echo "bump-version: $f not found" >&2; exit 1; }
+done
+
+previous=$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -1)
+repository=$(sed -n 's/^repository *= *"\(.*\)"/\1/p' Cargo.toml | head -1)
+[ -n "$repository" ] || { echo "bump-version: no repository in Cargo.toml" >&2; exit 1; }
+
+awk -v v="$version" '
+	/^\[/ { in_package = ($0 == "[package]") }
+	in_package && /^version *=/ && !seen { print "version = \"" v "\""; seen = 1; next }
+	{ print }
+' Cargo.toml > Cargo.toml.bump && mv Cargo.toml.bump Cargo.toml
+
+awk -v v="$version" '
+	after_name && /^version *=/ { print "version = \"" v "\""; after_name = 0; next }
+	{ after_name = ($0 == "name = \"scrolex\""); print }
+' Cargo.lock > Cargo.lock.bump && mv Cargo.lock.bump Cargo.lock
+
+if grep -q "<release version=\"$version\"" "$metainfo"; then
+	metainfo_note="already listed $version, left alone"
+else
+	awk -v v="$version" -v d="$date" -v url="$repository" '
+		{ print }
+		/<releases>/ && !seen {
+			printf "    <release version=\"%s\" date=\"%s\">\n", v, d
+			printf "      <url>%s/releases/tag/%s</url>\n", url, v
+			print  "    </release>"
+			seen = 1
+		}
+	' "$metainfo" > "$metainfo.bump" && mv "$metainfo.bump" "$metainfo"
+	metainfo_note="added $version dated $date"
+fi
+
+echo "$previous -> $version"
+echo "  Cargo.toml"
+echo "  Cargo.lock"
+echo "  $metainfo ($metainfo_note)"
