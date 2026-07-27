@@ -24,10 +24,8 @@ modules:
         # mupdf-sys compiles its bundled C library and runs bindgen, which
         # needs libclang from the llvm SDK extension.
         LIBCLANG_PATH: /usr/lib/sdk/llvm20/lib
-      build-args:
-        - --share=network
     build-commands:
-      - cargo build --release
+      - cargo build --offline --release
       - install -Dm755 target/release/scrolex /app/bin/scrolex
       - install -Dm644 resources/icon-64.png /app/share/icons/hicolor/64x64/apps/com.andr2i.scrolex.png
       - install -Dm644 resources/icon-128.png /app/share/icons/hicolor/128x128/apps/com.andr2i.scrolex.png
@@ -35,7 +33,10 @@ modules:
       - install -Dm644 resources/icon-512.png /app/share/icons/hicolor/512x512/apps/com.andr2i.scrolex.png
       - install -Dm644 resources/com.andr2i.scrolex.desktop /app/share/applications/com.andr2i.scrolex.desktop
       - install -Dm644 resources/com.andr2i.scrolex.metainfo.xml /app/share/metainfo/com.andr2i.scrolex.metainfo.xml
+      - install -Dm644 LICENSE /app/share/licenses/com.andr2i.scrolex/LICENSE
+      - install -Dm644 cargo/vendor/mupdf-sys-*/mupdf/COPYING /app/share/licenses/com.andr2i.scrolex/mupdf-COPYING
     sources:
       - type: git
         path: ../..
         branch: main
+      - cargo-sources.json

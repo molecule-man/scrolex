@@ -19,6 +19,12 @@
     <name>Andrii Berezhynskyi</name>
   </developer>
   <content_rating type="oars-1.1"/>
+  <screenshots>
+    <screenshot type="default">
+      <caption>Pages laid out along a single horizontal strip</caption>
+      <image>https://raw.githubusercontent.com/molecule-man/scrolex/main/resources/screenshots/horizontal-layout.png</image>
+    </screenshot>
+  </screenshots>
   <releases>
     <release version="0.7.2" date="2026-07-27">
       <url>https://github.com/molecule-man/scrolex/releases/tag/0.7.2</url>

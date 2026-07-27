@@ -47,6 +47,9 @@ jobs:
     - name: Run Clippy
       run: cargo clippy --all-targets --all-features -- -D warnings
 
+    - name: Check Flatpak cargo sources are in sync with Cargo.lock
+      run: ci/check-cargo-sources
+
     - name: Build
       run: cargo build --verbose
 

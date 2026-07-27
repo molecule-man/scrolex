@@ -28,7 +28,9 @@ root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$root"
 
 metainfo=resources/com.andr2i.scrolex.metainfo.xml
-for f in Cargo.toml Cargo.lock "$metainfo"; do
+sources=packaging/flatpak/cargo-sources.json
+generator=https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/f03a673abe6ce189cea1c2857e2b44af2dd79d1f/cargo/flatpak-cargo-generator.py
+for f in Cargo.toml Cargo.lock "$metainfo" "$sources"; do
 	[ -f "$f" ] || { echo "bump-version: $f not found" >&2; exit 1; }
 done
 
@@ -47,22 +49,42 @@ awk -v v="$version" '
 	{ after_name = ($0 == "name = \"scrolex\""); print }
 ' Cargo.lock > Cargo.lock.bump && mv Cargo.lock.bump Cargo.lock
 
-if grep -q "<release version=\"$version\"" "$metainfo"; then
-	metainfo_note="already listed $version, left alone"
-else
-	awk -v v="$version" -v d="$date" -v url="$repository" '
-		{ print }
-		/<releases>/ && !seen {
-			printf "    <release version=\"%s\" date=\"%s\">\n", v, d
-			printf "      <url>%s/releases/tag/%s</url>\n", url, v
-			print  "    </release>"
-			seen = 1
-		}
-	' "$metainfo" > "$metainfo.bump" && mv "$metainfo.bump" "$metainfo"
-	metainfo_note="added $version dated $date"
-fi
+# AppStream sorts 0.7.3-rc1 above 0.7.3, so listing a pre-release breaks the
+# ordering once the final release lands
+case $version in
+*-*)
+	metainfo_note="pre-release, not listed"
+	;;
+*)
+	if grep -q "<release version=\"$version\"" "$metainfo"; then
+		metainfo_note="already listed $version, left alone"
+	else
+		awk -v v="$version" -v d="$date" -v url="$repository" '
+			{ print }
+			/<releases>/ && !seen {
+				printf "    <release version=\"%s\" date=\"%s\">\n", v, d
+				printf "      <url>%s/releases/tag/%s</url>\n", url, v
+				print  "    </release>"
+				seen = 1
+			}
+		' "$metainfo" > "$metainfo.bump" && mv "$metainfo.bump" "$metainfo"
+		metainfo_note="added $version dated $date"
+	fi
+	;;
+esac
+
+command -v uv >/dev/null || {
+	echo "bump-version: uv is required to regenerate $sources" >&2
+	exit 1
+}
+uv run --quiet "$generator" Cargo.lock -o "$sources" || {
+	echo "bump-version: failed to regenerate $sources" >&2
+	exit 1
+}
+ci/check-cargo-sources >/dev/null
 
 echo "$previous -> $version"
 echo "  Cargo.toml"
 echo "  Cargo.lock"
 echo "  $metainfo ($metainfo_note)"
+echo "  $sources (regenerated)"
