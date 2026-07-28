@@ -13,6 +13,8 @@ use gtk::prelude::FileExt;
 use mupdf::{Colorspace, Document, Matrix};
 use once_cell::sync::Lazy;
 
+const PROBE_PAGES: i32 = 8;
+
 // Bumped on document load so every thread's cached Document is reopened - otherwise reloading the
 // same path after the file changed on disk would keep serving the stale document.
 static GENERATION: AtomicU64 = AtomicU64::new(0);
@@ -103,8 +105,10 @@ pub(crate) fn stage_candidate(uri: &str) -> Option<Candidate> {
 }
 
 impl Candidate {
-    // One open reading both the page count and the first page's size, so a load needs a single
-    // document open (safe to run off the main thread). None if unopenable.
+    // One open reading both the page count and the largest of the first PROBE_PAGES page sizes, so a
+    // load needs a single document open (safe to run off the main thread). None if unopenable.
+    // Sampled rather than exhaustive: a long document would be slow to walk, and pages seen later
+    // widen the size as they are drawn (State::observe_page_size).
     pub(crate) fn probe(&self) -> Option<(i32, Option<(f64, f64)>)> {
         if let Some(cfg) = crate::emulate::config() {
             return Some((cfg.pages, Some(cfg.page_pt)));
@@ -112,12 +116,11 @@ impl Candidate {
         let _ctx = Colorspace::device_bgr();
         let doc = Document::open(self.path.as_path()).ok()?;
         let n_pages = doc.page_count().ok()?;
-        let first_page_size = doc
-            .load_page(0)
-            .ok()
-            .and_then(|page| page.bounds().ok())
-            .map(|b| ((b.x1 - b.x0) as f64, (b.y1 - b.y0) as f64));
-        Some((n_pages, first_page_size))
+        let max_page_size = (0..n_pages.min(PROBE_PAGES))
+            .filter_map(|index| doc.load_page(index).ok()?.bounds().ok())
+            .map(|b| ((b.x1 - b.x0) as f64, (b.y1 - b.y0) as f64))
+            .max_by(|(aw, ah), (bw, bh)| (aw * ah).total_cmp(&(bw * bh)));
+        Some((n_pages, max_page_size))
     }
 
     // Publish the validated temp so workers render these exact bytes. Call after invalidate().
@@ -388,6 +391,30 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         assert_eq!(
             stage_candidate("file:///no/such/file.pdf").unwrap().probe(),
             None
+        );
+    }
+
+    // Three pages, the middle one much larger: a small cover followed by big content, the case where
+    // the first page alone would understate the document's size.
+    const MIXED_SIZE_PDF: &[u8] = b"%PDF-1.4\n\
+1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n\
+2 0 obj\n<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 3 >>\nendobj\n\
+3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] >>\nendobj\n\
+4 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 2000 3000] >>\nendobj\n\
+5 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 400] >>\nendobj\n\
+trailer\n<< /Root 1 0 R >>\n%%EOF";
+
+    #[test]
+    fn probe_reports_the_largest_sampled_page() {
+        let dir = std::env::temp_dir().join("scrolex_mixed_size_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mixed.pdf");
+        std::fs::write(&path, MIXED_SIZE_PDF).unwrap();
+        let uri = format!("file://{}", path.display());
+
+        assert_eq!(
+            stage_candidate(&uri).unwrap().probe(),
+            Some((3, Some((2000.0, 3000.0))))
         );
     }
 

@@ -50,8 +50,10 @@ pub struct State {
     // rendered pages keyed by page index, kept so scrolling back to an already seen page reuses the
     // texture instead of re-rendering (and flashing white)
     pub(crate) render_cache: Rc<RefCell<crate::render_cache::RenderCache>>,
-    // page indices with a render currently queued, to avoid scheduling duplicates
-    pub(crate) render_inflight: Rc<RefCell<HashSet<i32>>>,
+    // pages with a render in flight, mapped to the render_epoch it was scheduled at. One render per
+    // page at a time: a zoom leaves the entry in place, and the stale render's completion releases it
+    // (see Page::schedule_render), so zooming can't stack up buffers for the same page.
+    pub(crate) render_inflight: Rc<RefCell<HashMap<i32, u64>>>,
     // widget currently waiting to display each page, so a finished render repaints the right widget
     // even if list recycling moved the requester
     pub(crate) render_waiters: Rc<RefCell<HashMap<i32, glib::WeakRef<crate::page::Page>>>>,
@@ -73,9 +75,9 @@ pub struct State {
     // direction of travel, used to prefetch the pages being read toward: true = forward (higher page
     // numbers), the default; flipped when the user scrolls back.
     pub(crate) scroll_forward: Cell<bool>,
-    // bumped on zoom (alongside the inflight/waiter clears); a render captures it at schedule and
-    // drops out on completion if it changed, so an old-scale render can't cache/rebook. Per-State so
-    // one window's zoom never invalidates another's in-flight renders.
+    // bumped on zoom; a render captures it at schedule and drops out on completion if it changed, so
+    // an old-scale render can't cache/rebook. Per-State so one window's zoom never invalidates
+    // another's in-flight renders.
     pub(crate) render_epoch: Cell<u64>,
     // this window's id in the render pool's wanted-range filter, so windows don't filter each other
     pub(crate) render_client_id: Cell<u64>,
@@ -83,6 +85,12 @@ pub struct State {
     // out on completion if it changed (catches same-path reload, where the uri is unchanged).
     // Per-State so one window's load never invalidates another's in-flight renders.
     pub(crate) doc_epoch: Cell<u64>,
+
+    // first page's size in points and the window's device pixels per point. Together they set the
+    // zoom ceiling (see zoom_ceiling); page size is None until a document is loaded, and mixed-size
+    // documents are bounded by their first page.
+    pub(crate) page_size_pt: Cell<Option<(f64, f64)>>,
+    pub(crate) device_scale: Cell<i32>,
 
     // global render-thread count (user setting) and how many pages fully fit across the viewport;
     // together they set prefetch depth. Set in constructed / by the window.
@@ -123,11 +131,12 @@ impl ObjectImpl for State {
             .set(crate::config::DEFAULT_RENDER_THREADS);
 
         // Zoom changes every page's render scale: drop the now-wrong-scale cache entries and queued
-        // renders. Must live here, not State::new: the builder-created instance skips it.
+        // renders. In-flight markers stay: their renders are still running and holding buffers, so
+        // the page waits for that completion rather than starting a second render alongside it.
+        // Must live here, not State::new: the builder-created instance skips it.
         self.obj().connect_notify_local(Some("zoom"), |state, _| {
             let imp = state.imp();
             imp.render_cache.borrow_mut().clear();
-            imp.render_inflight.borrow_mut().clear();
             imp.render_waiters.borrow_mut().clear();
             crate::page::clear_full_renders(imp.render_client_id.get());
             // in-flight renders started at the old scale are now stale; bump so their completion

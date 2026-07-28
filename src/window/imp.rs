@@ -199,6 +199,7 @@ impl ObjectImpl for Window {
         }
 
         self.setup_scroll_selection_sync();
+        self.setup_device_scale_tracking();
         self.setup_thread_setting();
         self.setup_cache_setting();
         let cfg = crate::config::load_config();
@@ -288,7 +289,7 @@ impl Window {
                     _ => dy / TOUCHPAD_NOTCH,
                 };
                 self.state
-                    .set_zoom(self.state.zoom() * ZOOM_STEP.powf(-notches));
+                    .zoom_to(self.state.zoom() * ZOOM_STEP.powf(-notches));
             }
             return glib::Propagation::Stop;
         }
@@ -394,12 +395,12 @@ impl Window {
 
     #[template_callback]
     fn zoom_out(&self) {
-        self.state.set_zoom(self.state.zoom() / ZOOM_STEP);
+        self.state.zoom_to(self.state.zoom() / ZOOM_STEP);
     }
 
     #[template_callback]
     fn zoom_in(&self) {
-        self.state.set_zoom(self.state.zoom() * ZOOM_STEP);
+        self.state.zoom_to(self.state.zoom() * ZOOM_STEP);
     }
 
     #[template_callback]
@@ -418,7 +419,7 @@ impl Window {
         if scale <= 0.0 {
             return;
         }
-        self.state.set_zoom(self.zoom_gesture_base.get() * scale);
+        self.state.zoom_to(self.zoom_gesture_base.get() * scale);
     }
 
     #[template_callback]
@@ -538,7 +539,7 @@ impl Window {
             return;
         }
 
-        self.state.set_zoom(zoom / 100.0);
+        self.state.zoom_to(zoom / 100.0);
     }
 
     fn goto_page(&self, page_num: u32) {
@@ -1099,6 +1100,18 @@ impl Window {
                     eprintln!("Error saving config: {e}");
                 }
             }
+        ));
+    }
+
+    // Keep the state's device scale current: it sets the zoom ceiling, since a page's render buffer
+    // is sized in device pixels.
+    fn setup_device_scale_tracking(&self) {
+        let obj = self.obj();
+        self.state.set_device_scale(obj.scale_factor());
+        obj.connect_scale_factor_notify(clone!(
+            #[weak(rename_to = imp)]
+            self,
+            move |window| imp.state.set_device_scale(window.scale_factor())
         ));
     }
 

@@ -54,6 +54,10 @@ impl RenderCache {
         self.evict();
     }
 
+    pub fn budget_bytes(&self) -> usize {
+        self.budget_bytes
+    }
+
     pub fn get(&mut self, page: i32) -> Option<gdk::Texture> {
         let texture = self.entries.get(&page)?.texture.clone();
         self.touch(page);
@@ -67,7 +71,7 @@ impl RenderCache {
     }
 
     // Rough number of pages that fit the budget, from the average cached page size. 0 until
-    // something is cached. Used to bound prefetch so it can't render more than it can keep.
+    // something is cached. Bounds the preview window so it can't schedule more than it can keep.
     pub fn page_capacity(&self) -> usize {
         if self.entries.is_empty() {
             return 0;
