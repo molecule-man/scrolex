@@ -1,11 +1,18 @@
 # Flatpak
 
-Local/CI Flatpak build for scrolex. Not published to Flathub.
+The manifest scrolex is published from, plus a local build of it for testing
+inside the sandbox.
+
+Scrolex ships on Flathub as
+[com.andr2i.scrolex](https://flathub.org/apps/com.andr2i.scrolex), built from
+the [flathub/com.andr2i.scrolex](https://github.com/flathub/com.andr2i.scrolex)
+repo. The manifest here is the one to edit; the Flathub copy is derived from it
+(see [Releasing to Flathub](#releasing-to-flathub)).
 
 ## Prerequisites
 
 ```sh
-flatpak install flathub org.gnome.Platform//49 org.gnome.Sdk//49 \
+flatpak install flathub org.gnome.Platform//50 org.gnome.Sdk//50 \
     org.freedesktop.Sdk.Extension.rust-stable//25.08 \
     org.freedesktop.Sdk.Extension.llvm20//25.08
 ```
@@ -13,6 +20,9 @@ flatpak install flathub org.gnome.Platform//49 org.gnome.Sdk//49 \
 `flatpak-builder` is also required (e.g. `pacman -S flatpak-builder`).
 
 ## Build and install
+
+Useful for reproducing behaviour that only shows up under the sandbox — portal
+file dialogs, `--device=dri` rendering, missing filesystem access.
 
 The app module builds from the local git repo's committed `main`, so commit
 before building.
@@ -49,10 +59,35 @@ uv run https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/f03a673ab
 nothing needs installing. The generator is pinned to a commit so a release never
 runs whatever upstream's `master` happens to say that day.
 
-## Gaps to close before Flathub
+## Releasing to Flathub
 
-- Screenshots in the metainfo (Flathub requires at least one).
-- `--filesystem=host:ro` is permitted but gets flagged in review; a document
-  viewer has a case for it, to be justified in the submission PR.
-- The manifest in the Flathub repo must build from a remote git URL pinned to a
-  tag and commit, not this one's local `path:` source.
+The Flathub repo holds its own copy of `com.andr2i.scrolex.yml` and
+`cargo-sources.json`, identical to these except for the app module's `sources`
+entry: Flathub builds from a remote git URL pinned to a tag and commit, not this
+one's local `path:`. Publishing a release means copying both files over and
+repinning:
+
+```sh
+cd ../flathub-com.andr2i.scrolex        # a clone of flathub/com.andr2i.scrolex
+cp ../scrolex/packaging/flatpak/{com.andr2i.scrolex.yml,cargo-sources.json} .
+```
+
+Then in the copied manifest replace
+
+```yaml
+      - type: git
+        path: ../..
+        branch: main
+```
+
+with the tag and its commit:
+
+```yaml
+      - type: git
+        url: https://github.com/molecule-man/scrolex.git
+        tag: X.Y.Z
+        commit: <git rev-parse X.Y.Z>
+```
+
+Open that as a PR against `master`; Flathub's buildbot builds it and publishes
+once merged.
