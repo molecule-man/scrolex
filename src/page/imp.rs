@@ -2,6 +2,7 @@
 #![expect(unused_lifetimes)]
 
 use std::cell::{Cell, RefCell};
+use std::collections::hash_map::Entry;
 use std::rc::Rc;
 use std::sync::OnceLock;
 
@@ -78,14 +79,14 @@ pub(crate) fn clear_all_renders(client: u64) {
 
 // How many pages to prefetch ahead: the threads not busy on visible pages, but never more full
 // pages than the cache can hold beyond the visible ones - else completed prefetches evict the
-// visible pages and thrash. `capacity` 0 means nothing is cached yet, so fall back to at least one.
-fn prefetch_depth(threads: usize, visible: usize, capacity: usize) -> usize {
+// visible pages and thrash. At deep zoom `page_bytes` alone fills the budget, which yields 0: pages
+// that big are neither cacheable nor worth rendering unseen.
+fn prefetch_depth(threads: usize, visible: usize, page_bytes: usize, budget: usize) -> usize {
     let want = threads.saturating_sub(visible);
-    if capacity == 0 {
-        want.max(1)
-    } else {
-        want.min(capacity.saturating_sub(visible + 1))
+    if page_bytes == 0 {
+        return want.max(1);
     }
+    want.min((budget / page_bytes).saturating_sub(visible + 1))
 }
 
 // Preview prefetch half-width, bounded so both directions fit the preview cache - else big-page docs
@@ -636,6 +637,8 @@ impl Page {
         let (canvas_width, canvas_height) =
             (width * scale * scale_factor, height * scale * scale_factor);
         let expected = (canvas_width as i32, canvas_height as i32);
+        // 4 bytes/pixel, matching how the cache sizes an entry
+        let page_bytes = (expected.0.max(0) as usize) * (expected.1.max(0) as usize) * 4;
 
         let cache = obj.state().render_cache();
         let cached = cache.borrow_mut().get(page_num);
@@ -645,7 +648,7 @@ impl Page {
                 let bbox = self.get_bbox(page, obj.crop());
                 self.append_page_texture(snapshot, &texture, &bbox, scale);
                 self.prefetch_previews(page_num);
-                self.prefetch_next(page_num);
+                self.prefetch_next(page_num, page_bytes);
                 return;
             }
             // dimensions changed (e.g. zoom), the cached texture is stale
@@ -653,12 +656,9 @@ impl Page {
             cache.borrow_mut().remove(page_num);
         }
 
-        // Schedule the full render unless one is already queued. Flung-past pages are dropped at the
-        // queue (see set_wanted_pages), so this doesn't saturate the workers mid-scroll.
-        let is_new = obj.state().render_inflight().borrow_mut().insert(page_num);
-        if is_new {
-            self.schedule_render(page_num, scale, scale_factor, RenderPriority::Visible);
-        }
+        // Flung-past pages are dropped at the queue (see set_wanted_pages), so this doesn't saturate
+        // the workers mid-scroll.
+        self.schedule_render(page_num, scale, scale_factor, RenderPriority::Visible);
 
         // remember that this widget is the one waiting for page_num, so the
         // render repaints it when it lands
@@ -684,12 +684,13 @@ impl Page {
         // fast scroll)
         self.prefetch_previews(page_num);
         self.schedule_preview_if_needed(page_num, RenderPriority::VisiblePreview);
-        self.prefetch_next(page_num);
+        self.prefetch_next(page_num, page_bytes);
     }
 
     // Full-render pages ahead in the scroll direction so reading on lands on a cached page. Skips
     // cached/queued pages; lowest priority, dropped at the queue if the scroll leaves its range.
-    fn prefetch_next(&self, current: i32) {
+    // `page_bytes` is the current page's render size, which bounds the depth.
+    fn prefetch_next(&self, current: i32, page_bytes: usize) {
         let obj = self.obj();
         let state = obj.state();
         let n_pages = state.n_pages();
@@ -700,11 +701,10 @@ impl Page {
         let scale = obj.zoom();
         let scale_factor = obj.scale_factor() as f64;
         let cache = state.render_cache();
-        let inflight = state.render_inflight();
 
         let visible = state.visible_page_count().max(1) as usize;
-        let capacity = cache.borrow().page_capacity();
-        let ahead = prefetch_depth(state.render_threads(), visible, capacity) as i32;
+        let budget = cache.borrow().budget_bytes();
+        let ahead = prefetch_depth(state.render_threads(), visible, page_bytes, budget) as i32;
 
         // farthest first so the LIFO queue pops the nearest ahead-page first
         for d in (1..=ahead).rev() {
@@ -715,12 +715,13 @@ impl Page {
             if cache.borrow().contains(page_num) {
                 continue;
             }
-            if inflight.borrow_mut().insert(page_num) {
-                self.schedule_render(page_num, scale, scale_factor, RenderPriority::Prefetch);
-            }
+            self.schedule_render(page_num, scale, scale_factor, RenderPriority::Prefetch);
         }
     }
 
+    // Queue a full render of `page_num`, unless one is already in flight for it. The marker records
+    // the epoch the render was scheduled at, so its completion can tell whether the slot is still
+    // its own to release.
     fn schedule_render(
         &self,
         page_num: i32,
@@ -729,6 +730,14 @@ impl Page {
         priority: RenderPriority,
     ) {
         let obj = self.obj();
+        let epoch = obj.state().render_epoch();
+        match obj.state().render_inflight().borrow_mut().entry(page_num) {
+            Entry::Occupied(_) => return,
+            Entry::Vacant(slot) => {
+                slot.insert(epoch);
+            }
+        }
+
         let uri = obj.uri();
         let client = obj.state().render_client_id();
         // Page size (points) from the main-thread doc, so the worker sizes its pixel buffer to
@@ -739,35 +748,45 @@ impl Page {
         let (resp_sender, resp_receiver) = oneshot::channel::<RenderedPage>();
         let obj_clone = obj.clone();
         let doc_epoch = obj.state().doc_epoch();
-        let epoch = obj.state().render_epoch();
         glib::spawn_future_local(async move {
             let result = resp_receiver.await;
             let state = obj_clone.state();
 
-            // Stale completion - this window loaded/reloaded a document, or its scale changed (zoom),
-            // since this was scheduled? Those paths already cleared this window's inflight/waiter
-            // entries, so bail before touching the current ones: mutating them here would drop the
-            // live render's marker/waiter and cache an obsolete texture. Both epochs are per-window,
-            // so another window's load or zoom never invalidates this render.
-            if state.doc_epoch() != doc_epoch || state.render_epoch() != epoch {
+            // This window loaded/reloaded a document since this was scheduled? That path already
+            // cleared the inflight/waiter entries, so bail before touching the current ones: mutating
+            // them here would drop the live render's marker/waiter. Per-window, so another window's
+            // load never invalidates this render.
+            if state.doc_epoch() != doc_epoch {
                 return;
             }
-            state.render_inflight().borrow_mut().remove(&page_num);
-
-            // Request dropped (over-cap, or out of the wanted range). Redraw the widget still on this
-            // page so it reschedules; the index check means a scrolled-off page stays dropped.
-            let Ok(rendered) = result else {
-                if let Some(widget) = state
-                    .render_waiters()
-                    .borrow()
-                    .get(&page_num)
-                    .and_then(glib::WeakRef::upgrade)
-                {
-                    if widget.index() == page_num {
-                        widget.queue_draw();
-                    }
+            // release the slot this render holds, freeing the page for a render at the current scale
+            {
+                let inflight = state.render_inflight();
+                let mut inflight = inflight.borrow_mut();
+                if inflight.get(&page_num) == Some(&epoch) {
+                    inflight.remove(&page_num);
                 }
-                return;
+            }
+
+            // Zoom moved on while this rendered, or the request was dropped (over-cap, or out of the
+            // wanted range): discard the pixels and redraw the widget still on this page so it
+            // reschedules at the current scale. The index check means a scrolled-off page stays
+            // dropped.
+            let rendered = match result {
+                Ok(rendered) if state.render_epoch() == epoch => rendered,
+                _ => {
+                    if let Some(widget) = state
+                        .render_waiters()
+                        .borrow()
+                        .get(&page_num)
+                        .and_then(glib::WeakRef::upgrade)
+                    {
+                        if widget.index() == page_num {
+                            widget.queue_draw();
+                        }
+                    }
+                    return;
+                }
             };
 
             let texture = rendered.into_texture();
@@ -1257,12 +1276,17 @@ mod tests {
 
     #[test]
     fn prefetch_depth_bounds() {
-        // spare threads run ahead, capped so visible pages + 1 headroom stay in the cache
-        assert_eq!(prefetch_depth(11, 3, 8), 4); // min(11-3, 8-4)
-        assert_eq!(prefetch_depth(4, 1, 8), 3); // threads-bound, cache has room
-        assert_eq!(prefetch_depth(11, 3, 0), 8); // capacity unknown: thread-bound
-        assert_eq!(prefetch_depth(11, 7, 8), 0); // no room left: don't evict visible pages
-        assert_eq!(prefetch_depth(2, 3, 8), 0); // more visible than threads
+        // 8 pages fit the budget in these cases; spare threads run ahead, capped so the visible
+        // pages + 1 headroom stay in the cache
+        let mb = 1024 * 1024;
+        assert_eq!(prefetch_depth(11, 3, mb, 8 * mb), 4); // min(11-3, 8-4)
+        assert_eq!(prefetch_depth(4, 1, mb, 8 * mb), 3); // threads-bound, cache has room
+        assert_eq!(prefetch_depth(11, 3, 0, 8 * mb), 8); // page size unknown: thread-bound
+        assert_eq!(prefetch_depth(11, 7, mb, 8 * mb), 0); // no room left: don't evict visible pages
+        assert_eq!(prefetch_depth(2, 3, mb, 8 * mb), 0); // more visible than threads
+
+        // deep zoom: one page fills the budget, so nothing is rendered ahead
+        assert_eq!(prefetch_depth(11, 1, 100 * mb, 64 * mb), 0);
     }
 
     #[test]
