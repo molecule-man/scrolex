@@ -99,6 +99,37 @@ fn page_buffer_bytes(page_pt: (f64, f64), scale: f64, dsf: f64) -> f64 {
     width * height * 4.0
 }
 
+fn render_dimensions(page_pt: (f64, f64), scale: f64, dsf: f64) -> (i32, i32) {
+    (
+        ((page_pt.0 * scale * dsf) as i32).max(1),
+        ((page_pt.1 * scale * dsf) as i32).max(1),
+    )
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum FallbackSource {
+    Render,
+    Preview,
+    None,
+}
+
+fn fallback_source(render_width: Option<i32>, preview_width: Option<i32>) -> FallbackSource {
+    match (render_width, preview_width) {
+        (Some(render), Some(preview)) if preview > render => FallbackSource::Preview,
+        (Some(_), _) => FallbackSource::Render,
+        (None, Some(_)) => FallbackSource::Preview,
+        (None, None) => FallbackSource::None,
+    }
+}
+
+fn needs_visible_preview(
+    render_width: Option<i32>,
+    has_preview: bool,
+    preview_target_width: i32,
+) -> bool {
+    !has_preview && render_width.is_none_or(|width| width < preview_target_width)
+}
+
 // Preview prefetch half-width, bounded so both directions fit the preview cache - else big-page docs
 // schedule previews that evict each other, thrashing the cache and render pool. Full window until
 // the cache has sized its first preview (`capacity` 0).
@@ -554,9 +585,8 @@ impl Page {
         snapshot.pop();
     }
 
-    // Blurry stand-in while the full render lands: a low-res preview stretched over the page.
-    // Deliberately upscaled, so no 1:1 snapping.
-    fn append_preview_texture(
+    // Present a stand-in over the current page extent while its target-scale render is pending.
+    fn append_scaled_page_texture(
         &self,
         snapshot: &gtk::Snapshot,
         texture: &gtk::gdk::Texture,
@@ -658,14 +688,12 @@ impl Page {
         let (width, height) = (page.width, page.height);
         let scale = obj.zoom();
         let scale_factor = obj.scale_factor() as f64;
-        let (canvas_width, canvas_height) =
-            (width * scale * scale_factor, height * scale * scale_factor);
-        let expected = (canvas_width as i32, canvas_height as i32);
+        let expected = render_dimensions((width, height), scale, scale_factor);
         let page_bytes = page_buffer_bytes((page.width, page.height), scale, scale_factor);
 
         let cache = obj.state().render_cache();
         let cached = cache.borrow_mut().get(page_num);
-        if let Some(texture) = cached {
+        let stale_render = if let Some(texture) = cached {
             if (texture.width(), texture.height()) == expected {
                 log::debug!("draw page {page_num}: cache hit");
                 let bbox = self.get_bbox(page, obj.crop());
@@ -674,10 +702,11 @@ impl Page {
                 self.prefetch_next(page_num, page_bytes as usize);
                 return;
             }
-            // dimensions changed (e.g. zoom), the cached texture is stale
-            log::debug!("draw page {page_num}: cache stale (zoom/scale changed)");
-            cache.borrow_mut().remove(page_num);
-        }
+            log::debug!("draw page {page_num}: cache stale");
+            Some(texture)
+        } else {
+            None
+        };
 
         // Flung-past pages are dropped at the queue (see set_wanted_pages), so this doesn't saturate
         // the workers mid-scroll. A page over the buffer cap is declined here and stands in below
@@ -691,23 +720,42 @@ impl Page {
             .borrow_mut()
             .insert(page_num, obj.downgrade());
 
-        // show a low-res preview (upscaled) if we have one, otherwise a loading placeholder
         let bbox = self.get_cached_bbox(page, obj.crop());
         let preview = obj.state().preview_cache().borrow_mut().get(page_num);
-        if let Some(preview) = preview {
-            log::debug!("draw page {page_num}: cache miss, showing preview");
-            self.append_preview_texture(snapshot, &preview, page, &bbox, scale);
+        let source = fallback_source(
+            stale_render.as_ref().map(|texture| texture.width()),
+            preview.as_ref().map(|texture| texture.width()),
+        );
+        let fallback = match source {
+            FallbackSource::Render => {
+                log::debug!("draw page {page_num}: showing scaled full render");
+                stale_render.as_ref()
+            }
+            FallbackSource::Preview => {
+                log::debug!("draw page {page_num}: showing preview");
+                preview.as_ref()
+            }
+            FallbackSource::None => None,
+        };
+        if let Some(texture) = fallback {
+            self.append_scaled_page_texture(snapshot, texture, page, &bbox, scale);
         } else {
             log::debug!("draw page {page_num}: cache miss (loading placeholder)");
             let (w, h) = bbox.size();
             append_loading_placeholder(snapshot, w * scale, h * scale);
         }
 
-        // prefetch a wider window of previews and queue this page's own preview at the highest
-        // render priority so a blurry stand-in appears before any full render (never white on a
-        // fast scroll)
+        // Prefetch low-resolution textures for surrounding pages. Request one for this page only
+        // when no preview is cached and the completed texture is below the preview target.
         self.prefetch_previews(page_num);
-        self.schedule_preview_if_needed(page_num, RenderPriority::VisiblePreview);
+        let preview_target_width = ((page.width * obj.state().preview_scale()) as i32).max(1);
+        if needs_visible_preview(
+            stale_render.as_ref().map(|texture| texture.width()),
+            preview.is_some(),
+            preview_target_width,
+        ) {
+            self.schedule_preview_if_needed(page_num, RenderPriority::VisiblePreview);
+        }
         self.prefetch_next(page_num, page_bytes as usize);
     }
 
@@ -736,7 +784,10 @@ impl Page {
             if page_num < 0 || page_num >= n_pages {
                 continue;
             }
-            if cache.borrow().contains(page_num) {
+            if cache
+                .borrow()
+                .contains_at_scale(page_num, scale * scale_factor)
+            {
                 continue;
             }
             self.schedule_render(page_num, scale, scale_factor, RenderPriority::Prefetch);
@@ -793,6 +844,7 @@ impl Page {
         let (resp_sender, resp_receiver) = oneshot::channel::<RenderedPage>();
         let obj_clone = obj.clone();
         let doc_epoch = obj.state().doc_epoch();
+        let pixel_scale = scale * scale_factor;
         glib::spawn_future_local(async move {
             let result = resp_receiver.await;
             let state = obj_clone.state();
@@ -838,7 +890,7 @@ impl Page {
             state
                 .render_cache()
                 .borrow_mut()
-                .insert(page_num, texture.upcast());
+                .insert(page_num, texture.upcast(), pixel_scale);
 
             log::debug!(
                 "memory: rss={:.0}MB preview_scale={:.3} render_cache={:?} preview_cache={:?}",
@@ -993,7 +1045,7 @@ impl Page {
             state
                 .preview_cache()
                 .borrow_mut()
-                .insert(page_num, texture.upcast());
+                .insert(page_num, texture.upcast(), scale);
 
             // repaint the waiting widget, but leave the waiter registered so the
             // full render still repaints it when it lands
@@ -1344,6 +1396,35 @@ mod tests {
         // degenerate sizes measure as nothing rather than going negative
         assert_eq!(page_buffer_bytes((0.0, 0.0), 1.0, 1.0), 0.0);
         assert_eq!(page_buffer_bytes((-5.0, 10.0), 1.0, 1.0), 0.0);
+    }
+
+    #[test]
+    fn render_dimensions_match_the_full_render_buffer() {
+        assert_eq!(render_dimensions((595.0, 842.0), 1.0, 2.0), (1190, 1684));
+        assert_eq!(render_dimensions((0.0, 0.0), 1.0, 1.0), (1, 1));
+    }
+
+    #[test]
+    fn fallback_uses_the_higher_resolution_texture() {
+        assert_eq!(
+            fallback_source(Some(1000), Some(250)),
+            FallbackSource::Render
+        );
+        assert_eq!(
+            fallback_source(Some(100), Some(250)),
+            FallbackSource::Preview
+        );
+        assert_eq!(fallback_source(Some(100), None), FallbackSource::Render);
+        assert_eq!(fallback_source(None, Some(250)), FallbackSource::Preview);
+        assert_eq!(fallback_source(None, None), FallbackSource::None);
+    }
+
+    #[test]
+    fn coarse_render_requests_a_missing_visible_preview() {
+        assert!(needs_visible_preview(Some(100), false, 250));
+        assert!(!needs_visible_preview(Some(300), false, 250));
+        assert!(!needs_visible_preview(Some(100), true, 250));
+        assert!(needs_visible_preview(None, false, 250));
     }
 
     #[test]

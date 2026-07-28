@@ -458,6 +458,7 @@ fn get_state_file_path(uri: &str) -> Result<PathBuf, env::VarError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gtk::prelude::Cast;
 
     // 4 bytes per device pixel
     fn page_bytes_at(page_pt: (f64, f64), device_scale: i32, zoom: f64) -> f64 {
@@ -498,6 +499,22 @@ mod tests {
         state.observe_page_size((0.0, 0.0));
         state.observe_page_size((f64::NAN, 10.0));
         assert_eq!(state.max_zoom(), big_page_ceiling);
+    }
+
+    #[gtk::test]
+    fn zoom_retains_full_render_as_a_transition_texture() {
+        let state = State::new();
+        let bytes = glib::Bytes::from_owned(vec![255u8; 16]);
+        let texture =
+            gtk::gdk::MemoryTexture::new(2, 2, gtk::gdk::MemoryFormat::B8g8r8x8, &bytes, 8);
+        state
+            .render_cache()
+            .borrow_mut()
+            .insert(3, texture.upcast(), 1.0);
+
+        state.zoom_to(1.1);
+
+        assert!(state.render_cache().borrow().contains_at_scale(3, 1.0));
     }
 
     #[test]

@@ -131,13 +131,13 @@ impl ObjectImpl for State {
         self.render_threads
             .set(crate::config::DEFAULT_RENDER_THREADS);
 
-        // Zoom changes every page's render scale: drop the now-wrong-scale cache entries and queued
-        // renders. In-flight markers stay: their renders are still running and holding buffers, so
-        // the page waits for that completion rather than starting a second render alongside it.
+        // Zoom changes every page's render scale. Keep completed textures as bounded transition
+        // images, but drop queued renders whose scale is now wrong. In-flight markers stay: their
+        // renders are still running and holding buffers, so the page waits for that completion
+        // rather than starting a second render alongside it.
         // Must live here, not State::new: the builder-created instance skips it.
         self.obj().connect_notify_local(Some("zoom"), |state, _| {
             let imp = state.imp();
-            imp.render_cache.borrow_mut().clear();
             imp.render_waiters.borrow_mut().clear();
             crate::page::clear_full_renders(imp.render_client_id.get());
             // in-flight renders started at the old scale are now stale; bump so their completion
