@@ -219,6 +219,7 @@ impl State {
         self.imp().bbox_cache.borrow_mut().clear();
         self.imp().links.borrow_mut().clear();
         self.imp().search.borrow_mut().clear();
+        self.imp().selection.replace(None);
         self.imp().render_cache.borrow_mut().clear();
         self.imp().render_inflight.borrow_mut().clear();
         self.imp().render_waiters.borrow_mut().clear();
@@ -304,6 +305,41 @@ impl State {
 
     pub(crate) fn search(&self) -> Rc<RefCell<crate::search::Search>> {
         self.imp().search.clone()
+    }
+
+    pub(crate) fn selection(&self) -> Rc<RefCell<Option<crate::selection::PageSelection>>> {
+        self.imp().selection.clone()
+    }
+
+    // Emits selection-changed for the page losing the highlight and the one gaining it.
+    pub(crate) fn set_selection(&self, selection: Option<crate::selection::PageSelection>) {
+        let page = selection.as_ref().map(|s| s.page);
+        let prev_page = self.imp().selection.replace(selection).map(|s| s.page);
+
+        if let Some(prev_page) = prev_page.filter(|prev| Some(*prev) != page) {
+            self.emit_by_name::<()>("selection-changed", &[&prev_page]);
+        }
+        if let Some(page) = page {
+            self.emit_by_name::<()>("selection-changed", &[&page]);
+        }
+    }
+
+    pub(crate) fn clear_selection(&self) {
+        self.set_selection(None);
+    }
+
+    pub(crate) fn has_selection(&self) -> bool {
+        self.imp().selection.borrow().is_some()
+    }
+
+    // Empty text (a drag over no glyphs) reads as nothing selected.
+    pub(crate) fn selected_text(&self) -> Option<String> {
+        self.imp()
+            .selection
+            .borrow()
+            .as_ref()
+            .map(|selection| selection.text.clone())
+            .filter(|text| !text.is_empty())
     }
 
     pub(crate) fn render_cache(&self) -> Rc<RefCell<crate::render_cache::RenderCache>> {
@@ -472,5 +508,74 @@ mod tests {
         // degenerate sizes fall back to the absolute bound rather than dividing by zero
         assert_eq!(zoom_ceiling((0.0, 0.0), 1), MAX_ZOOM);
         assert_eq!(zoom_ceiling((f64::NAN, 100.0), 1), MAX_ZOOM);
+    }
+
+    fn selection_on(page: i32, text: &str) -> crate::selection::PageSelection {
+        crate::selection::PageSelection {
+            page,
+            rects: vec![page::Rectangle::new(0.0, 0.0, 10.0, 10.0)],
+            text: text.to_string(),
+        }
+    }
+
+    // Pages announced for repaint, in order.
+    fn watch_repaints(state: &State) -> Rc<RefCell<Vec<i32>>> {
+        let repainted = Rc::new(RefCell::new(Vec::new()));
+        state.connect_closure(
+            "selection-changed",
+            false,
+            glib::closure_local!(
+                #[strong]
+                repainted,
+                move |_: &State, page: i32| repainted.borrow_mut().push(page)
+            ),
+        );
+        repainted
+    }
+
+    #[gtk::test]
+    fn one_selection_at_a_time_and_both_pages_repaint() {
+        let state = State::new();
+        let repainted = watch_repaints(&state);
+
+        state.set_selection(Some(selection_on(3, "first")));
+        assert!(state.has_selection());
+        assert_eq!(state.selected_text().as_deref(), Some("first"));
+        assert_eq!(*repainted.borrow(), vec![3]);
+
+        // page 3 loses the highlight, page 7 gains it
+        state.set_selection(Some(selection_on(7, "second")));
+        assert_eq!(state.selection().borrow().as_ref().map(|s| s.page), Some(7));
+        assert_eq!(state.selected_text().as_deref(), Some("second"));
+        assert_eq!(*repainted.borrow(), vec![3, 3, 7]);
+
+        // same page: one repaint
+        repainted.borrow_mut().clear();
+        state.set_selection(Some(selection_on(7, "second, longer")));
+        assert_eq!(*repainted.borrow(), vec![7]);
+    }
+
+    #[gtk::test]
+    fn clearing_repaints_the_page_that_held_the_selection() {
+        let state = State::new();
+        state.set_selection(Some(selection_on(4, "text")));
+        let repainted = watch_repaints(&state);
+
+        state.clear_selection();
+        assert!(!state.has_selection());
+        assert_eq!(state.selected_text(), None);
+        assert_eq!(*repainted.borrow(), vec![4]);
+
+        // clearing with nothing selected is silent
+        repainted.borrow_mut().clear();
+        state.clear_selection();
+        assert!(repainted.borrow().is_empty());
+    }
+
+    #[gtk::test]
+    fn an_empty_selection_has_no_text_to_copy() {
+        let state = State::new();
+        state.set_selection(Some(selection_on(1, "")));
+        assert_eq!(state.selected_text(), None);
     }
 }

@@ -46,6 +46,7 @@ pub struct State {
     pub(crate) bbox_cache: Rc<RefCell<HashMap<i32, crate::page::Rectangle>>>,
     pub(crate) links: Rc<RefCell<crate::links::Links>>,
     pub(crate) search: Rc<RefCell<crate::search::Search>>,
+    pub(crate) selection: Rc<RefCell<Option<crate::selection::PageSelection>>>,
 
     // rendered pages keyed by page index, kept so scrolling back to an already seen page reuses the
     // texture instead of re-rendering (and flashing white)
@@ -155,6 +156,10 @@ impl ObjectImpl for State {
                     .build(),
                 Signal::builder("before-load").build(),
                 Signal::builder("loaded").build(),
+                // a page that gained or lost the selection highlight and needs repainting
+                Signal::builder("selection-changed")
+                    .param_types([i32::static_type()])
+                    .build(),
             ]
         })
     }

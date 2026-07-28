@@ -4,7 +4,7 @@ use std::cell::{Cell, RefCell};
 use futures::StreamExt;
 use glib::clone;
 use glib::subclass::InitializingObject;
-use gtk::gdk::{EventSequence, Key, ModifierType};
+use gtk::gdk::{EventSequence, Key, ModifierType, BUTTON_PRIMARY};
 use gtk::glib::closure_local;
 use gtk::glib::subclass::prelude::*;
 use gtk::glib::subclass::types::ObjectSubclassIsExt;
@@ -205,6 +205,7 @@ impl ObjectImpl for Window {
         let cfg = crate::config::load_config();
         self.state.set_preview_cache_pages(cfg.preview_cache_pages);
         self.setup_animate_scroll();
+        self.setup_text_selection();
         self.setup_search();
         self.setup_toc();
         self.setup_drop_target();
@@ -427,9 +428,17 @@ impl Window {
         &self,
         keyval: Key,
         _keycode: u32,
-        _modifier: ModifierType,
+        modifier: ModifierType,
     ) -> glib::Propagation {
         match keyval {
+            Key::c
+                if modifier.contains(ModifierType::CONTROL_MASK) && self.state.has_selection() =>
+            {
+                self.copy_selection();
+            }
+            Key::Escape if self.state.has_selection() => {
+                self.state.clear_selection();
+            }
             Key::o => {
                 self.open_document();
             }
@@ -504,6 +513,13 @@ impl Window {
         }
 
         glib::Propagation::Stop
+    }
+
+    // The only writer of the clipboard; a drag publishes to the primary selection instead.
+    fn copy_selection(&self) {
+        if let Some(text) = self.state.selected_text() {
+            self.obj().clipboard().set_text(&text);
+        }
     }
 
     #[template_callback]
@@ -1152,6 +1168,30 @@ impl Window {
                     eprintln!("Error saving config: {e}");
                 }
             });
+    }
+
+    fn setup_text_selection(&self) {
+        // The window is what can reach the page widgets.
+        self.state.connect_closure(
+            "selection-changed",
+            false,
+            closure_local!(
+                #[weak(rename_to = imp)]
+                self,
+                move |_: &State, page: i32| imp.redraw_page(page)
+            ),
+        );
+
+        // Pages clear the selection themselves (see Page::setup_text_selection); this covers the
+        // margins and gaps. Primary button only: right-click keeps the selection, middle pans.
+        let click = gtk::GestureClick::builder().button(BUTTON_PRIMARY).build();
+        click.set_propagation_phase(gtk::PropagationPhase::Capture);
+        click.connect_pressed(clone!(
+            #[weak(rename_to = imp)]
+            self,
+            move |_, _, _, _| imp.state.clear_selection()
+        ));
+        self.scrolledwindow.add_controller(click);
     }
 
     fn apply_render_threads(&self, n: usize) {

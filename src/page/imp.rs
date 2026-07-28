@@ -21,6 +21,7 @@ use once_cell::sync::Lazy;
 use super::Rectangle;
 use crate::bg_job::{RenderPool, RenderPriority};
 use crate::links::LinkTarget;
+use crate::selection::PageSelection;
 use crate::state::MAX_PAGE_BYTES;
 
 // Low-resolution previews rendered ahead of the visible page and shown (upscaled) while the full
@@ -121,8 +122,6 @@ pub struct Page {
     #[property(get, set)]
     index: Cell<i32>,
 
-    // per-line highlight rects of the current text selection (page-local top-left points)
-    selection_rects: RefCell<Vec<Rectangle>>,
     bbox: RefCell<Rectangle>,
     cursor_guard: Cell<bool>,
 
@@ -193,10 +192,7 @@ impl WidgetImpl for Page {
             self.render_snapshot(snapshot, &page);
         }
 
-        let selection = self.selection_rects.borrow();
-        if !selection.is_empty() {
-            self.snapshot_selection_overlay(snapshot, &page, &selection);
-        }
+        self.snapshot_selection_overlay(snapshot, &page);
         self.snapshot_search_overlay(snapshot, &page);
     }
 }
@@ -306,6 +302,7 @@ impl Page {
             #[strong]
             cursor,
             move |_gc, _n_press, x, y| {
+                page.state().clear_selection();
                 mouse_coords.replace(Some((x, y)));
                 if !imp.cursor_guard.get() {
                     page.set_cursor_from_name(Some("text"));
@@ -319,8 +316,6 @@ impl Page {
         gc.connect_update(clone!(
             #[strong]
             mouse_coords,
-            #[weak(rename_to = imp)]
-            self,
             move |gc, seq| {
                 let Some((start_x, start_y)) = *mouse_coords.borrow() else {
                     return;
@@ -335,22 +330,24 @@ impl Page {
                 let selection =
                     crate::selection::selection(&obj.uri(), obj.index(), (x1, y1), (x2, y2));
                 match selection {
-                    Some(sel) => {
-                        if !sel.text.is_empty() {
-                            obj.clipboard().set_text(&sel.text);
-                        }
-                        imp.selection_rects
-                            .replace(sel.rects.into_iter().map(Rectangle::from).collect());
+                    Some(sel) if !sel.rects.is_empty() => {
+                        obj.state().set_selection(Some(PageSelection {
+                            page: obj.index(),
+                            rects: sel.rects.into_iter().map(Rectangle::from).collect(),
+                            text: sel.text,
+                        }));
                     }
-                    None => imp.selection_rects.borrow_mut().clear(),
+                    _ => obj.state().clear_selection(),
                 }
-
-                obj.queue_draw();
             }
         ));
 
         let obj = self.obj().clone();
         gc.connect_end(move |_, _| {
+            // Primary selection only (middle-click paste); the clipboard needs an explicit copy.
+            if let Some(text) = obj.state().selected_text() {
+                obj.primary_clipboard().set_text(&text);
+            }
             if Cell::get(&cursor) {
                 cursor.set(false);
                 obj.set_cursor(None);
@@ -586,21 +583,26 @@ impl Page {
         snapshot.pop();
     }
 
-    // Fill the selection's per-line highlight rects, using the same zoom/crop transform as the page
-    // render so they land on the words.
-    fn snapshot_selection_overlay(
-        &self,
-        snapshot: &gtk::Snapshot,
-        page: &PageInfo,
-        rects: &[Rectangle],
-    ) {
-        let bbox = self.get_bbox(page, self.obj().crop());
-        let scale = self.obj().zoom();
+    // Fill this page's selection rects, using the same zoom/crop transform as the page render so they
+    // land on the words.
+    fn snapshot_selection_overlay(&self, snapshot: &gtk::Snapshot, page: &PageInfo) {
+        let obj = self.obj();
+        let selection = obj.state().selection();
+        let selection = selection.borrow();
+        let Some(selection) = selection
+            .as_ref()
+            .filter(|selection| selection.page == obj.index())
+        else {
+            return;
+        };
+
+        let bbox = self.get_bbox(page, obj.crop());
+        let scale = obj.zoom();
 
         snapshot.save();
         overlay_transform(snapshot, &bbox, scale);
         let color = RGBA::new(0.5, 0.8, 0.9, 0.5);
-        for rect in rects {
+        for rect in &selection.rects {
             let (w, h) = rect.size();
             snapshot.append_color(
                 &color,
