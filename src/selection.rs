@@ -9,10 +9,20 @@ use std::rc::Rc;
 use mupdf::TextPageFlags;
 
 use crate::mupdf_render::{self, with_doc};
+use crate::page::Rectangle;
 
 pub struct Selection {
     // highlight rects, one per selected line, in page-local top-left points
     pub rects: Vec<(f64, f64, f64, f64)>,
+    pub text: String,
+}
+
+// The document's text selection: page, per-line highlight rects (page-local top-left points) and
+// text. Held by State, not by the page widget, since list recycling reassigns widgets to pages.
+#[derive(Debug)]
+pub struct PageSelection {
+    pub page: i32,
+    pub rects: Vec<Rectangle>,
     pub text: String,
 }
 

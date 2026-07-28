@@ -75,7 +75,9 @@ JPEG, TIFF, …) open as well. DjVu is not supported.
 | `f` / Ctrl + f  | Search in document                       |
 | `n` / `F3`      | Next match                               |
 | `N` / Shift + F3 | Previous match                          |
-| Esc             | Close search                             |
+| Drag            | Select text (also copied to the primary selection) |
+| Ctrl + c        | Copy the selected text to the clipboard  |
+| Esc             | Close search / drop the selection        |
 
 ## Installation
 
