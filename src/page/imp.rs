@@ -89,6 +89,12 @@ fn prefetch_depth(threads: usize, visible: usize, page_bytes: usize, budget: usi
     want.min((budget / page_bytes).saturating_sub(visible + 1))
 }
 
+fn page_buffer_bytes(page: &PageInfo, scale: f64, dsf: f64) -> usize {
+    let width = (page.width * scale * dsf) as i64;
+    let height = (page.height * scale * dsf) as i64;
+    (width.max(0) as usize) * (height.max(0) as usize) * 4
+}
+
 // Preview prefetch half-width, bounded so both directions fit the preview cache - else big-page docs
 // schedule previews that evict each other, thrashing the cache and render pool. Full window until
 // the cache has sized its first preview (`capacity` 0).
@@ -171,6 +177,12 @@ impl WidgetImpl for Page {
             }
             return;
         }
+
+        // This page's own size, which the zoom bound has to cover - the document's load-time sample
+        // only saw its first pages.
+        self.obj()
+            .state()
+            .observe_page_size((page.width, page.height));
 
         if self.obj().state().multithread_rendering() {
             self.multithread_snapshot(snapshot, &page);
@@ -484,6 +496,13 @@ impl Page {
         let bbox = self.get_bbox(page, obj.crop());
         let scale = obj.zoom();
 
+        // over the cap: wait for the re-clamped zoom
+        if page_buffer_bytes(page, scale, scale_factor) as f64 > crate::state::MAX_PAGE_BYTES {
+            log::debug!("draw page {}: over the page buffer cap", page.index);
+            append_white(snapshot, &bbox, scale);
+            return;
+        }
+
         match render_page_texture(
             &obj.uri(),
             page.index,
@@ -637,8 +656,7 @@ impl Page {
         let (canvas_width, canvas_height) =
             (width * scale * scale_factor, height * scale * scale_factor);
         let expected = (canvas_width as i32, canvas_height as i32);
-        // 4 bytes/pixel, matching how the cache sizes an entry
-        let page_bytes = (expected.0.max(0) as usize) * (expected.1.max(0) as usize) * 4;
+        let page_bytes = page_buffer_bytes(page, scale, scale_factor);
 
         let cache = obj.state().render_cache();
         let cached = cache.borrow_mut().get(page_num);
@@ -656,16 +674,23 @@ impl Page {
             cache.borrow_mut().remove(page_num);
         }
 
-        // Flung-past pages are dropped at the queue (see set_wanted_pages), so this doesn't saturate
-        // the workers mid-scroll.
-        self.schedule_render(page_num, scale, scale_factor, RenderPriority::Visible);
+        // A page over the cap is one the zoom bound didn't cover yet (bigger than the pages sampled
+        // at load): observe_page_size has lowered the ceiling, so stand in until the re-clamped zoom
+        // arrives rather than allocating this buffer.
+        let fits = page_bytes as f64 <= crate::state::MAX_PAGE_BYTES;
 
-        // remember that this widget is the one waiting for page_num, so the
-        // render repaints it when it lands
-        obj.state()
-            .render_waiters()
-            .borrow_mut()
-            .insert(page_num, obj.downgrade());
+        if fits {
+            // Flung-past pages are dropped at the queue (see set_wanted_pages), so this doesn't
+            // saturate the workers mid-scroll.
+            self.schedule_render(page_num, scale, scale_factor, RenderPriority::Visible);
+
+            // remember that this widget is the one waiting for page_num, so the
+            // render repaints it when it lands
+            obj.state()
+                .render_waiters()
+                .borrow_mut()
+                .insert(page_num, obj.downgrade());
+        }
 
         // show a low-res preview (upscaled) if we have one, otherwise a loading placeholder
         let bbox = self.get_cached_bbox(page, obj.crop());
@@ -684,7 +709,9 @@ impl Page {
         // fast scroll)
         self.prefetch_previews(page_num);
         self.schedule_preview_if_needed(page_num, RenderPriority::VisiblePreview);
-        self.prefetch_next(page_num, page_bytes);
+        if fits {
+            self.prefetch_next(page_num, page_bytes);
+        }
     }
 
     // Full-render pages ahead in the scroll direction so reading on lands on a cached page. Skips

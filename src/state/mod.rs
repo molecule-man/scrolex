@@ -24,7 +24,7 @@ pub(crate) const PREVIEW_TARGET_BYTES: usize = 20 * 1024 * 1024 / 65;
 // Ceiling on one page's pixel buffer. Pages are rendered whole, so the buffer grows with the square
 // of the zoom; the zoom bound derived from this cap (see zoom_ceiling) is what keeps deep zoom from
 // allocating buffers in the gigabytes.
-const MAX_PAGE_BYTES: f64 = 128.0 * 1024.0 * 1024.0;
+pub(crate) const MAX_PAGE_BYTES: f64 = 128.0 * 1024.0 * 1024.0;
 // Absolute zoom bounds, so a postage-stamp page can't reach unusable zoom levels and zooming out
 // can't shrink a page to nothing.
 const MAX_ZOOM: f64 = 10.0;
@@ -50,7 +50,7 @@ fn zoom_ceiling(page_pt: (f64, f64), device_scale: i32) -> f64 {
         .clamp(MIN_ZOOM, MAX_ZOOM)
 }
 
-type FirstPageSize = Option<(f64, f64)>;
+type MaxPageSize = Option<(f64, f64)>;
 
 fn document_size_bytes(f: &gtk::gio::File) -> i64 {
     f.query_info(
@@ -94,6 +94,33 @@ impl State {
         }
     }
 
+    // Widen the document's page size to cover `page_pt`: the load-time sample only sees the first
+    // pages, and the bound has to hold for the biggest page actually drawn. Re-clamps the zoom on
+    // idle, since callers are mid-snapshot and lowering the zoom resizes every page widget.
+    pub(crate) fn observe_page_size(&self, page_pt: (f64, f64)) {
+        let area = page_pt.0 * page_pt.1;
+        if !area.is_finite() || area <= 0.0 {
+            return;
+        }
+        if self
+            .imp()
+            .page_size_pt
+            .get()
+            .is_some_and(|(w, h)| w * h >= area)
+        {
+            return;
+        }
+
+        self.imp().page_size_pt.set(Some(page_pt));
+        if self.zoom() > self.max_zoom() {
+            glib::idle_add_local_once(clone!(
+                #[weak(rename_to = state)]
+                self,
+                move || state.zoom_to(state.zoom())
+            ));
+        }
+    }
+
     // Device pixels per point of the window showing this document; moving to a differently scaled
     // monitor changes the zoom ceiling, so re-apply the current zoom against it.
     pub(crate) fn set_device_scale(&self, scale: i32) {
@@ -131,13 +158,13 @@ impl State {
         // since nothing below the commit runs until the open succeeds. Staging fetches a remote
         // file exactly once; those bytes are the ones committed for rendering - no re-fetch.
         let (tx, rx) =
-            oneshot::channel::<Option<(crate::mupdf_render::Candidate, i32, FirstPageSize)>>();
+            oneshot::channel::<Option<(crate::mupdf_render::Candidate, i32, MaxPageSize)>>();
         let uri_probe = uri.clone();
         std::thread::spawn(move || {
             let probed = crate::mupdf_render::stage_candidate(&uri_probe).and_then(|candidate| {
                 match candidate.probe() {
-                    Some((n_pages, first_page_size)) if n_pages > 0 => {
-                        Some((candidate, n_pages, first_page_size))
+                    Some((n_pages, max_page_size)) if n_pages > 0 => {
+                        Some((candidate, n_pages, max_page_size))
                     }
                     _ => None,
                 }
@@ -153,14 +180,14 @@ impl State {
                 if state.imp().load_seq.get() != seq {
                     return; // a newer load superseded this one
                 }
-                let Some((candidate, n_pages, first_page_size)) = probed else {
+                let Some((candidate, n_pages, max_page_size)) = probed else {
                     state.emit_by_name::<()>(
                         "load-failed",
                         &[&"could not open document".to_string()],
                     );
                     return;
                 };
-                state.commit_load(&uri, candidate, n_pages, first_page_size, size_bytes);
+                state.commit_load(&uri, candidate, n_pages, max_page_size, size_bytes);
             }
         ));
     }
@@ -170,7 +197,7 @@ impl State {
         uri: &str,
         candidate: crate::mupdf_render::Candidate,
         n_pages: i32,
-        first_page_size: FirstPageSize,
+        max_page_size: MaxPageSize,
         size_bytes: i64,
     ) {
         // Committed to the new document: force every thread to reopen (the same path may have
@@ -211,7 +238,7 @@ impl State {
         self.set_prev_page(0);
         self.set_uri(uri);
         self.set_n_pages(n_pages);
-        self.imp().page_size_pt.set(first_page_size);
+        self.imp().page_size_pt.set(max_page_size);
         self.zoom_to(1.0);
         self.set_crop(false);
         self.set_page(0);
@@ -240,7 +267,7 @@ impl State {
         }
 
         log::info!(
-            "Loaded document: {n_pages} pages, {size_bytes} bytes, first page {first_page_size:?} pt, \
+            "Loaded document: {n_pages} pages, {size_bytes} bytes, largest sampled page {max_page_size:?} pt, \
              start page {}, zoom {}, crop {}",
             self.page(),
             self.zoom(),
@@ -413,6 +440,28 @@ mod tests {
         }
         // the reported case: 1000% on an A4 page at scale factor 2 is not reachable
         assert!(zoom_ceiling(a4, 2) < 10.0);
+    }
+
+    #[gtk::test]
+    fn a_bigger_drawn_page_tightens_the_zoom_ceiling() {
+        let state = State::new();
+        state.imp().device_scale.set(1);
+        state.imp().page_size_pt.set(Some((200.0, 200.0)));
+        let small_page_ceiling = state.max_zoom();
+
+        // a page the load-time sample missed
+        state.observe_page_size((2000.0, 3000.0));
+        let big_page_ceiling = state.max_zoom();
+        assert!(big_page_ceiling < small_page_ceiling);
+        assert!(page_bytes_at((2000.0, 3000.0), 1, big_page_ceiling) <= MAX_PAGE_BYTES);
+
+        // smaller pages don't loosen it again
+        state.observe_page_size((100.0, 100.0));
+        assert_eq!(state.max_zoom(), big_page_ceiling);
+        // nor do degenerate sizes
+        state.observe_page_size((0.0, 0.0));
+        state.observe_page_size((f64::NAN, 10.0));
+        assert_eq!(state.max_zoom(), big_page_ceiling);
     }
 
     #[test]

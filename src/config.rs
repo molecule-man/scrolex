@@ -37,7 +37,7 @@ impl Default for Config {
         Self {
             render_threads: DEFAULT_RENDER_THREADS,
             preview_cache_pages: DEFAULT_PREVIEW_CACHE_PAGES,
-            render_cache_mb: DEFAULT_RENDER_CACHE_MB,
+            render_cache_mb: default_render_cache_mb(),
             animate_scroll: true,
             geometry: None,
         }
