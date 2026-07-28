@@ -10,6 +10,7 @@ pub const DEFAULT_RENDER_THREADS: usize = 4;
 
 pub const DEFAULT_PREVIEW_CACHE_PAGES: usize = 65;
 
+// Fallback when system memory can't be read; see default_render_cache_mb.
 pub const DEFAULT_RENDER_CACHE_MB: usize = 64;
 pub const MIN_RENDER_CACHE_MB: usize = 32;
 pub const MAX_RENDER_CACHE_MB: usize = 512;
@@ -62,6 +63,24 @@ pub fn max_render_threads() -> usize {
         .max(1)
 }
 
+// Budget for a machine with `total_mb` of RAM: a sixteenth of it, since resident memory runs a few
+// times the budget at high zoom.
+fn cache_budget_for_memory(total_mb: usize) -> usize {
+    (total_mb / 16).clamp(MIN_RENDER_CACHE_MB, MAX_RENDER_CACHE_MB)
+}
+
+fn default_render_cache_mb() -> usize {
+    total_memory_mb().map_or(DEFAULT_RENDER_CACHE_MB, cache_budget_for_memory)
+}
+
+// Total RAM in MB, read from /proc (Linux).
+fn total_memory_mb() -> Option<usize> {
+    let meminfo = fs::read_to_string("/proc/meminfo").ok()?;
+    let field = meminfo.lines().find_map(|l| l.strip_prefix("MemTotal:"))?;
+    let kb: usize = field.split_whitespace().next()?.parse().ok()?;
+    Some(kb / 1024)
+}
+
 pub fn load_config() -> Config {
     let contents = config_file_path()
         .and_then(|p| fs::read_to_string(p).ok())
@@ -69,7 +88,7 @@ pub fn load_config() -> Config {
 
     let mut render_threads = DEFAULT_RENDER_THREADS;
     let mut preview_cache_pages = DEFAULT_PREVIEW_CACHE_PAGES;
-    let mut render_cache_mb = DEFAULT_RENDER_CACHE_MB;
+    let mut render_cache_mb = default_render_cache_mb();
     let mut animate_scroll = true;
     let mut width = None;
     let mut height = None;
@@ -143,6 +162,14 @@ pub fn save_config(config: &Config) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_budget_scales_with_memory_within_the_setting_range() {
+        assert_eq!(cache_budget_for_memory(256), MIN_RENDER_CACHE_MB); // floor
+        assert_eq!(cache_budget_for_memory(1024), 64);
+        assert_eq!(cache_budget_for_memory(4096), 256);
+        assert_eq!(cache_budget_for_memory(65536), MAX_RENDER_CACHE_MB); // capped
+    }
 
     #[test]
     fn round_trips_and_clamps_to_max() {
