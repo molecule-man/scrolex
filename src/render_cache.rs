@@ -70,6 +70,13 @@ impl RenderCache {
         self.entries.contains_key(&page)
     }
 
+    // Whether a page is cached at the requested pixel dimensions, without affecting recency.
+    pub fn contains_dimensions(&self, page: i32, dimensions: (i32, i32)) -> bool {
+        self.entries
+            .get(&page)
+            .is_some_and(|entry| (entry.texture.width(), entry.texture.height()) == dimensions)
+    }
+
     // Rough number of pages that fit the budget, from the average cached page size. 0 until
     // something is cached. Bounds the preview window so it can't schedule more than it can keep.
     pub fn page_capacity(&self) -> usize {
@@ -152,6 +159,16 @@ mod tests {
         assert!(cache.get(1).is_none());
         assert!(cache.get(2).is_some());
         assert!(cache.get(3).is_some());
+    }
+
+    #[gtk::test]
+    fn distinguishes_render_dimensions_for_the_same_page() {
+        let mut cache = RenderCache::new(100);
+        cache.insert(1, texture(40));
+
+        assert!(cache.contains_dimensions(1, (10, 1)));
+        assert!(!cache.contains_dimensions(1, (20, 1)));
+        assert!(!cache.contains_dimensions(2, (10, 1)));
     }
 
     #[gtk::test]
