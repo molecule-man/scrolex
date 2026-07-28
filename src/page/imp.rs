@@ -21,6 +21,7 @@ use once_cell::sync::Lazy;
 use super::Rectangle;
 use crate::bg_job::{RenderPool, RenderPriority};
 use crate::links::LinkTarget;
+use crate::state::MAX_PAGE_BYTES;
 
 // Low-resolution previews rendered ahead of the visible page and shown (upscaled) while the full
 // render is pending, so aggressive scrolling shows blurry pages rather than blank ones. The render
@@ -89,10 +90,12 @@ fn prefetch_depth(threads: usize, visible: usize, page_bytes: usize, budget: usi
     want.min((budget / page_bytes).saturating_sub(visible + 1))
 }
 
-fn page_buffer_bytes(page: &PageInfo, scale: f64, dsf: f64) -> usize {
-    let width = (page.width * scale * dsf) as i64;
-    let height = (page.height * scale * dsf) as i64;
-    (width.max(0) as usize) * (height.max(0) as usize) * 4
+// Bytes a full render of a page this size allocates, truncated as the renderer truncates. In f64: an
+// extreme page size wraps integer maths, and a wrapped product reads as under the cap.
+fn page_buffer_bytes(page_pt: (f64, f64), scale: f64, dsf: f64) -> f64 {
+    let width = (page_pt.0 * scale * dsf).trunc().max(0.0);
+    let height = (page_pt.1 * scale * dsf).trunc().max(0.0);
+    width * height * 4.0
 }
 
 // Preview prefetch half-width, bounded so both directions fit the preview cache - else big-page docs
@@ -497,7 +500,7 @@ impl Page {
         let scale = obj.zoom();
 
         // over the cap: wait for the re-clamped zoom
-        if page_buffer_bytes(page, scale, scale_factor) as f64 > crate::state::MAX_PAGE_BYTES {
+        if page_buffer_bytes((page.width, page.height), scale, scale_factor) > MAX_PAGE_BYTES {
             log::debug!("draw page {}: over the page buffer cap", page.index);
             append_white(snapshot, &bbox, scale);
             return;
@@ -656,7 +659,7 @@ impl Page {
         let (canvas_width, canvas_height) =
             (width * scale * scale_factor, height * scale * scale_factor);
         let expected = (canvas_width as i32, canvas_height as i32);
-        let page_bytes = page_buffer_bytes(page, scale, scale_factor);
+        let page_bytes = page_buffer_bytes((page.width, page.height), scale, scale_factor);
 
         let cache = obj.state().render_cache();
         let cached = cache.borrow_mut().get(page_num);
@@ -666,7 +669,7 @@ impl Page {
                 let bbox = self.get_bbox(page, obj.crop());
                 self.append_page_texture(snapshot, &texture, &bbox, scale);
                 self.prefetch_previews(page_num);
-                self.prefetch_next(page_num, page_bytes);
+                self.prefetch_next(page_num, page_bytes as usize);
                 return;
             }
             // dimensions changed (e.g. zoom), the cached texture is stale
@@ -674,23 +677,17 @@ impl Page {
             cache.borrow_mut().remove(page_num);
         }
 
-        // A page over the cap is one the zoom bound didn't cover yet (bigger than the pages sampled
-        // at load): observe_page_size has lowered the ceiling, so stand in until the re-clamped zoom
-        // arrives rather than allocating this buffer.
-        let fits = page_bytes as f64 <= crate::state::MAX_PAGE_BYTES;
+        // Flung-past pages are dropped at the queue (see set_wanted_pages), so this doesn't saturate
+        // the workers mid-scroll. A page over the buffer cap is declined here and stands in below
+        // until observe_page_size's lowered ceiling re-clamps the zoom.
+        self.schedule_render(page_num, scale, scale_factor, RenderPriority::Visible);
 
-        if fits {
-            // Flung-past pages are dropped at the queue (see set_wanted_pages), so this doesn't
-            // saturate the workers mid-scroll.
-            self.schedule_render(page_num, scale, scale_factor, RenderPriority::Visible);
-
-            // remember that this widget is the one waiting for page_num, so the
-            // render repaints it when it lands
-            obj.state()
-                .render_waiters()
-                .borrow_mut()
-                .insert(page_num, obj.downgrade());
-        }
+        // remember that this widget is the one waiting for page_num, so the
+        // render repaints it when it lands
+        obj.state()
+            .render_waiters()
+            .borrow_mut()
+            .insert(page_num, obj.downgrade());
 
         // show a low-res preview (upscaled) if we have one, otherwise a loading placeholder
         let bbox = self.get_cached_bbox(page, obj.crop());
@@ -709,9 +706,7 @@ impl Page {
         // fast scroll)
         self.prefetch_previews(page_num);
         self.schedule_preview_if_needed(page_num, RenderPriority::VisiblePreview);
-        if fits {
-            self.prefetch_next(page_num, page_bytes);
-        }
+        self.prefetch_next(page_num, page_bytes as usize);
     }
 
     // Full-render pages ahead in the scroll direction so reading on lands on a cached page. Skips
@@ -746,9 +741,9 @@ impl Page {
         }
     }
 
-    // Queue a full render of `page_num`, unless one is already in flight for it. The marker records
-    // the epoch the render was scheduled at, so its completion can tell whether the slot is still
-    // its own to release.
+    // Queue a full render of `page_num`, unless one is already in flight for it or its buffer would
+    // exceed the cap. The marker records the epoch the render was scheduled at, so its completion can
+    // tell whether the slot is still its own to release.
     fn schedule_render(
         &self,
         page_num: i32,
@@ -757,6 +752,20 @@ impl Page {
         priority: RenderPriority,
     ) {
         let obj = self.obj();
+        let uri = obj.uri();
+        // Page size (points) from the main-thread doc, so the worker sizes its pixel buffer to
+        // exactly what the render cache expects (see mupdf_render::render_page_pixels).
+        let page_pt = crate::mupdf_render::page_size(&uri, page_num);
+
+        // Checked here, before the marker: prefetched pages are scheduled without being drawn, so
+        // this is the only point that sees their size. Bailing after the insert would leave the page
+        // marked in flight with no render to release it.
+        if page_pt.is_some_and(|size| page_buffer_bytes(size, scale, scale_factor) > MAX_PAGE_BYTES)
+        {
+            log::debug!("page {page_num}: over the page buffer cap, not rendering");
+            return;
+        }
+
         let epoch = obj.state().render_epoch();
         match obj.state().render_inflight().borrow_mut().entry(page_num) {
             Entry::Occupied(_) => return,
@@ -765,11 +774,7 @@ impl Page {
             }
         }
 
-        let uri = obj.uri();
         let client = obj.state().render_client_id();
-        // Page size (points) from the main-thread doc, so the worker sizes its pixel buffer to
-        // exactly what the render cache expects (see mupdf_render::render_page_pixels).
-        let page_pt = crate::mupdf_render::page_size(&uri, page_num);
         log::trace!("Scheduling render of page {page_num}");
 
         let (resp_sender, resp_receiver) = oneshot::channel::<RenderedPage>();
@@ -1314,6 +1319,18 @@ mod tests {
 
         // deep zoom: one page fills the budget, so nothing is rendered ahead
         assert_eq!(prefetch_depth(11, 1, 100 * mb, 64 * mb), 0);
+    }
+
+    #[test]
+    fn page_buffer_bytes_stays_measurable_at_extreme_sizes() {
+        // A4 at 100%, device scale 2
+        assert_eq!(page_buffer_bytes((595.0, 842.0), 1.0, 2.0), 8_015_840.0);
+        // sizes no integer product could hold must still read as over the cap, never wrap under it
+        assert!(page_buffer_bytes((f64::MAX, f64::MAX), 10.0, 3.0) > MAX_PAGE_BYTES);
+        assert!(page_buffer_bytes((1e9, 1e9), 10.0, 3.0) > MAX_PAGE_BYTES);
+        // degenerate sizes measure as nothing rather than going negative
+        assert_eq!(page_buffer_bytes((0.0, 0.0), 1.0, 1.0), 0.0);
+        assert_eq!(page_buffer_bytes((-5.0, 10.0), 1.0, 1.0), 0.0);
     }
 
     #[test]
