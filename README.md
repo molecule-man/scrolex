@@ -10,6 +10,8 @@ distraction-free, efficient reading. With its horizontal scrolling layout,
 Scrolex lets you see more pages at once, making it ideal for large monitors and
 wide screens.
 
+<a href="https://flathub.org/apps/com.andr2i.scrolex"><img width="190" alt="Get it on Flathub" src="https://flathub.org/api/badge?locale=en"></a>
+
 https://github.com/user-attachments/assets/225c4b69-eb15-48d0-b978-f7bd747d463e
 
 ## Features
@@ -83,9 +85,9 @@ JPEG, TIFF, …) open as well. DjVu is not supported.
 
 ### 0. Dependencies
 
-The Flatpak bundle includes the application dependencies and downloads its
-GNOME runtime from Flathub. The AUR and `.deb` packages declare their system
-dependencies so their package managers can install them.
+The Flatpak carries the application dependencies and pulls its GNOME runtime
+from Flathub. The AUR and `.deb` packages declare their system dependencies so
+their package managers can install them.
 
 The release artifacts currently support x86-64 Linux. The raw pre-built binary
 needs GTK 4.12 or newer at runtime; the document engine (MuPDF) is statically
@@ -105,23 +107,19 @@ bindgen:
 sudo pacman -S gtk4 clang base-devel
 ```
 
-### 1. Install the Flatpak bundle
+### 1. Install from Flathub
 
-Download the `.flatpak` bundle from the [GitHub releases page][1].
-
-The bundle is self-contained, but it pulls its runtime (the GNOME Platform and
-GPU/codec extensions) from Flathub, so Flathub must be configured first. If it
-isn't already, add it:
+Scrolex is on [Flathub](https://flathub.org/apps/com.andr2i.scrolex). If the
+Flathub remote isn't configured yet, add it:
 
 ```bash
 flatpak remote-add --if-not-exists --user flathub https://dl.flathub.org/repo/flathub.flatpakrepo
 ```
 
-Then install the bundle by pointing `flatpak install` at the file directly, and
-run it:
+Then install and run:
 
 ```bash
-flatpak install --user scrolex_*.flatpak
+flatpak install --user flathub com.andr2i.scrolex
 flatpak run com.andr2i.scrolex
 ```
 
