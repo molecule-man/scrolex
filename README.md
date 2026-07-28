@@ -83,30 +83,6 @@ JPEG, TIFF, …) open as well. DjVu is not supported.
 
 ## Installation
 
-### 0. Dependencies
-
-The Flatpak carries the application dependencies and pulls its GNOME runtime
-from Flathub. The AUR and `.deb` packages declare their system dependencies so
-their package managers can install them.
-
-The release artifacts currently support x86-64 Linux. The raw pre-built binary
-needs GTK 4.12 or newer at runtime; the document engine (MuPDF) is statically
-linked.
-
-On arch:
-
-```bash
-sudo pacman -S gtk4
-```
-
-Building from source additionally needs a C/C++ toolchain and `clang`, since
-the `mupdf` crate compiles its bundled C library and generates bindings with
-bindgen:
-
-```bash
-sudo pacman -S gtk4 clang base-devel
-```
-
 ### 1. Install from Flathub
 
 Scrolex is on [Flathub](https://flathub.org/apps/com.andr2i.scrolex). If the
@@ -128,9 +104,14 @@ root).
 
 ### 2. Download from GitHub Releases
 
-You can download the latest x86-64 pre-built binary archive directly from the
-[GitHub releases page][1]. Extract it and run the `scrolex` executable. GTK
-4.12 or newer must already be installed.
+GTK 4.12 or newer must already be installed. On Arch:
+
+```bash
+sudo pacman -S gtk4
+```
+
+Then download the latest x86-64 pre-built binary archive from the [GitHub
+releases page][1], extract it, and run the `scrolex` executable.
 
 ### 3. Install from AUR (Arch Linux)
 
@@ -154,6 +135,16 @@ sudo apt install ./scrolex_<version>.deb
 ```
 
 ### 5. Build from source
+
+Needs GTK 4.12 or newer plus a C/C++ toolchain and `clang`, since the `mupdf`
+crate compiles its bundled C library and generates bindings with bindgen. On
+Arch:
+
+```bash
+sudo pacman -S gtk4 clang base-devel
+```
+
+Then:
 
 ```bash
 # clone the repository
