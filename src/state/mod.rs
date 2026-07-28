@@ -510,11 +510,11 @@ mod tests {
         state
             .render_cache()
             .borrow_mut()
-            .insert(3, texture.upcast());
+            .insert(3, texture.upcast(), 1.0);
 
         state.zoom_to(1.1);
 
-        assert!(state.render_cache().borrow().contains(3));
+        assert!(state.render_cache().borrow().contains_at_scale(3, 1.0));
     }
 
     #[test]

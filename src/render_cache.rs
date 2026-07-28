@@ -13,6 +13,7 @@ const DEFAULT_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 struct Entry {
     texture: gdk::Texture,
     bytes: usize,
+    pixel_scale: f64,
 }
 
 pub struct RenderCache {
@@ -70,11 +71,12 @@ impl RenderCache {
         self.entries.contains_key(&page)
     }
 
-    // Whether a page is cached at the requested pixel dimensions, without affecting recency.
-    pub fn contains_dimensions(&self, page: i32, dimensions: (i32, i32)) -> bool {
+    // Whether a page is cached at the requested render scale, without affecting recency. Exact
+    // comparison is stable because insertion and lookup use the same zoom * scale_factor product.
+    pub fn contains_at_scale(&self, page: i32, pixel_scale: f64) -> bool {
         self.entries
             .get(&page)
-            .is_some_and(|entry| (entry.texture.width(), entry.texture.height()) == dimensions)
+            .is_some_and(|entry| entry.pixel_scale == pixel_scale)
     }
 
     // Rough number of pages that fit the budget, from the average cached page size. 0 until
@@ -87,11 +89,18 @@ impl RenderCache {
         self.budget_bytes.checked_div(avg).unwrap_or(0)
     }
 
-    pub fn insert(&mut self, page: i32, texture: gdk::Texture) {
+    pub fn insert(&mut self, page: i32, texture: gdk::Texture, pixel_scale: f64) {
         // 4 bytes/pixel (BGRx) - close enough to the resident buffer for the budget.
         let bytes = (texture.width() as usize) * (texture.height() as usize) * 4;
         self.remove(page);
-        self.entries.insert(page, Entry { texture, bytes });
+        self.entries.insert(
+            page,
+            Entry {
+                texture,
+                bytes,
+                pixel_scale,
+            },
+        );
         self.order.push(page);
         self.total_bytes += bytes;
         self.evict();
@@ -151,10 +160,10 @@ mod tests {
     #[gtk::test]
     fn evicts_least_recently_used_over_budget() {
         let mut cache = RenderCache::new(100);
-        cache.insert(1, texture(40));
-        cache.insert(2, texture(40));
+        cache.insert(1, texture(40), 1.0);
+        cache.insert(2, texture(40), 1.0);
         // 80 bytes used; inserting another 40 exceeds 100 and evicts page 1
-        cache.insert(3, texture(40));
+        cache.insert(3, texture(40), 1.0);
 
         assert!(cache.get(1).is_none());
         assert!(cache.get(2).is_some());
@@ -162,23 +171,23 @@ mod tests {
     }
 
     #[gtk::test]
-    fn distinguishes_render_dimensions_for_the_same_page() {
+    fn distinguishes_render_scales_for_the_same_page() {
         let mut cache = RenderCache::new(100);
-        cache.insert(1, texture(40));
+        cache.insert(1, texture(40), 1.25);
 
-        assert!(cache.contains_dimensions(1, (10, 1)));
-        assert!(!cache.contains_dimensions(1, (20, 1)));
-        assert!(!cache.contains_dimensions(2, (10, 1)));
+        assert!(cache.contains_at_scale(1, 1.25));
+        assert!(!cache.contains_at_scale(1, 1.5));
+        assert!(!cache.contains_at_scale(2, 1.25));
     }
 
     #[gtk::test]
     fn touch_on_get_protects_from_eviction() {
         let mut cache = RenderCache::new(100);
-        cache.insert(1, texture(40));
-        cache.insert(2, texture(40));
+        cache.insert(1, texture(40), 1.0);
+        cache.insert(2, texture(40), 1.0);
         // touch page 1 so page 2 becomes least-recently-used
         assert!(cache.get(1).is_some());
-        cache.insert(3, texture(40));
+        cache.insert(3, texture(40), 1.0);
 
         assert!(cache.get(1).is_some());
         assert!(cache.get(2).is_none());
@@ -187,7 +196,7 @@ mod tests {
     #[gtk::test]
     fn always_keeps_most_recent_even_if_over_budget() {
         let mut cache = RenderCache::new(10);
-        cache.insert(1, texture(40));
+        cache.insert(1, texture(40), 1.0);
         assert!(cache.get(1).is_some());
     }
 }
