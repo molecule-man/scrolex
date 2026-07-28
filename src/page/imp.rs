@@ -752,14 +752,25 @@ impl Page {
         priority: RenderPriority,
     ) {
         let obj = self.obj();
+        // Cheap bail before reading page bounds: a page redrawn while its render runs comes back here
+        // on every snapshot.
+        if obj
+            .state()
+            .render_inflight()
+            .borrow()
+            .contains_key(&page_num)
+        {
+            return;
+        }
+
         let uri = obj.uri();
         // Page size (points) from the main-thread doc, so the worker sizes its pixel buffer to
         // exactly what the render cache expects (see mupdf_render::render_page_pixels).
         let page_pt = crate::mupdf_render::page_size(&uri, page_num);
 
-        // Checked here, before the marker: prefetched pages are scheduled without being drawn, so
-        // this is the only point that sees their size. Bailing after the insert would leave the page
-        // marked in flight with no render to release it.
+        // Checked before the marker: prefetched pages are scheduled without being drawn, so this is
+        // the only point that sees their size. Bailing after the insert would leave the page marked in
+        // flight with no render to release it.
         if page_pt.is_some_and(|size| page_buffer_bytes(size, scale, scale_factor) > MAX_PAGE_BYTES)
         {
             log::debug!("page {page_num}: over the page buffer cap, not rendering");
@@ -1473,6 +1484,40 @@ startxref
         assert!((r.y1 - 0.0).abs() < EPSILON);
         assert!((r.x2 - 250.0).abs() < EPSILON);
         assert!((r.y2 - 50.0).abs() < EPSILON);
+    }
+
+    // Two pages, the second far larger: the mixed-size case where the second page's buffer exceeds
+    // the cap at a zoom the first page allows.
+    const MIXED_SIZE_PDF: &[u8] = b"%PDF-1.4\n\
+1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n\
+2 0 obj\n<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>\nendobj\n\
+3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] >>\nendobj\n\
+4 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 2000 3000] >>\nendobj\n\
+trailer\n<< /Root 1 0 R >>\n%%EOF";
+
+    #[gtk::test]
+    fn schedule_render_declines_a_page_over_the_buffer_cap() {
+        let dir = std::env::temp_dir().join("scrolex_schedule_cap_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mixed.pdf");
+        std::fs::write(&path, MIXED_SIZE_PDF).unwrap();
+        let uri = format!("file://{}", path.display());
+
+        let state = crate::state::State::new();
+        state.set_uri(uri);
+        state.set_n_pages(2);
+        let page = crate::page::Page::new(&state);
+
+        // page 1 is 2000x3000pt: at zoom 10 its buffer is ~2.4GB, far over the cap. Nothing is
+        // scheduled, and no marker is left behind to wedge the page.
+        page.imp()
+            .schedule_render(1, 10.0, 1.0, RenderPriority::Prefetch);
+        assert!(state.render_inflight().borrow().is_empty());
+
+        // the same page at a zoom that fits is scheduled as usual
+        page.imp()
+            .schedule_render(1, 0.5, 1.0, RenderPriority::Prefetch);
+        assert!(state.render_inflight().borrow().contains_key(&1));
     }
 
     #[gtk::test]
