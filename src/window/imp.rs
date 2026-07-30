@@ -148,6 +148,15 @@ pub struct Window {
     // any scroll path - free-scroll included, not just page steps
     last_hadj: Cell<f64>,
 
+    // the position set_hscroll asked for last, and which input asked for it. If the position ends up
+    // somewhere else, something other than us moved it.
+    hscroll_intent: Cell<(f64, &'static str)>,
+
+    // the selected page and where its left edge sits on screen, as of the last position change. This
+    // is what the reader sees; the adjustment value is not. When page widths change, the list view
+    // can change its own coordinates, which moves the value while the page stays where it is.
+    seen_page_x: Cell<Option<(u32, f64)>>,
+
     // accumulates hi-res mouse-wheel deltas (libinput splits one notch into sub-events summing to
     // 1.0); a page advances when the total crosses a notch, keeping the remainder. Not reset between
     // gestures, so a reverse after a pause can need up to ~0.8 notch - accepted.
@@ -308,6 +317,12 @@ impl Window {
                     WHEEL_NOTCH,
                     WHEEL_TRIGGER,
                 );
+                log::trace!(
+                    target: "scrolex::pan",
+                    "wheel scroll: dy={dy:+.3} prev_dy={:+.3} accum {:+.3} -> {accum:+.3} step={step:+}",
+                    self.wheel_last_dy.get(),
+                    self.wheel_accum.get(),
+                );
                 self.wheel_accum.set(accum);
                 self.wheel_last_dy.set(dy);
                 self.step_page(step);
@@ -318,10 +333,17 @@ impl Window {
                 // Apply the horizontal delta to the scroll position, but only when no page slide is
                 // running. During a slide `scroll_tick` owns the adjustment; adding dx here (from a
                 // scroll event that arrives mid-slide) would fight its writes frame by frame.
-                if self.scroll_anim.borrow().is_none() {
+                let sliding = self.scroll_anim.borrow().is_some();
+                if !sliding {
                     let hadj = self.scrolledwindow.hadjustment();
-                    hadj.set_value(self.clamp_scroll(hadj.value() + dx));
+                    self.set_hscroll(self.clamp_scroll(hadj.value() + dx), "touchpad");
                 }
+                log::trace!(
+                    target: "scrolex::pan",
+                    "touchpad scroll: dx={dx:+.2} dy={dy:+.2}{}",
+                    // a slide that never ends would ignore every swipe
+                    if sliding { " DROPPED (slide in progress)" } else { "" },
+                );
 
                 // Vertical pan is independent of the horizontal slide, so it always applies. The
                 // adjustment clamps to its range, so this is a no-op when the page fits the viewport.
@@ -372,7 +394,7 @@ impl Window {
         };
         if let Some((prev_x, prev_y)) = *self.drag_coords.borrow() {
             let hadjustment = self.scrolledwindow.hadjustment();
-            hadjustment.set_value(hadjustment.value() - (x - prev_x));
+            self.set_hscroll(hadjustment.value() - (x - prev_x), "drag");
             let vadjustment = self.vscrolledwindow.vadjustment();
             vadjustment.set_value(vadjustment.value() - (y - prev_y));
         }
@@ -495,7 +517,7 @@ impl Window {
                     hadj.page_size() * 0.1
                 };
                 let delta = if keyval == Key::Left { -step } else { step };
-                hadj.set_value(hadj.value() + delta);
+                self.set_hscroll(hadj.value() + delta, "arrow-key");
             }
             Key::Up | Key::Down | Key::k | Key::j => {
                 // vertical pan of a zoomed-in page. The outer scroller owns the vertical axis (the
@@ -571,6 +593,7 @@ impl Window {
 
         let page_num = page_num.min(selection.n_items());
 
+        self.expect_hscroll("goto-page");
         self.listview.scroll_to(
             page_num.saturating_sub(1),
             gtk::ListScrollFlags::SELECT | gtk::ListScrollFlags::FOCUS,
@@ -591,6 +614,7 @@ impl Window {
 
         // normally I'd use list_view.scroll_to() here, but it doesn't scroll if the item
         // is already visible :(
+        self.expect_hscroll("prev-page select");
         selection.select_item(selection.selected().saturating_sub(1), true);
         let width = f64::from(
             selection
@@ -623,6 +647,7 @@ impl Window {
                 .width(),
         ) + 4.0; // 4px is padding of list item widget. TODO: figure out how to un-hardcode this
 
+        self.expect_hscroll("next-page select");
         selection.select_item(
             (selection.selected() + 1).min(selection.n_items() - 1),
             true,
@@ -646,7 +671,7 @@ impl Window {
 
         // animation toggled off: jump straight to the page
         if !self.state.animate_scroll() {
-            hadj.set_value(self.clamp_scroll(hadj.value() + delta));
+            self.set_hscroll(self.clamp_scroll(hadj.value() + delta), "page-step");
             return;
         }
 
@@ -739,7 +764,7 @@ impl Window {
             // land at the eased position (within sub-pixel of target) and let the normal sync
             // reconcile selection; never jump to a distant target - that snap is the visible jerk
             *self.scroll_anim.borrow_mut() = None;
-            hadj.set_value(next);
+            self.set_hscroll(next, "slide-settle");
             log::debug!(
                 target: "scrolex::scroll",
                 "settle: target={target:.2} value={next:.2} short={:.2} left_x={:?}",
@@ -750,8 +775,21 @@ impl Window {
         }
 
         *self.scroll_anim.borrow_mut() = Some(anim);
-        hadj.set_value(next);
+        self.set_hscroll(next, "slide");
         glib::ControlFlow::Continue
+    }
+
+    // The only place that changes the horizontal position, so the log can say which input moved it.
+    fn set_hscroll(&self, value: f64, cause: &'static str) {
+        self.hscroll_intent.set((value, cause));
+        self.scrolledwindow.hadjustment().set_value(value);
+    }
+
+    // Note that GtkListView is about to move us (scroll_to, or showing a page that was just
+    // selected). We cannot work out where it will stop, so store "unknown" and let the log print
+    // off=NaN instead of saying nobody asked for the move.
+    fn expect_hscroll(&self, cause: &'static str) {
+        self.hscroll_intent.set((f64::NAN, cause));
     }
 
     fn clamp_scroll(&self, value: f64) -> f64 {
@@ -1008,6 +1046,7 @@ impl Window {
             .map(page::PageNumber::new)
             .collect();
         model.extend_from_slice(&vector);
+        self.expect_hscroll("restore page");
         selection.select_item(scroll_to - init_load_from, true);
 
         glib::idle_add_local(move || {
@@ -1045,6 +1084,11 @@ impl Window {
     }
 
     fn setup_scroll_selection_sync(&self) {
+        // a backward move here is the view going back a page
+        self.selection.connect_selected_notify(|selection| {
+            log::debug!(target: "scrolex::pan", "selected page: {}", selection.selected());
+        });
+
         let hadj = self.scrolledwindow.hadjustment();
         // value-changed: the position moved (any scroll path). Track travel direction for prefetch,
         // refresh the wanted range, sync the selection.
@@ -1056,6 +1100,50 @@ impl Window {
                 if (adj.value() - prev).abs() > f64::EPSILON {
                     imp.state.set_scroll_forward(adj.value() > prev);
                 }
+                // `shift` is the one number that shows a real problem: how far the selected page moved
+                // on screen. REVERSED means it moved back while the reader was going forward.
+                // `off` is how far the position ended up from what `cause` asked for, and UNASKED
+                // means nobody asked for that move. UNASKED is usually harmless: when page widths get
+                // measured the list view also changes its own coordinates, so the value moves but the
+                // page does not - so expect UNASKED together with `shift` near 0. An `off` of NaN
+                // means the list view is doing the move and we cannot know where it will stop, so
+                // where it stops becomes the new starting point. Reading the page position takes
+                // time, so do it only when this log is turned on.
+                if log::log_enabled!(target: "scrolex::pan", log::Level::Trace) {
+                    let (want, cause) = imp.hscroll_intent.get();
+                    let off = adj.value() - want;
+                    if want.is_nan() {
+                        imp.hscroll_intent.set((adj.value(), cause));
+                    }
+                    let selected = imp.selection.selected();
+                    let page_x = imp.selected_page_left_x();
+                    // only means something while the same page stays selected: picking the next page
+                    // moves the edge for a good reason
+                    let shift = match (imp.seen_page_x.get(), page_x) {
+                        (Some((seen, was)), Some(now)) if seen == selected => now - was,
+                        _ => 0.0,
+                    };
+                    if let Some(now) = page_x {
+                        imp.seen_page_x.set(Some((selected, now)));
+                    }
+                    let reversed = if imp.state.scroll_forward() {
+                        shift > 8.0
+                    } else {
+                        shift < -8.0
+                    };
+                    log::trace!(
+                        target: "scrolex::pan",
+                        "hadj: v={:9.2} d={:+8.2} off={off:+8.2} upper={:9.0} page={:6.0} max={:9.0} sel={selected} x={:+8.2} shift={shift:+8.2} cause={cause}{}{}",
+                        adj.value(),
+                        adj.value() - prev,
+                        adj.upper(),
+                        adj.page_size(),
+                        adj.upper() - adj.page_size(),
+                        page_x.unwrap_or(f64::NAN),
+                        if off.abs() > 2.0 { " UNASKED" } else { "" },
+                        if reversed { " REVERSED" } else { "" },
+                    );
+                }
                 imp.update_wanted_render_range();
                 imp.schedule_selection_sync();
             }
@@ -1065,7 +1153,19 @@ impl Window {
         hadj.connect_changed(clone!(
             #[weak(rename_to = imp)]
             self,
-            move |_| imp.update_wanted_render_range()
+            move |adj| {
+                // `upper` changes as pages of different widths get measured, and that moves the
+                // position.
+                log::trace!(
+                    target: "scrolex::pan",
+                    "hadj bounds: v={:9.2} upper={:9.0} page={:6.0} max={:9.0}",
+                    adj.value(),
+                    adj.upper(),
+                    adj.page_size(),
+                    adj.upper() - adj.page_size(),
+                );
+                imp.update_wanted_render_range();
+            }
         ));
     }
 
@@ -1279,6 +1379,10 @@ impl Window {
 
         if let Some(index) = center {
             if index >= 0 && (index as u32) < n_items {
+                log::debug!(
+                    target: "scrolex::pan",
+                    "viewport sync: selection {selected} -> {index}",
+                );
                 self.selection.set_selected(index as u32);
             }
         }
@@ -1564,6 +1668,7 @@ impl Window {
         };
         let idx = (page_index.max(0) as u32).min(selection.n_items().saturating_sub(1));
         // SELECT only (no FOCUS) so typing focus stays in the entry
+        self.expect_hscroll("search scroll");
         self.listview
             .scroll_to(idx, gtk::ListScrollFlags::SELECT, None);
     }

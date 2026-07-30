@@ -161,6 +161,31 @@ pub struct Page {
     // one right after map) and be thrown away and re-rendered - expensive on HiDPI. While false,
     // the page paints blank.
     scale_known: Cell<bool>,
+
+    // last snapshot's (page index, paint, zoom); see note_paint
+    painted: Cell<Option<(i32, Paint, f64)>>,
+}
+
+// What a snapshot drew, from best-looking to worst.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Paint {
+    Sharp,
+    StaleRender,
+    Preview,
+    Placeholder,
+    Blank,
+}
+
+impl Paint {
+    fn fidelity(self) -> u8 {
+        match self {
+            Paint::Sharp => 4,
+            Paint::StaleRender => 3,
+            Paint::Preview => 2,
+            Paint::Placeholder => 1,
+            Paint::Blank => 0,
+        }
+    }
 }
 
 #[glib::object_subclass]
@@ -208,6 +233,7 @@ impl WidgetImpl for Page {
             if w > 0.0 && h > 0.0 {
                 snapshot.append_color(&white(), &graphene::Rect::new(0.0, 0.0, w, h));
             }
+            self.note_paint(page.index, Paint::Blank);
             return;
         }
 
@@ -297,7 +323,16 @@ impl Page {
 
                     imp.bbox.replace(bbox);
                     let (w, h) = bbox.size();
-                    page.set_size_request((w * page.zoom()) as i32, (h * page.zoom()) as i32);
+                    let (rw, rh) = ((w * page.zoom()) as i32, (h * page.zoom()) as i32);
+                    if page.width_request() != rw {
+                        log::debug!(
+                            target: "scrolex::pan",
+                            "page {} resize: width {} -> {rw}",
+                            page.index(),
+                            page.width_request(),
+                        );
+                    }
+                    page.set_size_request(rw, rh);
                 }
             ),
         );
@@ -519,6 +554,26 @@ impl Page {
             .copied()
     }
 
+    // Log when a page draws something different than last time. Getting worse while the zoom stays
+    // the same is a flicker the reader sees. A new zoom throws the texture away on purpose, so the
+    // zoom is compared too.
+    fn note_paint(&self, page_num: i32, paint: Paint) {
+        let zoom = self.obj().zoom();
+        let prev = self.painted.replace(Some((page_num, paint, zoom)));
+        let Some((prev_page, prev_paint, prev_zoom)) = prev else {
+            return;
+        };
+        if prev_page != page_num || prev_paint == paint {
+            return;
+        }
+        let regression = prev_zoom == zoom && paint.fidelity() < prev_paint.fidelity();
+        log::debug!(
+            target: "scrolex::flicker",
+            "page {page_num}: {prev_paint:?} -> {paint:?} at zoom {zoom}{}",
+            if regression { " DEGRADED" } else { "" },
+        );
+    }
+
     fn render_snapshot(&self, snapshot: &gtk::Snapshot, page: &PageInfo) {
         let start = std::time::Instant::now();
         let obj = self.obj();
@@ -531,6 +586,7 @@ impl Page {
         if page_buffer_bytes((page.width, page.height), scale, scale_factor) > MAX_PAGE_BYTES {
             log::debug!("draw page {}: over the page buffer cap", page.index);
             append_white(snapshot, &bbox, scale);
+            self.note_paint(page.index, Paint::Blank);
             return;
         }
 
@@ -541,8 +597,14 @@ impl Page {
             scale_factor,
             Some((page.width, page.height)),
         ) {
-            Some(texture) => self.append_page_texture(snapshot, texture.upcast_ref(), &bbox, scale),
-            None => append_white(snapshot, &bbox, scale),
+            Some(texture) => {
+                self.append_page_texture(snapshot, texture.upcast_ref(), &bbox, scale);
+                self.note_paint(page.index, Paint::Sharp);
+            }
+            None => {
+                append_white(snapshot, &bbox, scale);
+                self.note_paint(page.index, Paint::Blank);
+            }
         }
 
         let elapsed = start.elapsed();
@@ -698,6 +760,7 @@ impl Page {
                 log::debug!("draw page {page_num}: cache hit");
                 let bbox = self.get_bbox(page, obj.crop());
                 self.append_page_texture(snapshot, &texture, &bbox, scale);
+                self.note_paint(page_num, Paint::Sharp);
                 self.prefetch_previews(page_num);
                 self.prefetch_next(page_num, page_bytes as usize);
                 return;
@@ -739,10 +802,18 @@ impl Page {
         };
         if let Some(texture) = fallback {
             self.append_scaled_page_texture(snapshot, texture, page, &bbox, scale);
+            self.note_paint(
+                page_num,
+                match source {
+                    FallbackSource::Preview => Paint::Preview,
+                    _ => Paint::StaleRender,
+                },
+            );
         } else {
             log::debug!("draw page {page_num}: cache miss (loading placeholder)");
             let (w, h) = bbox.size();
             append_loading_placeholder(snapshot, w * scale, h * scale);
+            self.note_paint(page_num, Paint::Placeholder);
         }
 
         // Prefetch low-resolution textures for surrounding pages. Request one for this page only
@@ -1536,6 +1607,26 @@ startxref
         assert!((bbox.y1 - 0.0).abs() < EPSILON);
         assert!((bbox.x2 - 250.0).abs() < EPSILON);
         assert!((bbox.y2 - 50.0).abs() < EPSILON);
+    }
+
+    // note_paint compares these to decide DEGRADED, so the order must stay this way.
+    #[test]
+    fn paint_fidelity_ranks_sharp_highest_and_blank_lowest() {
+        let ranked = [
+            Paint::Blank,
+            Paint::Placeholder,
+            Paint::Preview,
+            Paint::StaleRender,
+            Paint::Sharp,
+        ];
+        for pair in ranked.windows(2) {
+            assert!(
+                pair[0].fidelity() < pair[1].fidelity(),
+                "{:?} should rank below {:?}",
+                pair[0],
+                pair[1],
+            );
+        }
     }
 
     // The crop math is pure geometry over a content box (whatever backend produced it), so it's
