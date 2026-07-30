@@ -379,8 +379,15 @@
 					</object>
 				</child>
 				<child>
+					<!--
+						Capture phase: GtkScrolledWindow's kinetic controller sits there too, and it
+						collects touchpad velocity even from events we stop on the way back up.
+						Claiming them here starves it, so only we move the position.
+						See handle_scroll.
+					-->
 					<object class="GtkEventControllerScroll">
 						<property name="flags">both-axes</property>
+						<property name="propagation-phase">capture</property>
 						<signal name="scroll" handler="handle_scroll" swapped="true" />
 					</object>
 				</child>

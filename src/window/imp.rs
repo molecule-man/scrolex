@@ -272,6 +272,10 @@ impl Window {
         page.bind(&page_number);
     }
 
+    // Runs in the capture phase, so GtkScrolledWindow's kinetic controller never gets the event.
+    // If it does, a touchpad flick leaves it decelerating for ~1s, writing positions from its own
+    // model. Meanwhile GtkListView shifts its coordinate origin as page widths get measured. With
+    // varying page sizes the two fight every frame and pages jump by almost a page (issue #41).
     #[template_callback]
     fn handle_scroll(
         &self,
@@ -2075,5 +2079,57 @@ mod tests {
             .map(|(i, _)| i)
             .collect();
         assert_eq!(fired, vec![0, 4, 8, 12]);
+    }
+}
+
+#[cfg(test)]
+mod controller_order_tests {
+    use gtk::prelude::*;
+    use gtk::subclass::prelude::ObjectSubclassIsExt;
+
+    // GtkScrolledWindow has a capture-phase kinetic controller that decelerates after a touchpad
+    // flick. We set the position ourselves, so we must get the event first. A controller runs
+    // before ones added earlier, so ours must be in the capture phase too (issue #41).
+    // gtk::test, not test: it runs the body on the thread GTK is initialized on.
+    #[gtk::test]
+    fn scroll_controller_reaches_events_before_the_kinetic_one() {
+        gtk::gio::resources_register_include!("scrolex-ui.gresource").expect("ui resources");
+        crate::state::State::static_type();
+        crate::page::PageNumber::static_type();
+        crate::page::Page::static_type();
+
+        let window: crate::window::Window = gtk::glib::Object::new();
+        let controllers = window.imp().scrolledwindow.observe_controllers();
+
+        let mut ours = None;
+        let mut kinetic = None;
+        for i in 0..controllers.n_items() {
+            let Ok(scroll) = controllers
+                .item(i)
+                .unwrap()
+                .downcast::<gtk::EventControllerScroll>()
+            else {
+                continue;
+            };
+            if scroll.propagation_phase() != gtk::PropagationPhase::Capture {
+                continue;
+            }
+            let slot = if scroll
+                .flags()
+                .contains(gtk::EventControllerScrollFlags::KINETIC)
+            {
+                &mut kinetic
+            } else {
+                &mut ours
+            };
+            slot.get_or_insert(i);
+        }
+
+        let kinetic = kinetic.expect("GtkScrolledWindow's capture-phase kinetic controller");
+        let ours = ours.expect("our scroll controller, in the capture phase");
+        assert!(
+            ours < kinetic,
+            "ours is at {ours} and the kinetic one at {kinetic}, so the kinetic one runs first"
+        );
     }
 }
