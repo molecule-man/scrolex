@@ -326,12 +326,16 @@
 			<object class="GtkScrolledWindow" id="vscrolledwindow">
 				<property name="hscrollbar-policy">never</property>
 				<property name="vscrollbar-policy">automatic</property>
+				<!-- no GTK kinetic scrolling from touch drags; its touchpad deceleration is
+				     cancelled in code, this property does not stop it -->
+				<property name="kinetic-scrolling">false</property>
 				<property name="hexpand">true</property>
 				<property name="vexpand">true</property>
 				<child>
 			<object class="GtkScrolledWindow" id="scrolledwindow">
 				<property name="hscrollbar-policy">automatic</property>
 				<property name="vscrollbar-policy">never</property>
+				<property name="kinetic-scrolling">false</property>
 				<property name="propagate-natural-height">true</property>
 				<property name="hexpand">true</property>
 				<child>
@@ -386,9 +390,12 @@
 						See handle_scroll.
 					-->
 					<object class="GtkEventControllerScroll">
-						<property name="flags">both-axes</property>
+						<!-- kinetic: gives us the swipe's lift-off speed via the decelerate signal -->
+						<property name="flags">both-axes|kinetic</property>
 						<property name="propagation-phase">capture</property>
 						<signal name="scroll" handler="handle_scroll" swapped="true" />
+						<signal name="scroll-begin" handler="handle_scroll_begin" swapped="true" />
+						<signal name="decelerate" handler="handle_decelerate" swapped="true" />
 					</object>
 				</child>
 				<child>

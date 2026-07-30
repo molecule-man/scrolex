@@ -43,6 +43,12 @@ const WHEEL_TRIGGER: f64 = 0.2;
 // Touchpad pixels per notch, used to scale a pinch's pixel travel onto the wheel's zoom rate.
 const TOUCHPAD_NOTCH: f64 = 40.0;
 
+// Time constant of the kinetic scroll that continues a touchpad swipe after the fingers lift. Travel
+// lift-off speed times this, so a brisk swipe covers a page or two.
+const KINETIC_TAU_US: f64 = 300_000.0;
+// Lift-off speed (px/s) under which the swipe counts as stopped rather than flung.
+const KINETIC_MIN_VELOCITY: f64 = 100.0;
+
 // Multiplicative zoom step per notch.
 const ZOOM_STEP: f64 = 1.1;
 
@@ -69,8 +75,15 @@ struct ScrollAnim {
     // travel direction (+1 forward, -1 back); the glide never moves against it
     dir: f64,
     // value written to hadjustment last tick (NaN until first write); a gap vs. this tick's read is
-    // external motion injected between our frames (GtkListView re-anchor, kinetic scroll).
+    // external motion injected between our frames (GtkListView re-anchor, GTK deceleration).
     last_next: f64,
+    // decay time constant of this glide; page steps and kinetic scrolls move at different rates
+    tau_us: f64,
+    // a kinetic scroll: driven by `vel` rather than a target, and a new swipe or a page step takes
+    // it over. The other fields above describe the page step and are inert here.
+    kinetic: bool,
+    // kinetic scroll only: speed left to spend, px/s
+    vel: f64,
 }
 
 // Object holding the state
@@ -143,6 +156,12 @@ pub struct Window {
 
     // in-flight animated one-page scroll; None when no slide is running
     scroll_anim: RefCell<Option<ScrollAnim>>,
+
+    // true while a tick callback drives scroll_anim; keeps a retarget from adding a second one
+    scroll_ticking: Cell<bool>,
+
+    // set when the current scroll sequence must not coast on: mouse wheel, pinch, ctrl+scroll zoom
+    kinetic_blocked: Cell<bool>,
 
     // last horizontal scroll position, to derive travel direction (prefetch reads toward it) from
     // any scroll path - free-scroll included, not just page steps
@@ -288,6 +307,7 @@ impl Window {
 
         // swallow the two-finger scroll a pinch emits alongside the zoom gesture
         if self.zoom_gesturing.get() {
+            self.kinetic_blocked.set(true);
             return glib::Propagation::Stop;
         }
 
@@ -297,6 +317,7 @@ impl Window {
             .current_event_state()
             .contains(ModifierType::CONTROL_MASK)
         {
+            self.kinetic_blocked.set(true);
             if dy != 0.0 {
                 let notches = match unit {
                     gtk::gdk::ScrollUnit::Wheel => dy,
@@ -314,6 +335,8 @@ impl Window {
             // the wheel responds immediately, then pace one page per full notch (subtract NOTCH,
             // keep the remainder). Steps land at cumulative 0.2, 1.2, 2.2, … of a notch.
             gtk::gdk::ScrollUnit::Wheel => {
+                // the wheel steps pages; it never coasts on
+                self.kinetic_blocked.set(true);
                 let (accum, step) = accumulate_step(
                     self.wheel_accum.get(),
                     self.wheel_last_dy.get(),
@@ -334,6 +357,10 @@ impl Window {
             // Touchpad (and any other pixel-precise device): a horizontal swipe pans the page flow;
             // a vertical swipe pans a zoomed-in page along the axis the outer scroller owns.
             _ => {
+                // a new swipe takes over from the kinetic scroll the previous one left running
+                if (*self.scroll_anim.borrow()).is_some_and(|a| a.kinetic) {
+                    *self.scroll_anim.borrow_mut() = None;
+                }
                 // Apply the horizontal delta to the scroll position, but only when no page slide is
                 // running. During a slide `scroll_tick` owns the adjustment; adding dx here (from a
                 // scroll event that arrives mid-slide) would fight its writes frame by frame.
@@ -364,6 +391,68 @@ impl Window {
         }
 
         glib::Propagation::Stop
+    }
+
+    #[template_callback]
+    fn handle_scroll_begin(&self) {
+        self.kinetic_blocked.set(false);
+    }
+
+    // End of a touchpad swipe. GTK measured the lift-off speed for us; keep scrolling with it so long
+    // distances don't need swipe after swipe.
+    #[template_callback]
+    fn handle_decelerate(&self, vel_x: f64, _vel_y: f64) {
+        // GTK starts decelerating the scrolled windows from this same swipe. Kill that on idle, once
+        // the event that armed it is fully dispatched, so only our glide moves the position.
+        glib::idle_add_local_once(clone!(
+            #[weak(rename_to = imp)]
+            self,
+            move || imp.cancel_gtk_deceleration()
+        ));
+
+        if self.kinetic_blocked.get() || vel_x.abs() < KINETIC_MIN_VELOCITY {
+            return;
+        }
+        self.start_kinetic_scroll(vel_x);
+    }
+
+    // Stop the deceleration GTK runs on the scrolled windows after a touchpad swipe; it writes the
+    // adjustments behind our back and fights whatever we are animating. kinetic-scrolling=false does
+    // not prevent it - only a real change of that property cancels a running one, hence two calls.
+    fn cancel_gtk_deceleration(&self) {
+        for sw in [&*self.scrolledwindow, &*self.vscrolledwindow] {
+            sw.set_kinetic_scrolling(true);
+            sw.set_kinetic_scrolling(false);
+        }
+    }
+
+    // Keep the pages moving after the fingers lift: the swipe's speed decays over KINETIC_TAU_US, which
+    // covers about `vel_x * tau` pixels. Speed, not a target position - the list view rewrites the
+    // scroll coordinates as it measures page widths, and a target would drift with them.
+    fn start_kinetic_scroll(&self, vel_x: f64) {
+        // a page slide owns the position; don't scroll on top of it
+        if self.scroll_anim.borrow().is_some() {
+            return;
+        }
+
+        let value = self.scrolledwindow.hadjustment().value();
+        log::debug!(
+            target: "scrolex::scroll",
+            "kinetic scroll: vel={vel_x:+.0}px/s hadj={value:.2} travel={:+.0}",
+            vel_x * KINETIC_TAU_US / 1_000_000.0,
+        );
+        *self.scroll_anim.borrow_mut() = Some(ScrollAnim {
+            anchor_x: None,
+            last_target: value,
+            last_frame: -1,
+            start_frame: -1,
+            dir: vel_x.signum(),
+            last_next: f64::NAN,
+            tau_us: KINETIC_TAU_US,
+            kinetic: true,
+            vel: vel_x,
+        });
+        self.start_scroll_ticks();
     }
 
     // Apply a page step from a scroll accumulator: +1 forward, -1 back, 0 nothing.
@@ -666,10 +755,13 @@ impl Window {
     // stays smooth. `delta` seeds a resting position only for the degenerate case where the
     // selected page's live geometry can't be read at all.
     fn animate_scroll(&self, anchor_x: Option<f64>, delta: f64) {
-        // Cancel any kinetic deceleration the GTK is doing to the scrolled window. Why calling it
-        // two times? The Api is a bit strange: its cancel only runs on a real property change.
-        self.scrolledwindow.set_kinetic_scrolling(true);
-        self.scrolledwindow.set_kinetic_scrolling(false);
+        self.cancel_gtk_deceleration();
+
+        // A page step supersedes a kinetic scroll: drop it so the step starts fresh and anchors on
+        // the page instead of retargeting the anchor-less glide.
+        if (*self.scroll_anim.borrow()).is_some_and(|a| a.kinetic) {
+            *self.scroll_anim.borrow_mut() = None;
+        }
 
         let hadj = self.scrolledwindow.hadjustment();
 
@@ -700,7 +792,6 @@ impl Window {
             anim.is_none(),
             hadj.value(),
         );
-        let start_fresh = anim.is_none();
         *anim = Some(ScrollAnim {
             anchor_x,
             last_target,
@@ -708,30 +799,42 @@ impl Window {
             start_frame,
             dir: delta.signum(),
             last_next: f64::NAN,
+            tau_us: SCROLL_ANIM_TAU_US,
+            kinetic: false,
+            vel: 0.0,
         });
         drop(anim);
 
-        if start_fresh {
-            self.scrolledwindow.add_tick_callback(clone!(
-                #[weak(rename_to = imp)]
-                self,
-                #[upgrade_or]
-                glib::ControlFlow::Break,
-                move |_, clock| imp.scroll_tick(clock)
-            ));
+        self.start_scroll_ticks();
+    }
+
+    fn start_scroll_ticks(&self) {
+        if self.scroll_ticking.replace(true) {
+            return;
         }
+        self.scrolledwindow.add_tick_callback(clone!(
+            #[weak(rename_to = imp)]
+            self,
+            #[upgrade_or]
+            glib::ControlFlow::Break,
+            move |_, clock| imp.scroll_tick(clock)
+        ));
     }
 
     fn scroll_tick(&self, clock: &gtk::gdk::FrameClock) -> glib::ControlFlow {
         let Some(mut anim) = *self.scroll_anim.borrow() else {
+            self.scroll_ticking.set(false);
             return glib::ControlFlow::Break;
         };
+
+        let hadj = self.scrolledwindow.hadjustment();
+        let value = hadj.value();
+        let prev_target = anim.last_target;
 
         // Chase the selected page's live resting position; when it isn't realised yet (selection
         // raced ahead in a burst) hold the last known one. Real page positions only advance as
         // selection advances, so the target never jumps behind us and the slide never reverses.
         let live = self.live_target(anim.anchor_x);
-        let prev_target = anim.last_target;
         let target = live.unwrap_or(anim.last_target);
         anim.last_target = target;
 
@@ -746,40 +849,84 @@ impl Window {
         };
         anim.last_frame = now;
 
-        let hadj = self.scrolledwindow.hadjustment();
-        let value = hadj.value();
-        let (next, settled) = glide_step(value, target, raw_dt, now - anim.start_frame, anim.dir);
+        let (next, settled) = if anim.kinetic {
+            let (next, vel, spent) = kinetic_step(value, anim.vel, raw_dt, anim.tau_us);
+            anim.vel = vel;
+            let next = self.clamp_scroll(next);
+            // pinned against an end of the document: there is nowhere left to go
+            let pinned = raw_dt > 0 && (next - value).abs() < 0.01;
+            (next, spent || pinned)
+        } else {
+            glide_step(
+                value,
+                target,
+                raw_dt,
+                now - anim.start_frame,
+                anim.dir,
+                anim.tau_us,
+            )
+        };
 
         // Per-frame trace (RUST_LOG=scrolex::scroll=trace). drift = external hadj motion since our
         // last write; dtgt = live-target jitter from crop relayout; vel = px/ms. Smooth = regular
-        // dt, drift~0, dtgt~0, decaying vel.
+        // dt, drift~0, dtgt~0, decaying vel. A kinetic scroll has no target: `left` is the speed to
+        // spend, and drift shows the coordinate rewrites it rides out.
         let drift = value - anim.last_next; // NaN on the first frame
         let dt_ms = raw_dt as f64 / 1000.0;
-        log::trace!(
-            target: "scrolex::scroll",
-            "frame: dt={dt_ms:5.1}ms v={value:9.2} drift={drift:+7.2} tgt={target:9.2} dtgt={:+7.2} live={} step={:+7.2} vel={:5.2}px/ms",
-            target - prev_target,
-            live.is_some(),
-            next - value,
-            if dt_ms > 0.0 { (next - value).abs() / dt_ms } else { 0.0 },
-        );
+        let step_vel = if dt_ms > 0.0 {
+            (next - value).abs() / dt_ms
+        } else {
+            0.0
+        };
+        if anim.kinetic {
+            log::trace!(
+                target: "scrolex::scroll",
+                "kinetic frame: dt={dt_ms:5.1}ms v={value:9.2} drift={drift:+7.2} step={:+7.2} vel={step_vel:5.2}px/ms left={:5.0}px/s",
+                next - value,
+                anim.vel,
+            );
+        } else {
+            log::trace!(
+                target: "scrolex::scroll",
+                "frame: dt={dt_ms:5.1}ms v={value:9.2} drift={drift:+7.2} tgt={target:9.2} dtgt={:+7.2} live={} step={:+7.2} vel={step_vel:5.2}px/ms",
+                target - prev_target,
+                live.is_some(),
+                next - value,
+            );
+        }
         anim.last_next = next;
         if settled {
             // land at the eased position (within sub-pixel of target) and let the normal sync
             // reconcile selection; never jump to a distant target - that snap is the visible jerk
             *self.scroll_anim.borrow_mut() = None;
-            self.set_hscroll(next, "slide-settle");
-            log::debug!(
-                target: "scrolex::scroll",
-                "settle: target={target:.2} value={next:.2} short={:.2} left_x={:?}",
-                target - next,
-                self.selected_page_left_x(),
+            self.scroll_ticking.set(false);
+            self.set_hscroll(
+                next,
+                if anim.kinetic {
+                    "kinetic-settle"
+                } else {
+                    "slide-settle"
+                },
             );
+            if anim.kinetic {
+                log::debug!(
+                    target: "scrolex::scroll",
+                    "kinetic scroll done: value={next:.2} left_x={:?}",
+                    self.selected_page_left_x(),
+                );
+            } else {
+                log::debug!(
+                    target: "scrolex::scroll",
+                    "settle: target={target:.2} value={next:.2} short={:.2} left_x={:?}",
+                    target - next,
+                    self.selected_page_left_x(),
+                );
+            }
             return glib::ControlFlow::Break;
         }
 
         *self.scroll_anim.borrow_mut() = Some(anim);
-        self.set_hscroll(next, "slide");
+        self.set_hscroll(next, if anim.kinetic { "kinetic" } else { "slide" });
         glib::ControlFlow::Continue
     }
 
@@ -1336,8 +1483,9 @@ impl Window {
     // wheeling) and mis-select.
     fn schedule_selection_sync(&self) {
         // during an animated one-page slide the selection is already set explicitly; skip the
-        // viewport sync so the moving pages don't fight it
-        if self.scroll_anim.borrow().is_some() {
+        // viewport sync so the moving pages don't fight it. A kinetic scroll picks no page, so it syncs like
+        // any free scroll.
+        if (*self.scroll_anim.borrow()).is_some_and(|a| !a.kinetic) {
             return;
         }
         if self.sync_pending.replace(true) {
@@ -1801,15 +1949,36 @@ fn accumulate_step(accum: f64, prev: f64, delta: f64, notch: f64, trigger: f64) 
     }
 }
 
+// One frame of a kinetic scroll. The speed decays exponentially and the position moves by the distance
+// covered while it does, so each frame is a step relative to wherever the position is now - the list
+// view can rewrite the scroll coordinates underneath it without cutting the swipe short. Returns the next
+// scroll value, the speed left, and whether it has run out.
+fn kinetic_step(value: f64, vel: f64, dt_us: i64, tau_us: f64) -> (f64, f64, bool) {
+    if dt_us <= 0 {
+        return (value, vel, false);
+    }
+    let decay = (-(dt_us as f64) / tau_us).exp();
+    let step = vel * (tau_us / 1_000_000.0) * (1.0 - decay);
+    let vel = vel * decay;
+    (value + step, vel, vel.abs() < KINETIC_MIN_VELOCITY)
+}
+
 // One frame of the exponential glide toward `target`. Returns the next scroll value and whether the
 // glide has settled. `dt_us` is clamped so a stalled-then-resumed frame clock can't spike the gain
 // into a sustained oscillation; the glide settles on arrival, on a sub-pixel step, or once
 // `elapsed_us` passes the ceiling (bounding a target that relayout keeps nudging).
-fn glide_step(value: f64, target: f64, dt_us: i64, elapsed_us: i64, dir: f64) -> (f64, bool) {
+fn glide_step(
+    value: f64,
+    target: f64,
+    dt_us: i64,
+    elapsed_us: i64,
+    dir: f64,
+    tau_us: f64,
+) -> (f64, bool) {
     let k = if dt_us <= 0 {
         0.0
     } else {
-        (1.0 - (-(dt_us as f64) / SCROLL_ANIM_TAU_US).exp()).min(SCROLL_ANIM_MAX_GAIN)
+        (1.0 - (-(dt_us as f64) / tau_us).exp()).min(SCROLL_ANIM_MAX_GAIN)
     };
     let remaining = target - value;
     let mut step = remaining * k;
@@ -1854,14 +2023,17 @@ fn descendant_page(widget: &gtk::Widget) -> Option<page::Page> {
 
 #[cfg(test)]
 mod tests {
-    use super::{accumulate_step, glide_step, SCROLL_ANIM_MAX_US, WHEEL_NOTCH, WHEEL_TRIGGER};
+    use super::{
+        accumulate_step, glide_step, kinetic_step, KINETIC_TAU_US, SCROLL_ANIM_MAX_US,
+        SCROLL_ANIM_TAU_US, WHEEL_NOTCH, WHEEL_TRIGGER,
+    };
 
     // Drive the glide toward a fixed target at a steady frame rate; return frames until it settles.
-    fn glide_frames(mut value: f64, target: f64, dt_us: i64) -> usize {
+    fn glide_frames(mut value: f64, target: f64, dt_us: i64, tau_us: f64) -> usize {
         let dir = (target - value).signum();
         let mut elapsed = 0;
         for frame in 1..100_000 {
-            let (next, settled) = glide_step(value, target, dt_us, elapsed, dir);
+            let (next, settled) = glide_step(value, target, dt_us, elapsed, dir, tau_us);
             value = next;
             elapsed += dt_us;
             if settled {
@@ -1874,21 +2046,21 @@ mod tests {
     #[test]
     fn glide_settles_at_normal_frame_rate() {
         // a full page-width glide at 60fps settles in well under a second
-        let frames = glide_frames(0.0, 500.0, 16_000);
+        let frames = glide_frames(0.0, 500.0, 16_000, SCROLL_ANIM_TAU_US);
         assert!(frames > 1 && frames < 60, "settled in {frames} frames");
     }
 
     #[test]
     fn glide_settles_even_with_huge_dt() {
         // a 1s dt from a stalled clock; the gain cap bounds the step and it still converges
-        let (next, _) = glide_step(0.0, 500.0, 1_000_000, 0, 1.0);
+        let (next, _) = glide_step(0.0, 500.0, 1_000_000, 0, 1.0, SCROLL_ANIM_TAU_US);
         assert!(next < 500.0, "capped step overshot: {next}");
-        glide_frames(0.0, 500.0, 1_000_000);
+        glide_frames(0.0, 500.0, 1_000_000, SCROLL_ANIM_TAU_US);
     }
 
     // Total wall-clock time for the glide to settle, driven at a steady frame rate.
     fn glide_duration_us(target: f64, dt_us: i64) -> i64 {
-        glide_frames(0.0, target, dt_us) as i64 * dt_us
+        glide_frames(0.0, target, dt_us, SCROLL_ANIM_TAU_US) as i64 * dt_us
     }
 
     #[test]
@@ -1910,17 +2082,66 @@ mod tests {
         }
     }
 
+    // Drive a kinetic scroll to a standstill at a steady frame rate; return the distance and frames.
+    fn kinetic_run(vel: f64, dt_us: i64) -> (f64, usize) {
+        let (mut value, mut vel) = (0.0, vel);
+        for frame in 1..100_000 {
+            let (next, left, spent) = kinetic_step(value, vel, dt_us, KINETIC_TAU_US);
+            value = next;
+            vel = left;
+            if spent {
+                return (value, frame);
+            }
+        }
+        panic!("kinetic scroll never ran out");
+    }
+
+    #[test]
+    fn kinetic_scroll_travels_speed_times_tau() {
+        // a 3000px/s swipe covers ~900px, less the tail below KINETIC_MIN_VELOCITY
+        let ideal = 3000.0 * KINETIC_TAU_US / 1_000_000.0;
+        let (distance, frames) = kinetic_run(3000.0, 16_667);
+        assert!(
+            (distance - ideal).abs() < ideal * 0.05,
+            "covered {distance} of {ideal}"
+        );
+        assert!(frames > 10 && frames < 120, "ran for {frames} frames");
+    }
+
+    #[test]
+    fn kinetic_scroll_distance_is_frame_rate_independent() {
+        // the step is the integral over the frame, so a slow clock covers the same ground
+        let (fast, _) = kinetic_run(3000.0, 16_667); // ~60fps
+        let (slow, _) = kinetic_run(3000.0, 100_000); // ~10fps
+        assert!((fast - slow).abs() < 20.0, "60fps={fast} 10fps={slow}");
+    }
+
+    #[test]
+    fn kinetic_scroll_is_symmetric() {
+        let (fwd, fwd_frames) = kinetic_run(3000.0, 16_667);
+        let (back, back_frames) = kinetic_run(-3000.0, 16_667);
+        assert!((fwd + back).abs() < 0.01, "forward {fwd} vs back {back}");
+        assert_eq!(fwd_frames, back_frames);
+    }
+
     #[test]
     fn glide_force_settles_past_ceiling() {
         // a target far away still settles once the duration ceiling is passed
-        let (_, settled) = glide_step(0.0, 100_000.0, 16_000, SCROLL_ANIM_MAX_US + 1, 1.0);
+        let (_, settled) = glide_step(
+            0.0,
+            100_000.0,
+            16_000,
+            SCROLL_ANIM_MAX_US + 1,
+            1.0,
+            SCROLL_ANIM_TAU_US,
+        );
         assert!(settled);
     }
 
     #[test]
     fn glide_never_reverses_on_backward_target_jump() {
         // relayout jumps the target behind us mid-forward-glide: the view must not move back
-        let (next, settled) = glide_step(100.0, 50.0, 16_000, 0, 1.0);
+        let (next, settled) = glide_step(100.0, 50.0, 16_000, 0, 1.0, SCROLL_ANIM_TAU_US);
         assert_eq!(next, 100.0, "glide reversed to {next}");
         assert!(settled, "should settle rather than crawl backward");
     }
@@ -1932,7 +2153,8 @@ mod tests {
         let mut value = 0.0;
         let mut elapsed = 0;
         loop {
-            let (next, settled) = glide_step(value, 500.0, 16_000, elapsed, 1.0);
+            let (next, settled) =
+                glide_step(value, 500.0, 16_000, elapsed, 1.0, SCROLL_ANIM_TAU_US);
             let step = next - value;
             value = next;
             elapsed += 16_000;
