@@ -209,6 +209,24 @@ pub struct Window {
     // true while a touchpad pinch is in progress; gates off the two-finger scroll events the touchpad
     // still emits during a pinch
     zoom_gesturing: Cell<bool>,
+
+    // pointer position in the viewport, None while the pointer is elsewhere
+    pointer: Cell<Option<(f64, f64)>>,
+
+    // document point a zoom must hold still, pending until the pages have relayouted
+    zoom_anchor: Cell<Option<ZoomAnchor>>,
+
+    // true when the next allocation must restore zoom_anchor
+    zoom_anchor_pending: Cell<bool>,
+}
+
+// A document point held still across a zoom: which page, where in it (page points from its
+// top-left), and where in the viewport it must stay.
+#[derive(Clone, Copy)]
+struct ZoomAnchor {
+    page: i32,
+    offset: (f64, f64),
+    screen: (f64, f64),
 }
 
 // The central trait for subclassing a GObject
@@ -245,6 +263,7 @@ impl ObjectImpl for Window {
         }
 
         self.setup_scroll_selection_sync();
+        self.setup_pointer_tracking();
         self.setup_thread_setting();
         self.setup_cache_setting();
         let cfg = crate::config::load_config();
@@ -340,7 +359,7 @@ impl Window {
                     gtk::gdk::ScrollUnit::Wheel => dy,
                     _ => dy / TOUCHPAD_NOTCH,
                 };
-                self.zoom_to(self.state.zoom() * ZOOM_STEP.powf(-notches));
+                self.zoom_anchored(self.state.zoom() * ZOOM_STEP.powf(-notches));
             }
             return glib::Propagation::Stop;
         }
@@ -607,35 +626,188 @@ impl Window {
         self.state.zoom_to(zoom);
     }
 
+    // Zoom, keeping the point under the pointer in place.
+    fn zoom_anchored(&self, zoom: f64) {
+        let screen = self.pointer.get().unwrap_or_else(|| self.viewport_center());
+        self.zoom_at(zoom, screen);
+    }
+
     #[template_callback]
     fn zoom_out(&self) {
-        self.zoom_to(self.state.zoom() / ZOOM_STEP);
+        self.zoom_anchored(self.state.zoom() / ZOOM_STEP);
     }
 
     #[template_callback]
     fn zoom_in(&self) {
-        self.zoom_to(self.state.zoom() * ZOOM_STEP);
+        self.zoom_anchored(self.state.zoom() * ZOOM_STEP);
+    }
+
+    // The point to hold: under the pointer, or the viewport centre when the pointer is elsewhere
+    // (toolbar buttons, keys pressed with the mouse away).
+    fn viewport_center(&self) -> (f64, f64) {
+        (
+            f64::from(self.vscrolledwindow.width()) / 2.0,
+            f64::from(self.vscrolledwindow.height()) / 2.0,
+        )
+    }
+
+    fn zoom_at(&self, zoom: f64, screen: (f64, f64)) {
+        if self.zoom_anchor.get().is_none() {
+            self.zoom_anchor.set(self.capture_zoom_anchor(screen));
+        }
+
+        let before = self.state.zoom();
+        self.zoom_to(zoom);
+        if self.state.zoom() == before {
+            if !self.zoom_gesturing.get() {
+                self.zoom_anchor.set(None);
+            }
+            return;
+        }
+        if self.zoom_anchor.get().is_some() {
+            self.zoom_anchor_pending.set(true);
+        }
+    }
+
+    fn capture_zoom_anchor(&self, screen: (f64, f64)) -> Option<ZoomAnchor> {
+        let zoom = self.state.zoom();
+        if zoom <= 0.0 {
+            return None;
+        }
+        let page = self.page_at_x(screen.0)?;
+        let (left, top) = self.page_origin(&page)?;
+        Some(ZoomAnchor {
+            page: page.index(),
+            offset: ((screen.0 - left) / zoom, (screen.1 - top) / zoom),
+            screen,
+        })
+    }
+
+    // Scroll both axes after the resized pages have been allocated and before that layout is painted.
+    fn restore_zoom_anchor(&self) {
+        if !self.zoom_anchor_pending.replace(false) {
+            return;
+        }
+        let Some(anchor) = self.zoom_anchor.get() else {
+            return;
+        };
+        let Some((left, top)) = self
+            .mapped_page(anchor.page)
+            .and_then(|page| self.page_origin(&page))
+        else {
+            self.zoom_anchor_pending.set(true);
+            return;
+        };
+        let zoom = self.state.zoom();
+        let hadj = self.scrolledwindow.hadjustment();
+        let vadj = self.vscrolledwindow.vadjustment();
+        // Each adjustment clamps itself, so a point the new geometry cannot reach (already at an
+        // edge, or the page no longer fills the viewport) lands as close as it can.
+        let h = anchored_scroll(hadj.value(), left, anchor.screen.0, anchor.offset.0, zoom);
+        self.set_hscroll(self.clamp_scroll(h), "zoom");
+        vadj.set_value(anchored_scroll(
+            vadj.value(),
+            top,
+            anchor.screen.1,
+            anchor.offset.1,
+            zoom,
+        ));
+        if !self.zoom_gesturing.get() {
+            self.zoom_anchor.set(None);
+        }
+    }
+
+    // The page under viewport x, or the selected one when x falls between pages.
+    fn page_at_x(&self, x: f64) -> Option<page::Page> {
+        let selected = self.selection.selected() as i32;
+        let mut fallback = None;
+        let mut child = self.listview.first_child();
+        while let Some(c) = child {
+            if let Some(page) = descendant_page(&c) {
+                if page.is_mapped() && page.width() > 0 {
+                    if let Some((left, _)) = self.page_origin(&page) {
+                        if x >= left && x < left + f64::from(page.width()) {
+                            return Some(page);
+                        }
+                    }
+                    if page.index() == selected {
+                        fallback = Some(page);
+                    }
+                }
+            }
+            child = c.next_sibling();
+        }
+        fallback
+    }
+
+    fn mapped_page(&self, index: i32) -> Option<page::Page> {
+        let mut child = self.listview.first_child();
+        while let Some(c) = child {
+            if let Some(page) = descendant_page(&c) {
+                if page.index() == index && page.is_mapped() && page.width() > 0 {
+                    return Some(page);
+                }
+            }
+            child = c.next_sibling();
+        }
+        None
+    }
+
+    // A page widget's top-left in viewport coordinates.
+    fn page_origin(&self, page: &page::Page) -> Option<(f64, f64)> {
+        let point =
+            page.compute_point(&*self.vscrolledwindow, &gtk::graphene::Point::new(0.0, 0.0))?;
+        Some((f64::from(point.x()), f64::from(point.y())))
     }
 
     #[template_callback]
-    fn handle_zoom_begin(&self) {
+    fn handle_zoom_begin(&self, _sequence: Option<&EventSequence>, gesture: &gtk::GestureZoom) {
+        self.begin_zoom_gesture(self.gesture_center(gesture));
+    }
+
+    fn begin_zoom_gesture(&self, screen: Option<(f64, f64)>) {
         // the pinch takes over before it has changed the zoom at all
         self.cancel_coast();
         self.zoom_gesturing.set(true);
         self.zoom_gesture_base.set(self.state.zoom());
+        self.zoom_anchor
+            .set(screen.and_then(|p| self.capture_zoom_anchor(p)));
     }
 
     #[template_callback]
     fn handle_zoom_end(&self) {
         self.zoom_gesturing.set(false);
+        if !self.zoom_anchor_pending.get() {
+            self.zoom_anchor.set(None);
+        }
     }
 
     #[template_callback]
-    fn handle_zoom_scale_changed(&self, scale: f64) {
+    fn handle_zoom_scale_changed(&self, scale: f64, gesture: &gtk::GestureZoom) {
         if scale <= 0.0 {
             return;
         }
-        self.zoom_to(self.zoom_gesture_base.get() * scale);
+        let screen = self
+            .gesture_center(gesture)
+            .unwrap_or_else(|| self.viewport_center());
+        self.update_zoom_gesture(scale, screen);
+    }
+
+    fn update_zoom_gesture(&self, scale: f64, screen: (f64, f64)) {
+        if let Some(mut anchor) = self.zoom_anchor.get() {
+            anchor.screen = screen;
+            self.zoom_anchor.set(Some(anchor));
+        }
+        self.zoom_at(self.zoom_gesture_base.get() * scale, screen);
+    }
+
+    fn gesture_center(&self, gesture: &gtk::GestureZoom) -> Option<(f64, f64)> {
+        let (x, y) = gesture.bounding_box_center()?;
+        let point = self.scrolledwindow.compute_point(
+            &*self.vscrolledwindow,
+            &gtk::graphene::Point::new(x as f32, y as f32),
+        )?;
+        Some((f64::from(point.x()), f64::from(point.y())))
     }
 
     #[template_callback]
@@ -1357,6 +1529,24 @@ impl Window {
         None
     }
 
+    // Follow the pointer, so a zoom knows which document point to hold still.
+    fn setup_pointer_tracking(&self) {
+        let motion = gtk::EventControllerMotion::new();
+        motion.connect_motion(clone!(
+            #[weak(rename_to = imp)]
+            self,
+            move |_, x, y| {
+                imp.pointer.set(Some((x, y)));
+            }
+        ));
+        motion.connect_leave(clone!(
+            #[weak(rename_to = imp)]
+            self,
+            move |_| imp.pointer.set(None)
+        ));
+        self.vscrolledwindow.add_controller(motion);
+    }
+
     fn setup_scroll_selection_sync(&self) {
         // a backward move here is the view going back a page
         self.selection.connect_selected_notify(|selection| {
@@ -2026,7 +2216,12 @@ impl Window {
 }
 
 // Trait shared by all widgets
-impl WidgetImpl for Window {}
+impl WidgetImpl for Window {
+    fn size_allocate(&self, width: i32, height: i32, baseline: i32) {
+        self.parent_size_allocate(width, height, baseline);
+        self.restore_zoom_anchor();
+    }
+}
 
 // Trait shared by all windows
 impl WindowImpl for Window {}
@@ -2116,6 +2311,12 @@ fn glide_step(
     let overshot = (dir > 0.0 && target < value) || (dir < 0.0 && target > value);
     let settled = (target - next).abs() < 0.5 || overshot || elapsed_us > SCROLL_ANIM_MAX_US;
     (next, settled)
+}
+
+// Scroll value that puts a point `offset` page points into the page back at `screen`, with the page's
+// top-left now at `origin`. A bigger value moves the content the other way, hence the minus.
+fn anchored_scroll(value: f64, origin: f64, screen: f64, offset: f64, zoom: f64) -> f64 {
+    value - (screen - offset * zoom - origin)
 }
 
 // Find the Page widget within a list item's widget subtree.
@@ -2418,9 +2619,10 @@ mod tests {
 
 #[cfg(test)]
 mod widget_tests {
-    use super::KINETIC_MIN_VELOCITY;
+    use super::{anchored_scroll, KINETIC_MIN_VELOCITY};
     use gtk::prelude::*;
     use gtk::subclass::prelude::ObjectSubclassIsExt;
+    use std::time::{Duration, Instant};
 
     fn window() -> crate::window::Window {
         gtk::gio::resources_register_include!("scrolex-ui.gresource").expect("ui resources");
@@ -2429,6 +2631,16 @@ mod widget_tests {
         crate::page::Page::static_type();
 
         gtk::glib::Object::new()
+    }
+
+    fn wait_until(mut ready: impl FnMut() -> bool) {
+        let context = gtk::glib::MainContext::default();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !ready() {
+            assert!(Instant::now() < deadline, "timed out waiting for GTK");
+            context.iteration(false);
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 
     // GTK's own kinetic scrolling is off on both scrollers, so nothing else coasts for us.
@@ -2469,7 +2681,7 @@ mod widget_tests {
         assert!(imp.scroll_anim.borrow().is_some(), "coasting horizontally");
         assert!(imp.vscroll_anim.get().is_some(), "coasting vertically");
 
-        imp.handle_zoom_begin();
+        imp.begin_zoom_gesture(None);
 
         assert!(imp.scroll_anim.borrow().is_none());
         assert!(imp.vscroll_anim.get().is_none());
@@ -2493,7 +2705,7 @@ mod widget_tests {
             vel: 0.0,
         });
 
-        imp.handle_zoom_begin();
+        imp.begin_zoom_gesture(None);
 
         assert!(imp.scroll_anim.borrow().is_some());
     }
@@ -2601,6 +2813,100 @@ mod widget_tests {
             ours_at < kinetic_at,
             "ours is at {ours_at}, GTK's at {kinetic_at}, so GTK's runs first"
         );
+    }
+
+    #[test]
+    fn anchored_scroll_holds_the_point_under_the_pointer() {
+        // captured at zoom 1 with the page's left edge at 0: the point 100pt in sits at screen 100
+        let (origin, screen, offset) = (0.0, 100.0, 100.0);
+        // same zoom, page unmoved: nothing to correct
+        assert_eq!(anchored_scroll(0.0, origin, screen, offset, 1.0), 0.0);
+        // zoom in: the point is now 200px into the page, so scroll 100 to leave it at screen 100
+        assert_eq!(anchored_scroll(0.0, origin, screen, offset, 2.0), 100.0);
+        // zoom out: back the other way
+        assert_eq!(anchored_scroll(0.0, origin, screen, offset, 0.5), -50.0);
+        // the page having moved since is taken into account
+        assert_eq!(anchored_scroll(0.0, -30.0, screen, offset, 2.0), 70.0);
+    }
+
+    #[gtk::test]
+    fn zoom_allocation_keeps_the_document_point_on_screen() {
+        let window = window();
+        window.set_default_size(900, 700);
+        window.present();
+        let fixture = gtk::gio::File::for_path(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/outline.pdf"
+        ));
+        window.state().load(&fixture);
+
+        let imp = window.imp();
+        wait_until(|| imp.mapped_page(0).is_some());
+        let page = imp.mapped_page(0).unwrap();
+        let (left, top) = imp.page_origin(&page).unwrap();
+        let screen = (left + 300.0, top + 300.0);
+        let anchor = imp.capture_zoom_anchor(screen).unwrap();
+
+        imp.zoom_at(2.0, screen);
+        wait_until(|| !imp.zoom_anchor_pending.get());
+
+        let page = imp.mapped_page(anchor.page).unwrap();
+        let (left, top) = imp.page_origin(&page).unwrap();
+        let landed = (
+            left + anchor.offset.0 * imp.state.zoom(),
+            top + anchor.offset.1 * imp.state.zoom(),
+        );
+        assert!(
+            (landed.0 - screen.0).abs() <= 1.0,
+            "horizontal anchor moved from {} to {}",
+            screen.0,
+            landed.0,
+        );
+        assert!(
+            (landed.1 - screen.1).abs() <= 1.0,
+            "vertical anchor moved from {} to {}",
+            screen.1,
+            landed.1,
+        );
+        window.close();
+    }
+
+    #[gtk::test]
+    fn pinch_keeps_its_document_point_and_follows_the_gesture_center() {
+        let window = window();
+        let imp = window.imp();
+        imp.zoom_gesture_base.set(1.0);
+        imp.zoom_anchor.set(Some(super::ZoomAnchor {
+            page: 3,
+            offset: (120.0, 80.0),
+            screen: (300.0, 250.0),
+        }));
+
+        imp.update_zoom_gesture(1.5, (340.0, 270.0));
+
+        let anchor = imp.zoom_anchor.get().unwrap();
+        assert_eq!(anchor.page, 3);
+        assert_eq!(anchor.offset, (120.0, 80.0));
+        assert_eq!(anchor.screen, (340.0, 270.0));
+        assert_eq!(imp.state.zoom(), 1.5);
+        assert!(imp.zoom_anchor_pending.get());
+    }
+
+    #[gtk::test]
+    fn zoom_at_a_bound_does_not_leave_a_stale_pointer_anchor() {
+        let window = window();
+        let imp = window.imp();
+        imp.state.zoom_to(f64::MAX);
+        imp.zoom_anchor.set(Some(super::ZoomAnchor {
+            page: 0,
+            offset: (10.0, 20.0),
+            screen: (30.0, 40.0),
+        }));
+
+        imp.zoom_at(f64::MAX, (30.0, 40.0));
+
+        assert!(imp.zoom_anchor.get().is_none());
+        assert!(!imp.zoom_anchor_pending.get());
     }
 
     #[gtk::test]
