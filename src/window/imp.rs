@@ -685,6 +685,15 @@ impl Window {
             Key::bracketright => {
                 self.zoom_in();
             }
+            // Ctrl+plus needs Shift on most layouts, so Ctrl+equal zooms in too
+            Key::plus | Key::equal | Key::KP_Add
+                if modifier.contains(ModifierType::CONTROL_MASK) =>
+            {
+                self.zoom_in();
+            }
+            Key::minus | Key::KP_Subtract if modifier.contains(ModifierType::CONTROL_MASK) => {
+                self.zoom_out();
+            }
             Key::n | Key::N => {
                 if self.state.search().borrow().total() == 0 {
                     return glib::Propagation::Proceed;
@@ -2592,5 +2601,29 @@ mod widget_tests {
             ours_at < kinetic_at,
             "ours is at {ours_at}, GTK's at {kinetic_at}, so GTK's runs first"
         );
+    }
+
+    #[gtk::test]
+    fn ctrl_plus_minus_and_equal_zoom() {
+        use gtk::gdk::{Key, ModifierType};
+        let window = window();
+        let imp = window.imp();
+        let ctrl = ModifierType::CONTROL_MASK;
+
+        for key in [Key::plus, Key::equal, Key::KP_Add] {
+            imp.state.zoom_to(1.0);
+            imp.handle_key_press(key, 0, ctrl);
+            assert!(imp.state.zoom() > 1.0, "{key:?} should zoom in");
+        }
+        for key in [Key::minus, Key::KP_Subtract] {
+            imp.state.zoom_to(1.0);
+            imp.handle_key_press(key, 0, ctrl);
+            assert!(imp.state.zoom() < 1.0, "{key:?} should zoom out");
+        }
+
+        // plain minus stays free for other bindings
+        imp.state.zoom_to(1.0);
+        imp.handle_key_press(Key::minus, 0, ModifierType::empty());
+        assert_eq!(imp.state.zoom(), 1.0);
     }
 }
