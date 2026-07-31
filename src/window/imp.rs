@@ -120,6 +120,8 @@ pub struct Window {
     #[template_child]
     pub vscrolledwindow: TemplateChild<ScrolledWindow>,
     #[template_child]
+    pub pan_scroll: TemplateChild<gtk::EventControllerScroll>,
+    #[template_child]
     pub listview: TemplateChild<ListView>,
     #[template_child]
     pub entry_page_num: TemplateChild<gtk::Entry>,
@@ -291,7 +293,7 @@ impl Window {
         page.bind(&page_number);
     }
 
-    // Runs in the capture phase, so GtkScrolledWindow's kinetic controller never gets the event.
+    // Runs in the capture phase, so the scrollers' kinetic controllers never get the event.
     // If it does, a touchpad flick leaves it decelerating for ~1s, writing positions from its own
     // model. Meanwhile GtkListView shifts its coordinate origin as page widths get measured. With
     // varying page sizes the two fight every frame and pages jump by almost a page (issue #41).
@@ -402,28 +404,10 @@ impl Window {
     // distances don't need swipe after swipe.
     #[template_callback]
     fn handle_decelerate(&self, vel_x: f64, _vel_y: f64) {
-        // GTK starts decelerating the scrolled windows from this same swipe. Kill that on idle, once
-        // the event that armed it is fully dispatched, so only our glide moves the position.
-        glib::idle_add_local_once(clone!(
-            #[weak(rename_to = imp)]
-            self,
-            move || imp.cancel_gtk_deceleration()
-        ));
-
         if self.kinetic_blocked.get() || vel_x.abs() < KINETIC_MIN_VELOCITY {
             return;
         }
         self.start_kinetic_scroll(vel_x);
-    }
-
-    // Stop the deceleration GTK runs on the scrolled windows after a touchpad swipe; it writes the
-    // adjustments behind our back and fights whatever we are animating. kinetic-scrolling=false does
-    // not prevent it - only a real change of that property cancels a running one, hence two calls.
-    fn cancel_gtk_deceleration(&self) {
-        for sw in [&*self.scrolledwindow, &*self.vscrolledwindow] {
-            sw.set_kinetic_scrolling(true);
-            sw.set_kinetic_scrolling(false);
-        }
     }
 
     // Keep the pages moving after the fingers lift: the swipe's speed decays over KINETIC_TAU_US, which
@@ -755,8 +739,6 @@ impl Window {
     // stays smooth. `delta` seeds a resting position only for the degenerate case where the
     // selected page's live geometry can't be read at all.
     fn animate_scroll(&self, anchor_x: Option<f64>, delta: f64) {
-        self.cancel_gtk_deceleration();
-
         // A page step supersedes a kinetic scroll: drop it so the step starts fresh and anchors on
         // the page instead of retargeting the anchor-less glide.
         if (*self.scroll_anim.borrow()).is_some_and(|a| a.kinetic) {
@@ -2309,49 +2291,51 @@ mod controller_order_tests {
     use gtk::prelude::*;
     use gtk::subclass::prelude::ObjectSubclassIsExt;
 
-    // GtkScrolledWindow has a capture-phase kinetic controller that decelerates after a touchpad
-    // flick. We set the position ourselves, so we must get the event first. A controller runs
-    // before ones added earlier, so ours must be in the capture phase too (issue #41).
+    // Both scrollers keep scrolling on their own after a touchpad flick, each from a capture-phase
+    // kinetic controller. We set the position ourselves, so we must get the event first: capture
+    // phase, on the outer scroller, because capture runs outside-in (issue #41).
     // gtk::test, not test: it runs the body on the thread GTK is initialized on.
     #[gtk::test]
-    fn scroll_controller_reaches_events_before_the_kinetic_one() {
+    fn scroll_controller_runs_before_gtk_coasts() {
         gtk::gio::resources_register_include!("scrolex-ui.gresource").expect("ui resources");
         crate::state::State::static_type();
         crate::page::PageNumber::static_type();
         crate::page::Page::static_type();
 
         let window: crate::window::Window = gtk::glib::Object::new();
-        let controllers = window.imp().scrolledwindow.observe_controllers();
+        let imp = window.imp();
+        let ours = imp.pan_scroll.get();
 
-        let mut ours = None;
-        let mut kinetic = None;
+        assert_eq!(ours.propagation_phase(), gtk::PropagationPhase::Capture);
+        // outside the inner scroller: capture reaches ours first
+        assert!(imp.scrolledwindow.is_ancestor(&*imp.vscrolledwindow));
+
+        let controllers = imp.vscrolledwindow.observe_controllers();
+        let mut ours_at = None;
+        let mut kinetic_at = None;
         for i in 0..controllers.n_items() {
-            let Ok(scroll) = controllers
-                .item(i)
-                .unwrap()
-                .downcast::<gtk::EventControllerScroll>()
-            else {
-                continue;
-            };
-            if scroll.propagation_phase() != gtk::PropagationPhase::Capture {
+            let item = controllers.item(i).unwrap();
+            if item == ours {
+                ours_at = Some(i);
                 continue;
             }
-            let slot = if scroll
-                .flags()
-                .contains(gtk::EventControllerScrollFlags::KINETIC)
-            {
-                &mut kinetic
-            } else {
-                &mut ours
+            let Ok(scroll) = item.downcast::<gtk::EventControllerScroll>() else {
+                continue;
             };
-            slot.get_or_insert(i);
+            if scroll.propagation_phase() == gtk::PropagationPhase::Capture
+                && scroll
+                    .flags()
+                    .contains(gtk::EventControllerScrollFlags::KINETIC)
+            {
+                kinetic_at.get_or_insert(i);
+            }
         }
 
-        let kinetic = kinetic.expect("GtkScrolledWindow's capture-phase kinetic controller");
-        let ours = ours.expect("our scroll controller, in the capture phase");
+        let ours_at = ours_at.expect("our controller on the outer scroller");
+        let kinetic_at = kinetic_at.expect("GtkScrolledWindow's capture-phase kinetic controller");
         assert!(
-            ours < kinetic,
-            "ours is at {ours} and the kinetic one at {kinetic}, so the kinetic one runs first"
+            ours_at < kinetic_at,
+            "ours is at {ours_at}, GTK's at {kinetic_at}, so GTK's runs first"
         );
     }
 }
