@@ -326,12 +326,15 @@
 			<object class="GtkScrolledWindow" id="vscrolledwindow">
 				<property name="hscrollbar-policy">never</property>
 				<property name="vscrollbar-policy">automatic</property>
+				<!-- GTK must not scroll on its own; we drive both axes -->
+				<property name="kinetic-scrolling">false</property>
 				<property name="hexpand">true</property>
 				<property name="vexpand">true</property>
 				<child>
 			<object class="GtkScrolledWindow" id="scrolledwindow">
 				<property name="hscrollbar-policy">automatic</property>
 				<property name="vscrollbar-policy">never</property>
+				<property name="kinetic-scrolling">false</property>
 				<property name="propagate-natural-height">true</property>
 				<property name="hexpand">true</property>
 				<child>
@@ -379,19 +382,6 @@
 					</object>
 				</child>
 				<child>
-					<!--
-						Capture phase: GtkScrolledWindow's kinetic controller sits there too, and it
-						collects touchpad velocity even from events we stop on the way back up.
-						Claiming them here starves it, so only we move the position.
-						See handle_scroll.
-					-->
-					<object class="GtkEventControllerScroll">
-						<property name="flags">both-axes</property>
-						<property name="propagation-phase">capture</property>
-						<signal name="scroll" handler="handle_scroll" swapped="true" />
-					</object>
-				</child>
-				<child>
 					<object class="GtkGestureClick">
 						<property name="button">2</property>
 						<signal name="pressed" handler="handle_drag_start" swapped="true" />
@@ -413,6 +403,20 @@
 					</object>
 				</child>
 			</object>
+			</child>
+			<child>
+				<!--
+					Both scrollers would keep scrolling on their own after a touchpad flick.
+					Capture runs outside-in, so only here do we get the event before both.
+				-->
+				<object class="GtkEventControllerScroll" id="pan_scroll">
+					<!-- kinetic: gives us the swipe's lift-off speed via the decelerate signal -->
+					<property name="flags">both-axes|kinetic</property>
+					<property name="propagation-phase">capture</property>
+					<signal name="scroll" handler="handle_scroll" swapped="true" />
+					<signal name="scroll-begin" handler="handle_scroll_begin" swapped="true" />
+					<signal name="decelerate" handler="handle_decelerate" swapped="true" />
+				</object>
 			</child>
 		</object>
 				</property>
