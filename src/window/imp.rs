@@ -339,8 +339,7 @@ impl Window {
                     gtk::gdk::ScrollUnit::Wheel => dy,
                     _ => dy / TOUCHPAD_NOTCH,
                 };
-                self.state
-                    .zoom_to(self.state.zoom() * ZOOM_STEP.powf(-notches));
+                self.zoom_to(self.state.zoom() * ZOOM_STEP.powf(-notches));
             }
             return glib::Propagation::Stop;
         }
@@ -373,11 +372,8 @@ impl Window {
             // Touchpad (and any other pixel-precise device): a horizontal swipe pans the page flow;
             // a vertical swipe pans a zoomed-in page along the axis the outer scroller owns.
             _ => {
-                // a new swipe takes over from the kinetic scroll the previous one left running
-                if (*self.scroll_anim.borrow()).is_some_and(|a| a.kinetic) {
-                    *self.scroll_anim.borrow_mut() = None;
-                }
-                self.vscroll_anim.set(None);
+                // a new swipe takes over from the coast the previous one left running
+                self.cancel_coast();
                 // Apply the horizontal delta to the scroll position, but only when no page slide is
                 // running. During a slide `scroll_tick` owns the adjustment; adding dx here (from a
                 // scroll event that arrives mid-slide) would fight its writes frame by frame.
@@ -543,6 +539,15 @@ impl Window {
         self.vscroll_anim.set(None);
     }
 
+    // Stop the coasts, on both axes. A page slide survives: it aims at a page and re-reads where that
+    // page sits every frame, so a relayout can't throw it off. A coast has nothing to re-aim at.
+    fn cancel_coast(&self) {
+        if (*self.scroll_anim.borrow()).is_some_and(|a| a.kinetic) {
+            *self.scroll_anim.borrow_mut() = None;
+        }
+        self.vscroll_anim.set(None);
+    }
+
     // Apply a page step from a scroll accumulator: +1 forward, -1 back, 0 nothing.
     fn step_page(&self, step: i32) {
         if step > 0 {
@@ -595,18 +600,26 @@ impl Window {
         }
     }
 
+    // Every zoom goes through here. A zoom relayouts the pages, so a coast has to stop first.
+    fn zoom_to(&self, zoom: f64) {
+        self.cancel_coast();
+        self.state.zoom_to(zoom);
+    }
+
     #[template_callback]
     fn zoom_out(&self) {
-        self.state.zoom_to(self.state.zoom() / ZOOM_STEP);
+        self.zoom_to(self.state.zoom() / ZOOM_STEP);
     }
 
     #[template_callback]
     fn zoom_in(&self) {
-        self.state.zoom_to(self.state.zoom() * ZOOM_STEP);
+        self.zoom_to(self.state.zoom() * ZOOM_STEP);
     }
 
     #[template_callback]
     fn handle_zoom_begin(&self) {
+        // the pinch takes over before it has changed the zoom at all
+        self.cancel_coast();
         self.zoom_gesturing.set(true);
         self.zoom_gesture_base.set(self.state.zoom());
     }
@@ -621,7 +634,7 @@ impl Window {
         if scale <= 0.0 {
             return;
         }
-        self.state.zoom_to(self.zoom_gesture_base.get() * scale);
+        self.zoom_to(self.zoom_gesture_base.get() * scale);
     }
 
     #[template_callback]
@@ -758,7 +771,7 @@ impl Window {
             return;
         }
 
-        self.state.zoom_to(zoom / 100.0);
+        self.zoom_to(zoom / 100.0);
     }
 
     fn goto_page(&self, page_num: u32) {
@@ -844,11 +857,9 @@ impl Window {
     // stays smooth. `delta` seeds a resting position only for the degenerate case where the
     // selected page's live geometry can't be read at all.
     fn animate_scroll(&self, anchor_x: Option<f64>, delta: f64) {
-        // A page step supersedes a kinetic scroll: drop it so the step starts fresh and anchors on
-        // the page instead of retargeting the anchor-less glide.
-        if (*self.scroll_anim.borrow()).is_some_and(|a| a.kinetic) {
-            *self.scroll_anim.borrow_mut() = None;
-        }
+        // A page step supersedes a coast: the step anchors on a page, the coast has no anchor to
+        // retarget. Both axes stop, so the step decides where the reader lands.
+        self.cancel_coast();
 
         let hadj = self.scrolledwindow.hadjustment();
 
@@ -2432,6 +2443,46 @@ mod widget_tests {
         imp.handle_decelerate(0.0, -1500.0);
 
         assert!(imp.vscroll_anim.get().is_none());
+    }
+
+    // Zoom relayouts the pages under a coast that has no target to re-aim at.
+    #[gtk::test]
+    fn a_pinch_stops_both_coasts() {
+        let window = window();
+        let imp = window.imp();
+        let vadj = imp.vscrolledwindow.vadjustment();
+        vadj.configure(0.0, 0.0, 2000.0, 10.0, 100.0, 500.0);
+        imp.handle_decelerate(-1500.0, -1500.0);
+        assert!(imp.scroll_anim.borrow().is_some(), "coasting horizontally");
+        assert!(imp.vscroll_anim.get().is_some(), "coasting vertically");
+
+        imp.handle_zoom_begin();
+
+        assert!(imp.scroll_anim.borrow().is_none());
+        assert!(imp.vscroll_anim.get().is_none());
+    }
+
+    // Unlike a coast, a page slide reads its page's position every frame, which is what keeps the page
+    // landing on its anchor when zoom or crop moves it mid-slide.
+    #[gtk::test]
+    fn a_pinch_leaves_a_page_slide_running() {
+        let window = window();
+        let imp = window.imp();
+        *imp.scroll_anim.borrow_mut() = Some(super::ScrollAnim {
+            anchor_x: Some(0.0),
+            last_target: 100.0,
+            last_frame: -1,
+            start_frame: -1,
+            dir: 1.0,
+            last_next: f64::NAN,
+            tau_us: super::SCROLL_ANIM_TAU_US,
+            kinetic: false,
+            vel: 0.0,
+        });
+
+        imp.handle_zoom_begin();
+
+        assert!(imp.scroll_anim.borrow().is_some());
     }
 
     // A slow lift-off means the fingers stopped before they left, not a fling.
