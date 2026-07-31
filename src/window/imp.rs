@@ -86,6 +86,15 @@ struct ScrollAnim {
     vel: f64,
 }
 
+// Vertical coast after a touchpad flick. There is no page to land on, so speed is all it needs.
+#[derive(Clone, Copy)]
+struct KineticPan {
+    // px/s, decays every tick
+    vel: f64,
+    // previous tick's frame time; -1 until the first tick
+    last_frame: i64,
+}
+
 // Object holding the state
 #[derive(CompositeTemplate, Default)]
 #[template(resource = "/com/andr2i/scrolex/app.ui")]
@@ -161,6 +170,11 @@ pub struct Window {
 
     // true while a tick callback drives scroll_anim; keeps a retarget from adding a second one
     scroll_ticking: Cell<bool>,
+
+    vscroll_anim: Cell<Option<KineticPan>>,
+
+    // a tick callback drives vscroll_anim; a new flick must not add a second one
+    vscroll_ticking: Cell<bool>,
 
     // set when the current scroll sequence must not coast on: mouse wheel, pinch, ctrl+scroll zoom
     kinetic_blocked: Cell<bool>,
@@ -325,8 +339,7 @@ impl Window {
                     gtk::gdk::ScrollUnit::Wheel => dy,
                     _ => dy / TOUCHPAD_NOTCH,
                 };
-                self.state
-                    .zoom_to(self.state.zoom() * ZOOM_STEP.powf(-notches));
+                self.zoom_to(self.state.zoom() * ZOOM_STEP.powf(-notches));
             }
             return glib::Propagation::Stop;
         }
@@ -359,10 +372,8 @@ impl Window {
             // Touchpad (and any other pixel-precise device): a horizontal swipe pans the page flow;
             // a vertical swipe pans a zoomed-in page along the axis the outer scroller owns.
             _ => {
-                // a new swipe takes over from the kinetic scroll the previous one left running
-                if (*self.scroll_anim.borrow()).is_some_and(|a| a.kinetic) {
-                    *self.scroll_anim.borrow_mut() = None;
-                }
+                // a new swipe takes over from the coast the previous one left running
+                self.cancel_coast();
                 // Apply the horizontal delta to the scroll position, but only when no page slide is
                 // running. During a slide `scroll_tick` owns the adjustment; adding dx here (from a
                 // scroll event that arrives mid-slide) would fight its writes frame by frame.
@@ -401,13 +412,21 @@ impl Window {
     }
 
     // End of a touchpad swipe. GTK measured the lift-off speed for us; keep scrolling with it so long
-    // distances don't need swipe after swipe.
+    // distances don't need swipe after swipe. Both axes coast, because both axes pan.
+    //
+    // The speeds are px/s. GTK's docs say px/ms, but its code divides pixels by a time in ms and then
+    // scales by 1000. GtkScrolledWindow feeds them to the same place as GtkGestureSwipe, also px/s.
     #[template_callback]
-    fn handle_decelerate(&self, vel_x: f64, _vel_y: f64) {
-        if self.kinetic_blocked.get() || vel_x.abs() < KINETIC_MIN_VELOCITY {
+    fn handle_decelerate(&self, vel_x: f64, vel_y: f64) {
+        if self.kinetic_blocked.get() {
             return;
         }
-        self.start_kinetic_scroll(vel_x);
+        if vel_x.abs() >= KINETIC_MIN_VELOCITY {
+            self.start_kinetic_scroll(vel_x);
+        }
+        if vel_y.abs() >= KINETIC_MIN_VELOCITY {
+            self.start_kinetic_pan(vel_y);
+        }
     }
 
     // Keep the pages moving after the fingers lift: the swipe's speed decays over KINETIC_TAU_US, which
@@ -439,6 +458,96 @@ impl Window {
         self.start_scroll_ticks();
     }
 
+    // Vertical counterpart of start_kinetic_scroll: coasts a zoomed-in page up or down.
+    fn start_kinetic_pan(&self, vel_y: f64) {
+        let vadj = self.vscrolledwindow.vadjustment();
+        // the page fits the viewport: nothing to pan
+        if vadj.upper() - vadj.lower() <= vadj.page_size() {
+            return;
+        }
+
+        log::debug!(
+            target: "scrolex::scroll",
+            "kinetic pan: vel={vel_y:+.0}px/s vadj={:.2} travel={:+.0}",
+            vadj.value(),
+            vel_y * KINETIC_TAU_US / 1_000_000.0,
+        );
+        self.vscroll_anim.set(Some(KineticPan {
+            vel: vel_y,
+            last_frame: -1,
+        }));
+
+        if self.vscroll_ticking.replace(true) {
+            return;
+        }
+        self.vscrolledwindow.add_tick_callback(clone!(
+            #[weak(rename_to = imp)]
+            self,
+            #[upgrade_or]
+            glib::ControlFlow::Break,
+            move |_, clock| imp.pan_tick(clock)
+        ));
+    }
+
+    fn pan_tick(&self, clock: &gtk::gdk::FrameClock) -> glib::ControlFlow {
+        let Some(mut pan) = self.vscroll_anim.get() else {
+            self.vscroll_ticking.set(false);
+            return glib::ControlFlow::Break;
+        };
+
+        let vadj = self.vscrolledwindow.vadjustment();
+        let value = vadj.value();
+        let now = clock.frame_time();
+        let dt = if pan.last_frame < 0 {
+            0
+        } else {
+            now - pan.last_frame
+        };
+        pan.last_frame = now;
+
+        let (next, vel, spent) = kinetic_step(value, pan.vel, dt, KINETIC_TAU_US);
+        pan.vel = vel;
+        vadj.set_value(next);
+        // nowhere left to go: vadj clamped our write, so we sit at the top or the bottom
+        let pinned = dt > 0 && (vadj.value() - value).abs() < 0.01;
+
+        log::trace!(
+            target: "scrolex::scroll",
+            "kinetic pan frame: dt={:5.1}ms v={value:9.2} step={:+7.2} left={vel:5.0}px/s",
+            dt as f64 / 1000.0,
+            vadj.value() - value,
+        );
+
+        if spent || pinned {
+            self.vscroll_anim.set(None);
+            self.vscroll_ticking.set(false);
+            log::debug!(
+                target: "scrolex::scroll",
+                "kinetic pan done: value={:.2}", vadj.value(),
+            );
+            return glib::ControlFlow::Break;
+        }
+
+        self.vscroll_anim.set(Some(pan));
+        glib::ControlFlow::Continue
+    }
+
+    // Stop both axes. For inputs that own the position outright - a jump, a drag, a new document -
+    // because a slide or a coast keeps writing the adjustments every frame and would drag us off.
+    fn cancel_scroll_motion(&self) {
+        *self.scroll_anim.borrow_mut() = None;
+        self.vscroll_anim.set(None);
+    }
+
+    // Stop the coasts, on both axes. A page slide survives: it aims at a page and re-reads where that
+    // page sits every frame, so a relayout can't throw it off. A coast has nothing to re-aim at.
+    fn cancel_coast(&self) {
+        if (*self.scroll_anim.borrow()).is_some_and(|a| a.kinetic) {
+            *self.scroll_anim.borrow_mut() = None;
+        }
+        self.vscroll_anim.set(None);
+    }
+
     // Apply a page step from a scroll accumulator: +1 forward, -1 back, 0 nothing.
     fn step_page(&self, step: i32) {
         if step > 0 {
@@ -450,9 +559,7 @@ impl Window {
 
     #[template_callback]
     fn handle_drag_start(&self, _n_press: i32, x: f64, y: f64) {
-        // A drag takes over the scroll position; drop any in-flight slide so scroll_tick stops
-        // writing hadj and fighting the drag.
-        *self.scroll_anim.borrow_mut() = None;
+        self.cancel_scroll_motion();
         *self.drag_coords.borrow_mut() = self.drag_point_in_window(x, y);
 
         if let Some(surface) = self.obj().surface() {
@@ -493,18 +600,26 @@ impl Window {
         }
     }
 
+    // Every zoom goes through here. A zoom relayouts the pages, so a coast has to stop first.
+    fn zoom_to(&self, zoom: f64) {
+        self.cancel_coast();
+        self.state.zoom_to(zoom);
+    }
+
     #[template_callback]
     fn zoom_out(&self) {
-        self.state.zoom_to(self.state.zoom() / ZOOM_STEP);
+        self.zoom_to(self.state.zoom() / ZOOM_STEP);
     }
 
     #[template_callback]
     fn zoom_in(&self) {
-        self.state.zoom_to(self.state.zoom() * ZOOM_STEP);
+        self.zoom_to(self.state.zoom() * ZOOM_STEP);
     }
 
     #[template_callback]
     fn handle_zoom_begin(&self) {
+        // the pinch takes over before it has changed the zoom at all
+        self.cancel_coast();
         self.zoom_gesturing.set(true);
         self.zoom_gesture_base.set(self.state.zoom());
     }
@@ -519,7 +634,7 @@ impl Window {
         if scale <= 0.0 {
             return;
         }
-        self.state.zoom_to(self.zoom_gesture_base.get() * scale);
+        self.zoom_to(self.zoom_gesture_base.get() * scale);
     }
 
     #[template_callback]
@@ -599,6 +714,8 @@ impl Window {
             Key::Up | Key::Down | Key::k | Key::j => {
                 // vertical pan of a zoomed-in page. The outer scroller owns the vertical axis (the
                 // horizontal listview doesn't scroll its cross axis); k/Up pan up, j/Down pan down.
+                // the nudge owns the axis; a coast would overwrite it next frame
+                self.vscroll_anim.set(None);
                 let vadj = self.vscrolledwindow.vadjustment();
                 let step = if vadj.step_increment() > 0.0 {
                     vadj.step_increment()
@@ -654,7 +771,7 @@ impl Window {
             return;
         }
 
-        self.state.zoom_to(zoom / 100.0);
+        self.zoom_to(zoom / 100.0);
     }
 
     fn goto_page(&self, page_num: u32) {
@@ -670,6 +787,7 @@ impl Window {
 
         let page_num = page_num.min(selection.n_items());
 
+        self.cancel_scroll_motion();
         self.expect_hscroll("goto-page");
         self.listview.scroll_to(
             page_num.saturating_sub(1),
@@ -739,11 +857,9 @@ impl Window {
     // stays smooth. `delta` seeds a resting position only for the degenerate case where the
     // selected page's live geometry can't be read at all.
     fn animate_scroll(&self, anchor_x: Option<f64>, delta: f64) {
-        // A page step supersedes a kinetic scroll: drop it so the step starts fresh and anchors on
-        // the page instead of retargeting the anchor-less glide.
-        if (*self.scroll_anim.borrow()).is_some_and(|a| a.kinetic) {
-            *self.scroll_anim.borrow_mut() = None;
-        }
+        // A page step supersedes a coast: the step anchors on a page, the coast has no anchor to
+        // retarget. Both axes stop, so the step decides where the reader lands.
+        self.cancel_coast();
 
         let hadj = self.scrolledwindow.hadjustment();
 
@@ -1141,6 +1257,7 @@ impl Window {
 
     #[template_callback]
     fn on_load_started(&self) {
+        self.cancel_scroll_motion();
         self.loading_spinner.start();
         self.loading_overlay.set_visible(true);
     }
@@ -1801,6 +1918,7 @@ impl Window {
             return;
         };
         let idx = (page_index.max(0) as u32).min(selection.n_items().saturating_sub(1));
+        self.cancel_scroll_motion();
         // SELECT only (no FOCUS) so typing focus stays in the entry
         self.expect_hscroll("search scroll");
         self.listview
@@ -2287,9 +2405,98 @@ mod tests {
 }
 
 #[cfg(test)]
-mod controller_order_tests {
+mod widget_tests {
+    use super::KINETIC_MIN_VELOCITY;
     use gtk::prelude::*;
     use gtk::subclass::prelude::ObjectSubclassIsExt;
+
+    fn window() -> crate::window::Window {
+        gtk::gio::resources_register_include!("scrolex-ui.gresource").expect("ui resources");
+        crate::state::State::static_type();
+        crate::page::PageNumber::static_type();
+        crate::page::Page::static_type();
+
+        gtk::glib::Object::new()
+    }
+
+    // GTK's own kinetic scrolling is off on both scrollers, so nothing else coasts for us.
+    #[gtk::test]
+    fn vertical_flick_coasts_when_the_page_is_taller_than_the_viewport() {
+        let window = window();
+        let imp = window.imp();
+        let vadj = imp.vscrolledwindow.vadjustment();
+        vadj.configure(0.0, 0.0, 2000.0, 10.0, 100.0, 500.0);
+
+        imp.handle_decelerate(0.0, -1500.0);
+
+        let pan = imp.vscroll_anim.get().expect("kinetic pan armed");
+        assert!((pan.vel + 1500.0).abs() < f64::EPSILON, "vel={}", pan.vel);
+    }
+
+    #[gtk::test]
+    fn a_page_that_fits_the_viewport_has_nothing_to_coast() {
+        let window = window();
+        let imp = window.imp();
+        let vadj = imp.vscrolledwindow.vadjustment();
+        vadj.configure(0.0, 0.0, 400.0, 10.0, 100.0, 500.0);
+
+        imp.handle_decelerate(0.0, -1500.0);
+
+        assert!(imp.vscroll_anim.get().is_none());
+    }
+
+    // Zoom relayouts the pages under a coast that has no target to re-aim at.
+    #[gtk::test]
+    fn a_pinch_stops_both_coasts() {
+        let window = window();
+        let imp = window.imp();
+        let vadj = imp.vscrolledwindow.vadjustment();
+        vadj.configure(0.0, 0.0, 2000.0, 10.0, 100.0, 500.0);
+        imp.handle_decelerate(-1500.0, -1500.0);
+        assert!(imp.scroll_anim.borrow().is_some(), "coasting horizontally");
+        assert!(imp.vscroll_anim.get().is_some(), "coasting vertically");
+
+        imp.handle_zoom_begin();
+
+        assert!(imp.scroll_anim.borrow().is_none());
+        assert!(imp.vscroll_anim.get().is_none());
+    }
+
+    // Unlike a coast, a page slide reads its page's position every frame, which is what keeps the page
+    // landing on its anchor when zoom or crop moves it mid-slide.
+    #[gtk::test]
+    fn a_pinch_leaves_a_page_slide_running() {
+        let window = window();
+        let imp = window.imp();
+        *imp.scroll_anim.borrow_mut() = Some(super::ScrollAnim {
+            anchor_x: Some(0.0),
+            last_target: 100.0,
+            last_frame: -1,
+            start_frame: -1,
+            dir: 1.0,
+            last_next: f64::NAN,
+            tau_us: super::SCROLL_ANIM_TAU_US,
+            kinetic: false,
+            vel: 0.0,
+        });
+
+        imp.handle_zoom_begin();
+
+        assert!(imp.scroll_anim.borrow().is_some());
+    }
+
+    // A slow lift-off means the fingers stopped before they left, not a fling.
+    #[gtk::test]
+    fn a_slow_vertical_lift_off_does_not_coast() {
+        let window = window();
+        let imp = window.imp();
+        let vadj = imp.vscrolledwindow.vadjustment();
+        vadj.configure(0.0, 0.0, 2000.0, 10.0, 100.0, 500.0);
+
+        imp.handle_decelerate(0.0, -(KINETIC_MIN_VELOCITY - 1.0));
+
+        assert!(imp.vscroll_anim.get().is_none());
+    }
 
     // Both scrollers keep scrolling on their own after a touchpad flick, each from a capture-phase
     // kinetic controller. We set the position ourselves, so we must get the event first: capture
@@ -2297,12 +2504,7 @@ mod controller_order_tests {
     // gtk::test, not test: it runs the body on the thread GTK is initialized on.
     #[gtk::test]
     fn scroll_controller_runs_before_gtk_coasts() {
-        gtk::gio::resources_register_include!("scrolex-ui.gresource").expect("ui resources");
-        crate::state::State::static_type();
-        crate::page::PageNumber::static_type();
-        crate::page::Page::static_type();
-
-        let window: crate::window::Window = gtk::glib::Object::new();
+        let window = window();
         let imp = window.imp();
         let ours = imp.pan_scroll.get();
 
