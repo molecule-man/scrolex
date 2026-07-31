@@ -106,9 +106,9 @@ pub(crate) fn stage_candidate(uri: &str) -> Option<Candidate> {
 
 impl Candidate {
     // One open reading both the page count and the largest of the first PROBE_PAGES page sizes, so a
-    // load needs a single document open (safe to run off the main thread). None if unopenable.
-    // Sampled rather than exhaustive: a long document would be slow to walk, and pages seen later
-    // widen the size as they are drawn (State::observe_page_size).
+    // load needs a single document open (safe to run off the main thread). None if unopenable. The
+    // size is only reported in the load log: walking a long document would be slow, and every render
+    // is sized from its own page.
     pub(crate) fn probe(&self) -> Option<(i32, Option<(f64, f64)>)> {
         if let Some(cfg) = crate::emulate::config() {
             return Some((cfg.pages, Some(cfg.page_pt)));

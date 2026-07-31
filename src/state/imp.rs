@@ -87,12 +87,6 @@ pub struct State {
     // Per-State so one window's load never invalidates another's in-flight renders.
     pub(crate) doc_epoch: Cell<u64>,
 
-    // first page's size in points and the window's device pixels per point. Together they set the
-    // zoom ceiling (see zoom_ceiling); page size is None until a document is loaded, and mixed-size
-    // documents are bounded by their first page.
-    pub(crate) page_size_pt: Cell<Option<(f64, f64)>>,
-    pub(crate) device_scale: Cell<i32>,
-
     // global render-thread count (user setting) and how many pages fully fit across the viewport;
     // together they set prefetch depth. Set in constructed / by the window.
     pub(crate) render_threads: Cell<usize>,

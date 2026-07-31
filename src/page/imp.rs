@@ -22,7 +22,13 @@ use super::Rectangle;
 use crate::bg_job::{RenderPool, RenderPriority};
 use crate::links::LinkTarget;
 use crate::selection::PageSelection;
-use crate::state::MAX_PAGE_BYTES;
+
+// Max bytes in one page buffer. A whole page is rendered at once, so the buffer grows with the
+// scale squared. render_scale keeps it under this.
+pub(crate) const MAX_PAGE_BYTES: f64 = 128.0 * 1024.0 * 1024.0;
+// Max pixels per axis. GPUs commonly refuse a texture wider or taller than this. A long thin page
+// can pass this while still under MAX_PAGE_BYTES.
+const MAX_TEXTURE_DIM: f64 = 16384.0;
 
 // Low-resolution previews rendered ahead of the visible page and shown (upscaled) while the full
 // render is pending, so aggressive scrolling shows blurry pages rather than blank ones. The render
@@ -99,6 +105,18 @@ fn page_buffer_bytes(page_pt: (f64, f64), scale: f64, dsf: f64) -> f64 {
     width * height * 4.0
 }
 
+// Scale to render this page at: the zoom, or the biggest scale that still fits the caps. A big page
+// at deep zoom is then rendered small and upscaled - soft, but every zoom stays reachable.
+fn render_scale(page_pt: (f64, f64), zoom: f64, dsf: f64) -> f64 {
+    let (w, h) = (page_pt.0 * dsf, page_pt.1 * dsf);
+    let (area, longest) = (w * h * 4.0, w.max(h));
+    if !area.is_finite() || area <= 0.0 || !longest.is_finite() {
+        return zoom;
+    }
+    zoom.min((MAX_PAGE_BYTES / area).sqrt())
+        .min(MAX_TEXTURE_DIM / longest)
+}
+
 fn render_dimensions(page_pt: (f64, f64), scale: f64, dsf: f64) -> (i32, i32) {
     (
         ((page_pt.0 * scale * dsf) as i32).max(1),
@@ -170,6 +188,8 @@ pub struct Page {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Paint {
     Sharp,
+    // capped render, upscaled: the best this zoom can look
+    Upscaled,
     StaleRender,
     Preview,
     Placeholder,
@@ -179,7 +199,8 @@ enum Paint {
 impl Paint {
     fn fidelity(self) -> u8 {
         match self {
-            Paint::Sharp => 4,
+            Paint::Sharp => 5,
+            Paint::Upscaled => 4,
             Paint::StaleRender => 3,
             Paint::Preview => 2,
             Paint::Placeholder => 1,
@@ -236,12 +257,6 @@ impl WidgetImpl for Page {
             self.note_paint(page.index, Paint::Blank);
             return;
         }
-
-        // This page's own size, which the zoom bound has to cover - the document's load-time sample
-        // only saw its first pages.
-        self.obj()
-            .state()
-            .observe_page_size((page.width, page.height));
 
         if self.obj().state().multithread_rendering() {
             self.multithread_snapshot(snapshot, &page);
@@ -581,25 +596,24 @@ impl Page {
 
         let bbox = self.get_bbox(page, obj.crop());
         let scale = obj.zoom();
-
-        // over the cap: wait for the re-clamped zoom
-        if page_buffer_bytes((page.width, page.height), scale, scale_factor) > MAX_PAGE_BYTES {
-            log::debug!("draw page {}: over the page buffer cap", page.index);
-            append_white(snapshot, &bbox, scale);
-            self.note_paint(page.index, Paint::Blank);
-            return;
-        }
+        let render_scale = render_scale((page.width, page.height), scale, scale_factor);
 
         match render_page_texture(
             &obj.uri(),
             page.index,
-            scale,
+            render_scale,
             scale_factor,
             Some((page.width, page.height)),
         ) {
             Some(texture) => {
-                self.append_page_texture(snapshot, texture.upcast_ref(), &bbox, scale);
-                self.note_paint(page.index, Paint::Sharp);
+                self.append_render(
+                    snapshot,
+                    texture.upcast_ref(),
+                    page,
+                    &bbox,
+                    scale,
+                    render_scale,
+                );
             }
             None => {
                 append_white(snapshot, &bbox, scale);
@@ -616,6 +630,25 @@ impl Page {
         if elapsed > std::time::Duration::from_millis(100) {
             log::warn!("Rendering took too long: {elapsed:?}. Switching to multithreading mode.");
             obj.state().set_multithread_rendering(true);
+        }
+    }
+
+    // Draw a render: 1:1 with device pixels, or stretched if the caps held its scale below the zoom.
+    fn append_render(
+        &self,
+        snapshot: &gtk::Snapshot,
+        texture: &gtk::gdk::Texture,
+        page: &PageInfo,
+        bbox: &Rectangle,
+        zoom: f64,
+        render_scale: f64,
+    ) {
+        if render_scale < zoom {
+            self.append_scaled_page_texture(snapshot, texture, page, bbox, zoom);
+            self.note_paint(page.index, Paint::Upscaled);
+        } else {
+            self.append_page_texture(snapshot, texture, bbox, zoom);
+            self.note_paint(page.index, Paint::Sharp);
         }
     }
 
@@ -647,7 +680,8 @@ impl Page {
         snapshot.pop();
     }
 
-    // Present a stand-in over the current page extent while its target-scale render is pending.
+    // Stretch a texture of any scale over the page extent, cropped to `bbox`. Used for stand-ins
+    // while a render is pending, and for capped renders.
     fn append_scaled_page_texture(
         &self,
         snapshot: &gtk::Snapshot,
@@ -750,8 +784,9 @@ impl Page {
         let (width, height) = (page.width, page.height);
         let scale = obj.zoom();
         let scale_factor = obj.scale_factor() as f64;
-        let expected = render_dimensions((width, height), scale, scale_factor);
-        let page_bytes = page_buffer_bytes((page.width, page.height), scale, scale_factor);
+        let render_scale = render_scale((width, height), scale, scale_factor);
+        let expected = render_dimensions((width, height), render_scale, scale_factor);
+        let page_bytes = page_buffer_bytes((width, height), render_scale, scale_factor);
 
         let cache = obj.state().render_cache();
         let cached = cache.borrow_mut().get(page_num);
@@ -759,8 +794,7 @@ impl Page {
             if (texture.width(), texture.height()) == expected {
                 log::debug!("draw page {page_num}: cache hit");
                 let bbox = self.get_bbox(page, obj.crop());
-                self.append_page_texture(snapshot, &texture, &bbox, scale);
-                self.note_paint(page_num, Paint::Sharp);
+                self.append_render(snapshot, &texture, page, &bbox, scale, render_scale);
                 self.prefetch_previews(page_num);
                 self.prefetch_next(page_num, page_bytes as usize);
                 return;
@@ -772,9 +806,13 @@ impl Page {
         };
 
         // Flung-past pages are dropped at the queue (see set_wanted_pages), so this doesn't saturate
-        // the workers mid-scroll. A page over the buffer cap is declined here and stands in below
-        // until observe_page_size's lowered ceiling re-clamps the zoom.
-        self.schedule_render(page_num, scale, scale_factor, RenderPriority::Visible);
+        // the workers mid-scroll.
+        self.schedule_render(
+            page_num,
+            render_scale,
+            scale_factor,
+            RenderPriority::Visible,
+        );
 
         // remember that this widget is the one waiting for page_num, so the
         // render repaints it when it lands
@@ -855,19 +893,13 @@ impl Page {
             if page_num < 0 || page_num >= n_pages {
                 continue;
             }
-            if cache
-                .borrow()
-                .contains_at_scale(page_num, scale * scale_factor)
-            {
-                continue;
-            }
             self.schedule_render(page_num, scale, scale_factor, RenderPriority::Prefetch);
         }
     }
 
-    // Queue a full render of `page_num`, unless one is already in flight for it or its buffer would
-    // exceed the cap. The marker records the epoch the render was scheduled at, so its completion can
-    // tell whether the slot is still its own to release.
+    // Queue a full render of `page_num`. Skipped if one is in flight, or if the cache holds the page
+    // at the capped scale already - callers pass the zoom, so only this point knows that scale. The
+    // marker records the epoch, so the completion can tell whether the slot is still its own.
     fn schedule_render(
         &self,
         page_num: i32,
@@ -892,12 +924,19 @@ impl Page {
         // exactly what the render cache expects (see mupdf_render::render_page_pixels).
         let page_pt = crate::mupdf_render::page_size(&uri, page_num);
 
-        // Checked before the marker: prefetched pages are scheduled without being drawn, so this is
-        // the only point that sees their size. Bailing after the insert would leave the page marked in
-        // flight with no render to release it.
-        if page_pt.is_some_and(|size| page_buffer_bytes(size, scale, scale_factor) > MAX_PAGE_BYTES)
+        // Capped and skipped before the marker goes in. A page marked in flight with no render to
+        // release it would stay wedged.
+        let scale = match page_pt {
+            Some(size) => render_scale(size, scale, scale_factor),
+            None => scale,
+        };
+        let pixel_scale = scale * scale_factor;
+        if obj
+            .state()
+            .render_cache()
+            .borrow()
+            .contains_at_scale(page_num, pixel_scale)
         {
-            log::debug!("page {page_num}: over the page buffer cap, not rendering");
             return;
         }
 
@@ -915,7 +954,6 @@ impl Page {
         let (resp_sender, resp_receiver) = oneshot::channel::<RenderedPage>();
         let obj_clone = obj.clone();
         let doc_epoch = obj.state().doc_epoch();
-        let pixel_scale = scale * scale_factor;
         glib::spawn_future_local(async move {
             let result = resp_receiver.await;
             let state = obj_clone.state();
@@ -1470,6 +1508,30 @@ mod tests {
     }
 
     #[test]
+    fn render_scale_follows_the_zoom_until_the_buffer_cap() {
+        let a4 = (595.0, 842.0);
+        assert_eq!(render_scale(a4, 1.0, 1.0), 1.0);
+        assert_eq!(render_scale(a4, 4.0, 2.0), 4.0);
+
+        // deep zoom on a normal page, and plain 100% on a huge canvas: both render below the zoom
+        for (page_pt, zoom, dsf) in [(a4, 10.0, 2.0), ((6120.0, 7920.0), 1.0, 1.0)] {
+            let scale = render_scale(page_pt, zoom, dsf);
+            assert!(scale < zoom, "{page_pt:?} at {zoom}x{dsf}: {scale}");
+            assert!(page_buffer_bytes(page_pt, scale, dsf) <= MAX_PAGE_BYTES);
+        }
+
+        // a long thin page hits the axis limit, not the byte cap
+        let banner = (200.0, 40000.0);
+        let scale = render_scale(banner, 10.0, 1.0);
+        assert!(render_dimensions(banner, scale, 1.0).1 <= MAX_TEXTURE_DIM as i32);
+
+        // degenerate sizes: no divide by zero, zoom passes through
+        assert_eq!(render_scale((0.0, 0.0), 3.0, 1.0), 3.0);
+        assert_eq!(render_scale((f64::NAN, 100.0), 3.0, 1.0), 3.0);
+        assert_eq!(render_scale((f64::MAX, f64::MAX), 3.0, 1.0), 3.0);
+    }
+
+    #[test]
     fn render_dimensions_match_the_full_render_buffer() {
         assert_eq!(render_dimensions((595.0, 842.0), 1.0, 2.0), (1190, 1684));
         assert_eq!(render_dimensions((0.0, 0.0), 1.0, 1.0), (1, 1));
@@ -1660,8 +1722,7 @@ startxref
         assert!((r.y2 - 50.0).abs() < EPSILON);
     }
 
-    // Two pages, the second far larger: the mixed-size case where the second page's buffer exceeds
-    // the cap at a zoom the first page allows.
+    // Two pages, the second far larger. At a zoom the first page renders fine, the second is capped.
     const MIXED_SIZE_PDF: &[u8] = b"%PDF-1.4\n\
 1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n\
 2 0 obj\n<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>\nendobj\n\
@@ -1670,7 +1731,7 @@ startxref
 trailer\n<< /Root 1 0 R >>\n%%EOF";
 
     #[gtk::test]
-    fn schedule_render_declines_a_page_over_the_buffer_cap() {
+    fn schedule_render_caps_the_scale_of_an_oversized_page() {
         let dir = std::env::temp_dir().join("scrolex_schedule_cap_test");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("mixed.pdf");
@@ -1682,16 +1743,25 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         state.set_n_pages(2);
         let page = crate::page::Page::new(&state);
 
-        // page 1 is 2000x3000pt: at zoom 10 its buffer is ~2.4GB, far over the cap. Nothing is
-        // scheduled, and no marker is left behind to wedge the page.
+        // page 1 is 2000x3000pt. At zoom 10 a whole-page buffer would be ~2.4GB, so it renders
+        // capped instead of not at all.
+        page.imp()
+            .schedule_render(1, 10.0, 1.0, RenderPriority::Prefetch);
+        assert!(state.render_inflight().borrow().contains_key(&1));
+
+        // already cached at the capped scale: don't render it again on every draw
+        state.render_inflight().borrow_mut().clear();
+        let capped = render_scale((2000.0, 3000.0), 10.0, 1.0);
+        let (w, h) = render_dimensions((2000.0, 3000.0), capped, 1.0);
+        let bytes = glib::Bytes::from_owned(vec![255u8; (w * h * 4) as usize]);
+        let texture = MemoryTexture::new(w, h, MemoryFormat::B8g8r8x8, &bytes, (w * 4) as usize);
+        state
+            .render_cache()
+            .borrow_mut()
+            .insert(1, texture.upcast(), capped);
         page.imp()
             .schedule_render(1, 10.0, 1.0, RenderPriority::Prefetch);
         assert!(state.render_inflight().borrow().is_empty());
-
-        // the same page at a zoom that fits is scheduled as usual
-        page.imp()
-            .schedule_render(1, 0.5, 1.0, RenderPriority::Prefetch);
-        assert!(state.render_inflight().borrow().contains_key(&1));
     }
 
     #[gtk::test]

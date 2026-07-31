@@ -245,7 +245,6 @@ impl ObjectImpl for Window {
         }
 
         self.setup_scroll_selection_sync();
-        self.setup_device_scale_tracking();
         self.setup_thread_setting();
         self.setup_cache_setting();
         let cfg = crate::config::load_config();
@@ -1482,18 +1481,6 @@ impl Window {
                     eprintln!("Error saving config: {e}");
                 }
             }
-        ));
-    }
-
-    // Keep the state's device scale current: it sets the zoom ceiling, since a page's render buffer
-    // is sized in device pixels.
-    fn setup_device_scale_tracking(&self) {
-        let obj = self.obj();
-        self.state.set_device_scale(obj.scale_factor());
-        obj.connect_scale_factor_notify(clone!(
-            #[weak(rename_to = imp)]
-            self,
-            move |window| imp.state.set_device_scale(window.scale_factor())
         ));
     }
 

@@ -21,33 +21,14 @@ use crate::page;
 // holds about that many previews regardless of the adaptive scale.
 pub(crate) const PREVIEW_TARGET_BYTES: usize = 20 * 1024 * 1024 / 65;
 
-// Ceiling on one page's pixel buffer. Pages are rendered whole, so the buffer grows with the square
-// of the zoom; the zoom bound derived from this cap (see zoom_ceiling) is what keeps deep zoom from
-// allocating buffers in the gigabytes.
-pub(crate) const MAX_PAGE_BYTES: f64 = 128.0 * 1024.0 * 1024.0;
-// Absolute zoom bounds, so a postage-stamp page can't reach unusable zoom levels and zooming out
-// can't shrink a page to nothing.
+// Zoom bounds. The same for every document: huge pages are the ones that need deep zoom most.
+// Render buffers are bounded by scale instead (see page::render_scale).
 const MAX_ZOOM: f64 = 10.0;
 const MIN_ZOOM: f64 = 0.05;
 
 // Preview cache byte budget for a given number of resident previews.
 pub(crate) fn preview_cache_budget(pages: usize) -> usize {
     pages * PREVIEW_TARGET_BYTES
-}
-
-// Zoom at which one page's pixel buffer reaches MAX_PAGE_BYTES, given the page size in points and
-// the device scale factor (4 bytes per device pixel). HiDPI screens hit it at a lower zoom because
-// the bound is on rendered pixels, not on nominal zoom.
-fn zoom_ceiling(page_pt: (f64, f64), device_scale: i32) -> f64 {
-    let (w, h) = page_pt;
-    let dsf = f64::from(device_scale.max(1));
-    let bytes_at_1x = w * h * dsf * dsf * 4.0;
-    if !bytes_at_1x.is_finite() || bytes_at_1x <= 0.0 {
-        return MAX_ZOOM;
-    }
-    (MAX_PAGE_BYTES / bytes_at_1x)
-        .sqrt()
-        .clamp(MIN_ZOOM, MAX_ZOOM)
 }
 
 type MaxPageSize = Option<(f64, f64)>;
@@ -78,54 +59,12 @@ impl State {
             .build()
     }
 
-    // Every zoom change goes through here: the ceiling depends on this document's page size and the
-    // device scale, and setting the property directly skips it.
+    // Every zoom change goes through here. Setting the property directly skips the bounds.
     pub(crate) fn zoom_to(&self, zoom: f64) {
-        let bounded = zoom.clamp(MIN_ZOOM, self.max_zoom());
+        let bounded = zoom.clamp(MIN_ZOOM, MAX_ZOOM);
         if bounded != self.zoom() {
             self.set_zoom(bounded);
         }
-    }
-
-    pub(crate) fn max_zoom(&self) -> f64 {
-        match self.imp().page_size_pt.get() {
-            Some(page_pt) => zoom_ceiling(page_pt, self.imp().device_scale.get()),
-            None => MAX_ZOOM,
-        }
-    }
-
-    // Widen the document's page size to cover `page_pt`: the load-time sample only sees the first
-    // pages, and the bound has to hold for the biggest page actually drawn. Re-clamps the zoom on
-    // idle, since callers are mid-snapshot and lowering the zoom resizes every page widget.
-    pub(crate) fn observe_page_size(&self, page_pt: (f64, f64)) {
-        let area = page_pt.0 * page_pt.1;
-        if !area.is_finite() || area <= 0.0 {
-            return;
-        }
-        if self
-            .imp()
-            .page_size_pt
-            .get()
-            .is_some_and(|(w, h)| w * h >= area)
-        {
-            return;
-        }
-
-        self.imp().page_size_pt.set(Some(page_pt));
-        if self.zoom() > self.max_zoom() {
-            glib::idle_add_local_once(clone!(
-                #[weak(rename_to = state)]
-                self,
-                move || state.zoom_to(state.zoom())
-            ));
-        }
-    }
-
-    // Device pixels per point of the window showing this document; moving to a differently scaled
-    // monitor changes the zoom ceiling, so re-apply the current zoom against it.
-    pub(crate) fn set_device_scale(&self, scale: i32) {
-        self.imp().device_scale.set(scale);
-        self.zoom_to(self.zoom());
     }
 
     pub(crate) fn jump_list_add(&self, page: u32) {
@@ -239,7 +178,6 @@ impl State {
         self.set_prev_page(0);
         self.set_uri(uri);
         self.set_n_pages(n_pages);
-        self.imp().page_size_pt.set(max_page_size);
         self.zoom_to(1.0);
         self.set_crop(false);
         self.set_page(0);
@@ -460,45 +398,14 @@ mod tests {
     use super::*;
     use gtk::prelude::Cast;
 
-    // 4 bytes per device pixel
-    fn page_bytes_at(page_pt: (f64, f64), device_scale: i32, zoom: f64) -> f64 {
-        let dsf = f64::from(device_scale);
-        (page_pt.0 * zoom * dsf).floor() * (page_pt.1 * zoom * dsf).floor() * 4.0
-    }
-
-    #[test]
-    fn zoom_ceiling_bounds_the_page_buffer() {
-        let a4 = (595.44, 842.16);
-        for device_scale in [1, 2, 3] {
-            let ceiling = zoom_ceiling(a4, device_scale);
-            assert!(page_bytes_at(a4, device_scale, ceiling) <= MAX_PAGE_BYTES);
-            // a HiDPI screen reaches the same pixel count at a lower nominal zoom
-            assert!(ceiling <= zoom_ceiling(a4, device_scale - 1));
-        }
-        // the reported case: 1000% on an A4 page at scale factor 2 is not reachable
-        assert!(zoom_ceiling(a4, 2) < 10.0);
-    }
-
     #[gtk::test]
-    fn a_bigger_drawn_page_tightens_the_zoom_ceiling() {
+    fn zoom_bounds_hold_whatever_the_document() {
         let state = State::new();
-        state.imp().device_scale.set(1);
-        state.imp().page_size_pt.set(Some((200.0, 200.0)));
-        let small_page_ceiling = state.max_zoom();
-
-        // a page the load-time sample missed
-        state.observe_page_size((2000.0, 3000.0));
-        let big_page_ceiling = state.max_zoom();
-        assert!(big_page_ceiling < small_page_ceiling);
-        assert!(page_bytes_at((2000.0, 3000.0), 1, big_page_ceiling) <= MAX_PAGE_BYTES);
-
-        // smaller pages don't loosen it again
-        state.observe_page_size((100.0, 100.0));
-        assert_eq!(state.max_zoom(), big_page_ceiling);
-        // nor do degenerate sizes
-        state.observe_page_size((0.0, 0.0));
-        state.observe_page_size((f64::NAN, 10.0));
-        assert_eq!(state.max_zoom(), big_page_ceiling);
+        // no page size may narrow this range
+        state.zoom_to(50.0);
+        assert_eq!(state.zoom(), MAX_ZOOM);
+        state.zoom_to(0.0);
+        assert_eq!(state.zoom(), MIN_ZOOM);
     }
 
     #[gtk::test]
@@ -515,16 +422,6 @@ mod tests {
         state.zoom_to(1.1);
 
         assert!(state.render_cache().borrow().contains_at_scale(3, 1.0));
-    }
-
-    #[test]
-    fn zoom_ceiling_clamps_extreme_page_sizes() {
-        // a stamp-sized page would allow absurd zoom; a poster-sized one less than 100%
-        assert_eq!(zoom_ceiling((10.0, 10.0), 1), MAX_ZOOM);
-        assert!(zoom_ceiling((8000.0, 8000.0), 2) < 1.0);
-        // degenerate sizes fall back to the absolute bound rather than dividing by zero
-        assert_eq!(zoom_ceiling((0.0, 0.0), 1), MAX_ZOOM);
-        assert_eq!(zoom_ceiling((f64::NAN, 100.0), 1), MAX_ZOOM);
     }
 
     fn selection_on(page: i32, text: &str) -> crate::selection::PageSelection {
