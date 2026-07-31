@@ -44,8 +44,9 @@ const WHEEL_TRIGGER: f64 = 0.2;
 const TOUCHPAD_NOTCH: f64 = 40.0;
 
 // Time constant of the kinetic scroll that continues a touchpad swipe after the fingers lift. Travel
-// lift-off speed times this, so a brisk swipe covers a page or two.
-const KINETIC_TAU_US: f64 = 300_000.0;
+// lift-off speed times this, so a brisk swipe covers a couple of pages. It also sets how fast the
+// pages are still moving mid-coast: the speed decays as exp(-t/tau).
+const KINETIC_TAU_US: f64 = 420_000.0;
 // Lift-off speed (px/s) under which the swipe counts as stopped rather than flung.
 const KINETIC_MIN_VELOCITY: f64 = 100.0;
 
