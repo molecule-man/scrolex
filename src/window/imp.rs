@@ -62,7 +62,8 @@ const SEARCH_DEBOUNCE_MS: u64 = 100;
 // same on-screen spot. `anchor_x` is the viewport x where the selected page's left edge should come
 // to rest. `last_target` remembers the most recent geometry-derived resting position; it is used
 // when the selected page isn't realised yet (e.g. selection has raced ahead during a burst) so the
-// slide chases only real page positions and never overshoots into a reverse correction.
+// slide chases only real page positions and never overshoots into a reverse correction. The list
+// view rewrites those coordinates, so rebase it before use (`rebase_target`).
 // `last_frame` is the previous tick's frame time (-1 until the first tick) for a
 // frame-rate-independent glide.
 #[derive(Clone, Copy)]
@@ -74,8 +75,8 @@ struct ScrollAnim {
     start_frame: i64,
     // travel direction (+1 forward, -1 back); the glide never moves against it
     dir: f64,
-    // value written to hadjustment last tick (NaN until first write); a gap vs. this tick's read is
-    // external motion injected between our frames (GtkListView re-anchor, GTK deceleration).
+    // where we left the hadjustment: our last write, or its value when the glide was armed. A gap vs.
+    // this tick's read is someone else moving it (GtkListView re-anchor, GTK deceleration).
     last_next: f64,
     // decay time constant of this glide; page steps and kinetic scrolls move at different rates
     tau_us: f64,
@@ -450,7 +451,7 @@ impl Window {
             last_frame: -1,
             start_frame: -1,
             dir: vel_x.signum(),
-            last_next: f64::NAN,
+            last_next: value,
             tau_us: KINETIC_TAU_US,
             kinetic: true,
             vel: vel_x,
@@ -873,7 +874,12 @@ impl Window {
         // A retarget resets the duration ceiling (start_frame -1); else a long burst force-settles
         // short of target, landing the page off its anchor. last_frame carries over to keep pacing.
         let (anchor_x, prev_target, last_frame, start_frame) = match anim.as_ref() {
-            Some(a) => (a.anchor_x, Some(a.last_target), a.last_frame, -1),
+            Some(a) => (
+                a.anchor_x,
+                Some(self.rebase_target(a, hadj.value())),
+                a.last_frame,
+                -1,
+            ),
             None => (anchor_x, None, -1, -1),
         };
         // Prefer the selected page's exact live position. When it isn't laid out yet (selection
@@ -896,7 +902,7 @@ impl Window {
             last_frame,
             start_frame,
             dir: delta.signum(),
-            last_next: f64::NAN,
+            last_next: hadj.value(),
             tau_us: SCROLL_ANIM_TAU_US,
             kinetic: false,
             vel: 0.0,
@@ -928,12 +934,12 @@ impl Window {
         let hadj = self.scrolledwindow.hadjustment();
         let value = hadj.value();
         let prev_target = anim.last_target;
+        let drift = value - anim.last_next;
 
-        // Chase the selected page's live resting position; when it isn't realised yet (selection
-        // raced ahead in a burst) hold the last known one. Real page positions only advance as
-        // selection advances, so the target never jumps behind us and the slide never reverses.
+        // Chase the selected page's live resting position. While it slides in from off-screen it
+        // isn't realised, so rebase the last known one instead.
         let live = self.live_target(anim.anchor_x);
-        let target = live.unwrap_or(anim.last_target);
+        let target = live.unwrap_or_else(|| self.rebase_target(&anim, value));
         anim.last_target = target;
 
         let now = clock.frame_time();
@@ -966,10 +972,8 @@ impl Window {
         };
 
         // Per-frame trace (RUST_LOG=scrolex::scroll=trace). drift = external hadj motion since our
-        // last write; dtgt = live-target jitter from crop relayout; vel = px/ms. Smooth = regular
-        // dt, drift~0, dtgt~0, decaying vel. A kinetic scroll has no target: `left` is the speed to
-        // spend, and drift shows the coordinate rewrites it rides out.
-        let drift = value - anim.last_next; // NaN on the first frame
+        // last write; dtgt = how far the target moved; vel = px/ms. Smooth = regular dt, decaying
+        // vel, dtgt tracking drift. A kinetic scroll has no target: `left` is the speed to spend.
         let dt_ms = raw_dt as f64 / 1000.0;
         let step_vel = if dt_ms > 0.0 {
             (next - value).abs() / dt_ms
@@ -1045,6 +1049,17 @@ impl Window {
         let hadj = self.scrolledwindow.hadjustment();
         let lower = hadj.lower();
         value.clamp(lower, (hadj.upper() - hadj.page_size()).max(lower))
+    }
+
+    // Move an older target into the hadjustment's current coordinates. Measuring page widths changes
+    // `upper`, and the list view shifts the value to match while the pages stay put on screen. A
+    // target left behind names a spot a page or more off: the slide lunges, or settles short.
+    fn rebase_target(&self, anim: &ScrollAnim, value: f64) -> f64 {
+        let drift = value - anim.last_next;
+        if drift.is_finite() && drift != 0.0 {
+            return self.clamp_scroll(anim.last_target + drift);
+        }
+        anim.last_target
     }
 
     // Resting hadjustment that puts the selected page's left edge at `anchor_x`, from its live
@@ -2438,7 +2453,8 @@ mod widget_tests {
         let window = window();
         let imp = window.imp();
         let vadj = imp.vscrolledwindow.vadjustment();
-        vadj.configure(0.0, 0.0, 400.0, 10.0, 100.0, 500.0);
+        // page_size must not exceed `upper`; GtkAdjustment drops the whole call if it does
+        vadj.configure(0.0, 0.0, 400.0, 10.0, 100.0, 400.0);
 
         imp.handle_decelerate(0.0, -1500.0);
 
@@ -2483,6 +2499,55 @@ mod widget_tests {
         imp.handle_zoom_begin();
 
         assert!(imp.scroll_anim.borrow().is_some());
+    }
+
+    // A slide already running: we last wrote `value`, and aim at `target` a page ahead.
+    fn slide(imp: &super::Window, value: f64, target: f64) {
+        let hadj = imp.scrolledwindow.hadjustment();
+        hadj.configure(value, 0.0, 100_000.0, 10.0, 100.0, 1_000.0);
+        *imp.scroll_anim.borrow_mut() = Some(super::ScrollAnim {
+            anchor_x: None,
+            last_target: target,
+            last_frame: 0,
+            start_frame: 0,
+            dir: (target - value).signum(),
+            last_next: value,
+            tau_us: super::SCROLL_ANIM_TAU_US,
+            kinetic: false,
+            vel: 0.0,
+        });
+    }
+
+    // The pages don't move on screen when the list view shifts the value, so the target must shift too.
+    #[gtk::test]
+    fn a_coordinate_rewrite_carries_the_slide_target_with_it() {
+        let window = window();
+        let imp = window.imp();
+        slide(imp, 50_000.0, 50_677.0);
+        let anim = imp.scroll_anim.borrow().expect("slide armed");
+
+        assert!((imp.rebase_target(&anim, 50_000.0) - 50_677.0).abs() < f64::EPSILON);
+        // the list view moved us back 4631px; so does the target
+        assert!((imp.rebase_target(&anim, 45_369.0) - 46_046.0).abs() < f64::EPSILON);
+    }
+
+    // Wheeling mid-slide retargets the running slide, and starts from where it was already heading.
+    #[gtk::test]
+    fn a_retarget_advances_from_the_rebased_target() {
+        let window = window();
+        let imp = window.imp();
+        imp.state.set_animate_scroll(true);
+        slide(imp, 50_000.0, 50_677.0);
+
+        imp.scrolledwindow.hadjustment().set_value(45_369.0); // the list view rewrites coordinates
+        imp.animate_scroll(None, 677.0);
+
+        let anim = imp.scroll_anim.borrow().expect("slide still running");
+        assert!(
+            (anim.last_target - 46_723.0).abs() < f64::EPSILON,
+            "target={} - want the rebased 46046 plus a page",
+            anim.last_target,
+        );
     }
 
     // A slow lift-off means the fingers stopped before they left, not a fling.
