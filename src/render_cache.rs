@@ -135,23 +135,42 @@ impl RenderCache {
     }
 
     pub fn pin_page(&mut self, page: i32) {
+        if self
+            .pinned_by_page
+            .get(&page)
+            .is_some_and(|keys| keys.len() == 1 && keys.contains(&CacheKey::Page(page)))
+        {
+            return;
+        }
         self.pinned_by_page
             .insert(page, HashSet::from([CacheKey::Page(page)]));
         self.evict();
     }
 
     pub fn pin_tiles(&mut self, page: i32, tiles: &[TileId]) {
+        if self.pinned_by_page.get(&page).is_some_and(|keys| {
+            keys.len() == tiles.len()
+                && tiles
+                    .iter()
+                    .all(|tile| keys.contains(&CacheKey::Tile(*tile)))
+        }) {
+            return;
+        }
         self.pinned_by_page
             .insert(page, tiles.iter().copied().map(CacheKey::Tile).collect());
         self.evict();
     }
 
     pub fn unpin_page(&mut self, page: i32) {
-        self.pinned_by_page.remove(&page);
-        self.evict();
+        if self.pinned_by_page.remove(&page).is_some() {
+            self.evict();
+        }
     }
 
     pub fn clear_pins(&mut self) {
+        if self.pinned_by_page.is_empty() {
+            return;
+        }
         self.pinned_by_page.clear();
         self.evict();
     }
@@ -204,16 +223,19 @@ impl RenderCache {
         }
     }
 
-    // Drop unpinned LRU entries until within budget. With no pins, keep one oversized most-recent
-    // entry so a single whole-page texture remains usable.
+    // Drop unpinned LRU entries until within budget. Preserve the most-recent entry even when it is
+    // oversized: visible pages pin it before rendering, while retaining one completed prefetch
+    // avoids immediately scheduling the same render again.
     fn evict(&mut self) {
         while self.total_bytes > self.budget_bytes {
-            let Some(pos) = self.order.iter().position(|key| !self.is_pinned(key)) else {
+            let mru = self.order.last().copied();
+            let Some(pos) = self
+                .order
+                .iter()
+                .position(|key| Some(*key) != mru && !self.is_pinned(key))
+            else {
                 break;
             };
-            if self.pinned_by_page.is_empty() && self.order.len() == 1 {
-                break;
-            }
             let lru = self.order.remove(pos);
             if let Some(entry) = self.entries.remove(&lru) {
                 self.total_bytes -= entry.bytes;
@@ -348,7 +370,7 @@ mod tests {
     }
 
     #[gtk::test]
-    fn every_insert_path_preserves_pinned_viewport_entries() {
+    fn insertion_preserves_pinned_entries_and_one_completed_prefetch() {
         let mut cache = RenderCache::new(60);
         let left = TileId {
             page: 2,
@@ -367,7 +389,20 @@ mod tests {
 
         assert!(cache.get_tile(left, 2.0).is_some());
         assert!(cache.get_tile(right, 2.0).is_some());
-        assert!(cache.get(9).is_none(), "the unpinned insert should yield");
+        assert!(cache.get(9).is_some());
+
+        assert!(cache.get_tile(left, 2.0).is_some());
+        cache.pin_tiles(2, &[left, right]);
+        assert!(
+            cache.get(9).is_some(),
+            "an unchanged pin set should not run eviction"
+        );
+
+        cache.insert(10, texture(40), 1.0);
+        assert!(cache.get_tile(left, 2.0).is_some());
+        assert!(cache.get_tile(right, 2.0).is_some());
+        assert!(cache.get(9).is_none());
+        assert!(cache.get(10).is_some());
     }
 
     #[gtk::test]

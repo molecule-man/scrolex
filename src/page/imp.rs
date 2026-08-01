@@ -983,13 +983,15 @@ impl Page {
             FallbackSource::Preview => preview.as_ref(),
             FallbackSource::None => None,
         };
-        if !missing.is_empty() {
-            if let Some(texture) = fallback {
-                self.append_scaled_page_texture(snapshot, texture, page, bbox, scale);
-            } else {
-                let (w, h) = bbox.size();
-                append_loading_placeholder(snapshot, w * scale, h * scale);
-            }
+        if missing.is_empty() {
+            // The cached render node can briefly outlive its viewport regions while GTK collects a
+            // queued redraw. A solid page node keeps uncovered edges opaque until that redraw.
+            append_white(snapshot, bbox, scale);
+        } else if let Some(texture) = fallback {
+            self.append_scaled_page_texture(snapshot, texture, page, bbox, scale);
+        } else {
+            let (w, h) = bbox.size();
+            append_loading_placeholder(snapshot, w * scale, h * scale);
         }
 
         let (bw, bh) = bbox.size();
