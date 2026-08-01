@@ -26,6 +26,9 @@
     </screenshot>
   </screenshots>
   <releases>
+    <release version="0.8.1" date="2026-08-01">
+      <url>https://github.com/molecule-man/scrolex/releases/tag/0.8.1</url>
+    </release>
     <release version="0.8.0" date="2026-08-01">
       <url>https://github.com/molecule-man/scrolex/releases/tag/0.8.0</url>
     </release>

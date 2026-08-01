@@ -10,7 +10,7 @@ use std::sync::Mutex;
 use gtk::cairo::{Format, ImageSurface};
 use gtk::gio::prelude::InputStreamExtManual;
 use gtk::prelude::FileExt;
-use mupdf::{Colorspace, Document, Matrix};
+use mupdf::{Colorspace, Device, Document, IRect, Matrix, Pixmap, Rect};
 use once_cell::sync::Lazy;
 
 const PROBE_PAGES: i32 = 8;
@@ -181,7 +181,7 @@ pub fn with_doc<T>(uri: &str, f: impl FnOnce(&Document) -> Option<T>) -> Option<
     })
 }
 
-// One page's raw pixels (cairo Rgb24/BGRx). Shipped from a worker since ImageSurface isn't Send.
+// One raster buffer's raw pixels (cairo Rgb24/BGRx), transferable between render and UI threads.
 pub struct PagePixels {
     pub data: Vec<u8>,
     pub width: i32,
@@ -223,6 +223,72 @@ pub fn render_page_pixels(
             height,
             stride,
         })
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PixelRect {
+    pub x0: i32,
+    pub y0: i32,
+    pub x1: i32,
+    pub y1: i32,
+}
+
+impl PixelRect {
+    pub const fn new(x0: i32, y0: i32, x1: i32, y1: i32) -> Self {
+        Self { x0, y0, x1, y1 }
+    }
+}
+
+// Rasterize page regions serially from one recorded display list. Pixel-space origins make every
+// region land on the same page-anchored grid, so adjacent textures meet without resampling.
+pub fn render_page_regions(
+    uri: &str,
+    page_num: i32,
+    scale: f64,
+    dsf: f64,
+    regions: &[PixelRect],
+) -> Option<Vec<PagePixels>> {
+    with_doc(uri, |doc| {
+        let colorspace = Colorspace::device_bgr();
+        let page = doc.load_page(page_num).ok()?;
+        let list = page.to_display_list(true).ok()?;
+        let ctm = Matrix::new_scale((scale * dsf) as f32, (scale * dsf) as f32);
+        let mut rendered = Vec::with_capacity(regions.len());
+
+        for region in regions {
+            debug_assert!(region.x0 < region.x1 && region.y0 < region.y1);
+            if region.x0 >= region.x1 || region.y0 >= region.y1 {
+                return None;
+            }
+            let rect = IRect::new(region.x0, region.y0, region.x1, region.y1);
+            let mut pixmap = Pixmap::new_with_rect(&colorspace, rect, false).ok()?;
+            pixmap.clear_with(255).ok()?;
+            let device = Device::from_pixmap(&pixmap).ok()?;
+            list.run(
+                &device,
+                &ctm,
+                Rect::new(
+                    region.x0 as f32,
+                    region.y0 as f32,
+                    region.x1 as f32,
+                    region.y1 as f32,
+                ),
+            )
+            .ok()?;
+            drop(device);
+
+            let width = region.x1 - region.x0;
+            let height = region.y1 - region.y0;
+            let (data, stride) = pack_pixmap(&pixmap, width, height)?;
+            rendered.push(PagePixels {
+                data,
+                width,
+                height,
+                stride,
+            });
+        }
+        Some(rendered)
     })
 }
 
@@ -375,6 +441,36 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         let path = dir.join("margins.pdf");
         std::fs::write(&path, MARGIN_PDF).unwrap();
         format!("file://{}", path.display())
+    }
+
+    #[test]
+    fn page_regions_match_the_same_pixels_in_a_full_render() {
+        let uri = margin_pdf_uri();
+        let full = render_page_pixels(&uri, 0, 1.0, 1.0, Some((200.0, 200.0))).unwrap();
+        let regions = [
+            PixelRect::new(0, 0, 100, 100),
+            PixelRect::new(100, 0, 200, 100),
+            PixelRect::new(0, 100, 100, 200),
+            PixelRect::new(100, 100, 200, 200),
+        ];
+        let tiles = render_page_regions(&uri, 0, 1.0, 1.0, &regions).unwrap();
+
+        for (region, tile) in regions.into_iter().zip(tiles) {
+            for y in 0..tile.height {
+                for x in 0..tile.width {
+                    let tile_offset = (y * tile.stride + x * 4) as usize;
+                    let page_offset =
+                        ((region.y0 + y) * full.stride + (region.x0 + x) * 4) as usize;
+                    assert_eq!(
+                        &tile.data[tile_offset..tile_offset + 3],
+                        &full.data[page_offset..page_offset + 3],
+                        "pixel differs at ({}, {})",
+                        region.x0 + x,
+                        region.y0 + y,
+                    );
+                }
+            }
+        }
     }
 
     #[test]

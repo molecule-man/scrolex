@@ -48,8 +48,8 @@ pub struct State {
     pub(crate) search: Rc<RefCell<crate::search::Search>>,
     pub(crate) selection: Rc<RefCell<Option<crate::selection::PageSelection>>>,
 
-    // rendered pages keyed by page index, kept so scrolling back to an already seen page reuses the
-    // texture instead of re-rendering (and flashing white)
+    // Whole-page and viewport-region textures, kept so scrolling back reuses rendered pixels
+    // instead of re-rendering (and flashing white).
     pub(crate) render_cache: Rc<RefCell<crate::render_cache::RenderCache>>,
     // pages with a render in flight, mapped to the render_epoch it was scheduled at. One render per
     // page at a time: a zoom leaves the entry in place, and the stale render's completion releases it
@@ -133,6 +133,7 @@ impl ObjectImpl for State {
         self.obj().connect_notify_local(Some("zoom"), |state, _| {
             let imp = state.imp();
             imp.render_waiters.borrow_mut().clear();
+            imp.render_cache.borrow_mut().clear_pins();
             crate::page::clear_full_renders(imp.render_client_id.get());
             // in-flight renders started at the old scale are now stale; bump so their completion
             // drops out instead of caching an obsolete-scale texture

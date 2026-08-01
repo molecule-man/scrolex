@@ -29,6 +29,10 @@ pub(crate) const MAX_PAGE_BYTES: f64 = 128.0 * 1024.0 * 1024.0;
 // Max pixels per axis. GPUs commonly refuse a texture wider or taller than this. A long thin page
 // can pass this while still under MAX_PAGE_BYTES.
 const MAX_TEXTURE_DIM: f64 = 16384.0;
+// Fixed device-pixel grid for viewport rendering. A 1024-square BGRx texture is 4 MiB, which keeps
+// the usual viewport to a small serial batch while bounding every allocation independently.
+const TILE_SIZE: i32 = 1024;
+const TILE_GUTTER: i32 = 1;
 
 // Low-resolution previews rendered ahead of the visible page and shown (upscaled) while the full
 // render is pending, so aggressive scrolling shows blurry pages rather than blank ones. The render
@@ -124,6 +128,52 @@ fn render_dimensions(page_pt: (f64, f64), scale: f64, dsf: f64) -> (i32, i32) {
     )
 }
 
+fn tile_regions(
+    page_px: (i32, i32),
+    visible_px: (f64, f64, f64, f64),
+) -> Vec<crate::mupdf_render::PixelRect> {
+    let (page_w, page_h) = page_px;
+    let (x0, y0, x1, y1) = visible_px;
+    let x0 = x0.floor().clamp(0.0, page_w as f64) as i32;
+    let y0 = y0.floor().clamp(0.0, page_h as f64) as i32;
+    let x1 = x1.ceil().clamp(0.0, page_w as f64) as i32;
+    let y1 = y1.ceil().clamp(0.0, page_h as f64) as i32;
+    if x0 >= x1 || y0 >= y1 {
+        return Vec::new();
+    }
+
+    let first_x = x0 / TILE_SIZE;
+    let first_y = y0 / TILE_SIZE;
+    let last_x = (x1 - 1) / TILE_SIZE;
+    let last_y = (y1 - 1) / TILE_SIZE;
+    let mut regions = Vec::new();
+    for y in first_y..=last_y {
+        for x in first_x..=last_x {
+            let left = x * TILE_SIZE;
+            let top = y * TILE_SIZE;
+            regions.push(crate::mupdf_render::PixelRect::new(
+                left,
+                top,
+                (left + TILE_SIZE).min(page_w),
+                (top + TILE_SIZE).min(page_h),
+            ));
+        }
+    }
+    regions
+}
+
+fn raster_region(
+    region: crate::mupdf_render::PixelRect,
+    page_px: (i32, i32),
+) -> crate::mupdf_render::PixelRect {
+    crate::mupdf_render::PixelRect::new(
+        (region.x0 - TILE_GUTTER).max(0),
+        (region.y0 - TILE_GUTTER).max(0),
+        (region.x1 + TILE_GUTTER).min(page_px.0),
+        (region.y1 + TILE_GUTTER).min(page_px.1),
+    )
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum FallbackSource {
     Render,
@@ -182,6 +232,9 @@ pub struct Page {
 
     // last snapshot's (page index, paint, zoom); see note_paint
     painted: Cell<Option<(i32, Paint, f64)>>,
+
+    // Whether this widget currently needs viewport regions instead of a whole-page texture.
+    tiled: Cell<bool>,
 }
 
 // What a snapshot drew, from best-looking to worst.
@@ -225,6 +278,8 @@ impl ObjectImpl for Page {
         self.setup_state_listeners();
         self.setup_text_selection();
         self.setup_link_handling();
+
+        self.obj().connect_unmap(|page| page.imp().unpin_render());
 
         self.obj().set_size_request(600, 800);
     }
@@ -270,6 +325,19 @@ impl WidgetImpl for Page {
 }
 
 impl Page {
+    pub(super) fn uses_tiles(&self) -> bool {
+        self.tiled.get()
+    }
+
+    pub(super) fn unpin_render(&self) {
+        let obj = self.obj();
+        obj.state()
+            .render_cache()
+            .borrow_mut()
+            .unpin_page(obj.index());
+        self.tiled.set(false);
+    }
+
     // Mark the device scale factor as known once it has settled after map, so rendering starts at
     // the final scale.
     fn setup_scale_tracking(&self) {
@@ -594,9 +662,22 @@ impl Page {
         let obj = self.obj();
         let scale_factor = obj.scale_factor() as f64;
 
-        let bbox = self.get_bbox(page, obj.crop());
         let scale = obj.zoom();
         let render_scale = render_scale((page.width, page.height), scale, scale_factor);
+
+        if render_scale < scale {
+            // Viewport regions are rendered off the UI thread; entering this path also keeps later
+            // page renders asynchronous so snapshots do not alternate rendering modes.
+            obj.state().set_multithread_rendering(true);
+            self.multithread_snapshot(snapshot, page);
+            return;
+        }
+        self.tiled.set(false);
+        obj.state()
+            .render_cache()
+            .borrow_mut()
+            .unpin_page(page.index);
+        let bbox = self.get_bbox(page, obj.crop());
 
         match render_page_texture(
             &obj.uri(),
@@ -777,6 +858,183 @@ impl Page {
         snapshot.restore();
     }
 
+    fn visible_tile_regions(
+        &self,
+        page: &PageInfo,
+        bbox: &Rectangle,
+        scale: f64,
+        dsf: f64,
+    ) -> Vec<crate::mupdf_render::PixelRect> {
+        let obj = self.obj();
+        let (bw, bh) = bbox.size();
+        let mut visible = Rectangle::new(0.0, 0.0, bw * scale, bh * scale);
+        let mut found_viewport = false;
+        let mut ancestor = obj.parent();
+        while let Some(widget) = ancestor {
+            ancestor = widget.parent();
+            let Ok(scroller) = widget.downcast::<gtk::ScrolledWindow>() else {
+                continue;
+            };
+            let Some(origin) = obj.compute_point(&scroller, &graphene::Point::new(0.0, 0.0)) else {
+                continue;
+            };
+            found_viewport = true;
+            visible.x1 = visible.x1.max(-f64::from(origin.x()));
+            visible.y1 = visible.y1.max(-f64::from(origin.y()));
+            visible.x2 = visible
+                .x2
+                .min(f64::from(scroller.width()) - f64::from(origin.x()));
+            visible.y2 = visible
+                .y2
+                .min(f64::from(scroller.height()) - f64::from(origin.y()));
+        }
+
+        if !found_viewport {
+            let logical_tile = TILE_SIZE as f64 / dsf;
+            visible.x2 = visible.x2.min(logical_tile);
+            visible.y2 = visible.y2.min(logical_tile);
+        }
+
+        let (ox, oy) = page_offset(bbox, scale, dsf);
+        tile_regions(
+            render_dimensions((page.width, page.height), scale, dsf),
+            (
+                (visible.x1 - ox) * dsf,
+                (visible.y1 - oy) * dsf,
+                (visible.x2 - ox) * dsf,
+                (visible.y2 - oy) * dsf,
+            ),
+        )
+    }
+
+    fn append_tile_texture(
+        &self,
+        snapshot: &gtk::Snapshot,
+        texture: &gtk::gdk::Texture,
+        region: crate::mupdf_render::PixelRect,
+        page_px: (i32, i32),
+        bbox: &Rectangle,
+        density: (f64, f64),
+    ) {
+        let (scale, dsf) = density;
+        let (ox, oy) = page_offset(bbox, scale, dsf);
+        let pixels = raster_region(region, page_px);
+        snapshot.push_clip(&graphene::Rect::new(
+            (ox + region.x0 as f64 / dsf) as f32,
+            (oy + region.y0 as f64 / dsf) as f32,
+            ((region.x1 - region.x0) as f64 / dsf) as f32,
+            ((region.y1 - region.y0) as f64 / dsf) as f32,
+        ));
+        snapshot.append_texture(
+            texture,
+            &graphene::Rect::new(
+                (ox + pixels.x0 as f64 / dsf) as f32,
+                (oy + pixels.y0 as f64 / dsf) as f32,
+                (texture.width() as f64 / dsf) as f32,
+                (texture.height() as f64 / dsf) as f32,
+            ),
+        );
+        snapshot.pop();
+    }
+
+    fn tiled_snapshot(
+        &self,
+        snapshot: &gtk::Snapshot,
+        page: &PageInfo,
+        bbox: &Rectangle,
+        scale: f64,
+        dsf: f64,
+    ) {
+        let obj = self.obj();
+        let page_num = page.index;
+        let pixel_scale = scale * dsf;
+        let page_px = render_dimensions((page.width, page.height), scale, dsf);
+        let regions = self.visible_tile_regions(page, bbox, scale, dsf);
+        let mut ready = Vec::new();
+        let mut missing = Vec::new();
+        let visible_ids: Vec<_> = regions
+            .iter()
+            .map(|region| crate::render_cache::TileId {
+                page: page_num,
+                x: region.x0,
+                y: region.y0,
+            })
+            .collect();
+        {
+            let cache = obj.state().render_cache();
+            let mut cache = cache.borrow_mut();
+            cache.pin_tiles(page_num, &visible_ids);
+            for (region, id) in regions.into_iter().zip(visible_ids.iter().copied()) {
+                match cache.get_tile(id, pixel_scale) {
+                    Some(texture) => ready.push((region, texture)),
+                    None => missing.push(region),
+                }
+            }
+        }
+
+        let full = obj.state().render_cache().borrow_mut().get(page_num);
+        let preview = obj.state().preview_cache().borrow_mut().get(page_num);
+        let source = fallback_source(
+            full.as_ref().map(|texture| texture.width()),
+            preview.as_ref().map(|texture| texture.width()),
+        );
+        let fallback = match source {
+            FallbackSource::Render => full.as_ref(),
+            FallbackSource::Preview => preview.as_ref(),
+            FallbackSource::None => None,
+        };
+        if missing.is_empty() {
+            // The cached render node can briefly outlive its viewport regions while GTK collects a
+            // queued redraw. A solid page node keeps uncovered edges opaque until that redraw.
+            append_white(snapshot, bbox, scale);
+        } else if let Some(texture) = fallback {
+            self.append_scaled_page_texture(snapshot, texture, page, bbox, scale);
+        } else {
+            let (w, h) = bbox.size();
+            append_loading_placeholder(snapshot, w * scale, h * scale);
+        }
+
+        let (bw, bh) = bbox.size();
+        snapshot.push_clip(&graphene::Rect::new(
+            0.0,
+            0.0,
+            (bw * scale) as f32,
+            (bh * scale) as f32,
+        ));
+        for (region, texture) in ready {
+            self.append_tile_texture(snapshot, &texture, region, page_px, bbox, (scale, dsf));
+        }
+        snapshot.pop();
+
+        if missing.is_empty() {
+            self.note_paint(page_num, Paint::Sharp);
+        } else {
+            self.schedule_tile_render(page_num, scale, dsf, page_px, missing);
+            obj.state()
+                .render_waiters()
+                .borrow_mut()
+                .insert(page_num, obj.downgrade());
+            self.note_paint(
+                page_num,
+                match source {
+                    FallbackSource::Render => Paint::StaleRender,
+                    FallbackSource::Preview => Paint::Preview,
+                    FallbackSource::None => Paint::Placeholder,
+                },
+            );
+        }
+
+        self.prefetch_previews(page_num);
+        let preview_target_width = ((page.width * obj.state().preview_scale()) as i32).max(1);
+        if needs_visible_preview(
+            full.as_ref().map(|texture| texture.width()),
+            preview.is_some(),
+            preview_target_width,
+        ) {
+            self.schedule_preview_if_needed(page_num, RenderPriority::VisiblePreview);
+        }
+    }
+
     fn multithread_snapshot(&self, snapshot: &gtk::Snapshot, page: &PageInfo) {
         let obj = self.obj();
         let page_num = page.index;
@@ -785,6 +1043,14 @@ impl Page {
         let scale = obj.zoom();
         let scale_factor = obj.scale_factor() as f64;
         let render_scale = render_scale((width, height), scale, scale_factor);
+        let cached_bbox = self.get_cached_bbox(page, obj.crop());
+        if render_scale < scale {
+            self.tiled.set(true);
+            self.tiled_snapshot(snapshot, page, &cached_bbox, scale, scale_factor);
+            return;
+        }
+        self.tiled.set(false);
+        obj.state().render_cache().borrow_mut().pin_page(page_num);
         let expected = render_dimensions((width, height), render_scale, scale_factor);
         let page_bytes = page_buffer_bytes((width, height), render_scale, scale_factor);
 
@@ -821,7 +1087,6 @@ impl Page {
             .borrow_mut()
             .insert(page_num, obj.downgrade());
 
-        let bbox = self.get_cached_bbox(page, obj.crop());
         let preview = obj.state().preview_cache().borrow_mut().get(page_num);
         let source = fallback_source(
             stale_render.as_ref().map(|texture| texture.width()),
@@ -839,7 +1104,7 @@ impl Page {
             FallbackSource::None => None,
         };
         if let Some(texture) = fallback {
-            self.append_scaled_page_texture(snapshot, texture, page, &bbox, scale);
+            self.append_scaled_page_texture(snapshot, texture, page, &cached_bbox, scale);
             self.note_paint(
                 page_num,
                 match source {
@@ -849,7 +1114,7 @@ impl Page {
             );
         } else {
             log::debug!("draw page {page_num}: cache miss (loading placeholder)");
-            let (w, h) = bbox.size();
+            let (w, h) = cached_bbox.size();
             append_loading_placeholder(snapshot, w * scale, h * scale);
             self.note_paint(page_num, Paint::Placeholder);
         }
@@ -951,48 +1216,14 @@ impl Page {
         let client = obj.state().render_client_id();
         log::trace!("Scheduling render of page {page_num}");
 
-        let (resp_sender, resp_receiver) = oneshot::channel::<RenderedPage>();
+        let (resp_sender, resp_receiver) = oneshot::channel::<RenderedPixels>();
         let obj_clone = obj.clone();
         let doc_epoch = obj.state().doc_epoch();
         glib::spawn_future_local(async move {
             let result = resp_receiver.await;
             let state = obj_clone.state();
-
-            // This window loaded/reloaded a document since this was scheduled? That path already
-            // cleared the inflight/waiter entries, so bail before touching the current ones: mutating
-            // them here would drop the live render's marker/waiter. Per-window, so another window's
-            // load never invalidates this render.
-            if state.doc_epoch() != doc_epoch {
+            let Some(rendered) = accept_render(&state, page_num, epoch, doc_epoch, result) else {
                 return;
-            }
-            // release the slot this render holds, freeing the page for a render at the current scale
-            {
-                let inflight = state.render_inflight();
-                let mut inflight = inflight.borrow_mut();
-                if inflight.get(&page_num) == Some(&epoch) {
-                    inflight.remove(&page_num);
-                }
-            }
-
-            // Zoom moved on while this rendered, or the request was dropped (over-cap, or out of the
-            // wanted range): discard the pixels and redraw the widget still on this page so it
-            // reschedules at the current scale. The index check means a scrolled-off page stays
-            // dropped.
-            let rendered = match result {
-                Ok(rendered) if state.render_epoch() == epoch => rendered,
-                _ => {
-                    if let Some(widget) = state
-                        .render_waiters()
-                        .borrow()
-                        .get(&page_num)
-                        .and_then(glib::WeakRef::upgrade)
-                    {
-                        if widget.index() == page_num {
-                            widget.queue_draw();
-                        }
-                    }
-                    return;
-                }
             };
 
             let texture = rendered.into_texture();
@@ -1000,27 +1231,7 @@ impl Page {
                 .render_cache()
                 .borrow_mut()
                 .insert(page_num, texture.upcast(), pixel_scale);
-
-            log::debug!(
-                "memory: rss={:.0}MB preview_scale={:.3} render_cache={:?} preview_cache={:?}",
-                current_rss_mb(),
-                state.preview_scale(),
-                state.render_cache().borrow(),
-                state.preview_cache().borrow(),
-            );
-
-            // repaint whichever widget is currently waiting to show this page
-            // (not necessarily the one that requested the render)
-            if let Some(widget) = state
-                .render_waiters()
-                .borrow_mut()
-                .remove(&page_num)
-                .and_then(|weak| weak.upgrade())
-            {
-                if widget.index() == page_num {
-                    widget.queue_draw();
-                }
-            }
+            finish_render(&state, page_num);
         });
 
         let uri_job = uri.clone();
@@ -1038,6 +1249,81 @@ impl Page {
                         page_num,
                         priority,
                         page_pt,
+                        resp_sender,
+                    );
+                }),
+            );
+        });
+    }
+
+    // Queue one viewport batch. One worker records and replays the page serially, then publishes the
+    // complete batch; region identities remain independent in the cache and painter.
+    fn schedule_tile_render(
+        &self,
+        page_num: i32,
+        scale: f64,
+        scale_factor: f64,
+        page_px: (i32, i32),
+        regions: Vec<crate::mupdf_render::PixelRect>,
+    ) {
+        if regions.is_empty() {
+            return;
+        }
+        let obj = self.obj();
+        let epoch = obj.state().render_epoch();
+        match obj.state().render_inflight().borrow_mut().entry(page_num) {
+            Entry::Occupied(_) => return,
+            Entry::Vacant(slot) => {
+                slot.insert(epoch);
+            }
+        }
+
+        let uri = obj.uri();
+        let client = obj.state().render_client_id();
+        let doc_epoch = obj.state().doc_epoch();
+        let pixel_scale = scale * scale_factor;
+        let (resp_sender, resp_receiver) = oneshot::channel::<Vec<RenderedRegion>>();
+        let obj_clone = obj.clone();
+        glib::spawn_future_local(async move {
+            let result = resp_receiver.await;
+            let state = obj_clone.state();
+            let Some(rendered) = accept_render(&state, page_num, epoch, doc_epoch, result) else {
+                return;
+            };
+
+            let textures = rendered
+                .into_iter()
+                .map(|region| {
+                    let id = crate::render_cache::TileId {
+                        page: page_num,
+                        x: region.x,
+                        y: region.y,
+                    };
+                    (id, region.pixels.into_texture().upcast())
+                })
+                .collect();
+            state
+                .render_cache()
+                .borrow_mut()
+                .insert_tile_batch(textures, pixel_scale);
+            finish_render(&state, page_num);
+        });
+
+        let uri_job = uri.clone();
+        RENDER_QUEUE.with(move |queue| {
+            queue.submit(
+                &uri,
+                client,
+                page_num,
+                RenderPriority::Visible,
+                Box::new(move || {
+                    request_region_render(
+                        &uri_job,
+                        scale,
+                        scale_factor,
+                        page_num,
+                        page_px,
+                        regions,
                         resp_sender,
                     );
                 }),
@@ -1097,7 +1383,7 @@ impl Page {
         let scale = obj.state().preview_scale();
         let page_pt = crate::mupdf_render::page_size(&uri, page_num);
 
-        let (resp_sender, resp_receiver) = oneshot::channel::<RenderedPage>();
+        let (resp_sender, resp_receiver) = oneshot::channel::<RenderedPixels>();
         let obj_clone = obj.clone();
         // Previews survive a zoom (they're rescaled at draw), so only a document load invalidates
         // them - check doc_epoch, not render_epoch. Per-window, so another window's load can't wedge
@@ -1214,11 +1500,15 @@ fn page_footprint(
     scale: f64,
     dsf: f64,
 ) -> ((f64, f64), (f64, f64)) {
-    let snap = |v: f64| (v * dsf).round() / dsf;
     (
-        (snap(-bbox.x1 * scale), snap(-bbox.y1 * scale)),
+        page_offset(bbox, scale, dsf),
         (tex_px.0 as f64 / dsf, tex_px.1 as f64 / dsf),
     )
+}
+
+fn page_offset(bbox: &Rectangle, scale: f64, dsf: f64) -> (f64, f64) {
+    let snap = |v: f64| (v * dsf).round() / dsf;
+    (snap(-bbox.x1 * scale), snap(-bbox.y1 * scale))
 }
 
 // Zoom + crop offset, so overlay rects in page points land on the render.
@@ -1302,11 +1592,10 @@ fn append_loading_placeholder(snapshot: &gtk::Snapshot, width: f64, height: f64)
     }
 }
 
-// A rendered page as raw pixels. Rendering happens on a background thread, and GDK textures aren't
-// `Send`, so the pixels cross the thread boundary as a plain buffer and the texture is built on the
-// main thread.
+// Raw rendered pixels cross the thread boundary as a plain buffer because GDK textures are not
+// `Send`; the main thread creates the texture.
 #[derive(Debug)]
-struct RenderedPage {
+struct RenderedPixels {
     data: Box<[u8]>,
     width: i32,
     height: i32,
@@ -1314,7 +1603,13 @@ struct RenderedPage {
     render_ms: u128,
 }
 
-impl RenderedPage {
+struct RenderedRegion {
+    x: i32,
+    y: i32,
+    pixels: RenderedPixels,
+}
+
+impl RenderedPixels {
     fn into_texture(self) -> MemoryTexture {
         texture_from_raw(self.data.into_vec(), self.width, self.height, self.stride)
     }
@@ -1327,7 +1622,7 @@ fn request_render(
     page_num: i32,
     priority: RenderPriority,
     page_pt: Option<(f64, f64)>,
-    resp_sender: oneshot::Sender<RenderedPage>,
+    resp_sender: oneshot::Sender<RenderedPixels>,
 ) {
     let start = std::time::Instant::now();
     if let Some(cfg) = crate::emulate::config() {
@@ -1343,7 +1638,7 @@ fn request_render(
             "Rendered page {page_num} [{}] on background thread in {render_ms}ms (scale_factor={device_scale_factor})",
             priority.label()
         );
-        let _ = resp_sender.send(RenderedPage {
+        let _ = resp_sender.send(RenderedPixels {
             data: data.into_boxed_slice(),
             width,
             height,
@@ -1362,7 +1657,7 @@ fn request_render(
 
     // Send the raw buffer; the texture is built from it on the main thread.
     let rendered = match pixels {
-        Some(px) => RenderedPage {
+        Some(px) => RenderedPixels {
             data: px.data.into_boxed_slice(),
             width: px.width,
             height: px.height,
@@ -1379,6 +1674,113 @@ fn request_render(
     let _ = resp_sender.send(rendered);
 }
 
+fn request_region_render(
+    uri: &str,
+    scale: f64,
+    device_scale_factor: f64,
+    page_num: i32,
+    page_px: (i32, i32),
+    regions: Vec<crate::mupdf_render::PixelRect>,
+    resp_sender: oneshot::Sender<Vec<RenderedRegion>>,
+) {
+    let start = std::time::Instant::now();
+    let raster_regions: Vec<_> = regions
+        .iter()
+        .copied()
+        .map(|region| raster_region(region, page_px))
+        .collect();
+    let pixels = if let Some(cfg) = crate::emulate::config() {
+        std::thread::sleep(std::time::Duration::from_millis(cfg.full_ms));
+        let page_width = ((cfg.page_pt.0 * scale * device_scale_factor) as i32).max(1);
+        let page_height = ((cfg.page_pt.1 * scale * device_scale_factor) as i32).max(1);
+        Some(
+            raster_regions
+                .iter()
+                .map(|region| {
+                    let (data, width, height, stride) = crate::emulate::region_pixels(
+                        page_num,
+                        page_width,
+                        page_height,
+                        region.x0,
+                        region.y0,
+                        region.x1 - region.x0,
+                        region.y1 - region.y0,
+                    );
+                    crate::mupdf_render::PagePixels {
+                        data,
+                        width,
+                        height,
+                        stride,
+                    }
+                })
+                .collect(),
+        )
+    } else {
+        crate::mupdf_render::render_page_regions(
+            uri,
+            page_num,
+            scale,
+            device_scale_factor,
+            &raster_regions,
+        )
+    };
+    let render_ms = start.elapsed().as_millis();
+    log::debug!(
+        "Rendered {} regions of page {page_num} [{}] serially on background thread in {render_ms}ms (scale_factor={device_scale_factor})",
+        regions.len(),
+        RenderPriority::Visible.label(),
+    );
+
+    let rendered = match pixels {
+        Some(pixels) => regions
+            .into_iter()
+            .zip(pixels)
+            .map(|(region, px)| RenderedRegion {
+                x: region.x0,
+                y: region.y0,
+                pixels: RenderedPixels {
+                    data: px.data.into_boxed_slice(),
+                    width: px.width,
+                    height: px.height,
+                    stride: px.stride,
+                    render_ms,
+                },
+            })
+            .collect(),
+        None => {
+            log::warn!("mupdf region render failed for page {page_num}; showing blank");
+            regions
+                .into_iter()
+                .zip(raster_regions)
+                .map(|(region, pixels)| RenderedRegion {
+                    x: region.x0,
+                    y: region.y0,
+                    pixels: white_rendered_region(pixels, render_ms),
+                })
+                .collect()
+        }
+    };
+    let _ = resp_sender.send(rendered);
+}
+
+fn white_rendered_region(
+    region: crate::mupdf_render::PixelRect,
+    render_ms: u128,
+) -> RenderedPixels {
+    let width = region.x1 - region.x0;
+    let height = region.y1 - region.y0;
+    let stride = gtk::cairo::Format::Rgb24
+        .stride_for_width(width as u32)
+        .expect("stride");
+    RenderedPixels {
+        data: vec![0xffu8; (stride * height) as usize].into_boxed_slice(),
+        width,
+        height,
+        stride,
+        render_ms,
+    }
+}
+
 // Blank white page for a failed render: dimensions and stride match a real render at this scale, so
 // the render cache's dimension check passes instead of looping on the miss.
 fn white_rendered_page(
@@ -1386,7 +1788,7 @@ fn white_rendered_page(
     scale: f64,
     dsf: f64,
     render_ms: u128,
-) -> RenderedPage {
+) -> RenderedPixels {
     let (w, h) = page_pt.unwrap_or((1.0, 1.0));
     let width = ((w * scale * dsf) as i32).max(1);
     let height = ((h * scale * dsf) as i32).max(1);
@@ -1395,12 +1797,74 @@ fn white_rendered_page(
         .expect("stride");
     // Rgb24 with every byte 0xff is white (BGRx: B=G=R=255).
     let data = vec![0xffu8; (stride * height) as usize].into_boxed_slice();
-    RenderedPage {
+    RenderedPixels {
         data,
         width,
         height,
         stride,
         render_ms,
+    }
+}
+
+// Apply the shared completion lifecycle before a renderer-specific cache insertion. A document
+// switch already cleared these slots, so it must not mutate the current document's entries. A
+// stale zoom or dropped queue request releases its own slot and redraws only a widget still bound to
+// this page, allowing it to request the current viewport and scale.
+fn accept_render<T, E>(
+    state: &crate::state::State,
+    page_num: i32,
+    epoch: u64,
+    doc_epoch: u64,
+    result: Result<T, E>,
+) -> Option<T> {
+    if state.doc_epoch() != doc_epoch {
+        return None;
+    }
+    {
+        let inflight = state.render_inflight();
+        let mut inflight = inflight.borrow_mut();
+        if inflight.get(&page_num) == Some(&epoch) {
+            inflight.remove(&page_num);
+        }
+    }
+
+    match result {
+        Ok(rendered) if state.render_epoch() == epoch => Some(rendered),
+        _ => {
+            if let Some(widget) = state
+                .render_waiters()
+                .borrow()
+                .get(&page_num)
+                .and_then(glib::WeakRef::upgrade)
+            {
+                if widget.index() == page_num {
+                    widget.queue_draw();
+                }
+            }
+            None
+        }
+    }
+}
+
+// Log cache state and repaint whichever widget currently waits for this page, which may differ from
+// the widget that submitted the render after list-item recycling.
+fn finish_render(state: &crate::state::State, page_num: i32) {
+    log::debug!(
+        "memory: rss={:.0}MB preview_scale={:.3} render_cache={:?} preview_cache={:?}",
+        current_rss_mb(),
+        state.preview_scale(),
+        state.render_cache().borrow(),
+        state.preview_cache().borrow(),
+    );
+    if let Some(widget) = state
+        .render_waiters()
+        .borrow_mut()
+        .remove(&page_num)
+        .and_then(|weak| weak.upgrade())
+    {
+        if widget.index() == page_num {
+            widget.queue_draw();
+        }
     }
 }
 
@@ -1535,6 +1999,49 @@ mod tests {
     fn render_dimensions_match_the_full_render_buffer() {
         assert_eq!(render_dimensions((595.0, 842.0), 1.0, 2.0), (1190, 1684));
         assert_eq!(render_dimensions((0.0, 0.0), 1.0, 1.0), (1, 1));
+    }
+
+    #[test]
+    fn tile_regions_follow_a_page_anchored_pixel_grid() {
+        let regions = tile_regions((2500, 1800), (900.5, 700.0, 2200.2, 1700.0));
+        assert_eq!(
+            regions,
+            vec![
+                crate::mupdf_render::PixelRect::new(0, 0, 1024, 1024),
+                crate::mupdf_render::PixelRect::new(1024, 0, 2048, 1024),
+                crate::mupdf_render::PixelRect::new(2048, 0, 2500, 1024),
+                crate::mupdf_render::PixelRect::new(0, 1024, 1024, 1800),
+                crate::mupdf_render::PixelRect::new(1024, 1024, 2048, 1800),
+                crate::mupdf_render::PixelRect::new(2048, 1024, 2500, 1800),
+            ]
+        );
+    }
+
+    #[test]
+    fn tile_regions_clip_to_the_page_and_reject_an_empty_view() {
+        assert_eq!(
+            tile_regions((1500, 900), (1024.0, 0.0, 5000.0, 900.0)),
+            vec![crate::mupdf_render::PixelRect::new(1024, 0, 1500, 900)]
+        );
+        assert!(tile_regions((1500, 900), (1600.0, 0.0, 1700.0, 100.0)).is_empty());
+    }
+
+    #[test]
+    fn tile_rasters_include_a_clipped_sampling_gutter() {
+        assert_eq!(
+            raster_region(
+                crate::mupdf_render::PixelRect::new(1024, 1024, 2048, 1800),
+                (2500, 1800),
+            ),
+            crate::mupdf_render::PixelRect::new(1023, 1023, 2049, 1800),
+        );
+        assert_eq!(
+            raster_region(
+                crate::mupdf_render::PixelRect::new(0, 0, 1024, 1024),
+                (2500, 1800),
+            ),
+            crate::mupdf_render::PixelRect::new(0, 0, 1025, 1025),
+        );
     }
 
     #[test]

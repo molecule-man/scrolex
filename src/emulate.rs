@@ -85,6 +85,18 @@ pub fn full_surface(cfg: &Config, page_num: i32, scale: f64, dsf: f64) -> ImageS
 }
 
 fn dummy_pixels(page_num: i32, width: i32, height: i32) -> (Vec<u8>, i32, i32, i32) {
+    region_pixels(page_num, width, height, 0, 0, width, height)
+}
+
+pub fn region_pixels(
+    page_num: i32,
+    page_width: i32,
+    page_height: i32,
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+) -> (Vec<u8>, i32, i32, i32) {
     let mut surface = ImageSurface::create(Format::Rgb24, width, height).expect("emulate surface");
     {
         let cr = Context::new(&surface).expect("emulate context");
@@ -92,14 +104,14 @@ fn dummy_pixels(page_num: i32, width: i32, height: i32) -> (Vec<u8>, i32, i32, i
         cr.paint().expect("paint");
 
         let label = format!("{}", page_num + 1);
-        let font_size = (width.min(height) as f64 * 0.3).max(8.0);
+        let font_size = (page_width.min(page_height) as f64 * 0.3).max(8.0);
         cr.select_font_face("sans-serif", FontSlant::Normal, FontWeight::Bold);
         cr.set_font_size(font_size);
         cr.set_source_rgb(0.5, 0.5, 0.5);
         if let Ok(ext) = cr.text_extents(&label) {
-            let x = (width as f64 - ext.width()) / 2.0 - ext.x_bearing();
-            let y = (height as f64 - ext.height()) / 2.0 - ext.y_bearing();
-            cr.move_to(x, y);
+            let label_x = (page_width as f64 - ext.width()) / 2.0 - ext.x_bearing();
+            let label_y = (page_height as f64 - ext.height()) / 2.0 - ext.y_bearing();
+            cr.move_to(label_x - x as f64, label_y - y as f64);
             let _ = cr.show_text(&label);
         }
     }

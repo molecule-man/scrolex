@@ -1618,7 +1618,7 @@ impl Window {
                         if reversed { " REVERSED" } else { "" },
                     );
                 }
-                imp.update_wanted_render_range();
+                imp.update_wanted_render_range(true);
                 imp.schedule_selection_sync();
             }
         ));
@@ -1638,15 +1638,45 @@ impl Window {
                     adj.page_size(),
                     adj.upper() - adj.page_size(),
                 );
-                imp.update_wanted_render_range();
+                imp.update_wanted_render_range(true);
             }
         ));
+
+        let vadj = self.vscrolledwindow.vadjustment();
+        vadj.connect_value_changed(clone!(
+            #[weak(rename_to = imp)]
+            self,
+            move |_| imp.redraw_tiled_pages()
+        ));
+        vadj.connect_changed(clone!(
+            #[weak(rename_to = imp)]
+            self,
+            move |_| imp.redraw_tiled_pages()
+        ));
+    }
+
+    // Region-backed pages must snapshot after viewport movement so newly exposed regions can be
+    // requested. Whole-page texture nodes remain reusable and stay off this redraw path.
+    fn redraw_tiled_pages(&self) {
+        if !self.state.render_cache().borrow().has_tiled_pages() {
+            return;
+        }
+        let mut child = self.listview.first_child();
+        while let Some(item) = child {
+            if let Some(page) = descendant_page(&item) {
+                if page.is_mapped() && page.uses_tiles() {
+                    page.queue_draw();
+                }
+            }
+            child = item.next_sibling();
+        }
     }
 
     // Track the page range worth a full render as the viewport moves; flung-past pages drop at the
     // queue. Spans the mapped page widgets plus a prefetch margin. A briefly-excluded visible page
     // reschedules via the render-waiter redraw, so the range only needs to be roughly right.
-    fn update_wanted_render_range(&self) {
+    fn update_wanted_render_range(&self, redraw_tiles: bool) {
+        let redraw_tiles = redraw_tiles && self.state.render_cache().borrow().has_tiled_pages();
         let mut lo = i32::MAX;
         let mut hi = i32::MIN;
         let mut child = self.listview.first_child();
@@ -1656,6 +1686,9 @@ impl Window {
                     let idx = page.index();
                     lo = lo.min(idx);
                     hi = hi.max(idx);
+                    if redraw_tiles && page.uses_tiles() {
+                        page.queue_draw();
+                    }
                 }
             }
             child = c.next_sibling();
@@ -2878,6 +2911,81 @@ mod widget_tests {
             screen.1,
             landed.1,
         );
+        window.close();
+    }
+
+    #[gtk::test]
+    fn deep_zoom_renders_bounded_page_regions() {
+        const HUGE_PAGE_PDF: &[u8] = b"%PDF-1.4\n\
+1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n\
+2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n\
+3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 2000 3000] >>\nendobj\n\
+trailer\n<< /Root 1 0 R >>\n%%EOF";
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge.pdf");
+        std::fs::write(&path, HUGE_PAGE_PDF).unwrap();
+        let window = window();
+        window.set_default_size(500, 400);
+        window.present();
+        window.state().load(&gtk::gio::File::for_path(path));
+        let imp = window.imp();
+        wait_until(|| imp.mapped_page(0).is_some());
+
+        imp.state.zoom_to(10.0);
+        wait_until(|| imp.mapped_page(0).is_some_and(|page| page.uses_tiles()));
+        let dsf = f64::from(imp.mapped_page(0).unwrap().scale_factor());
+        let mut found = None;
+        wait_until(|| {
+            let cache = imp.state.render_cache();
+            let mut cache = cache.borrow_mut();
+            for y in 0..30 {
+                for x in 0..20 {
+                    let id = crate::render_cache::TileId {
+                        page: 0,
+                        x: x * 1024,
+                        y: y * 1024,
+                    };
+                    if let Some(texture) = cache.get_tile(id, 10.0 * dsf) {
+                        found = Some(texture);
+                        return true;
+                    }
+                }
+            }
+            false
+        });
+
+        let texture = found.expect("a visible region was cached");
+        assert!(texture.width() <= 1026);
+        assert!(texture.height() <= 1026);
+
+        let initial_width = imp.vscrolledwindow.width();
+        let initial_page = imp.mapped_page(0).unwrap();
+        let (initial_left, _) = imp.page_origin(&initial_page).unwrap();
+        let initial_right_tile =
+            (((f64::from(initial_width) - initial_left) * dsf).max(1.0) as i32 - 1) / 1024 * 1024;
+
+        window.set_size_request(initial_width + 1100, 700);
+        wait_until(|| imp.vscrolledwindow.width() >= initial_width + 1000);
+        let resized_page = imp.mapped_page(0).unwrap();
+        let (resized_left, _) = imp.page_origin(&resized_page).unwrap();
+        let resized_right_tile =
+            (((f64::from(imp.vscrolledwindow.width()) - resized_left) * dsf).max(1.0) as i32 - 1)
+                / 1024
+                * 1024;
+        assert!(resized_right_tile > initial_right_tile);
+        let newly_visible = crate::render_cache::TileId {
+            page: 0,
+            x: resized_right_tile,
+            y: 0,
+        };
+        wait_until(|| {
+            imp.state
+                .render_cache()
+                .borrow_mut()
+                .get_tile(newly_visible, 10.0 * dsf)
+                .is_some()
+        });
         window.close();
     }
 
