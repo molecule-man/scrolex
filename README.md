@@ -72,6 +72,7 @@ JPEG, TIFF, …) open as well. DjVu is not supported.
 | `j` / `↓`       | Pan down (zoomed-in page)                |
 | `]` / Ctrl + `+` / Ctrl + `=` | Zoom in                     |
 | `[` / Ctrl + `-` | Zoom out                                |
+| Ctrl + `0`      | Reset zoom to 100%                       |
 | Mouse wheel     | Move one page left/right per notch       |
 | Ctrl + scroll   | Zoom in/out (mouse wheel or touchpad)    |
 | `f` / Ctrl + f  | Search in document                       |

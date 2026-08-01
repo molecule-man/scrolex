@@ -632,18 +632,25 @@ impl Window {
         self.zoom_at(zoom, screen);
     }
 
+    // Zoom, keeping the viewport centre in place.
+    fn zoom_centered(&self, zoom: f64) {
+        self.zoom_at(zoom, self.viewport_center());
+    }
+
     #[template_callback]
     fn zoom_out(&self) {
-        self.zoom_anchored(self.state.zoom() / ZOOM_STEP);
+        self.zoom_centered(self.state.zoom() / ZOOM_STEP);
     }
 
     #[template_callback]
     fn zoom_in(&self) {
-        self.zoom_anchored(self.state.zoom() * ZOOM_STEP);
+        self.zoom_centered(self.state.zoom() * ZOOM_STEP);
     }
 
-    // The point to hold: under the pointer, or the viewport centre when the pointer is elsewhere
-    // (toolbar buttons, keys pressed with the mouse away).
+    fn reset_zoom(&self) {
+        self.zoom_centered(1.0);
+    }
+
     fn viewport_center(&self) -> (f64, f64) {
         (
             f64::from(self.vscrolledwindow.width()) / 2.0,
@@ -865,6 +872,9 @@ impl Window {
             }
             Key::minus | Key::KP_Subtract if modifier.contains(ModifierType::CONTROL_MASK) => {
                 self.zoom_out();
+            }
+            Key::_0 | Key::KP_0 if modifier.contains(ModifierType::CONTROL_MASK) => {
+                self.reset_zoom();
             }
             Key::n | Key::N => {
                 if self.state.search().borrow().total() == 0 {
@@ -2931,5 +2941,74 @@ mod widget_tests {
         imp.state.zoom_to(1.0);
         imp.handle_key_press(Key::minus, 0, ModifierType::empty());
         assert_eq!(imp.state.zoom(), 1.0);
+    }
+
+    // Keys and toolbar buttons zoom about the centre even when the mouse rests over a page, unlike
+    // Ctrl+scroll, which holds the point under the pointer.
+    #[gtk::test]
+    fn key_and_button_zoom_ignore_the_pointer() {
+        use gtk::gdk::{Key, ModifierType};
+        let window = window();
+        window.set_default_size(900, 700);
+        window.present();
+        let fixture = gtk::gio::File::for_path(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/outline.pdf"
+        ));
+        window.state().load(&fixture);
+
+        let imp = window.imp();
+        wait_until(|| imp.mapped_page(0).is_some());
+        let page = imp.mapped_page(0).unwrap();
+        let (left, top) = imp.page_origin(&page).unwrap();
+        let off_center = (left + 40.0, top + 40.0);
+        let center = imp.viewport_center();
+        assert_ne!(off_center, center, "pointer must sit away from the centre");
+
+        let zooms: [&dyn Fn(); 4] = [
+            &|| {
+                imp.handle_key_press(Key::plus, 0, ModifierType::CONTROL_MASK);
+            },
+            &|| imp.zoom_in(),
+            &|| imp.zoom_out(),
+            &|| imp.reset_zoom(),
+        ];
+        for zoom in zooms {
+            imp.state.zoom_to(1.5);
+            imp.zoom_anchor.set(None);
+            imp.pointer.set(Some(off_center));
+
+            zoom();
+
+            let anchor = imp.zoom_anchor.get().expect("zoom captured an anchor");
+            assert_eq!(
+                anchor.screen, center,
+                "zoom should hold the viewport centre"
+            );
+        }
+        window.close();
+    }
+
+    #[gtk::test]
+    fn ctrl_zero_resets_zoom() {
+        use gtk::gdk::{Key, ModifierType};
+        let window = window();
+        let imp = window.imp();
+        let ctrl = ModifierType::CONTROL_MASK;
+
+        for key in [Key::_0, Key::KP_0] {
+            imp.state.zoom_to(2.5);
+            imp.handle_key_press(key, 0, ctrl);
+            assert_eq!(imp.state.zoom(), 1.0, "{key:?} should reset to 100%");
+
+            imp.state.zoom_to(0.4);
+            imp.handle_key_press(key, 0, ctrl);
+            assert_eq!(imp.state.zoom(), 1.0, "{key:?} should reset to 100%");
+        }
+
+        // plain 0 stays free for other bindings
+        imp.state.zoom_to(2.5);
+        imp.handle_key_press(Key::_0, 0, ModifierType::empty());
+        assert_eq!(imp.state.zoom(), 2.5);
     }
 }
