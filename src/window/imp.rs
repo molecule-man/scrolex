@@ -1619,6 +1619,7 @@ impl Window {
                     );
                 }
                 imp.update_wanted_render_range();
+                imp.redraw_tiled_pages();
                 imp.schedule_selection_sync();
             }
         ));
@@ -1641,6 +1642,28 @@ impl Window {
                 imp.update_wanted_render_range();
             }
         ));
+
+        self.vscrolledwindow
+            .vadjustment()
+            .connect_value_changed(clone!(
+                #[weak(rename_to = imp)]
+                self,
+                move |_| imp.redraw_tiled_pages()
+            ));
+    }
+
+    // Region-backed pages must snapshot after viewport movement so newly exposed regions can be
+    // requested. Whole-page texture nodes remain reusable and stay off this redraw path.
+    fn redraw_tiled_pages(&self) {
+        let mut child = self.listview.first_child();
+        while let Some(item) = child {
+            if let Some(page) = descendant_page(&item) {
+                if page.is_mapped() && page.uses_tiles() {
+                    page.queue_draw();
+                }
+            }
+            child = item.next_sibling();
+        }
     }
 
     // Track the page range worth a full render as the viewport moves; flung-past pages drop at the
@@ -2878,6 +2901,53 @@ mod widget_tests {
             screen.1,
             landed.1,
         );
+        window.close();
+    }
+
+    #[gtk::test]
+    fn deep_zoom_renders_bounded_page_regions() {
+        const HUGE_PAGE_PDF: &[u8] = b"%PDF-1.4\n\
+1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n\
+2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n\
+3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 2000 3000] >>\nendobj\n\
+trailer\n<< /Root 1 0 R >>\n%%EOF";
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge.pdf");
+        std::fs::write(&path, HUGE_PAGE_PDF).unwrap();
+        let window = window();
+        window.set_default_size(900, 700);
+        window.present();
+        window.state().load(&gtk::gio::File::for_path(path));
+        let imp = window.imp();
+        wait_until(|| imp.mapped_page(0).is_some());
+
+        imp.state.zoom_to(10.0);
+        wait_until(|| imp.mapped_page(0).is_some_and(|page| page.uses_tiles()));
+        let dsf = f64::from(imp.mapped_page(0).unwrap().scale_factor());
+        let mut found = None;
+        wait_until(|| {
+            let cache = imp.state.render_cache();
+            let mut cache = cache.borrow_mut();
+            for y in 0..30 {
+                for x in 0..20 {
+                    let id = crate::render_cache::TileId {
+                        page: 0,
+                        x: x * 1024,
+                        y: y * 1024,
+                    };
+                    if let Some(texture) = cache.get_tile(id, 10.0 * dsf) {
+                        found = Some(texture);
+                        return true;
+                    }
+                }
+            }
+            false
+        });
+
+        let texture = found.expect("a visible region was cached");
+        assert!(texture.width() <= 1026);
+        assert!(texture.height() <= 1026);
         window.close();
     }
 

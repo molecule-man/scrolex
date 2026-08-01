@@ -91,4 +91,8 @@ impl Page {
     pub(crate) fn uri(&self) -> String {
         self.state().uri()
     }
+
+    pub(crate) fn uses_tiles(&self) -> bool {
+        self.imp().uses_tiles()
+    }
 }
