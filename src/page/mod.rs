@@ -65,11 +65,11 @@ impl Page {
     }
 
     pub(crate) fn bind(&self, pn: &PageNumber) {
-        self.set_index(pn.page_number());
-
         if let Some(prev_binding) = self.imp().binding.borrow_mut().take() {
+            self.imp().unpin_render();
             prev_binding.unbind();
         }
+        self.set_index(pn.page_number());
 
         let new_binding = self
             .bind_property("width-request", pn, "width")

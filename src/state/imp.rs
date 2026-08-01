@@ -133,6 +133,7 @@ impl ObjectImpl for State {
         self.obj().connect_notify_local(Some("zoom"), |state, _| {
             let imp = state.imp();
             imp.render_waiters.borrow_mut().clear();
+            imp.render_cache.borrow_mut().clear_pins();
             crate::page::clear_full_renders(imp.render_client_id.get());
             // in-flight renders started at the old scale are now stale; bump so their completion
             // drops out instead of caching an obsolete-scale texture

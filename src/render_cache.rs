@@ -35,6 +35,9 @@ pub struct RenderCache {
     entries: HashMap<CacheKey, Entry>,
     // texture identities ordered least- to most-recently used
     order: Vec<CacheKey>,
+    // Keys currently presented by each mapped page widget. They may exceed the nominal budget: a
+    // viewport cannot be made smaller by evicting its own pixels.
+    pinned_by_page: HashMap<i32, HashSet<CacheKey>>,
 }
 
 impl Default for RenderCache {
@@ -60,6 +63,7 @@ impl RenderCache {
             total_bytes: 0,
             entries: HashMap::new(),
             order: Vec::new(),
+            pinned_by_page: HashMap::new(),
         }
     }
 
@@ -118,23 +122,44 @@ impl RenderCache {
         self.insert_key(CacheKey::Page(page), texture, pixel_scale);
     }
 
-    pub fn insert_tile(&mut self, tile: TileId, texture: gdk::Texture, pixel_scale: f64) {
+    #[cfg(test)]
+    fn insert_tile(&mut self, tile: TileId, texture: gdk::Texture, pixel_scale: f64) {
         self.insert_key(CacheKey::Tile(tile), texture, pixel_scale);
     }
 
-    // Insert one serial render batch atomically. Every requested viewport region remains resident
-    // even when the configured budget is smaller than the physical viewport itself.
-    pub fn insert_tile_batch(
-        &mut self,
-        tiles: Vec<(TileId, gdk::Texture)>,
-        visible: &[TileId],
-        pixel_scale: f64,
-    ) {
-        let protected: HashSet<_> = visible.iter().copied().map(CacheKey::Tile).collect();
+    pub fn insert_tile_batch(&mut self, tiles: Vec<(TileId, gdk::Texture)>, pixel_scale: f64) {
         for (tile, texture) in tiles {
             self.insert_key_unbounded(CacheKey::Tile(tile), texture, pixel_scale);
         }
-        self.evict_except(&protected);
+        self.evict();
+    }
+
+    pub fn pin_page(&mut self, page: i32) {
+        self.pinned_by_page
+            .insert(page, HashSet::from([CacheKey::Page(page)]));
+        self.evict();
+    }
+
+    pub fn pin_tiles(&mut self, page: i32, tiles: &[TileId]) {
+        self.pinned_by_page
+            .insert(page, tiles.iter().copied().map(CacheKey::Tile).collect());
+        self.evict();
+    }
+
+    pub fn unpin_page(&mut self, page: i32) {
+        self.pinned_by_page.remove(&page);
+        self.evict();
+    }
+
+    pub fn clear_pins(&mut self) {
+        self.pinned_by_page.clear();
+        self.evict();
+    }
+
+    pub fn has_tiled_pages(&self) -> bool {
+        self.pinned_by_page
+            .values()
+            .any(|keys| keys.is_empty() || keys.iter().any(|key| matches!(key, CacheKey::Tile(_))))
     }
 
     fn insert_key(&mut self, key: CacheKey, texture: gdk::Texture, pixel_scale: f64) {
@@ -158,10 +183,6 @@ impl RenderCache {
         self.total_bytes += bytes;
     }
 
-    pub fn remove(&mut self, page: i32) {
-        self.remove_key(CacheKey::Page(page));
-    }
-
     fn remove_key(&mut self, key: CacheKey) {
         if let Some(entry) = self.entries.remove(&key) {
             self.total_bytes -= entry.bytes;
@@ -172,6 +193,7 @@ impl RenderCache {
     pub fn clear(&mut self) {
         self.entries.clear();
         self.order.clear();
+        self.pinned_by_page.clear();
         self.total_bytes = 0;
     }
 
@@ -182,27 +204,25 @@ impl RenderCache {
         }
     }
 
-    // Drop LRU entries until within budget, always keeping at least one (the just-inserted,
-    // most-recently-used page).
+    // Drop unpinned LRU entries until within budget. With no pins, keep one oversized most-recent
+    // entry so a single whole-page texture remains usable.
     fn evict(&mut self) {
-        while self.total_bytes > self.budget_bytes && self.order.len() > 1 {
-            let lru = self.order.remove(0);
+        while self.total_bytes > self.budget_bytes {
+            let Some(pos) = self.order.iter().position(|key| !self.is_pinned(key)) else {
+                break;
+            };
+            if self.pinned_by_page.is_empty() && self.order.len() == 1 {
+                break;
+            }
+            let lru = self.order.remove(pos);
             if let Some(entry) = self.entries.remove(&lru) {
                 self.total_bytes -= entry.bytes;
             }
         }
     }
 
-    fn evict_except(&mut self, protected: &HashSet<CacheKey>) {
-        while self.total_bytes > self.budget_bytes {
-            let Some(pos) = self.order.iter().position(|key| !protected.contains(key)) else {
-                break;
-            };
-            let lru = self.order.remove(pos);
-            if let Some(entry) = self.entries.remove(&lru) {
-                self.total_bytes -= entry.bytes;
-            }
-        }
+    fn is_pinned(&self, key: &CacheKey) -> bool {
+        self.pinned_by_page.values().any(|keys| keys.contains(key))
     }
 }
 
@@ -223,6 +243,16 @@ mod tests {
             (width * 4) as usize,
         )
         .upcast()
+    }
+
+    #[test]
+    fn tracks_tiled_pages_even_before_a_region_is_visible() {
+        let mut cache = RenderCache::new(100);
+        cache.pin_tiles(2, &[]);
+
+        assert!(cache.has_tiled_pages());
+        cache.pin_page(2);
+        assert!(!cache.has_tiled_pages());
     }
 
     #[gtk::test]
@@ -309,14 +339,51 @@ mod tests {
             x: 10,
             y: 0,
         };
-        cache.insert_tile_batch(
-            vec![(left, texture(40)), (right, texture(40))],
-            &[left, right],
-            2.0,
-        );
+        cache.pin_tiles(2, &[left, right]);
+        cache.insert_tile_batch(vec![(left, texture(40)), (right, texture(40))], 2.0);
 
         assert!(cache.get_tile(stale, 1.0).is_none());
         assert!(cache.get_tile(left, 2.0).is_some());
         assert!(cache.get_tile(right, 2.0).is_some());
+    }
+
+    #[gtk::test]
+    fn every_insert_path_preserves_pinned_viewport_entries() {
+        let mut cache = RenderCache::new(60);
+        let left = TileId {
+            page: 2,
+            x: 0,
+            y: 0,
+        };
+        let right = TileId {
+            page: 2,
+            x: 10,
+            y: 0,
+        };
+        cache.pin_tiles(2, &[left, right]);
+        cache.insert_tile_batch(vec![(left, texture(40)), (right, texture(40))], 2.0);
+
+        cache.insert(9, texture(40), 1.0);
+
+        assert!(cache.get_tile(left, 2.0).is_some());
+        assert!(cache.get_tile(right, 2.0).is_some());
+        assert!(cache.get(9).is_none(), "the unpinned insert should yield");
+    }
+
+    #[gtk::test]
+    fn mapped_whole_page_and_tiles_can_jointly_exceed_the_budget() {
+        let mut cache = RenderCache::new(60);
+        let tile = TileId {
+            page: 2,
+            x: 0,
+            y: 0,
+        };
+        cache.pin_tiles(2, &[tile]);
+        cache.insert_tile_batch(vec![(tile, texture(40))], 2.0);
+        cache.pin_page(9);
+        cache.insert(9, texture(40), 1.0);
+
+        assert!(cache.get_tile(tile, 2.0).is_some());
+        assert!(cache.get(9).is_some());
     }
 }

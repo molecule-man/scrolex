@@ -279,6 +279,8 @@ impl ObjectImpl for Page {
         self.setup_text_selection();
         self.setup_link_handling();
 
+        self.obj().connect_unmap(|page| page.imp().unpin_render());
+
         self.obj().set_size_request(600, 800);
     }
 
@@ -325,6 +327,15 @@ impl WidgetImpl for Page {
 impl Page {
     pub(super) fn uses_tiles(&self) -> bool {
         self.tiled.get()
+    }
+
+    pub(super) fn unpin_render(&self) {
+        let obj = self.obj();
+        obj.state()
+            .render_cache()
+            .borrow_mut()
+            .unpin_page(obj.index());
+        self.tiled.set(false);
     }
 
     // Mark the device scale factor as known once it has settled after map, so rendering starts at
@@ -651,17 +662,22 @@ impl Page {
         let obj = self.obj();
         let scale_factor = obj.scale_factor() as f64;
 
-        let bbox = self.get_bbox(page, obj.crop());
         let scale = obj.zoom();
         let render_scale = render_scale((page.width, page.height), scale, scale_factor);
 
         if render_scale < scale {
-            self.tiled.set(true);
+            // Viewport regions are rendered off the UI thread; entering this path also keeps later
+            // page renders asynchronous so snapshots do not alternate rendering modes.
             obj.state().set_multithread_rendering(true);
             self.multithread_snapshot(snapshot, page);
             return;
         }
         self.tiled.set(false);
+        obj.state()
+            .render_cache()
+            .borrow_mut()
+            .unpin_page(page.index);
+        let bbox = self.get_bbox(page, obj.crop());
 
         match render_page_texture(
             &obj.uri(),
@@ -901,13 +917,6 @@ impl Page {
         density: (f64, f64),
     ) {
         let (scale, dsf) = density;
-        let (bw, bh) = bbox.size();
-        snapshot.push_clip(&graphene::Rect::new(
-            0.0,
-            0.0,
-            (bw * scale) as f32,
-            (bh * scale) as f32,
-        ));
         let (ox, oy) = page_offset(bbox, scale, dsf);
         let pixels = raster_region(region, page_px);
         snapshot.push_clip(&graphene::Rect::new(
@@ -926,7 +935,6 @@ impl Page {
             ),
         );
         snapshot.pop();
-        snapshot.pop();
     }
 
     fn tiled_snapshot(
@@ -944,17 +952,19 @@ impl Page {
         let regions = self.visible_tile_regions(page, bbox, scale, dsf);
         let mut ready = Vec::new();
         let mut missing = Vec::new();
-        let mut visible_ids = Vec::new();
+        let visible_ids: Vec<_> = regions
+            .iter()
+            .map(|region| crate::render_cache::TileId {
+                page: page_num,
+                x: region.x0,
+                y: region.y0,
+            })
+            .collect();
         {
             let cache = obj.state().render_cache();
             let mut cache = cache.borrow_mut();
-            for region in regions {
-                let id = crate::render_cache::TileId {
-                    page: page_num,
-                    x: region.x0,
-                    y: region.y0,
-                };
-                visible_ids.push(id);
+            cache.pin_tiles(page_num, &visible_ids);
+            for (region, id) in regions.into_iter().zip(visible_ids.iter().copied()) {
                 match cache.get_tile(id, pixel_scale) {
                     Some(texture) => ready.push((region, texture)),
                     None => missing.push(region),
@@ -973,21 +983,31 @@ impl Page {
             FallbackSource::Preview => preview.as_ref(),
             FallbackSource::None => None,
         };
-        if let Some(texture) = fallback {
-            self.append_scaled_page_texture(snapshot, texture, page, bbox, scale);
-        } else {
-            let (w, h) = bbox.size();
-            append_loading_placeholder(snapshot, w * scale, h * scale);
+        if !missing.is_empty() {
+            if let Some(texture) = fallback {
+                self.append_scaled_page_texture(snapshot, texture, page, bbox, scale);
+            } else {
+                let (w, h) = bbox.size();
+                append_loading_placeholder(snapshot, w * scale, h * scale);
+            }
         }
 
+        let (bw, bh) = bbox.size();
+        snapshot.push_clip(&graphene::Rect::new(
+            0.0,
+            0.0,
+            (bw * scale) as f32,
+            (bh * scale) as f32,
+        ));
         for (region, texture) in ready {
             self.append_tile_texture(snapshot, &texture, region, page_px, bbox, (scale, dsf));
         }
+        snapshot.pop();
 
         if missing.is_empty() {
             self.note_paint(page_num, Paint::Sharp);
         } else {
-            self.schedule_tile_render(page_num, scale, dsf, page_px, missing, visible_ids);
+            self.schedule_tile_render(page_num, scale, dsf, page_px, missing);
             obj.state()
                 .render_waiters()
                 .borrow_mut()
@@ -1021,13 +1041,14 @@ impl Page {
         let scale = obj.zoom();
         let scale_factor = obj.scale_factor() as f64;
         let render_scale = render_scale((width, height), scale, scale_factor);
-        let bbox = self.get_bbox(page, obj.crop());
+        let cached_bbox = self.get_cached_bbox(page, obj.crop());
         if render_scale < scale {
             self.tiled.set(true);
-            self.tiled_snapshot(snapshot, page, &bbox, scale, scale_factor);
+            self.tiled_snapshot(snapshot, page, &cached_bbox, scale, scale_factor);
             return;
         }
         self.tiled.set(false);
+        obj.state().render_cache().borrow_mut().pin_page(page_num);
         let expected = render_dimensions((width, height), render_scale, scale_factor);
         let page_bytes = page_buffer_bytes((width, height), render_scale, scale_factor);
 
@@ -1036,6 +1057,7 @@ impl Page {
         let stale_render = if let Some(texture) = cached {
             if (texture.width(), texture.height()) == expected {
                 log::debug!("draw page {page_num}: cache hit");
+                let bbox = self.get_bbox(page, obj.crop());
                 self.append_render(snapshot, &texture, page, &bbox, scale, render_scale);
                 self.prefetch_previews(page_num);
                 self.prefetch_next(page_num, page_bytes as usize);
@@ -1063,7 +1085,6 @@ impl Page {
             .borrow_mut()
             .insert(page_num, obj.downgrade());
 
-        let bbox = self.get_cached_bbox(page, obj.crop());
         let preview = obj.state().preview_cache().borrow_mut().get(page_num);
         let source = fallback_source(
             stale_render.as_ref().map(|texture| texture.width()),
@@ -1081,7 +1102,7 @@ impl Page {
             FallbackSource::None => None,
         };
         if let Some(texture) = fallback {
-            self.append_scaled_page_texture(snapshot, texture, page, &bbox, scale);
+            self.append_scaled_page_texture(snapshot, texture, page, &cached_bbox, scale);
             self.note_paint(
                 page_num,
                 match source {
@@ -1091,7 +1112,7 @@ impl Page {
             );
         } else {
             log::debug!("draw page {page_num}: cache miss (loading placeholder)");
-            let (w, h) = bbox.size();
+            let (w, h) = cached_bbox.size();
             append_loading_placeholder(snapshot, w * scale, h * scale);
             self.note_paint(page_num, Paint::Placeholder);
         }
@@ -1199,42 +1220,8 @@ impl Page {
         glib::spawn_future_local(async move {
             let result = resp_receiver.await;
             let state = obj_clone.state();
-
-            // This window loaded/reloaded a document since this was scheduled? That path already
-            // cleared the inflight/waiter entries, so bail before touching the current ones: mutating
-            // them here would drop the live render's marker/waiter. Per-window, so another window's
-            // load never invalidates this render.
-            if state.doc_epoch() != doc_epoch {
+            let Some(rendered) = accept_render(&state, page_num, epoch, doc_epoch, result) else {
                 return;
-            }
-            // release the slot this render holds, freeing the page for a render at the current scale
-            {
-                let inflight = state.render_inflight();
-                let mut inflight = inflight.borrow_mut();
-                if inflight.get(&page_num) == Some(&epoch) {
-                    inflight.remove(&page_num);
-                }
-            }
-
-            // Zoom moved on while this rendered, or the request was dropped (over-cap, or out of the
-            // wanted range): discard the pixels and redraw the widget still on this page so it
-            // reschedules at the current scale. The index check means a scrolled-off page stays
-            // dropped.
-            let rendered = match result {
-                Ok(rendered) if state.render_epoch() == epoch => rendered,
-                _ => {
-                    if let Some(widget) = state
-                        .render_waiters()
-                        .borrow()
-                        .get(&page_num)
-                        .and_then(glib::WeakRef::upgrade)
-                    {
-                        if widget.index() == page_num {
-                            widget.queue_draw();
-                        }
-                    }
-                    return;
-                }
             };
 
             let texture = rendered.into_texture();
@@ -1242,27 +1229,7 @@ impl Page {
                 .render_cache()
                 .borrow_mut()
                 .insert(page_num, texture.upcast(), pixel_scale);
-
-            log::debug!(
-                "memory: rss={:.0}MB preview_scale={:.3} render_cache={:?} preview_cache={:?}",
-                current_rss_mb(),
-                state.preview_scale(),
-                state.render_cache().borrow(),
-                state.preview_cache().borrow(),
-            );
-
-            // repaint whichever widget is currently waiting to show this page
-            // (not necessarily the one that requested the render)
-            if let Some(widget) = state
-                .render_waiters()
-                .borrow_mut()
-                .remove(&page_num)
-                .and_then(|weak| weak.upgrade())
-            {
-                if widget.index() == page_num {
-                    widget.queue_draw();
-                }
-            }
+            finish_render(&state, page_num);
         });
 
         let uri_job = uri.clone();
@@ -1287,8 +1254,8 @@ impl Page {
         });
     }
 
-    // Queue one viewport batch. Its regions are rendered in order by one worker; their independent
-    // identities let the cache and painter consume them separately.
+    // Queue one viewport batch. One worker records and replays the page serially, then publishes the
+    // complete batch; region identities remain independent in the cache and painter.
     fn schedule_tile_render(
         &self,
         page_num: i32,
@@ -1296,21 +1263,11 @@ impl Page {
         scale_factor: f64,
         page_px: (i32, i32),
         regions: Vec<crate::mupdf_render::PixelRect>,
-        visible_ids: Vec<crate::render_cache::TileId>,
     ) {
         if regions.is_empty() {
             return;
         }
         let obj = self.obj();
-        if obj
-            .state()
-            .render_inflight()
-            .borrow()
-            .contains_key(&page_num)
-        {
-            return;
-        }
-
         let epoch = obj.state().render_epoch();
         match obj.state().render_inflight().borrow_mut().entry(page_num) {
             Entry::Occupied(_) => return,
@@ -1328,32 +1285,8 @@ impl Page {
         glib::spawn_future_local(async move {
             let result = resp_receiver.await;
             let state = obj_clone.state();
-            if state.doc_epoch() != doc_epoch {
+            let Some(rendered) = accept_render(&state, page_num, epoch, doc_epoch, result) else {
                 return;
-            }
-            {
-                let inflight = state.render_inflight();
-                let mut inflight = inflight.borrow_mut();
-                if inflight.get(&page_num) == Some(&epoch) {
-                    inflight.remove(&page_num);
-                }
-            }
-
-            let rendered = match result {
-                Ok(rendered) if state.render_epoch() == epoch => rendered,
-                _ => {
-                    if let Some(widget) = state
-                        .render_waiters()
-                        .borrow()
-                        .get(&page_num)
-                        .and_then(glib::WeakRef::upgrade)
-                    {
-                        if widget.index() == page_num {
-                            widget.queue_draw();
-                        }
-                    }
-                    return;
-                }
             };
 
             let textures = rendered
@@ -1367,29 +1300,11 @@ impl Page {
                     (id, region.pixels.into_texture().upcast())
                 })
                 .collect();
-            state.render_cache().borrow_mut().insert_tile_batch(
-                textures,
-                &visible_ids,
-                pixel_scale,
-            );
-
-            log::debug!(
-                "memory: rss={:.0}MB preview_scale={:.3} render_cache={:?} preview_cache={:?}",
-                current_rss_mb(),
-                state.preview_scale(),
-                state.render_cache().borrow(),
-                state.preview_cache().borrow(),
-            );
-            if let Some(widget) = state
-                .render_waiters()
+            state
+                .render_cache()
                 .borrow_mut()
-                .remove(&page_num)
-                .and_then(|weak| weak.upgrade())
-            {
-                if widget.index() == page_num {
-                    widget.queue_draw();
-                }
-            }
+                .insert_tile_batch(textures, pixel_scale);
+            finish_render(&state, page_num);
         });
 
         let uri_job = uri.clone();
@@ -1791,8 +1706,6 @@ fn request_region_render(
                     );
                     crate::mupdf_render::PagePixels {
                         data,
-                        x: region.x0,
-                        y: region.y0,
                         width,
                         height,
                         stride,
@@ -1811,8 +1724,9 @@ fn request_region_render(
     };
     let render_ms = start.elapsed().as_millis();
     log::debug!(
-        "Rendered {} regions of page {page_num} [on-demand (visible)] serially on background thread in {render_ms}ms (scale_factor={device_scale_factor})",
+        "Rendered {} regions of page {page_num} [{}] serially on background thread in {render_ms}ms (scale_factor={device_scale_factor})",
         regions.len(),
+        RenderPriority::Visible.label(),
     );
 
     let rendered = match pixels {
@@ -1887,6 +1801,68 @@ fn white_rendered_page(
         height,
         stride,
         render_ms,
+    }
+}
+
+// Apply the shared completion lifecycle before a renderer-specific cache insertion. A document
+// switch already cleared these slots, so it must not mutate the current document's entries. A
+// stale zoom or dropped queue request releases its own slot and redraws only a widget still bound to
+// this page, allowing it to request the current viewport and scale.
+fn accept_render<T, E>(
+    state: &crate::state::State,
+    page_num: i32,
+    epoch: u64,
+    doc_epoch: u64,
+    result: Result<T, E>,
+) -> Option<T> {
+    if state.doc_epoch() != doc_epoch {
+        return None;
+    }
+    {
+        let inflight = state.render_inflight();
+        let mut inflight = inflight.borrow_mut();
+        if inflight.get(&page_num) == Some(&epoch) {
+            inflight.remove(&page_num);
+        }
+    }
+
+    match result {
+        Ok(rendered) if state.render_epoch() == epoch => Some(rendered),
+        _ => {
+            if let Some(widget) = state
+                .render_waiters()
+                .borrow()
+                .get(&page_num)
+                .and_then(glib::WeakRef::upgrade)
+            {
+                if widget.index() == page_num {
+                    widget.queue_draw();
+                }
+            }
+            None
+        }
+    }
+}
+
+// Log cache state and repaint whichever widget currently waits for this page, which may differ from
+// the widget that submitted the render after list-item recycling.
+fn finish_render(state: &crate::state::State, page_num: i32) {
+    log::debug!(
+        "memory: rss={:.0}MB preview_scale={:.3} render_cache={:?} preview_cache={:?}",
+        current_rss_mb(),
+        state.preview_scale(),
+        state.render_cache().borrow(),
+        state.preview_cache().borrow(),
+    );
+    if let Some(widget) = state
+        .render_waiters()
+        .borrow_mut()
+        .remove(&page_num)
+        .and_then(|weak| weak.upgrade())
+    {
+        if widget.index() == page_num {
+            widget.queue_draw();
+        }
     }
 }
 

@@ -184,8 +184,6 @@ pub fn with_doc<T>(uri: &str, f: impl FnOnce(&Document) -> Option<T>) -> Option<
 // One raster buffer's raw pixels (cairo Rgb24/BGRx), transferable between render and UI threads.
 pub struct PagePixels {
     pub data: Vec<u8>,
-    pub x: i32,
-    pub y: i32,
     pub width: i32,
     pub height: i32,
     pub stride: i32,
@@ -221,8 +219,6 @@ pub fn render_page_pixels(
         let (data, stride) = pack_pixmap(&pixmap, width, height)?;
         Some(PagePixels {
             data,
-            x: 0,
-            y: 0,
             width,
             height,
             stride,
@@ -261,6 +257,7 @@ pub fn render_page_regions(
         let mut rendered = Vec::with_capacity(regions.len());
 
         for region in regions {
+            debug_assert!(region.x0 < region.x1 && region.y0 < region.y1);
             if region.x0 >= region.x1 || region.y0 >= region.y1 {
                 return None;
             }
@@ -286,8 +283,6 @@ pub fn render_page_regions(
             let (data, stride) = pack_pixmap(&pixmap, width, height)?;
             rendered.push(PagePixels {
                 data,
-                x: region.x0,
-                y: region.y0,
                 width,
                 height,
                 stride,
@@ -460,17 +455,18 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         ];
         let tiles = render_page_regions(&uri, 0, 1.0, 1.0, &regions).unwrap();
 
-        for tile in tiles {
+        for (region, tile) in regions.into_iter().zip(tiles) {
             for y in 0..tile.height {
                 for x in 0..tile.width {
                     let tile_offset = (y * tile.stride + x * 4) as usize;
-                    let page_offset = ((tile.y + y) * full.stride + (tile.x + x) * 4) as usize;
+                    let page_offset =
+                        ((region.y0 + y) * full.stride + (region.x0 + x) * 4) as usize;
                     assert_eq!(
                         &tile.data[tile_offset..tile_offset + 3],
                         &full.data[page_offset..page_offset + 3],
                         "pixel differs at ({}, {})",
-                        tile.x + x,
-                        tile.y + y,
+                        region.x0 + x,
+                        region.y0 + y,
                     );
                 }
             }

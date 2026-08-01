@@ -1618,8 +1618,7 @@ impl Window {
                         if reversed { " REVERSED" } else { "" },
                     );
                 }
-                imp.update_wanted_render_range();
-                imp.redraw_tiled_pages();
+                imp.update_wanted_render_range(true);
                 imp.schedule_selection_sync();
             }
         ));
@@ -1639,22 +1638,29 @@ impl Window {
                     adj.page_size(),
                     adj.upper() - adj.page_size(),
                 );
-                imp.update_wanted_render_range();
+                imp.update_wanted_render_range(true);
             }
         ));
 
-        self.vscrolledwindow
-            .vadjustment()
-            .connect_value_changed(clone!(
-                #[weak(rename_to = imp)]
-                self,
-                move |_| imp.redraw_tiled_pages()
-            ));
+        let vadj = self.vscrolledwindow.vadjustment();
+        vadj.connect_value_changed(clone!(
+            #[weak(rename_to = imp)]
+            self,
+            move |_| imp.redraw_tiled_pages()
+        ));
+        vadj.connect_changed(clone!(
+            #[weak(rename_to = imp)]
+            self,
+            move |_| imp.redraw_tiled_pages()
+        ));
     }
 
     // Region-backed pages must snapshot after viewport movement so newly exposed regions can be
     // requested. Whole-page texture nodes remain reusable and stay off this redraw path.
     fn redraw_tiled_pages(&self) {
+        if !self.state.render_cache().borrow().has_tiled_pages() {
+            return;
+        }
         let mut child = self.listview.first_child();
         while let Some(item) = child {
             if let Some(page) = descendant_page(&item) {
@@ -1669,7 +1675,8 @@ impl Window {
     // Track the page range worth a full render as the viewport moves; flung-past pages drop at the
     // queue. Spans the mapped page widgets plus a prefetch margin. A briefly-excluded visible page
     // reschedules via the render-waiter redraw, so the range only needs to be roughly right.
-    fn update_wanted_render_range(&self) {
+    fn update_wanted_render_range(&self, redraw_tiles: bool) {
+        let redraw_tiles = redraw_tiles && self.state.render_cache().borrow().has_tiled_pages();
         let mut lo = i32::MAX;
         let mut hi = i32::MIN;
         let mut child = self.listview.first_child();
@@ -1679,6 +1686,9 @@ impl Window {
                     let idx = page.index();
                     lo = lo.min(idx);
                     hi = hi.max(idx);
+                    if redraw_tiles && page.uses_tiles() {
+                        page.queue_draw();
+                    }
                 }
             }
             child = c.next_sibling();
@@ -2916,7 +2926,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         let path = dir.path().join("huge.pdf");
         std::fs::write(&path, HUGE_PAGE_PDF).unwrap();
         let window = window();
-        window.set_default_size(900, 700);
+        window.set_default_size(500, 400);
         window.present();
         window.state().load(&gtk::gio::File::for_path(path));
         let imp = window.imp();
@@ -2948,6 +2958,34 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         let texture = found.expect("a visible region was cached");
         assert!(texture.width() <= 1026);
         assert!(texture.height() <= 1026);
+
+        let initial_width = imp.vscrolledwindow.width();
+        let initial_page = imp.mapped_page(0).unwrap();
+        let (initial_left, _) = imp.page_origin(&initial_page).unwrap();
+        let initial_right_tile =
+            (((f64::from(initial_width) - initial_left) * dsf).max(1.0) as i32 - 1) / 1024 * 1024;
+
+        window.set_size_request(initial_width + 1100, 700);
+        wait_until(|| imp.vscrolledwindow.width() >= initial_width + 1000);
+        let resized_page = imp.mapped_page(0).unwrap();
+        let (resized_left, _) = imp.page_origin(&resized_page).unwrap();
+        let resized_right_tile =
+            (((f64::from(imp.vscrolledwindow.width()) - resized_left) * dsf).max(1.0) as i32 - 1)
+                / 1024
+                * 1024;
+        assert!(resized_right_tile > initial_right_tile);
+        let newly_visible = crate::render_cache::TileId {
+            page: 0,
+            x: resized_right_tile,
+            y: 0,
+        };
+        wait_until(|| {
+            imp.state
+                .render_cache()
+                .borrow_mut()
+                .get_tile(newly_visible, 10.0 * dsf)
+                .is_some()
+        });
         window.close();
     }
 
