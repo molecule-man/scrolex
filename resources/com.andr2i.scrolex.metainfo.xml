@@ -17,6 +17,7 @@
     <p>Other features:</p>
     <ul>
       <li>Margin cropping, to fit more content on screen</li>
+      <li>Hue-preserving dark mode that stays enabled across sessions</li>
       <li>Zoom with Ctrl+scroll or touchpad pinch gestures</li>
       <li>Full text search</li>
       <li>Table of contents to jump between sections</li>
@@ -65,6 +66,10 @@
     <screenshot type="default">
       <caption>Pages sit side by side and scroll left to right</caption>
       <image>https://raw.githubusercontent.com/molecule-man/scrolex/main/resources/screenshots/horizontal-layout.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Dark mode recolors pages while keeping their original hues</caption>
+      <image>https://raw.githubusercontent.com/molecule-man/scrolex/main/resources/screenshots/dark-mode.png</image>
     </screenshot>
     <screenshot>
       <caption>Margin cropping fits more text on the screen</caption>

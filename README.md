@@ -37,7 +37,13 @@ https://github.com/user-attachments/assets/225c4b69-eb15-48d0-b978-f7bd747d463e
     distractions, making it easy to stay focused on reading without needing to
     search for the needed keyboard key.
 
-4. Wayland Support
+4. Dark Mode
+
+    Scrolex can recolor document pages for comfortable reading in low-light
+    environments while preserving their original hues. Dark mode is an
+    explicit setting and remains enabled across sessions until turned off.
+
+5. Wayland Support
 
     Scrolex supports both Wayland and X11 sessions.
 

@@ -62,12 +62,16 @@ pub fn dark_mode_enabled() -> bool {
     DARK_MODE_ENABLED.load(Ordering::Relaxed)
 }
 
-pub(crate) fn page_colors() -> ([f64; 3], [f64; 3]) {
-    let mode = dark_mode();
-    let paper = mode.map_or([0xff; 3], |mode| mode.paper);
-    let ink = mode.map_or([0x99; 3], |mode| mode.ink);
-    let normalized = |color: [u8; 3]| color.map(|channel| f64::from(channel) / 255.0);
-    (normalized(paper), normalized(ink))
+pub(crate) fn page_background_rgb() -> [u8; 3] {
+    dark_mode().map_or([0xff; 3], |mode| mode.paper)
+}
+
+pub(crate) fn loading_text_rgb() -> [u8; 3] {
+    dark_mode().map_or([0x99; 3], |mode| {
+        std::array::from_fn(|i| {
+            (0.65 * f32::from(mode.ink[i]) + 0.35 * f32::from(mode.paper[i])).round() as u8
+        })
+    })
 }
 
 // Invalidate every thread's cached Document (call on document load). The next `with_doc` on each
@@ -299,6 +303,7 @@ pub fn render_page_regions(
         let list = page.to_display_list(true).ok()?;
         let ctm = Matrix::new_scale((scale * dsf) as f32, (scale * dsf) as f32);
         let mut rendered = Vec::with_capacity(regions.len());
+        let dark_mode = dark_mode();
 
         for region in regions {
             debug_assert!(region.x0 < region.x1 && region.y0 < region.y1);
@@ -324,7 +329,7 @@ pub fn render_page_regions(
 
             let width = region.x1 - region.x0;
             let height = region.y1 - region.y0;
-            let (data, stride) = pack_pixmap(&pixmap, width, height, dark_mode())?;
+            let (data, stride) = pack_pixmap(&pixmap, width, height, dark_mode)?;
             rendered.push(PagePixels {
                 data,
                 width,
@@ -336,7 +341,7 @@ pub fn render_page_regions(
     })
 }
 
-// `render_page_pixels` as an ImageSurface, for scanning its pixels (content_bbox).
+// `render_page_pixels` as an ImageSurface for benchmarks and tests.
 pub fn render_page_surface(
     uri: &str,
     page_num: i32,
@@ -344,10 +349,21 @@ pub fn render_page_surface(
     dsf: f64,
     page_pt: Option<(f64, f64)>,
 ) -> Option<ImageSurface> {
+    render_page_surface_with_mode(uri, page_num, scale, dsf, page_pt, dark_mode())
+}
+
+fn render_page_surface_with_mode(
+    uri: &str,
+    page_num: i32,
+    scale: f64,
+    dsf: f64,
+    page_pt: Option<(f64, f64)>,
+    dark_mode: Option<DarkMode>,
+) -> Option<ImageSurface> {
     if let Some(cfg) = crate::emulate::config() {
         return Some(crate::emulate::full_surface(cfg, page_num, scale, dsf));
     }
-    let px = render_page_pixels(uri, page_num, scale, dsf, page_pt)?;
+    let px = render_page_pixels_with_mode(uri, page_num, scale, dsf, page_pt, dark_mode)?;
     let surface =
         ImageSurface::create_for_data(px.data, Format::Rgb24, px.width, px.height, px.stride)
             .ok()?;
@@ -373,10 +389,7 @@ pub fn page_size(uri: &str, page_num: i32) -> Option<(f64, f64)> {
 // tightest non-white rect - robust across text, vector and image content.
 pub fn content_bbox(uri: &str, page_num: i32) -> Option<(f64, f64, f64, f64)> {
     const SCALE: f64 = 0.2; // 1 sampled pixel = 5pt; crop adds a 5pt margin anyway
-    let px = render_page_pixels_with_mode(uri, page_num, SCALE, 1.0, None, None)?;
-    let surface =
-        ImageSurface::create_for_data(px.data, Format::Rgb24, px.width, px.height, px.stride)
-            .ok()?;
+    let surface = render_page_surface_with_mode(uri, page_num, SCALE, 1.0, None, None)?;
     let (w, h, stride) = (surface.width(), surface.height(), surface.stride() as usize);
 
     let mut pixels = None;
@@ -425,13 +438,7 @@ fn pack_pixmap(
     let src_stride = pix.stride() as usize;
     let dst_stride = Format::Rgb24.stride_for_width(target_w as u32).ok()? as usize;
 
-    let padding = dark_mode.map_or([0xff; 3], |mode| mode.paper);
     let mut data = vec![0xffu8; dst_stride * target_h as usize];
-    if dark_mode.is_some() {
-        for pixel in data.chunks_exact_mut(4) {
-            pixel[..3].copy_from_slice(&[padding[2], padding[1], padding[0]]);
-        }
-    }
     let rows = (pix.height() as usize).min(target_h as usize);
     let cols = (pix.width() as usize).min(target_w as usize);
     for y in 0..rows {
@@ -447,6 +454,16 @@ fn pack_pixmap(
             drow[x * 4] = rgb[2];
             drow[x * 4 + 1] = rgb[1];
             drow[x * 4 + 2] = rgb[0];
+        }
+    }
+
+    if let Some(mode) = dark_mode {
+        for y in 0..target_h as usize {
+            let first_padding_pixel = if y < rows { cols } else { 0 };
+            let row = &mut data[y * dst_stride..][first_padding_pixel * 4..target_w as usize * 4];
+            for pixel in row.chunks_exact_mut(4) {
+                pixel[..3].copy_from_slice(&[mode.paper[2], mode.paper[1], mode.paper[0]]);
+            }
         }
     }
 
