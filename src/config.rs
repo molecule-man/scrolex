@@ -22,6 +22,7 @@ pub struct Config {
     pub render_cache_mb: usize,
     pub animate_scroll: bool,
     pub dark_mode: bool,
+    pub dismissed_notice: Option<u64>,
     pub geometry: Option<Geometry>,
 }
 
@@ -41,6 +42,7 @@ impl Default for Config {
             render_cache_mb: default_render_cache_mb(),
             animate_scroll: true,
             dark_mode: false,
+            dismissed_notice: None,
             geometry: None,
         }
     }
@@ -93,6 +95,7 @@ pub fn load_config() -> Config {
     let mut render_cache_mb = default_render_cache_mb();
     let mut animate_scroll = true;
     let mut dark_mode = false;
+    let mut dismissed_notice = None;
     let mut width = None;
     let mut height = None;
     let mut maximized = false;
@@ -116,6 +119,9 @@ pub fn load_config() -> Config {
             }
             Some(("animate_scroll", v)) => animate_scroll = v.trim().parse().unwrap_or(true),
             Some(("dark_mode", v)) => dark_mode = v.trim().parse().unwrap_or(false),
+            Some(("dismissed_notice", v)) => {
+                dismissed_notice = u64::from_str_radix(v.trim(), 16).ok();
+            }
             Some(("width", v)) => width = v.trim().parse::<i32>().ok().filter(|&w| w > 0),
             Some(("height", v)) => height = v.trim().parse::<i32>().ok().filter(|&h| h > 0),
             Some(("maximized", v)) => maximized = v.trim().parse().unwrap_or(false),
@@ -138,6 +144,7 @@ pub fn load_config() -> Config {
         render_cache_mb: render_cache_mb.clamp(MIN_RENDER_CACHE_MB, MAX_RENDER_CACHE_MB),
         animate_scroll,
         dark_mode,
+        dismissed_notice,
         geometry,
     }
 }
@@ -156,6 +163,9 @@ pub fn save_config(config: &Config) -> io::Result<()> {
     out.push_str(&format!("render_cache_mb={}\n", config.render_cache_mb));
     out.push_str(&format!("animate_scroll={}\n", config.animate_scroll));
     out.push_str(&format!("dark_mode={}\n", config.dark_mode));
+    if let Some(notice) = config.dismissed_notice {
+        out.push_str(&format!("dismissed_notice={notice:016x}\n"));
+    }
     if let Some(g) = config.geometry {
         out.push_str(&format!("width={}\n", g.width));
         out.push_str(&format!("height={}\n", g.height));
@@ -188,6 +198,7 @@ mod tests {
             render_cache_mb: 256,
             animate_scroll: false,
             dark_mode: true,
+            dismissed_notice: Some(0x1234_5678_90ab_cdef),
             geometry: Some(Geometry {
                 width: 1000,
                 height: 700,
@@ -201,6 +212,7 @@ mod tests {
         assert_eq!(loaded.render_cache_mb, 256);
         assert!(!loaded.animate_scroll);
         assert!(loaded.dark_mode);
+        assert_eq!(loaded.dismissed_notice, Some(0x1234_5678_90ab_cdef));
         let g = loaded.geometry.expect("geometry persisted");
         assert_eq!((g.width, g.height, g.maximized), (1000, 700, true));
 
@@ -211,6 +223,7 @@ mod tests {
             render_cache_mb: DEFAULT_RENDER_CACHE_MB,
             animate_scroll: true,
             dark_mode: false,
+            dismissed_notice: None,
             geometry: None,
         })
         .unwrap();
@@ -218,6 +231,7 @@ mod tests {
         assert_eq!(loaded.render_threads, max_render_threads());
         assert!(loaded.animate_scroll);
         assert!(!loaded.dark_mode);
+        assert!(loaded.dismissed_notice.is_none());
         assert!(loaded.geometry.is_none());
 
         fs::remove_dir_all(&dir).ok();

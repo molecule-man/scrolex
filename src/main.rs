@@ -26,6 +26,9 @@ use scrolex::page;
 use scrolex::window;
 
 const APP_ID: &str = "com.andr2i.scrolex";
+const RELEASE_NOTICE_TITLE: &str = "What's New";
+const RELEASE_NOTICE_BODY: &str = "Dark mode is now available.\n\nOpen the Settings menu in the top-right corner and turn on Dark Mode.";
+const RELEASE_NOTICE_BUTTON: &str = "Got It";
 
 extern "C" {
     // POSIX _exit: terminate immediately without running atexit handlers or C++ static destructors
@@ -191,6 +194,56 @@ fn build_ui(app: &Application, args: &[OsString]) {
     }
 
     window.present();
+    show_release_notice(&window);
+}
+
+fn show_release_notice(window: &window::Window) {
+    let notice = release_notice_id();
+    if config::load_config().dismissed_notice == Some(notice) {
+        return;
+    }
+
+    gtk::AlertDialog::builder()
+        .message(RELEASE_NOTICE_TITLE)
+        .detail(RELEASE_NOTICE_BODY)
+        .buttons([RELEASE_NOTICE_BUTTON])
+        .default_button(0)
+        .cancel_button(0)
+        .build()
+        .choose(
+            Some(window),
+            None::<&gtk::gio::Cancellable>,
+            move |result| {
+                if result.is_err() {
+                    return;
+                }
+
+                let mut settings = config::load_config();
+                settings.dismissed_notice = Some(notice);
+                if let Err(err) = config::save_config(&settings) {
+                    eprintln!("Error saving config: {err}");
+                }
+            },
+        );
+}
+
+fn release_notice_id() -> u64 {
+    content_id(&[
+        RELEASE_NOTICE_TITLE,
+        RELEASE_NOTICE_BODY,
+        RELEASE_NOTICE_BUTTON,
+    ])
+}
+
+fn content_id(parts: &[&str]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for part in parts {
+        for byte in part.bytes().chain(std::iter::once(0)) {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    hash
 }
 
 fn from_str_to_uri(oss: &OsString) -> Result<String, std::io::Error> {
@@ -207,4 +260,27 @@ fn from_str_to_uri(oss: &OsString) -> Result<String, std::io::Error> {
         std::io::ErrorKind::NotFound,
         format!("File not found: {}", oss.display()),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn release_notice_id_is_stable_and_content_based() {
+        let id = release_notice_id();
+        assert_eq!(id, release_notice_id());
+        assert_ne!(
+            id,
+            content_id(&["Changed", RELEASE_NOTICE_BODY, RELEASE_NOTICE_BUTTON])
+        );
+        assert_ne!(
+            id,
+            content_id(&[RELEASE_NOTICE_TITLE, "Changed", RELEASE_NOTICE_BUTTON])
+        );
+        assert_ne!(
+            id,
+            content_id(&[RELEASE_NOTICE_TITLE, RELEASE_NOTICE_BODY, "Changed"])
+        );
+    }
 }
