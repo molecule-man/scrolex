@@ -2,10 +2,11 @@
 Version=1.0
 Type=Application
 Name=Scrolex
-Comment=A Horizontally Scrolled PDF Viewer
+Comment=Read PDFs and ebooks horizontally
 Exec=scrolex %f
 Icon=com.andr2i.scrolex
 Terminal=false
 StartupWMClass=scrolex
 MimeType=application/pdf;application/epub+zip;application/x-mobipocket-ebook;application/x-fictionbook+xml;application/oxps;application/vnd.ms-xpsdocument;application/vnd.comicbook+zip;
-Categories=Graphics;Viewer;
+Categories=Office;Graphics;Viewer;
+Keywords=pdf;epub;mobi;cbz;xps;fb2;ebook;comic;document;reader;viewer;horizontal;

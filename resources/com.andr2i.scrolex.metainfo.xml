@@ -4,30 +4,94 @@
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>AGPL-3.0-or-later</project_license>
   <name>Scrolex</name>
-  <summary>A horizontally scrolled PDF viewer</summary>
+  <summary>Read PDFs and ebooks horizontally</summary>
   <description>
     <p>
-      Scrolex is a PDF viewer that lays pages out along a single horizontal
-      strip, letting you scroll continuously through a document. It supports
-      zooming, including Ctrl+scroll and touchpad gestures, and text search.
+      Scrolex puts pages side by side, so you scroll left and right through a
+      document instead of up and down. On a wide screen this shows several
+      pages at once without wasted space.
     </p>
+    <p>
+      It opens PDF, EPUB, MOBI, FictionBook, XPS and comic book (CBZ) files.
+    </p>
+    <p>Other features:</p>
+    <ul>
+      <li>Margin cropping, to fit more content on screen</li>
+      <li>Zoom with Ctrl+scroll or touchpad pinch gestures</li>
+      <li>Full text search</li>
+      <li>Table of contents to jump between sections</li>
+      <li>One page per scroll wheel step, or keyboard navigation</li>
+      <li>Sharp rendering on HiDPI displays</li>
+      <li>Runs on both Wayland and X11</li>
+    </ul>
   </description>
+  <keywords>
+    <keyword>pdf</keyword>
+    <keyword>epub</keyword>
+    <keyword>mobi</keyword>
+    <keyword>cbz</keyword>
+    <keyword>xps</keyword>
+    <keyword>fb2</keyword>
+    <keyword>ebook</keyword>
+    <keyword>comic</keyword>
+    <keyword>document</keyword>
+    <keyword>reader</keyword>
+    <keyword>viewer</keyword>
+    <keyword>horizontal</keyword>
+  </keywords>
+  <branding>
+    <color type="primary" scheme_preference="light">#b3d0c9</color>
+    <color type="primary" scheme_preference="dark">#25423f</color>
+  </branding>
+  <recommends>
+    <control>keyboard</control>
+    <control>pointing</control>
+  </recommends>
+  <supports>
+    <control>touch</control>
+  </supports>
+  <requires>
+    <display_length compare="ge">768</display_length>
+  </requires>
   <launchable type="desktop-id">com.andr2i.scrolex.desktop</launchable>
   <url type="homepage">https://github.com/molecule-man/scrolex</url>
   <url type="bugtracker">https://github.com/molecule-man/scrolex/issues</url>
+  <url type="vcs-browser">https://github.com/molecule-man/scrolex</url>
   <developer id="com.andr2i">
     <name>Andrii Berezhynskyi</name>
   </developer>
   <content_rating type="oars-1.1"/>
   <screenshots>
     <screenshot type="default">
-      <caption>Pages laid out along a single horizontal strip</caption>
+      <caption>Pages sit side by side and scroll left to right</caption>
       <image>https://raw.githubusercontent.com/molecule-man/scrolex/main/resources/screenshots/horizontal-layout.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Margin cropping fits more text on the screen</caption>
+      <image>https://raw.githubusercontent.com/molecule-man/scrolex/main/resources/screenshots/crop-margins.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Jump to any section from the document outline</caption>
+      <image>https://raw.githubusercontent.com/molecule-man/scrolex/main/resources/screenshots/outline.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Search highlights every match in the document</caption>
+      <image>https://raw.githubusercontent.com/molecule-man/scrolex/main/resources/screenshots/search.png</image>
     </screenshot>
   </screenshots>
   <releases>
     <release version="0.8.1" date="2026-08-01">
       <url>https://github.com/molecule-man/scrolex/releases/tag/0.8.1</url>
+      <description>
+        <ul>
+          <li>Render deeply zoomed pages in tiles, so they stay sharp</li>
+          <li>Kinetic scrolling with touchpad flicks</li>
+          <li>Stop coasting when zooming or stepping to another page</li>
+          <li>Fix scroll flickering in documents with varying page widths</li>
+          <li>Keep the current page in place while scrolling long documents</li>
+          <li>Same zoom limits for every document, plus anchored zoom shortcuts</li>
+        </ul>
+      </description>
     </release>
     <release version="0.8.0" date="2026-08-01">
       <url>https://github.com/molecule-man/scrolex/releases/tag/0.8.0</url>

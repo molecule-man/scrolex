@@ -49,6 +49,48 @@ awk -v v="$version" '
 	{ after_name = ($0 == "name = \"scrolex\""); print }
 ' Cargo.lock > Cargo.lock.bump && mv Cargo.lock.bump Cargo.lock
 
+# GitHub puts the PR title in the body of the merge commit
+merge_titles() {
+	git log --merges --reverse --format=%H "$1..HEAD" | while read -r sha; do
+		title=$(git log -1 --format=%b "$sha" | sed '/^[[:space:]]*$/d' | head -1)
+		[ -n "$title" ] || title=$(git log -1 --format=%s "$sha")
+		printf '%s' "$title" |
+			grep -Eq '^(chore|ci|docs|test|refactor|style|build)(\([^)]*\))?!?:' && continue
+		printf '%s\n' "$title" |
+			sed -E 's/^(feat|fix|perf|revert)(\([^)]*\))?!?: *//' |
+			sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' |
+			awk '{ printf "          <li>%s%s</li>\n", toupper(substr($0, 1, 1)), substr($0, 2) }'
+	done
+}
+
+release_notes() {
+	notes=
+	notes_note="no release notes"
+
+	last=$(sed -n 's/.*<release version="\([^"]*\)".*/\1/p' "$metainfo" | head -1)
+	if [ -z "$last" ]; then
+		notes_note="no release notes: $metainfo lists none to compare against"
+		return 0
+	fi
+	if ! git rev-parse -q --verify "refs/tags/$last" >/dev/null 2>&1; then
+		notes_note="no release notes: tag $last not found, write them by hand"
+		return 0
+	fi
+
+	items=$(merge_titles "$last")
+	if [ -z "$items" ]; then
+		notes_note="no release notes: no PR merges since $last"
+		return 0
+	fi
+
+	notes="      <description>
+        <ul>
+$items
+        </ul>
+      </description>"
+	notes_note="release notes: $(printf '%s\n' "$items" | wc -l | tr -d ' ') from PR merges since $last"
+}
+
 # AppStream sorts 0.7.3-rc1 above 0.7.3, so listing a pre-release breaks the
 # ordering once the final release lands
 case $version in
@@ -59,16 +101,18 @@ case $version in
 	if grep -q "<release version=\"$version\"" "$metainfo"; then
 		metainfo_note="already listed $version, left alone"
 	else
-		awk -v v="$version" -v d="$date" -v url="$repository" '
+		release_notes
+		awk -v v="$version" -v d="$date" -v url="$repository" -v notes="$notes" '
 			{ print }
 			/<releases>/ && !seen {
 				printf "    <release version=\"%s\" date=\"%s\">\n", v, d
 				printf "      <url>%s/releases/tag/%s</url>\n", url, v
+				if (notes != "") print notes
 				print  "    </release>"
 				seen = 1
 			}
 		' "$metainfo" > "$metainfo.bump" && mv "$metainfo.bump" "$metainfo"
-		metainfo_note="added $version dated $date"
+		metainfo_note="added $version dated $date, $notes_note"
 	fi
 	;;
 esac
