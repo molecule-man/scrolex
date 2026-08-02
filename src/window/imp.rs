@@ -2212,6 +2212,16 @@ impl Window {
         }
     }
 
+    pub(super) fn redraw_pages(&self) {
+        let mut child = self.listview.first_child();
+        while let Some(item) = child {
+            if let Some(page) = descendant_page(&item) {
+                page.queue_draw();
+            }
+            child = item.next_sibling();
+        }
+    }
+
     fn update_search_status(&self) {
         let search = self.state.search();
         let search = search.borrow();

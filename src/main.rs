@@ -57,11 +57,44 @@ fn main() -> glib::ExitCode {
     app.connect_startup(|_| {
         load_css();
     });
+    setup_dark_mode(&app);
     app.connect_command_line(|app, cmd| {
         build_ui(app, &cmd.arguments());
         glib::ExitCode::SUCCESS
     });
     app.run_with_args(&std::env::args().collect::<Vec<_>>())
+}
+
+fn setup_dark_mode(app: &Application) {
+    let enabled = config::load_config().dark_mode;
+    scrolex::mupdf_render::set_dark_mode(enabled);
+
+    let action = gtk::gio::SimpleAction::new_stateful("dark-mode", None, &enabled.to_variant());
+    action.connect_activate(clone!(
+        #[weak]
+        app,
+        move |action, _| {
+            let enabled = !action
+                .state()
+                .and_then(|v| v.get::<bool>())
+                .unwrap_or(false);
+            action.set_state(&enabled.to_variant());
+            scrolex::mupdf_render::set_dark_mode(enabled);
+
+            let mut settings = config::load_config();
+            settings.dark_mode = enabled;
+            if let Err(err) = config::save_config(&settings) {
+                eprintln!("Error saving config: {err}");
+            }
+
+            for gtk_window in app.windows() {
+                if let Ok(window) = gtk_window.downcast::<window::Window>() {
+                    window.apply_dark_mode(enabled);
+                }
+            }
+        }
+    ));
+    app.add_action(&action);
 }
 
 fn init_logging() {
@@ -95,6 +128,7 @@ fn load_css() {
 fn build_ui(app: &Application, args: &[OsString]) {
     let window = window::Window::new(app);
     window.set_widget_name("main");
+    window.apply_dark_mode(scrolex::mupdf_render::dark_mode_enabled());
 
     if args.iter().any(|a| a == "-d" || a == "--debug") {
         window.add_css_class("debug");

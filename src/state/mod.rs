@@ -315,6 +315,17 @@ impl State {
         self.imp().doc_epoch.get()
     }
 
+    pub(crate) fn invalidate_rendering(&self) {
+        crate::page::clear_all_renders(self.render_client_id());
+        self.imp()
+            .doc_epoch
+            .set(self.imp().doc_epoch.get().wrapping_add(1));
+        self.imp().render_cache.borrow_mut().clear();
+        self.imp().render_inflight.borrow_mut().clear();
+        self.imp().preview_cache.borrow_mut().clear();
+        self.imp().preview_inflight.borrow_mut().clear();
+    }
+
     pub(crate) fn set_render_cache_mb(&self, mb: usize) {
         self.imp()
             .render_cache

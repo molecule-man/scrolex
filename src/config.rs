@@ -21,6 +21,7 @@ pub struct Config {
     pub preview_cache_pages: usize,
     pub render_cache_mb: usize,
     pub animate_scroll: bool,
+    pub dark_mode: bool,
     pub geometry: Option<Geometry>,
 }
 
@@ -39,6 +40,7 @@ impl Default for Config {
             preview_cache_pages: DEFAULT_PREVIEW_CACHE_PAGES,
             render_cache_mb: default_render_cache_mb(),
             animate_scroll: true,
+            dark_mode: false,
             geometry: None,
         }
     }
@@ -90,6 +92,7 @@ pub fn load_config() -> Config {
     let mut preview_cache_pages = DEFAULT_PREVIEW_CACHE_PAGES;
     let mut render_cache_mb = default_render_cache_mb();
     let mut animate_scroll = true;
+    let mut dark_mode = false;
     let mut width = None;
     let mut height = None;
     let mut maximized = false;
@@ -112,6 +115,7 @@ pub fn load_config() -> Config {
                 }
             }
             Some(("animate_scroll", v)) => animate_scroll = v.trim().parse().unwrap_or(true),
+            Some(("dark_mode", v)) => dark_mode = v.trim().parse().unwrap_or(false),
             Some(("width", v)) => width = v.trim().parse::<i32>().ok().filter(|&w| w > 0),
             Some(("height", v)) => height = v.trim().parse::<i32>().ok().filter(|&h| h > 0),
             Some(("maximized", v)) => maximized = v.trim().parse().unwrap_or(false),
@@ -133,6 +137,7 @@ pub fn load_config() -> Config {
         preview_cache_pages,
         render_cache_mb: render_cache_mb.clamp(MIN_RENDER_CACHE_MB, MAX_RENDER_CACHE_MB),
         animate_scroll,
+        dark_mode,
         geometry,
     }
 }
@@ -150,6 +155,7 @@ pub fn save_config(config: &Config) -> io::Result<()> {
     ));
     out.push_str(&format!("render_cache_mb={}\n", config.render_cache_mb));
     out.push_str(&format!("animate_scroll={}\n", config.animate_scroll));
+    out.push_str(&format!("dark_mode={}\n", config.dark_mode));
     if let Some(g) = config.geometry {
         out.push_str(&format!("width={}\n", g.width));
         out.push_str(&format!("height={}\n", g.height));
@@ -181,6 +187,7 @@ mod tests {
             preview_cache_pages: 120,
             render_cache_mb: 256,
             animate_scroll: false,
+            dark_mode: true,
             geometry: Some(Geometry {
                 width: 1000,
                 height: 700,
@@ -193,6 +200,7 @@ mod tests {
         assert_eq!(loaded.preview_cache_pages, 120);
         assert_eq!(loaded.render_cache_mb, 256);
         assert!(!loaded.animate_scroll);
+        assert!(loaded.dark_mode);
         let g = loaded.geometry.expect("geometry persisted");
         assert_eq!((g.width, g.height, g.maximized), (1000, 700, true));
 
@@ -202,12 +210,14 @@ mod tests {
             preview_cache_pages: DEFAULT_PREVIEW_CACHE_PAGES,
             render_cache_mb: DEFAULT_RENDER_CACHE_MB,
             animate_scroll: true,
+            dark_mode: false,
             geometry: None,
         })
         .unwrap();
         let loaded = load_config();
         assert_eq!(loaded.render_threads, max_render_threads());
         assert!(loaded.animate_scroll);
+        assert!(!loaded.dark_mode);
         assert!(loaded.geometry.is_none());
 
         fs::remove_dir_all(&dir).ok();

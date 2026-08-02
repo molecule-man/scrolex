@@ -1,5 +1,9 @@
 #main row {
-	background-color: #999;
+	background-color: @window_bg_color;
+}
+
+#main.dark-mode row {
+	background-color: #242424;
 }
 
 #main row,

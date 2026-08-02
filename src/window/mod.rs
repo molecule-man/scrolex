@@ -2,6 +2,7 @@ mod imp;
 
 use glib::Object;
 use gtk::glib::subclass::types::ObjectSubclassIsExt;
+use gtk::prelude::WidgetExt;
 use gtk::{gio, glib, Application};
 
 use crate::state::State;
@@ -21,6 +22,19 @@ impl Window {
 
     pub fn state(&self) -> &State {
         self.imp().state.as_ref()
+    }
+
+    pub fn apply_dark_mode(&self, enabled: bool) {
+        if self.has_css_class("dark-mode") == enabled {
+            return;
+        }
+        if enabled {
+            self.add_css_class("dark-mode");
+        } else {
+            self.remove_css_class("dark-mode");
+        }
+        self.state().invalidate_rendering();
+        self.imp().redraw_pages();
     }
 
     pub fn show_error_dialog(&self, message: &str) {
