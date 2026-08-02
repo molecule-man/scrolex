@@ -4,7 +4,7 @@
 use std::cell::RefCell;
 use std::collections::{hash_map::Entry, HashMap};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use gtk::cairo::{Format, ImageSurface};
@@ -14,6 +14,23 @@ use mupdf::{Colorspace, Device, Document, IRect, Matrix, Pixmap, Rect};
 use once_cell::sync::Lazy;
 
 const PROBE_PAGES: i32 = 8;
+
+#[derive(Clone, Copy)]
+struct DarkMode {
+    paper: [u8; 3],
+    ink: [u8; 3],
+}
+
+const DARK_MODE: DarkMode = DarkMode {
+    paper: [0x1e, 0x1e, 0x1e],
+    ink: [0xea, 0xea, 0xea],
+};
+
+static DARK_MODE_ENABLED: AtomicBool = AtomicBool::new(false);
+
+static GREY_LUT: Lazy<[[u8; 3]; 256]> = Lazy::new(|| {
+    std::array::from_fn(|value| recolor(value as u8, value as u8, value as u8, DARK_MODE))
+});
 
 // Bumped on document load so every thread's cached Document is reopened - otherwise reloading the
 // same path after the file changed on disk would keep serving the stale document.
@@ -35,6 +52,26 @@ thread_local! {
 // selection glyph list) can key on it so a reload rebuilds.
 pub(crate) fn generation() -> u64 {
     GENERATION.load(Ordering::Relaxed)
+}
+
+pub fn set_dark_mode(enabled: bool) {
+    DARK_MODE_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+pub fn dark_mode_enabled() -> bool {
+    DARK_MODE_ENABLED.load(Ordering::Relaxed)
+}
+
+pub(crate) fn page_background_rgb() -> [u8; 3] {
+    dark_mode().map_or([0xff; 3], |mode| mode.paper)
+}
+
+pub(crate) fn loading_text_rgb() -> [u8; 3] {
+    dark_mode().map_or([0x99; 3], |mode| {
+        std::array::from_fn(|i| {
+            (0.65 * f32::from(mode.ink[i]) + 0.35 * f32::from(mode.paper[i])).round() as u8
+        })
+    })
 }
 
 // Invalidate every thread's cached Document (call on document load). The next `with_doc` on each
@@ -199,6 +236,17 @@ pub fn render_page_pixels(
     dsf: f64,
     page_pt: Option<(f64, f64)>,
 ) -> Option<PagePixels> {
+    render_page_pixels_with_mode(uri, page_num, scale, dsf, page_pt, dark_mode())
+}
+
+fn render_page_pixels_with_mode(
+    uri: &str,
+    page_num: i32,
+    scale: f64,
+    dsf: f64,
+    page_pt: Option<(f64, f64)>,
+    dark_mode: Option<DarkMode>,
+) -> Option<PagePixels> {
     with_doc(uri, |doc| {
         // device_bgr + no alpha yields B,G,R samples, matching cairo Rgb24's byte order.
         let colorspace = Colorspace::device_bgr();
@@ -216,7 +264,7 @@ pub fn render_page_pixels(
         };
         let width = ((pw * scale * dsf) as i32).max(1);
         let height = ((ph * scale * dsf) as i32).max(1);
-        let (data, stride) = pack_pixmap(&pixmap, width, height)?;
+        let (data, stride) = pack_pixmap(&pixmap, width, height, dark_mode)?;
         Some(PagePixels {
             data,
             width,
@@ -255,6 +303,7 @@ pub fn render_page_regions(
         let list = page.to_display_list(true).ok()?;
         let ctm = Matrix::new_scale((scale * dsf) as f32, (scale * dsf) as f32);
         let mut rendered = Vec::with_capacity(regions.len());
+        let dark_mode = dark_mode();
 
         for region in regions {
             debug_assert!(region.x0 < region.x1 && region.y0 < region.y1);
@@ -280,7 +329,7 @@ pub fn render_page_regions(
 
             let width = region.x1 - region.x0;
             let height = region.y1 - region.y0;
-            let (data, stride) = pack_pixmap(&pixmap, width, height)?;
+            let (data, stride) = pack_pixmap(&pixmap, width, height, dark_mode)?;
             rendered.push(PagePixels {
                 data,
                 width,
@@ -292,7 +341,7 @@ pub fn render_page_regions(
     })
 }
 
-// `render_page_pixels` as an ImageSurface, for scanning its pixels (content_bbox).
+// `render_page_pixels` as an ImageSurface for benchmarks and tests.
 pub fn render_page_surface(
     uri: &str,
     page_num: i32,
@@ -300,10 +349,21 @@ pub fn render_page_surface(
     dsf: f64,
     page_pt: Option<(f64, f64)>,
 ) -> Option<ImageSurface> {
+    render_page_surface_with_mode(uri, page_num, scale, dsf, page_pt, dark_mode())
+}
+
+fn render_page_surface_with_mode(
+    uri: &str,
+    page_num: i32,
+    scale: f64,
+    dsf: f64,
+    page_pt: Option<(f64, f64)>,
+    dark_mode: Option<DarkMode>,
+) -> Option<ImageSurface> {
     if let Some(cfg) = crate::emulate::config() {
         return Some(crate::emulate::full_surface(cfg, page_num, scale, dsf));
     }
-    let px = render_page_pixels(uri, page_num, scale, dsf, page_pt)?;
+    let px = render_page_pixels_with_mode(uri, page_num, scale, dsf, page_pt, dark_mode)?;
     let surface =
         ImageSurface::create_for_data(px.data, Format::Rgb24, px.width, px.height, px.stride)
             .ok()?;
@@ -329,7 +389,7 @@ pub fn page_size(uri: &str, page_num: i32) -> Option<(f64, f64)> {
 // tightest non-white rect - robust across text, vector and image content.
 pub fn content_bbox(uri: &str, page_num: i32) -> Option<(f64, f64, f64, f64)> {
     const SCALE: f64 = 0.2; // 1 sampled pixel = 5pt; crop adds a 5pt margin anyway
-    let surface = render_page_surface(uri, page_num, SCALE, 1.0, None)?;
+    let surface = render_page_surface_with_mode(uri, page_num, SCALE, 1.0, None, None)?;
     let (w, h, stride) = (surface.width(), surface.height(), surface.stride() as usize);
 
     let mut pixels = None;
@@ -366,8 +426,13 @@ fn scan_bbox(data: &[u8], w: i32, h: i32, stride: usize) -> Option<(i32, i32, i3
 }
 
 // Pack a MuPDF BGR pixmap into a Rgb24 (BGRx) buffer of exactly (target_w, target_h) plus its stride.
-// The pixmap is within ~1px; copy the overlap, leave padding white so no black seam shows.
-fn pack_pixmap(pix: &mupdf::Pixmap, target_w: i32, target_h: i32) -> Option<(Vec<u8>, i32)> {
+// The pixmap is within ~1px; copy the overlap and fill any padding with the page background.
+fn pack_pixmap(
+    pix: &mupdf::Pixmap,
+    target_w: i32,
+    target_h: i32,
+    dark_mode: Option<DarkMode>,
+) -> Option<(Vec<u8>, i32)> {
     let n = pix.n() as usize; // 3 for device_bgr without alpha
     let src = pix.samples();
     let src_stride = pix.stride() as usize;
@@ -381,18 +446,103 @@ fn pack_pixmap(pix: &mupdf::Pixmap, target_w: i32, target_h: i32) -> Option<(Vec
         let drow = &mut data[y * dst_stride..];
         for x in 0..cols {
             let s = &srow[x * n..];
-            drow[x * 4] = s[0];
-            drow[x * 4 + 1] = s[1];
-            drow[x * 4 + 2] = s[2];
+            let rgb = match dark_mode {
+                Some(_) if s[0] == s[1] && s[1] == s[2] => GREY_LUT[s[0] as usize],
+                Some(mode) => recolor(s[2], s[1], s[0], mode),
+                None => [s[2], s[1], s[0]],
+            };
+            drow[x * 4] = rgb[2];
+            drow[x * 4 + 1] = rgb[1];
+            drow[x * 4 + 2] = rgb[0];
+        }
+    }
+
+    if let Some(mode) = dark_mode {
+        for y in 0..target_h as usize {
+            let first_padding_pixel = if y < rows { cols } else { 0 };
+            let row = &mut data[y * dst_stride..][first_padding_pixel * 4..target_w as usize * 4];
+            for pixel in row.chunks_exact_mut(4) {
+                pixel[..3].copy_from_slice(&[mode.paper[2], mode.paper[1], mode.paper[0]]);
+            }
         }
     }
 
     Some((data, dst_stride as i32))
 }
 
+fn dark_mode() -> Option<DarkMode> {
+    dark_mode_enabled().then_some(DARK_MODE)
+}
+
+fn recolor(r: u8, g: u8, b: u8, mode: DarkMode) -> [u8; 3] {
+    const WEIGHTS: [f32; 3] = [0.30, 0.59, 0.11];
+
+    let rgb = [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0];
+    let paper = mode.paper.map(|value| value as f32 / 255.0);
+    let ink = mode.ink.map(|value| value as f32 / 255.0);
+    let lightness =
+        |color: [f32; 3]| WEIGHTS[0] * color[0] + WEIGHTS[1] * color[1] + WEIGHTS[2] * color[2];
+    let source_lightness = lightness(rgb);
+    let hue = rgb.map(|channel| channel - source_lightness);
+    let source_scale = colorumax(hue, source_lightness, 0.0, 1.0);
+    let saturation = if source_scale.abs() > f32::EPSILON {
+        1.0 / source_scale
+    } else {
+        0.0
+    };
+    let ink_lightness = lightness(ink);
+    let paper_lightness = lightness(paper);
+    let target_lightness = source_lightness * (paper_lightness - ink_lightness) + ink_lightness;
+    let target_scale =
+        saturation * colorumax(hue, target_lightness, ink_lightness, paper_lightness);
+
+    std::array::from_fn(|i| {
+        ((target_lightness + target_scale * hue[i]) * 255.0)
+            .round()
+            .clamp(0.0, 255.0) as u8
+    })
+}
+
+fn colorumax(hue: [f32; 3], lightness: f32, low: f32, high: f32) -> f32 {
+    if hue == [0.0; 3] {
+        return 0.0;
+    }
+    let remapped_lightness = (lightness - low) / (high - low);
+    let mut source_limit = f32::MAX;
+    let mut target_limit = f32::MAX;
+    for channel in hue {
+        if channel > f32::EPSILON {
+            source_limit = source_limit.min(((1.0 - lightness) / channel).abs());
+            target_limit = target_limit.min(((1.0 - remapped_lightness) / channel).abs());
+        } else if channel < -f32::EPSILON {
+            source_limit = source_limit.min((lightness / channel).abs());
+            target_limit = target_limit.min((remapped_lightness / channel).abs());
+        }
+    }
+    source_limit.min((high - low).abs() * target_limit)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dark_mode_maps_page_and_ink_to_configured_colors() {
+        assert_eq!(recolor(0, 0, 0, DARK_MODE), DARK_MODE.ink);
+        assert_eq!(recolor(255, 255, 255, DARK_MODE), DARK_MODE.paper);
+        assert_eq!(GREY_LUT[0], DARK_MODE.ink);
+        assert_eq!(GREY_LUT[255], DARK_MODE.paper);
+    }
+
+    #[test]
+    fn dark_mode_grey_lut_matches_recolor() {
+        for value in 0..=255_u8 {
+            assert_eq!(
+                GREY_LUT[value as usize],
+                recolor(value, value, value, DARK_MODE)
+            );
+        }
+    }
 
     // Cold (open+repair) vs warm (render) cost, plus a PPM dump to eyeball correctness. Needs a file:
     //   PDF_PATH=/abs/scan.pdf SCALE=0.25 cargo test --release \

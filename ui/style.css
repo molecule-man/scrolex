@@ -2,6 +2,10 @@
 	background-color: #999;
 }
 
+#main.dark-mode row {
+	background-color: #242424;
+}
+
 #main row,
 #main row * {
 	outline: none;

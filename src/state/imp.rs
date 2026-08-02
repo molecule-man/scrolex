@@ -82,9 +82,9 @@ pub struct State {
     pub(crate) render_epoch: Cell<u64>,
     // this window's id in the render pool's wanted-range filter, so windows don't filter each other
     pub(crate) render_client_id: Cell<u64>,
-    // bumped when this window loads/reloads a document; a render captures it at schedule and drops
-    // out on completion if it changed (catches same-path reload, where the uri is unchanged).
-    // Per-State so one window's load never invalidates another's in-flight renders.
+    // Bumped when the document or its rendering mode changes; a render captures it at schedule and
+    // drops out on completion if it changed. Per-State so one window never invalidates another's
+    // in-flight renders.
     pub(crate) doc_epoch: Cell<u64>,
 
     // global render-thread count (user setting) and how many pages fully fit across the viewport;

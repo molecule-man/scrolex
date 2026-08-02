@@ -307,7 +307,7 @@ impl WidgetImpl for Page {
             let obj = self.obj();
             let (w, h) = (obj.width() as f32, obj.height() as f32);
             if w > 0.0 && h > 0.0 {
-                snapshot.append_color(&white(), &graphene::Rect::new(0.0, 0.0, w, h));
+                snapshot.append_color(&page_background(), &graphene::Rect::new(0.0, 0.0, w, h));
             }
             self.note_paint(page.index, Paint::Blank);
             return;
@@ -697,7 +697,7 @@ impl Page {
                 );
             }
             None => {
-                append_white(snapshot, &bbox, scale);
+                append_page_background(snapshot, &bbox, scale);
                 self.note_paint(page.index, Paint::Blank);
             }
         }
@@ -986,7 +986,7 @@ impl Page {
         if missing.is_empty() {
             // The cached render node can briefly outlive its viewport regions while GTK collects a
             // queued redraw. A solid page node keeps uncovered edges opaque until that redraw.
-            append_white(snapshot, bbox, scale);
+            append_page_background(snapshot, bbox, scale);
         } else if let Some(texture) = fallback {
             self.append_scaled_page_texture(snapshot, texture, page, bbox, scale);
         } else {
@@ -1479,15 +1479,21 @@ impl Page {
     }
 }
 
-fn white() -> RGBA {
-    RGBA::new(1.0, 1.0, 1.0, 1.0)
+fn page_background() -> RGBA {
+    let paper = crate::mupdf_render::page_background_rgb();
+    RGBA::new(
+        f32::from(paper[0]) / 255.0,
+        f32::from(paper[1]) / 255.0,
+        f32::from(paper[2]) / 255.0,
+        1.0,
+    )
 }
 
 // Fallback when a page can't be rendered.
-fn append_white(snapshot: &gtk::Snapshot, bbox: &Rectangle, scale: f64) {
+fn append_page_background(snapshot: &gtk::Snapshot, bbox: &Rectangle, scale: f64) {
     let (w, h) = bbox.size();
     snapshot.append_color(
-        &white(),
+        &page_background(),
         &graphene::Rect::new(0.0, 0.0, (w * scale) as f32, (h * scale) as f32),
     );
 }
@@ -1574,9 +1580,11 @@ fn adapt_preview_scale(cur_scale: f64, render_ms: u128, bytes: usize) -> f64 {
 
 // Cairo node because it draws text; rare enough to stay off the scroll hot path.
 fn append_loading_placeholder(snapshot: &gtk::Snapshot, width: f64, height: f64) {
+    let paper = crate::mupdf_render::page_background_rgb().map(|v| f64::from(v) / 255.0);
+    let text = crate::mupdf_render::loading_text_rgb().map(|v| f64::from(v) / 255.0);
     let cr = snapshot.append_cairo(&graphene::Rect::new(0.0, 0.0, width as f32, height as f32));
     cr.rectangle(0.0, 0.0, width, height);
-    cr.set_source_rgb(1.0, 1.0, 1.0);
+    cr.set_source_rgb(paper[0], paper[1], paper[2]);
     cr.fill().expect("Failed to fill");
 
     let label = "Loading …";
@@ -1587,7 +1595,7 @@ fn append_loading_placeholder(snapshot: &gtk::Snapshot, width: f64, height: f64)
         let x = (width - extents.width()) / 2.0 - extents.x_bearing();
         let y = (height - extents.height()) / 2.0 - extents.y_bearing();
         cr.move_to(x, y);
-        cr.set_source_rgb(0.6, 0.6, 0.6);
+        cr.set_source_rgb(text[0], text[1], text[2]);
         let _ = cr.show_text(label);
     }
 }
@@ -1666,7 +1674,7 @@ fn request_render(
         },
         None => {
             log::warn!("mupdf render failed for page {page_num}; showing blank");
-            white_rendered_page(page_pt, scale, device_scale_factor, render_ms)
+            blank_rendered_page(page_pt, scale, device_scale_factor, render_ms)
         }
     };
     // ignore send failure: the receiver is gone if the page's widget was
@@ -1755,7 +1763,7 @@ fn request_region_render(
                 .map(|(region, pixels)| RenderedRegion {
                     x: region.x0,
                     y: region.y0,
-                    pixels: white_rendered_region(pixels, render_ms),
+                    pixels: blank_rendered_region(pixels, render_ms),
                 })
                 .collect()
         }
@@ -1763,7 +1771,7 @@ fn request_region_render(
     let _ = resp_sender.send(rendered);
 }
 
-fn white_rendered_region(
+fn blank_rendered_region(
     region: crate::mupdf_render::PixelRect,
     render_ms: u128,
 ) -> RenderedPixels {
@@ -1773,7 +1781,7 @@ fn white_rendered_region(
         .stride_for_width(width as u32)
         .expect("stride");
     RenderedPixels {
-        data: vec![0xffu8; (stride * height) as usize].into_boxed_slice(),
+        data: solid_page_data(stride, height, crate::mupdf_render::page_background_rgb()),
         width,
         height,
         stride,
@@ -1781,9 +1789,9 @@ fn white_rendered_region(
     }
 }
 
-// Blank white page for a failed render: dimensions and stride match a real render at this scale, so
+// Blank page for a failed render: dimensions and stride match a real render at this scale, so
 // the render cache's dimension check passes instead of looping on the miss.
-fn white_rendered_page(
+fn blank_rendered_page(
     page_pt: Option<(f64, f64)>,
     scale: f64,
     dsf: f64,
@@ -1795,8 +1803,7 @@ fn white_rendered_page(
     let stride = gtk::cairo::Format::Rgb24
         .stride_for_width(width as u32)
         .expect("stride");
-    // Rgb24 with every byte 0xff is white (BGRx: B=G=R=255).
-    let data = vec![0xffu8; (stride * height) as usize].into_boxed_slice();
+    let data = solid_page_data(stride, height, crate::mupdf_render::page_background_rgb());
     RenderedPixels {
         data,
         width,
@@ -1806,8 +1813,16 @@ fn white_rendered_page(
     }
 }
 
-// Apply the shared completion lifecycle before a renderer-specific cache insertion. A document
-// switch already cleared these slots, so it must not mutate the current document's entries. A
+fn solid_page_data(stride: i32, height: i32, color: [u8; 3]) -> Box<[u8]> {
+    let mut data = vec![0xffu8; (stride * height) as usize];
+    for pixel in data.chunks_exact_mut(4) {
+        pixel[..3].copy_from_slice(&[color[2], color[1], color[0]]);
+    }
+    data.into_boxed_slice()
+}
+
+// Apply the shared completion lifecycle before a renderer-specific cache insertion. A document or
+// rendering-mode switch already cleared these slots, so it must not mutate the current entries. A
 // stale zoom or dropped queue request releases its own slot and redraws only a widget still bound to
 // this page, allowing it to request the current viewport and scale.
 fn accept_render<T, E>(
@@ -2196,6 +2211,18 @@ startxref
                 pair[1],
             );
         }
+    }
+
+    #[test]
+    fn failed_render_buffer_uses_page_color_in_bgrx_order() {
+        let data = solid_page_data(8, 2, [0x12, 0x34, 0x56]);
+        assert_eq!(
+            data.as_ref(),
+            [
+                0x56, 0x34, 0x12, 0xff, 0x56, 0x34, 0x12, 0xff, 0x56, 0x34, 0x12, 0xff, 0x56, 0x34,
+                0x12, 0xff,
+            ]
+        );
     }
 
     // The crop math is pure geometry over a content box (whatever backend produced it), so it's
