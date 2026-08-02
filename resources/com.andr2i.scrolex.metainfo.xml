@@ -85,6 +85,15 @@
     </screenshot>
   </screenshots>
   <releases>
+    <release version="0.9.0" date="2026-08-02">
+      <url>https://github.com/molecule-man/scrolex/releases/tag/0.9.0</url>
+      <description>
+        <ul>
+          <li>Add dark mode</li>
+          <li>Add "What's new" popup</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.8.1" date="2026-08-01">
       <url>https://github.com/molecule-man/scrolex/releases/tag/0.8.1</url>
       <description>
