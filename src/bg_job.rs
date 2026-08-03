@@ -7,10 +7,8 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
 // Priority of a queued job. Visible (on-screen full renders) outrank the low-res previews: the
-// current page's own blur (VisiblePreview) still comes first so a stand-in appears in ~40ms, but
-// the look-ahead previews yield to the sharp renders of pages on screen. Prefetch (full render of
-// the next pages in the scroll direction) is nice-to-have and runs last, only once everything on
-// screen is done.
+// current page's own blur (VisiblePreview) still comes first. Full pages ahead run before distant
+// previews, so nearby pages stay sharp during fast input.
 #[derive(Clone, Copy)]
 pub(crate) enum RenderPriority {
     VisiblePreview,
@@ -135,13 +133,13 @@ impl RenderQueue {
                 return Some(req);
             }
         }
-        if let Some(req) = self.preview.pop() {
-            return Some(req);
-        }
         while let Some(req) = self.prefetch.pop() {
             if self.in_wanted(req.client, req.page) {
                 return Some(req);
             }
+        }
+        if let Some(req) = self.preview.pop() {
+            return Some(req);
         }
         None
     }
@@ -337,10 +335,10 @@ mod tests {
         q.push(RenderPriority::Visible, req("v2"));
         q.push(RenderPriority::VisiblePreview, req("vp2"));
 
-        // visible preview, visible full, look-ahead preview, prefetch; newest first
+        // Visible work comes first. Full nearby pages precede distant previews.
         assert_eq!(
             drain(&mut q),
-            vec!["vp2", "vp1", "v2", "v1", "pv2", "pv1", "pf2", "pf1"]
+            vec!["vp2", "vp1", "v2", "v1", "pf2", "pf1", "pv2", "pv1"]
         );
     }
 

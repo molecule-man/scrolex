@@ -24,6 +24,12 @@ pub struct State {
     #[property(get, set)]
     crop: Cell<bool>,
 
+    // Zoom that the reader selected.
+    pub(crate) manual_zoom: Cell<f64>,
+
+    // Tallest paper height in points.
+    pub(crate) tallest_page_height: Cell<f64>,
+
     #[property(get, set)]
     animate_scroll: Cell<bool>,
 

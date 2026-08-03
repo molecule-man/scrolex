@@ -49,6 +49,11 @@ impl Default for Config {
 }
 
 fn config_file_path() -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Some(path) = test_config_path() {
+        return Some(path);
+    }
+
     let mut path = env::var("XDG_CONFIG_HOME")
         .or_else(|_| env::var("HOME").map(|home| format!("{home}/.config")))
         .map(PathBuf::from)
@@ -56,6 +61,39 @@ fn config_file_path() -> Option<PathBuf> {
     path.push("scrolex");
     path.push("config.ini");
     Some(path)
+}
+
+// Tests build windows that read these settings. Redirect the file per test: one test's setting must
+// not reach another test's window, nor the reader's own config.
+#[cfg(test)]
+struct ScratchConfig {
+    dir: tempfile::TempDir,
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_CONFIG: std::cell::RefCell<Option<ScratchConfig>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn test_config_path() -> Option<PathBuf> {
+    TEST_CONFIG.with(|config| {
+        config
+            .borrow()
+            .as_ref()
+            .map(|config| config.dir.path().join("config.ini"))
+    })
+}
+
+// Point this thread's settings at an empty file.
+#[cfg(test)]
+pub(crate) fn use_scratch_config() {
+    let dir = tempfile::Builder::new()
+        .prefix("scrolex-test-config-")
+        .tempdir()
+        .expect("scratch config dir");
+    TEST_CONFIG.with(|slot| *slot.borrow_mut() = Some(ScratchConfig { dir }));
 }
 
 // Upper bound on render threads: reserve one core for the UI thread, since uninterruptible MuPDF
@@ -180,6 +218,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn replacing_scratch_config_removes_the_previous_directory() {
+        use_scratch_config();
+        let path = config_file_path().unwrap();
+        save_config(&Config::default()).unwrap();
+        let dir = path.parent().unwrap().to_path_buf();
+
+        use_scratch_config();
+
+        assert!(!dir.exists());
+    }
+
+    #[test]
     fn cache_budget_scales_with_memory_within_the_setting_range() {
         assert_eq!(cache_budget_for_memory(256), MIN_RENDER_CACHE_MB); // floor
         assert_eq!(cache_budget_for_memory(1024), 64);
@@ -189,8 +239,7 @@ mod tests {
 
     #[test]
     fn round_trips_and_clamps_to_max() {
-        let dir = env::temp_dir().join(format!("scrolex-cfg-test-{}", std::process::id()));
-        env::set_var("XDG_CONFIG_HOME", &dir);
+        use_scratch_config();
 
         save_config(&Config {
             render_threads: 1,
@@ -233,7 +282,5 @@ mod tests {
         assert!(!loaded.dark_mode);
         assert!(loaded.dismissed_notice.is_none());
         assert!(loaded.geometry.is_none());
-
-        fs::remove_dir_all(&dir).ok();
     }
 }

@@ -117,6 +117,8 @@ pub struct Window {
     #[template_child]
     pub btn_crop: TemplateChild<ToggleButton>,
     #[template_child]
+    pub btn_fit_height: TemplateChild<ToggleButton>,
+    #[template_child]
     pub btn_animate_scroll: TemplateChild<ToggleButton>,
     #[template_child]
     pub spin_threads: TemplateChild<gtk::SpinButton>,
@@ -183,8 +185,7 @@ pub struct Window {
     // set when the current scroll sequence must not coast on: mouse wheel, pinch, ctrl+scroll zoom
     kinetic_blocked: Cell<bool>,
 
-    // last horizontal scroll position, to derive travel direction (prefetch reads toward it) from
-    // any scroll path - free-scroll included, not just page steps
+    // Previous horizontal scroll position for diagnostics.
     last_hadj: Cell<f64>,
 
     // the position set_hscroll asked for last, and which input asked for it. If the position ends up
@@ -220,6 +221,12 @@ pub struct Window {
 
     // true when the next allocation must restore zoom_anchor
     zoom_anchor_pending: Cell<bool>,
+
+    // An idle fit request exists.
+    fit_pending: Cell<bool>,
+
+    // Vertical list-row padding in logical pixels.
+    fit_chrome_height: Cell<Option<f64>>,
 }
 
 // A document point held still across a zoom: which page, where in it (page points from its
@@ -271,6 +278,7 @@ impl ObjectImpl for Window {
         let cfg = crate::config::load_config();
         self.state.set_preview_cache_pages(cfg.preview_cache_pages);
         self.setup_animate_scroll();
+        self.setup_fit_height();
         self.setup_text_selection();
         self.setup_search();
         self.setup_toc();
@@ -314,6 +322,12 @@ impl Window {
                 obj.imp().goto_page(page_num as u32);
             }),
         );
+
+        page.connect_map(clone!(
+            #[weak(rename_to = imp)]
+            self,
+            move |page| imp.cache_fit_chrome_height(page)
+        ));
 
         list_item.set_child(Some(page));
     }
@@ -402,6 +416,7 @@ impl Window {
                 let sliding = self.scroll_anim.borrow().is_some();
                 if !sliding {
                     let hadj = self.scrolledwindow.hadjustment();
+                    self.set_scroll_direction_from_delta(dx);
                     self.set_hscroll(self.clamp_scroll(hadj.value() + dx), "touchpad");
                 }
                 log::trace!(
@@ -600,7 +615,9 @@ impl Window {
         };
         if let Some((prev_x, prev_y)) = *self.drag_coords.borrow() {
             let hadjustment = self.scrolledwindow.hadjustment();
-            self.set_hscroll(hadjustment.value() - (x - prev_x), "drag");
+            let delta = prev_x - x;
+            self.set_scroll_direction_from_delta(delta);
+            self.set_hscroll(hadjustment.value() + delta, "drag");
             let vadjustment = self.vscrolledwindow.vadjustment();
             vadjustment.set_value(vadjustment.value() - (y - prev_y));
         }
@@ -622,8 +639,14 @@ impl Window {
         }
     }
 
-    // Every zoom goes through here. A zoom relayouts the pages, so a coast has to stop first.
+    // Manual zoom turns fit off.
     fn zoom_to(&self, zoom: f64) {
+        self.apply_zoom(zoom);
+        self.btn_fit_height.set_active(false);
+    }
+
+    // A zoom relayouts the pages, so a coast has to stop first.
+    fn apply_zoom(&self, zoom: f64) {
         self.cancel_coast();
         self.state.zoom_to(zoom);
     }
@@ -653,6 +676,76 @@ impl Window {
         self.zoom_centered(1.0);
     }
 
+    // Defer the fit until the current layout ends.
+    fn queue_fit_height(&self) {
+        if !self.btn_fit_height.is_active() || self.fit_pending.replace(true) {
+            return;
+        }
+
+        glib::idle_add_local_once(clone!(
+            #[weak(rename_to = imp)]
+            self,
+            move || {
+                imp.fit_pending.set(false);
+                imp.fit_height();
+            }
+        ));
+    }
+
+    // Fit the tallest paper to the viewport.
+    fn fit_height(&self) {
+        if !self.btn_fit_height.is_active() {
+            return;
+        }
+        let Some(zoom) = self.fit_height_zoom() else {
+            return;
+        };
+
+        let vadj = self.vscrolledwindow.vadjustment();
+        log::debug!(
+            target: "scrolex::fit",
+            "fit: page={} tallest_pt={:.1} viewport={:.1} content={:.1} zoom {:.4} -> {zoom:.4}",
+            self.state.page(),
+            self.state.tallest_page_height(),
+            vadj.page_size(),
+            vadj.upper(),
+            self.state.zoom(),
+        );
+
+        // Hold the page's own top-left, not the viewport centre. The reader reads one page, and a
+        // sideways slide reads as a jump off it.
+        let anchor = self
+            .mapped_page(self.state.page() as i32)
+            .and_then(|page| self.page_origin(&page))
+            .unwrap_or_else(|| self.viewport_center());
+        self.apply_fit_zoom_at(zoom, anchor);
+    }
+
+    // One paper scale keeps the text size stable across pages.
+    // Crop heights cost 13 ms per page, so this calculation excludes them.
+    fn fit_height_zoom(&self) -> Option<f64> {
+        let viewport = self.vscrolledwindow.vadjustment().page_size()
+            - self.fit_chrome_height.get()?
+            - f64::from(self.scrolledwindow.hscrollbar().height());
+        let tallest = self.state.tallest_page_height();
+
+        (viewport > 0.0 && tallest > 0.0).then(|| viewport / tallest)
+    }
+
+    fn cache_fit_chrome_height(&self, page: &page::Page) {
+        if self.fit_chrome_height.get().is_some() {
+            return;
+        }
+        let Some(row) = page.parent() else {
+            return;
+        };
+
+        let natural = |widget: &gtk::Widget| widget.measure(gtk::Orientation::Vertical, -1).1;
+        let height = f64::from((natural(&row) - natural(page.upcast_ref())).max(0));
+        self.fit_chrome_height.set(Some(height));
+        self.queue_fit_height();
+    }
+
     fn viewport_center(&self) -> (f64, f64) {
         (
             f64::from(self.vscrolledwindow.width()) / 2.0,
@@ -660,13 +753,29 @@ impl Window {
         )
     }
 
+    // Manual zoom about `screen` turns fit off.
     fn zoom_at(&self, zoom: f64, screen: (f64, f64)) {
+        self.apply_zoom_at(zoom, screen);
+        self.btn_fit_height.set_active(false);
+    }
+
+    // Zoom about `screen` and hold the document point there still. The zoom mode does not change.
+    fn apply_zoom_at(&self, zoom: f64, screen: (f64, f64)) {
+        self.apply_zoom_at_with(zoom, screen, |state, zoom| state.zoom_to(zoom));
+    }
+
+    fn apply_fit_zoom_at(&self, zoom: f64, screen: (f64, f64)) {
+        self.apply_zoom_at_with(zoom, screen, |state, zoom| state.fit_zoom_to(zoom));
+    }
+
+    fn apply_zoom_at_with(&self, zoom: f64, screen: (f64, f64), apply: impl FnOnce(&State, f64)) {
         if self.zoom_anchor.get().is_none() {
             self.zoom_anchor.set(self.capture_zoom_anchor(screen));
         }
 
         let before = self.state.zoom();
-        self.zoom_to(zoom);
+        self.cancel_coast();
+        apply(&self.state, zoom);
         if self.state.zoom() == before {
             if !self.zoom_gesturing.get() {
                 self.zoom_anchor.set(None);
@@ -903,6 +1012,7 @@ impl Window {
                     hadj.page_size() * 0.1
                 };
                 let delta = if keyval == Key::Left { -step } else { step };
+                self.set_scroll_direction_from_delta(delta);
                 self.set_hscroll(hadj.value() + delta, "arrow-key");
             }
             Key::Up | Key::Down | Key::k | Key::j => {
@@ -1242,6 +1352,12 @@ impl Window {
         self.scrolledwindow.hadjustment().set_value(value);
     }
 
+    fn set_scroll_direction_from_delta(&self, delta: f64) {
+        if delta.abs() > f64::EPSILON {
+            self.state.set_scroll_forward(delta > 0.0);
+        }
+    }
+
     // Note that GtkListView is about to move us (scroll_to, or showing a page that was just
     // selected). We cannot work out where it will stop, so store "unknown" and let the log print
     // off=NaN instead of saying nobody asked for the move.
@@ -1534,6 +1650,9 @@ impl Window {
             glib::ControlFlow::Break
         });
 
+        // The loaded document has its own paper height.
+        self.queue_fit_height();
+
         // move keyboard focus off the header entry so h/l/arrows work
         self.scrolledwindow.grab_focus();
     }
@@ -1577,16 +1696,12 @@ impl Window {
         });
 
         let hadj = self.scrolledwindow.hadjustment();
-        // value-changed: the position moved (any scroll path). Track travel direction for prefetch,
-        // refresh the wanted range, sync the selection.
+        // Refresh the wanted range and sync the selection after each position change.
         hadj.connect_value_changed(clone!(
             #[weak(rename_to = imp)]
             self,
             move |adj| {
                 let prev = imp.last_hadj.replace(adj.value());
-                if (adj.value() - prev).abs() > f64::EPSILON {
-                    imp.state.set_scroll_forward(adj.value() > prev);
-                }
                 // `shift` is the one number that shows a real problem: how far the selected page moved
                 // on screen. REVERSED means it moved back while the reader was going forward.
                 // `off` is how far the position ended up from what `cause` asked for, and UNASKED
@@ -1778,6 +1893,32 @@ impl Window {
             });
     }
 
+    fn setup_fit_height(&self) {
+        self.btn_fit_height.connect_toggled(clone!(
+            #[weak(rename_to = imp)]
+            self,
+            move |button| {
+                if button.is_active() {
+                    imp.queue_fit_height();
+                } else if imp.state.zoom() != imp.state.manual_zoom() {
+                    let anchor = imp
+                        .mapped_page(imp.state.page() as i32)
+                        .and_then(|page| imp.page_origin(&page))
+                        .unwrap_or_else(|| imp.viewport_center());
+                    imp.apply_zoom_at(imp.state.manual_zoom(), anchor);
+                }
+            }
+        ));
+
+        self.vscrolledwindow
+            .vadjustment()
+            .connect_page_size_notify(clone!(
+                #[weak(rename_to = imp)]
+                self,
+                move |_| imp.queue_fit_height()
+            ));
+    }
+
     fn setup_text_selection(&self) {
         // The window is what can reach the page widgets.
         self.state.connect_closure(
@@ -1888,6 +2029,7 @@ impl Window {
 
         if let Some(index) = center {
             if index >= 0 && (index as u32) < n_items {
+                self.state.set_scroll_forward(index > selected);
                 log::debug!(
                     target: "scrolex::pan",
                     "viewport sync: selection {selected} -> {index}",
@@ -2731,17 +2873,42 @@ mod widget_tests {
     use std::time::{Duration, Instant};
 
     fn window() -> crate::window::Window {
+        // before the window: it reads the settings while it builds
+        crate::config::use_scratch_config();
+        crate::state::use_scratch_state_dir();
         gtk::gio::resources_register_include!("scrolex-ui.gresource").expect("ui resources");
         crate::state::State::static_type();
         crate::page::PageNumber::static_type();
         crate::page::Page::static_type();
+        load_css();
 
-        gtk::glib::Object::new()
+        let window: crate::window::Window = gtk::glib::Object::new();
+        // the stylesheet keys off this name, as in main
+        window.set_widget_name("main");
+        window.set_default_size(TEST_WINDOW.0, TEST_WINDOW.1);
+        window
+    }
+
+    // Size every test window shares.
+    const TEST_WINDOW: (i32, i32) = (900, 700);
+
+    // The app's own stylesheet, so the tests measure the widgets the reader gets.
+    fn load_css() {
+        static LOADED: std::sync::Once = std::sync::Once::new();
+        LOADED.call_once(|| {
+            let provider = gtk::CssProvider::new();
+            provider.load_from_string(include_str!("../../ui/style.css"));
+            gtk::style_context_add_provider_for_display(
+                &gtk::gdk::Display::default().expect("display"),
+                &provider,
+                gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+            );
+        });
     }
 
     fn wait_until(mut ready: impl FnMut() -> bool) {
         let context = gtk::glib::MainContext::default();
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(10);
         while !ready() {
             assert!(Instant::now() < deadline, "timed out waiting for GTK");
             context.iteration(false);
@@ -2844,6 +3011,21 @@ mod widget_tests {
         assert!((imp.rebase_target(&anim, 50_000.0) - 50_677.0).abs() < f64::EPSILON);
         // the list view moved us back 4631px; so does the target
         assert!((imp.rebase_target(&anim, 45_369.0) - 46_046.0).abs() < f64::EPSILON);
+    }
+
+    #[gtk::test]
+    fn a_coordinate_rewrite_does_not_reverse_prefetch() {
+        let window = window();
+        let imp = window.imp();
+        let hadj = imp.scrolledwindow.hadjustment();
+        hadj.configure(500.0, 0.0, 2000.0, 10.0, 100.0, 500.0);
+        imp.state.set_scroll_forward(true);
+
+        hadj.set_value(400.0);
+
+        assert!(imp.state.scroll_forward());
+        imp.set_scroll_direction_from_delta(-1.0);
+        assert!(!imp.state.scroll_forward());
     }
 
     // Wheeling mid-slide retargets the running slide, and starts from where it was already heading.
@@ -2990,6 +3172,225 @@ mod widget_tests {
         wait_until(|| window.imp().selection.n_items() == 3);
 
         window
+    }
+
+    // Three pages of different heights, to show which one the fit measures.
+    const MIXED_HEIGHTS_PDF: &[u8] = b"%PDF-1.4\n\
+1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n\
+2 0 obj\n<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 3 >>\nendobj\n\
+3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] >>\nendobj\n\
+4 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 2000 3000] >>\nendobj\n\
+5 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 400] >>\nendobj\n\
+trailer\n<< /Root 1 0 R >>\n%%EOF";
+
+    fn mixed_heights_document() -> gtk::gio::File {
+        let dir = std::env::temp_dir().join("scrolex_fit_height_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mixed_heights.pdf");
+        std::fs::write(&path, MIXED_HEIGHTS_PDF).unwrap();
+
+        gtk::gio::File::for_path(path)
+    }
+
+    // Height the list asks for to show the page in view, the row's own padding included. Measured,
+    // not allocated: Xvfb has no window manager, so the window re-lays out only when it resizes.
+    fn asked_height(imp: &super::Window) -> f64 {
+        let row = imp
+            .mapped_page(imp.state.page() as i32)
+            .and_then(|page| page.parent())
+            .expect("a page in view");
+
+        f64::from(row.measure(gtk::Orientation::Vertical, -1).1)
+    }
+
+    // Nothing to pan to: the page in view asks for no more than the viewport holds.
+    fn assert_nothing_to_pan(imp: &super::Window) {
+        let (asked, viewport) = (
+            asked_height(imp) + f64::from(imp.scrolledwindow.hscrollbar().height()),
+            imp.vscrolledwindow.vadjustment().page_size(),
+        );
+
+        assert!(
+            asked <= viewport + 1.0,
+            "the list asks for {asked}px, and the viewport holds {viewport}px, so the view pans",
+        );
+    }
+
+    // The page in view is as tall as the viewport, to the pixel.
+    fn assert_fills_the_viewport(imp: &super::Window) {
+        let (asked, viewport) = (
+            asked_height(imp) + f64::from(imp.scrolledwindow.hscrollbar().height()),
+            imp.vscrolledwindow.vadjustment().page_size(),
+        );
+
+        assert!(
+            (asked - viewport).abs() <= 1.0,
+            "the list asks for {asked}px, and the viewport holds {viewport}px",
+        );
+    }
+
+    // The reader has nothing left to pan to: the page is exactly as tall as the viewport. The list
+    // pads its rows, and the fit must leave that padding out.
+    #[gtk::test]
+    fn a_fitted_page_fills_the_viewport_exactly() {
+        let window = loaded_window();
+        let imp = window.imp();
+
+        imp.btn_fit_height.set_active(true);
+        wait_until(|| !imp.fit_pending.get());
+
+        assert_fills_the_viewport(imp);
+        window.close();
+    }
+
+    #[gtk::test]
+    fn fit_keeps_cached_chrome_without_a_mapped_selected_page() {
+        let window = loaded_window();
+        let imp = window.imp();
+        imp.btn_fit_height.set_active(true);
+        wait_until(|| !imp.fit_pending.get());
+        let zoom = imp.state.zoom();
+
+        imp.state.set_page(imp.state.n_pages() as u32 + 1);
+        imp.queue_fit_height();
+        wait_until(|| !imp.fit_pending.get());
+
+        assert_eq!(imp.state.zoom(), zoom);
+        window.close();
+    }
+
+    #[gtk::test]
+    fn turning_fit_off_restores_the_manual_zoom() {
+        let window = loaded_window();
+        let imp = window.imp();
+        imp.state.zoom_to(2.0);
+
+        imp.btn_fit_height.set_active(true);
+        wait_until(|| !imp.fit_pending.get());
+        assert_ne!(imp.state.zoom(), 2.0);
+
+        imp.btn_fit_height.set_active(false);
+
+        assert_eq!(imp.state.zoom(), 2.0);
+        window.close();
+    }
+
+    // Crop boxes are per-page: a sparse page gets a small one. A fit to them re-zooms on every page
+    // turn, and a neighbour with a taller box runs past the viewport.
+    #[gtk::test]
+    fn cropping_does_not_move_the_fit() {
+        let window = loaded_window();
+        let imp = window.imp();
+
+        imp.btn_fit_height.set_active(true);
+        wait_until(|| !imp.fit_pending.get());
+        let zoom = imp.state.zoom();
+
+        imp.state.set_crop(true);
+
+        assert_eq!(imp.state.zoom(), zoom);
+        assert!(imp.btn_fit_height.is_active(), "the mode stays on");
+        assert_nothing_to_pan(imp);
+        window.close();
+    }
+
+    // The viewport height is one side of the fit, so a resize must re-zoom. Xvfb has no window
+    // manager to resize the window, so the test writes the viewport that a resize leaves behind.
+    #[gtk::test]
+    fn a_shorter_viewport_queues_a_re_fit() {
+        let window = loaded_window();
+        let imp = window.imp();
+
+        imp.btn_fit_height.set_active(true);
+        wait_until(|| !imp.fit_pending.get());
+
+        let vadj = imp.vscrolledwindow.vadjustment();
+        vadj.configure(
+            vadj.value(),
+            0.0,
+            2000.0,
+            10.0,
+            100.0,
+            vadj.page_size() / 2.0,
+        );
+
+        assert!(imp.fit_pending.get());
+        window.close();
+    }
+
+    // The zoom the reader dials in replaces the fit, so the mode turns itself off.
+    #[gtk::test]
+    fn a_zoom_of_the_readers_own_ends_fit_height() {
+        let window = loaded_window();
+        let imp = window.imp();
+
+        let zooms: [&dyn Fn(); 4] = [
+            &|| imp.zoom_in(),
+            &|| imp.zoom_out(),
+            &|| imp.reset_zoom(),
+            &|| imp.handle_zoom_entry(&imp.entry_zoom.get()),
+        ];
+        for zoom in zooms {
+            imp.btn_fit_height.set_active(true);
+            wait_until(|| !imp.fit_pending.get());
+            imp.entry_zoom.set_text("42");
+
+            zoom();
+
+            assert!(!imp.btn_fit_height.is_active());
+            assert_eq!(imp.state.manual_zoom(), imp.state.zoom());
+        }
+        window.close();
+    }
+
+    #[gtk::test]
+    fn manual_zoom_from_fit_keeps_its_anchor() {
+        let window = loaded_window();
+        let imp = window.imp();
+        imp.state.zoom_to(2.0);
+        imp.btn_fit_height.set_active(true);
+        wait_until(|| !imp.fit_pending.get());
+        imp.zoom_anchor.set(None);
+
+        imp.zoom_in();
+
+        assert!(imp.zoom_anchor.get().is_some());
+        assert!(imp.zoom_anchor_pending.get());
+        window.close();
+    }
+
+    // Pages of different heights: one zoom for the document, set by the tallest page. The page in
+    // view does not move it, so the text keeps its size from page to page.
+    #[gtk::test]
+    fn the_tallest_page_sets_the_fit_for_every_page() {
+        let window = window();
+        window.present();
+        let imp = window.imp();
+        imp.btn_fit_height.set_active(true);
+
+        window.state().load(&mixed_heights_document());
+        wait_until(|| imp.selection.n_items() == 3);
+        wait_until(|| !imp.fit_pending.get() && imp.mapped_page(0).is_some());
+
+        assert_eq!(
+            imp.state.tallest_page_height(),
+            3000.0,
+            "the tallest of 200, 3000, 400"
+        );
+        let first = imp.state.zoom();
+
+        // page 2 is the tallest in the document: it fills the viewport, and the page turn to it
+        // leaves the zoom where it was
+        imp.navigate_to_page(2);
+        wait_until(|| imp.state.page() == 1 && imp.mapped_page(1).is_some());
+
+        assert!(
+            (imp.state.zoom() - first).abs() < f64::EPSILON,
+            "the page turn moved the zoom from {first} to {}",
+            imp.state.zoom(),
+        );
+        assert_fills_the_viewport(imp);
+        window.close();
     }
 
     // Issue #53: a live icon that does nothing reads as broken. Covers the binding wiring;

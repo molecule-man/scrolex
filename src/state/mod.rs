@@ -39,7 +39,7 @@ pub(crate) fn preview_cache_budget(pages: usize) -> usize {
     pages * PREVIEW_TARGET_BYTES
 }
 
-type MaxPageSize = Option<(f64, f64)>;
+type TallestPageHeight = Option<f64>;
 
 fn document_size_bytes(f: &gtk::gio::File) -> i64 {
     f.query_info(
@@ -67,12 +67,30 @@ impl State {
             .build()
     }
 
-    // Every zoom change goes through here. Setting the property directly skips the bounds.
+    // Apply and save a manual zoom.
     pub(crate) fn zoom_to(&self, zoom: f64) {
         let bounded = zoom.clamp(MIN_ZOOM, MAX_ZOOM);
-        if bounded != self.zoom() {
-            self.set_zoom(bounded);
+        self.imp().manual_zoom.set(bounded);
+        self.set_bounded_zoom(bounded);
+    }
+
+    // Apply a calculated zoom. Preserve the saved manual zoom.
+    pub(crate) fn fit_zoom_to(&self, zoom: f64) {
+        self.set_bounded_zoom(zoom.clamp(MIN_ZOOM, MAX_ZOOM));
+    }
+
+    pub(crate) fn manual_zoom(&self) -> f64 {
+        self.imp().manual_zoom.get()
+    }
+
+    fn set_bounded_zoom(&self, zoom: f64) {
+        if zoom != self.zoom() {
+            self.set_zoom(zoom);
         }
+    }
+
+    pub(crate) fn tallest_page_height(&self) -> f64 {
+        self.imp().tallest_page_height.get()
     }
 
     pub(crate) fn jump_list_add(&self, page: u32) {
@@ -105,14 +123,12 @@ impl State {
         // since nothing below the commit runs until the open succeeds. Staging fetches a remote
         // file exactly once; those bytes are the ones committed for rendering - no re-fetch.
         let (tx, rx) =
-            oneshot::channel::<Option<(crate::mupdf_render::Candidate, i32, MaxPageSize)>>();
+            oneshot::channel::<Option<(crate::mupdf_render::Candidate, i32, TallestPageHeight)>>();
         let uri_probe = uri.clone();
         std::thread::spawn(move || {
             let probed = crate::mupdf_render::stage_candidate(&uri_probe).and_then(|candidate| {
                 match candidate.probe() {
-                    Some((n_pages, max_page_size)) if n_pages > 0 => {
-                        Some((candidate, n_pages, max_page_size))
-                    }
+                    Some((n_pages, tallest)) if n_pages > 0 => Some((candidate, n_pages, tallest)),
                     _ => None,
                 }
             });
@@ -127,14 +143,14 @@ impl State {
                 if state.imp().load_seq.get() != seq {
                     return; // a newer load superseded this one
                 }
-                let Some((candidate, n_pages, max_page_size)) = probed else {
+                let Some((candidate, n_pages, tallest)) = probed else {
                     state.emit_by_name::<()>(
                         "load-failed",
                         &[&"could not open document".to_string()],
                     );
                     return;
                 };
-                state.commit_load(&uri, candidate, n_pages, max_page_size, size_bytes);
+                state.commit_load(&uri, candidate, n_pages, tallest, size_bytes);
             }
         ));
     }
@@ -144,7 +160,7 @@ impl State {
         uri: &str,
         candidate: crate::mupdf_render::Candidate,
         n_pages: i32,
-        max_page_size: MaxPageSize,
+        tallest_page_height: TallestPageHeight,
         size_bytes: i64,
     ) {
         // Committed to the new document: force every thread to reopen (the same path may have
@@ -186,6 +202,9 @@ impl State {
         self.set_prev_page(0);
         self.set_uri(uri);
         self.set_n_pages(n_pages);
+        self.imp()
+            .tallest_page_height
+            .set(tallest_page_height.unwrap_or(0.0));
         self.zoom_to(1.0);
         self.set_crop(false);
         self.set_page(0);
@@ -214,7 +233,7 @@ impl State {
         }
 
         log::info!(
-            "Loaded document: {n_pages} pages, {size_bytes} bytes, largest sampled page {max_page_size:?} pt, \
+            "Loaded document: {n_pages} pages, {size_bytes} bytes, tallest page {tallest_page_height:?} pt, \
              start page {}, zoom {}, crop {}",
             self.page(),
             self.zoom(),
@@ -238,7 +257,7 @@ impl State {
             .truncate(true)
             .open(&state_path)?;
 
-        writeln!(file, "zoom={}", self.zoom())?;
+        writeln!(file, "zoom={}", self.imp().manual_zoom.get())?;
         writeln!(file, "page={}", self.page())?;
         writeln!(file, "crop={}", self.crop())?;
 
@@ -400,7 +419,41 @@ impl Default for State {
     }
 }
 
+// Tests open documents, and an open writes the reading position. Redirect the directory per test:
+// a zoom left by one test must not come back in another, nor in the reader's own files.
+#[cfg(test)]
+struct ScratchState {
+    dir: tempfile::TempDir,
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_STATE: RefCell<Option<ScratchState>> = const { RefCell::new(None) };
+}
+
+// Point this thread's per-document state at an empty directory.
+#[cfg(test)]
+pub(crate) fn use_scratch_state_dir() {
+    let dir = tempfile::Builder::new()
+        .prefix("scrolex-test-state-")
+        .tempdir()
+        .expect("scratch state dir");
+    TEST_STATE.with(|slot| *slot.borrow_mut() = Some(ScratchState { dir }));
+}
+
 fn get_state_file_path(uri: &str) -> Result<PathBuf, env::VarError> {
+    #[cfg(test)]
+    if let Some(mut state_path) = TEST_STATE.with(|state| {
+        state
+            .borrow()
+            .as_ref()
+            .map(|state| state.dir.path().to_path_buf())
+    }) {
+        state_path.push(uri);
+        state_path.set_extension("ini");
+        return Ok(state_path);
+    }
+
     let mut state_path = env::var("XDG_STATE_HOME")
         .or_else(|_| env::var("HOME").map(|home| format!("{home}/.local/state")))
         .map(PathBuf::from)?;
@@ -417,6 +470,20 @@ mod tests {
     use super::*;
     use gtk::prelude::Cast;
 
+    #[test]
+    fn replacing_scratch_state_removes_the_previous_directory() {
+        use_scratch_state_dir();
+        let state = State::new();
+        state.set_uri("scratch.pdf");
+        state.save().unwrap();
+        let path = get_state_file_path(&state.uri()).unwrap();
+        let dir = path.parent().unwrap().to_path_buf();
+
+        use_scratch_state_dir();
+
+        assert!(!dir.exists());
+    }
+
     #[gtk::test]
     fn zoom_bounds_hold_whatever_the_document() {
         let state = State::new();
@@ -425,6 +492,21 @@ mod tests {
         assert_eq!(state.zoom(), MAX_ZOOM);
         state.zoom_to(0.0);
         assert_eq!(state.zoom(), MIN_ZOOM);
+    }
+
+    #[gtk::test]
+    fn fit_zoom_does_not_replace_the_saved_manual_zoom() {
+        use_scratch_state_dir();
+        let state = State::new();
+        state.set_uri("fit-zoom-test.pdf");
+        state.zoom_to(2.0);
+        state.fit_zoom_to(0.5);
+
+        state.save().unwrap();
+
+        let path = get_state_file_path(&state.uri()).unwrap();
+        let saved = fs::read_to_string(path).unwrap();
+        assert!(saved.lines().any(|line| line == "zoom=2"));
     }
 
     #[gtk::test]
