@@ -464,6 +464,60 @@
 		</object>
 				</property>
 				<child type="overlay">
+					<object class="GtkBox" id="empty_view">
+						<property name="halign">center</property>
+						<property name="valign">center</property>
+						<property name="orientation">vertical</property>
+						<property name="spacing">18</property>
+						<binding name="visible">
+							<closure type="gboolean" function="document_is_empty">
+								<lookup name="n_pages">state</lookup>
+							</closure>
+						</binding>
+						<child>
+							<object class="GtkImage">
+								<property name="icon-name">x-office-document-symbolic</property>
+								<property name="pixel-size">128</property>
+								<style>
+									<class name="dim-label"/>
+								</style>
+							</object>
+						</child>
+						<child>
+							<object class="GtkLabel">
+								<property name="label">Open a Document</property>
+								<style>
+									<class name="title-1"/>
+								</style>
+							</object>
+						</child>
+						<child>
+							<object class="GtkButton">
+								<signal name="clicked" handler="open_document" swapped="true"/>
+								<property name="label">Open…</property>
+								<property name="halign">center</property>
+								<property name="cursor">
+									<object class="GdkCursor">
+										<property name="name">pointer</property>
+									</object>
+								</property>
+								<style>
+									<class name="suggested-action"/>
+									<class name="pill"/>
+								</style>
+							</object>
+						</child>
+						<child>
+							<object class="GtkLabel">
+								<property name="label">… or drag a document here</property>
+								<style>
+									<class name="dim-label"/>
+								</style>
+							</object>
+						</child>
+					</object>
+				</child>
+				<child type="overlay">
 					<object class="GtkBox" id="loading_overlay">
 						<property name="visible">false</property>
 						<property name="can-target">false</property>
