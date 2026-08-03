@@ -20,6 +20,7 @@
 				<child type="title">
 					<object class="GtkBox">
 						<property name="orientation">horizontal</property>
+						<property name="spacing">6</property>
 						<child>
 							<object class="GtkButton" id="btn_jump_back">
 								<signal name="clicked" handler="jump_back" swapped="true"/>
@@ -43,7 +44,7 @@
 						</child>
 						<child>
 							<object class="GtkLabel">
-								<property name="label">Page: </property>
+								<property name="label">Page:</property>
 							</object>
 						</child>
 						<child>
