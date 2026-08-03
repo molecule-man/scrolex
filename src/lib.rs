@@ -1,3 +1,4 @@
+pub mod about;
 pub mod bg_job;
 pub mod config;
 pub mod emulate;
