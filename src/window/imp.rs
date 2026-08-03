@@ -153,6 +153,8 @@ pub struct Window {
     #[template_child]
     pub toc_list: TemplateChild<gtk::ListBox>,
     #[template_child]
+    pub empty_view: TemplateChild<gtk::Box>,
+    #[template_child]
     pub loading_overlay: TemplateChild<gtk::Box>,
     #[template_child]
     pub loading_spinner: TemplateChild<gtk::Spinner>,
@@ -2412,6 +2414,12 @@ impl Window {
 
     #[allow(clippy::unused_self)]
     #[template_callback]
+    fn document_is_empty(&self, n_pages: i32) -> bool {
+        n_pages == 0
+    }
+
+    #[allow(clippy::unused_self)]
+    #[template_callback]
     fn page_entry_text(&self, page: i32) -> String {
         format!("{}", page + 1)
     }
@@ -2914,6 +2922,18 @@ mod widget_tests {
             context.iteration(false);
             std::thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    #[gtk::test]
+    fn empty_view_follows_document_state() {
+        let window = window();
+        let imp = window.imp();
+
+        assert!(imp.empty_view.property::<bool>("visible"));
+        imp.state.set_n_pages(1);
+        assert!(!imp.empty_view.property::<bool>("visible"));
+        imp.state.set_n_pages(0);
+        assert!(imp.empty_view.property::<bool>("visible"));
     }
 
     // GTK's own kinetic scrolling is off on both scrollers, so nothing else coasts for us.
