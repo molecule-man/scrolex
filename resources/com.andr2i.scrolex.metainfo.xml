@@ -85,6 +85,21 @@
     </screenshot>
   </screenshots>
   <releases>
+    <release version="0.10.0" date="2026-08-03">
+      <url>https://github.com/molecule-man/scrolex/releases/tag/0.10.0</url>
+      <description>
+        <ul>
+          <li>Add "About Scrolex" menu</li>
+          <li>Fix uneven spacing around the page label</li>
+          <li>Make the input-apply buttons disabled. Enable once input changes</li>
+          <li>Round the zoom entry to two decimals</li>
+          <li>Introduce fit-to-height zoom option</li>
+          <li>Fix too eager switching to multithreading mode</li>
+          <li>Add empty document view</li>
+          <li>Add jump forward button</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.9.0" date="2026-08-02">
       <url>https://github.com/molecule-man/scrolex/releases/tag/0.9.0</url>
       <description>

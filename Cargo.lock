@@ -1450,7 +1450,7 @@ dependencies = [
 
 [[package]]
 name = "scrolex"
-version = "0.10.0-beta"
+version = "0.10.0"
 dependencies = [
  "criterion",
  "env_logger",
