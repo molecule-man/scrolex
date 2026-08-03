@@ -12,6 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::time::Duration;
 use std::{env, fs};
 
 use crate::page;
@@ -20,6 +21,7 @@ use crate::page;
 // this times the configured number of resident previews (config::preview_cache_pages), so the cache
 // holds about that many previews regardless of the adaptive scale.
 pub(crate) const PREVIEW_TARGET_BYTES: usize = 20 * 1024 * 1024 / 65;
+const MAX_MAIN_THREAD_RENDER_TIME: Duration = Duration::from_millis(100);
 
 // Zoom bounds. The same for every document: huge pages are the ones that need deep zoom most.
 // Render buffers are bounded by scale instead (see page::render_scale).
@@ -81,6 +83,18 @@ impl State {
 
     pub(crate) fn manual_zoom(&self) -> f64 {
         self.imp().manual_zoom.get()
+    }
+
+    pub(crate) fn record_main_thread_render(&self, elapsed: Duration) -> bool {
+        let mut recent = self.imp().slow_main_thread_renders.get();
+        recent.rotate_left(1);
+        recent[2] = elapsed > MAX_MAIN_THREAD_RENDER_TIME;
+
+        let use_workers = recent.into_iter().filter(|slow| *slow).count() >= 2;
+        self.imp()
+            .slow_main_thread_renders
+            .set(if use_workers { [false; 3] } else { recent });
+        use_workers
     }
 
     fn set_bounded_zoom(&self, zoom: f64) {
@@ -208,6 +222,7 @@ impl State {
         self.zoom_to(1.0);
         self.set_crop(false);
         self.set_page(0);
+        self.imp().slow_main_thread_renders.set([false; 3]);
         self.set_multithread_rendering(false);
 
         if state_path.exists() {
@@ -469,6 +484,34 @@ fn get_state_file_path(uri: &str) -> Result<PathBuf, env::VarError> {
 mod tests {
     use super::*;
     use gtk::prelude::Cast;
+    use std::time::Duration;
+
+    #[gtk::test]
+    fn one_slow_main_thread_render_does_not_require_workers() {
+        let state = State::new();
+
+        assert!(!state.record_main_thread_render(Duration::from_millis(101)));
+        assert!(!state.record_main_thread_render(Duration::from_millis(20)));
+        assert!(!state.record_main_thread_render(Duration::from_millis(20)));
+    }
+
+    #[gtk::test]
+    fn two_consecutive_slow_main_thread_renders_require_workers() {
+        let state = State::new();
+
+        assert!(!state.record_main_thread_render(Duration::from_millis(101)));
+        assert!(state.record_main_thread_render(Duration::from_millis(101)));
+        assert!(!state.record_main_thread_render(Duration::from_millis(101)));
+    }
+
+    #[gtk::test]
+    fn two_alternating_slow_main_thread_renders_require_workers() {
+        let state = State::new();
+
+        assert!(!state.record_main_thread_render(Duration::from_millis(101)));
+        assert!(!state.record_main_thread_render(Duration::from_millis(20)));
+        assert!(state.record_main_thread_render(Duration::from_millis(101)));
+    }
 
     #[test]
     fn replacing_scratch_state_removes_the_previous_directory() {
