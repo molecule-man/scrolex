@@ -2277,7 +2277,7 @@ impl Window {
     #[allow(clippy::unused_self)]
     #[template_callback]
     fn zoom_entry_text(&self, zoom_value: f64) -> String {
-        format!("{}", zoom_value * 100.0)
+        zoom_percent_text(zoom_value)
     }
 
     // Dims the page entry's jump icon while pressing it would scroll nowhere. Runs while the
@@ -2300,8 +2300,10 @@ impl Window {
             return false;
         };
 
-        // text and zoom round-trip through a decimal percent, so exact equality misses no-ops
-        crate::state::zoom_from_percent(percent).is_some_and(|target| (target - zoom).abs() > 1e-6)
+        // compared at the precision the entry shows, so applying what is already displayed counts as
+        // no change
+        crate::state::zoom_from_percent(percent)
+            .is_some_and(|target| zoom_percent_text(target) != zoom_percent_text(zoom))
     }
 }
 
@@ -2407,6 +2409,11 @@ fn glide_step(
 // top-left now at `origin`. A bigger value moves the content the other way, hence the minus.
 fn anchored_scroll(value: f64, origin: f64, screen: f64, offset: f64, zoom: f64) -> f64 {
     value - (screen - offset * zoom - origin)
+}
+
+// Zoom as a percent for the entry, at most two decimals so that it fully fits into entry input
+fn zoom_percent_text(zoom: f64) -> String {
+    format!("{}", (zoom * 10_000.0).round() / 100.0)
 }
 
 fn dismiss_menu(btn: &Button) {
@@ -2718,7 +2725,7 @@ mod tests {
 
 #[cfg(test)]
 mod widget_tests {
-    use super::{anchored_scroll, KINETIC_MIN_VELOCITY};
+    use super::{anchored_scroll, zoom_percent_text, KINETIC_MIN_VELOCITY};
     use gtk::prelude::*;
     use gtk::subclass::prelude::ObjectSubclassIsExt;
     use std::time::{Duration, Instant};
@@ -3092,8 +3099,38 @@ mod widget_tests {
             !imp.zoom_apply_enabled(&imp.zoom_entry_text(0.07), 0.07),
             "7% round-trips as no change"
         );
+        // the entry rounds, so what it shows for an odd zoom must still read as no change
+        let odd = 3.331_061_493_552_564;
+        assert_eq!(imp.zoom_entry_text(odd), "333.11");
+        assert!(
+            !imp.zoom_apply_enabled(&imp.zoom_entry_text(odd), odd),
+            "the rounded percent the entry shows"
+        );
+        assert!(
+            imp.zoom_apply_enabled("333.2", odd),
+            "a percent that differs at two decimals"
+        );
 
         window.close();
+    }
+
+    // Issue #51: a zoom step lands on values like 333.1061493552564 percent, which does not fit the
+    // entry.
+    #[test]
+    fn zoom_percent_text_keeps_at_most_two_decimals() {
+        assert_eq!(zoom_percent_text(3.331_061_493_552_564), "333.11");
+        assert_eq!(zoom_percent_text(1.0), "100");
+        assert_eq!(zoom_percent_text(10.0), "1000");
+        assert_eq!(zoom_percent_text(0.05), "5");
+        // 0.07 * 100 is 7.000000000000001 in binary
+        assert_eq!(zoom_percent_text(0.07), "7");
+        assert_eq!(zoom_percent_text(1.5), "150");
+        assert_eq!(zoom_percent_text(0.125), "12.5");
+        // the entry is six characters wide, and 1000 is the largest zoom
+        for zoom in [0.05, 0.07, 0.333, 1.0, 3.331_061_493_552_564, 9.9999, 10.0] {
+            let text = zoom_percent_text(zoom);
+            assert!(text.len() <= 6, "{zoom} shows as {text}");
+        }
     }
 
     #[gtk::test]
