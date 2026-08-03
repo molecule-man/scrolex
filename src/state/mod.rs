@@ -110,11 +110,42 @@ impl State {
     pub(crate) fn jump_list_add(&self, page: u32) {
         self.set_prev_page(page);
         self.imp().jump_stack.borrow_mut().push(page);
+        self.imp().forward_jump_stack.borrow_mut().reset();
+        self.set_next_page(0);
     }
 
-    pub(crate) fn jump_list_pop(&self) -> Option<u32> {
+    pub(crate) fn jump_list_back(&self, current_page: u32) -> Option<u32> {
         let page = self.imp().jump_stack.borrow_mut().pop();
+        if page.is_some() {
+            self.imp()
+                .forward_jump_stack
+                .borrow_mut()
+                .push(current_page);
+        }
         self.set_prev_page(self.imp().jump_stack.borrow().peek().unwrap_or_default());
+        self.set_next_page(
+            self.imp()
+                .forward_jump_stack
+                .borrow()
+                .peek()
+                .unwrap_or_default(),
+        );
+        page
+    }
+
+    pub(crate) fn jump_list_forward(&self, current_page: u32) -> Option<u32> {
+        let page = self.imp().forward_jump_stack.borrow_mut().pop();
+        if page.is_some() {
+            self.imp().jump_stack.borrow_mut().push(current_page);
+        }
+        self.set_prev_page(self.imp().jump_stack.borrow().peek().unwrap_or_default());
+        self.set_next_page(
+            self.imp()
+                .forward_jump_stack
+                .borrow()
+                .peek()
+                .unwrap_or_default(),
+        );
         page
     }
 
@@ -213,7 +244,9 @@ impl State {
         let state_path = get_state_file_path(uri).unwrap();
 
         self.imp().jump_stack.borrow_mut().reset();
+        self.imp().forward_jump_stack.borrow_mut().reset();
         self.set_prev_page(0);
+        self.set_next_page(0);
         self.set_uri(uri);
         self.set_n_pages(n_pages);
         self.imp()
@@ -511,6 +544,37 @@ mod tests {
         assert!(!state.record_main_thread_render(Duration::from_millis(101)));
         assert!(!state.record_main_thread_render(Duration::from_millis(20)));
         assert!(state.record_main_thread_render(Duration::from_millis(101)));
+    }
+
+    #[gtk::test]
+    fn jump_history_moves_in_both_directions() {
+        let state = State::new();
+        state.jump_list_add(1);
+        state.jump_list_add(2);
+
+        assert_eq!(state.jump_list_back(3), Some(2));
+        assert_eq!(state.prev_page(), 1);
+        assert_eq!(state.next_page(), 3);
+
+        assert_eq!(state.jump_list_back(2), Some(1));
+        assert_eq!(state.prev_page(), 0);
+        assert_eq!(state.next_page(), 2);
+
+        assert_eq!(state.jump_list_forward(1), Some(2));
+        assert_eq!(state.prev_page(), 1);
+        assert_eq!(state.next_page(), 3);
+    }
+
+    #[gtk::test]
+    fn a_page_jump_clears_forward_history() {
+        let state = State::new();
+        state.jump_list_add(1);
+        assert_eq!(state.jump_list_back(2), Some(1));
+
+        state.jump_list_add(1);
+
+        assert_eq!(state.next_page(), 0);
+        assert_eq!(state.jump_list_forward(3), None);
     }
 
     #[test]

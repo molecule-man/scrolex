@@ -127,6 +127,8 @@ pub struct Window {
     #[template_child]
     pub btn_jump_back: TemplateChild<Button>,
     #[template_child]
+    pub btn_jump_forward: TemplateChild<Button>,
+    #[template_child]
     pub scrolledwindow: TemplateChild<ScrolledWindow>,
     // outer scroller that provides the vertical axis the horizontal listview can't; pans a
     // zoomed-in page whose rendered height exceeds the viewport
@@ -1071,6 +1073,14 @@ impl Window {
         let Some(zoom) = crate::state::zoom_from_percent(percent) else {
             return;
         };
+
+        if self
+            .fit_height_zoom()
+            .is_some_and(|fit_zoom| zoom_percent_text(fit_zoom) == zoom_percent_text(zoom))
+        {
+            self.btn_fit_height.set_active(true);
+            return;
+        }
 
         self.zoom_to(zoom);
     }
@@ -2395,7 +2405,14 @@ impl Window {
 
     #[template_callback]
     fn jump_back(&self) {
-        if let Some(page) = self.state.jump_list_pop() {
+        if let Some(page) = self.state.jump_list_back(self.state.page() + 1) {
+            self.navigate_to_page(page);
+        }
+    }
+
+    #[template_callback]
+    fn jump_forward(&self) {
+        if let Some(page) = self.state.jump_list_forward(self.state.page() + 1) {
             self.navigate_to_page(page);
         }
     }
@@ -2410,6 +2427,18 @@ impl Window {
     #[template_callback]
     fn back_btn_text(&self, prev_page: u32) -> String {
         format!("Jump back to page {prev_page}")
+    }
+
+    #[allow(clippy::unused_self)]
+    #[template_callback]
+    fn can_jump_forward(&self, next_page: u32) -> bool {
+        next_page > 0
+    }
+
+    #[allow(clippy::unused_self)]
+    #[template_callback]
+    fn forward_btn_text(&self, next_page: u32) -> String {
+        format!("Jump forward to page {next_page}")
     }
 
     #[allow(clippy::unused_self)]
@@ -3367,6 +3396,28 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         imp.btn_fit_height.set_active(false);
 
         assert_eq!(imp.state.zoom(), 2.0);
+        window.close();
+    }
+
+    #[gtk::test]
+    fn entering_the_displayed_fit_zoom_restores_fit_height() {
+        let window = loaded_window();
+        let imp = window.imp();
+        imp.btn_fit_height.set_active(true);
+        wait_until(|| !imp.fit_pending.get());
+        let fit_zoom = imp.zoom_entry_text(imp.state.zoom());
+
+        imp.zoom_in();
+        assert!(!imp.btn_fit_height.is_active());
+        let manual_zoom = imp.state.manual_zoom();
+        imp.entry_zoom.set_text(&fit_zoom);
+        imp.handle_zoom_entry(&imp.entry_zoom.get());
+
+        assert!(imp.btn_fit_height.is_active());
+        wait_until(|| !imp.fit_pending.get());
+        assert_eq!(imp.state.manual_zoom(), manual_zoom);
+        imp.btn_fit_height.set_active(false);
+        assert_eq!(imp.state.zoom(), manual_zoom);
         window.close();
     }
 
