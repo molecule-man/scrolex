@@ -26,6 +26,14 @@ pub(crate) const PREVIEW_TARGET_BYTES: usize = 20 * 1024 * 1024 / 65;
 const MAX_ZOOM: f64 = 10.0;
 const MIN_ZOOM: f64 = 0.05;
 
+// The zoom a typed percent asks for. None below MIN_ZOOM: too small is a typo, so keep the current
+// zoom instead of clamping up to it.
+pub(crate) fn zoom_from_percent(percent: f64) -> Option<f64> {
+    let zoom = percent / 100.0;
+
+    (zoom >= MIN_ZOOM).then(|| zoom.min(MAX_ZOOM))
+}
+
 // Preview cache byte budget for a given number of resident previews.
 pub(crate) fn preview_cache_budget(pages: usize) -> usize {
     pages * PREVIEW_TARGET_BYTES
