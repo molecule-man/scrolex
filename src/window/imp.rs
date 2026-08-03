@@ -641,8 +641,8 @@ impl Window {
 
     // Manual zoom turns fit off.
     fn zoom_to(&self, zoom: f64) {
-        self.btn_fit_height.set_active(false);
         self.apply_zoom(zoom);
+        self.btn_fit_height.set_active(false);
     }
 
     // A zoom relayouts the pages, so a coast has to stop first.
@@ -724,8 +724,9 @@ impl Window {
     // One paper scale keeps the text size stable across pages.
     // Crop heights cost 13 ms per page, so this calculation excludes them.
     fn fit_height_zoom(&self) -> Option<f64> {
-        let viewport =
-            self.vscrolledwindow.vadjustment().page_size() - self.fit_chrome_height.get()?;
+        let viewport = self.vscrolledwindow.vadjustment().page_size()
+            - self.fit_chrome_height.get()?
+            - f64::from(self.scrolledwindow.hscrollbar().height());
         let tallest = self.state.tallest_page_height();
 
         (viewport > 0.0 && tallest > 0.0).then(|| viewport / tallest)
@@ -754,8 +755,8 @@ impl Window {
 
     // Manual zoom about `screen` turns fit off.
     fn zoom_at(&self, zoom: f64, screen: (f64, f64)) {
-        self.btn_fit_height.set_active(false);
         self.apply_zoom_at(zoom, screen);
+        self.btn_fit_height.set_active(false);
     }
 
     // Zoom about `screen` and hold the document point there still. The zoom mode does not change.
@@ -1896,7 +1897,17 @@ impl Window {
         self.btn_fit_height.connect_toggled(clone!(
             #[weak(rename_to = imp)]
             self,
-            move |_| imp.queue_fit_height()
+            move |button| {
+                if button.is_active() {
+                    imp.queue_fit_height();
+                } else {
+                    let anchor = imp
+                        .mapped_page(imp.state.page() as i32)
+                        .and_then(|page| imp.page_origin(&page))
+                        .unwrap_or_else(|| imp.viewport_center());
+                    imp.apply_zoom_at(imp.state.manual_zoom(), anchor);
+                }
+            }
         ));
 
         self.vscrolledwindow
@@ -3195,7 +3206,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
     // Nothing to pan to: the page in view asks for no more than the viewport holds.
     fn assert_nothing_to_pan(imp: &super::Window) {
         let (asked, viewport) = (
-            asked_height(imp),
+            asked_height(imp) + f64::from(imp.scrolledwindow.hscrollbar().height()),
             imp.vscrolledwindow.vadjustment().page_size(),
         );
 
@@ -3208,7 +3219,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
     // The page in view is as tall as the viewport, to the pixel.
     fn assert_fills_the_viewport(imp: &super::Window) {
         let (asked, viewport) = (
-            asked_height(imp),
+            asked_height(imp) + f64::from(imp.scrolledwindow.hscrollbar().height()),
             imp.vscrolledwindow.vadjustment().page_size(),
         );
 
@@ -3245,6 +3256,22 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         wait_until(|| !imp.fit_pending.get());
 
         assert_eq!(imp.state.zoom(), zoom);
+        window.close();
+    }
+
+    #[gtk::test]
+    fn turning_fit_off_restores_the_manual_zoom() {
+        let window = loaded_window();
+        let imp = window.imp();
+        imp.state.zoom_to(2.0);
+
+        imp.btn_fit_height.set_active(true);
+        wait_until(|| !imp.fit_pending.get());
+        assert_ne!(imp.state.zoom(), 2.0);
+
+        imp.btn_fit_height.set_active(false);
+
+        assert_eq!(imp.state.zoom(), 2.0);
         window.close();
     }
 
@@ -3311,6 +3338,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
             zoom();
 
             assert!(!imp.btn_fit_height.is_active());
+            assert_eq!(imp.state.manual_zoom(), imp.state.zoom());
         }
         window.close();
     }

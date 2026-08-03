@@ -79,6 +79,10 @@ impl State {
         self.set_bounded_zoom(zoom.clamp(MIN_ZOOM, MAX_ZOOM));
     }
 
+    pub(crate) fn manual_zoom(&self) -> f64 {
+        self.imp().manual_zoom.get()
+    }
+
     fn set_bounded_zoom(&self, zoom: f64) {
         if zoom != self.zoom() {
             self.set_zoom(zoom);
@@ -418,29 +422,33 @@ impl Default for State {
 // Tests open documents, and an open writes the reading position. Redirect the directory per test:
 // a zoom left by one test must not come back in another, nor in the reader's own files.
 #[cfg(test)]
-thread_local! {
-    static TEST_STATE_DIR: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+struct ScratchState {
+    dir: tempfile::TempDir,
 }
 
-// Point this thread's per-document state at an empty directory. Test threads are reused, so every
-// call hands out another directory.
+#[cfg(test)]
+thread_local! {
+    static TEST_STATE: RefCell<Option<ScratchState>> = const { RefCell::new(None) };
+}
+
+// Point this thread's per-document state at an empty directory.
 #[cfg(test)]
 pub(crate) fn use_scratch_state_dir() {
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-    let serial = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let dir = env::temp_dir().join(format!(
-        "scrolex-test-state-{}/{serial}",
-        std::process::id()
-    ));
-    fs::remove_dir_all(&dir).ok();
-
-    TEST_STATE_DIR.with(|slot| *slot.borrow_mut() = Some(dir));
+    let dir = tempfile::Builder::new()
+        .prefix("scrolex-test-state-")
+        .tempdir()
+        .expect("scratch state dir");
+    TEST_STATE.with(|slot| *slot.borrow_mut() = Some(ScratchState { dir }));
 }
 
 fn get_state_file_path(uri: &str) -> Result<PathBuf, env::VarError> {
     #[cfg(test)]
-    if let Some(mut state_path) = TEST_STATE_DIR.with(|dir| dir.borrow().clone()) {
+    if let Some(mut state_path) = TEST_STATE.with(|state| {
+        state
+            .borrow()
+            .as_ref()
+            .map(|state| state.dir.path().to_path_buf())
+    }) {
         state_path.push(uri);
         state_path.set_extension("ini");
         return Ok(state_path);
@@ -461,6 +469,20 @@ fn get_state_file_path(uri: &str) -> Result<PathBuf, env::VarError> {
 mod tests {
     use super::*;
     use gtk::prelude::Cast;
+
+    #[test]
+    fn replacing_scratch_state_removes_the_previous_directory() {
+        use_scratch_state_dir();
+        let state = State::new();
+        state.set_uri("scratch.pdf");
+        state.save().unwrap();
+        let path = get_state_file_path(&state.uri()).unwrap();
+        let dir = path.parent().unwrap().to_path_buf();
+
+        use_scratch_state_dir();
+
+        assert!(!dir.exists());
+    }
 
     #[gtk::test]
     fn zoom_bounds_hold_whatever_the_document() {

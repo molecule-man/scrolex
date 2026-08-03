@@ -1010,21 +1010,20 @@ impl Page {
             self.note_paint(page_num, Paint::Sharp);
             self.prefetch_previews(page_num);
             return;
-        } else {
-            self.schedule_tile_render(page_num, scale, dsf, page_px, missing);
-            obj.state()
-                .render_waiters()
-                .borrow_mut()
-                .insert(page_num, obj.downgrade());
-            self.note_paint(
-                page_num,
-                match source {
-                    FallbackSource::Render => Paint::StaleRender,
-                    FallbackSource::Preview => Paint::Preview,
-                    FallbackSource::None => Paint::Placeholder,
-                },
-            );
         }
+        self.schedule_tile_render(page_num, scale, dsf, page_px, missing);
+        obj.state()
+            .render_waiters()
+            .borrow_mut()
+            .insert(page_num, obj.downgrade());
+        self.note_paint(
+            page_num,
+            match source {
+                FallbackSource::Render => Paint::StaleRender,
+                FallbackSource::Preview => Paint::Preview,
+                FallbackSource::None => Paint::Placeholder,
+            },
+        );
 
         let preview_target_width = ((page.width * obj.state().preview_scale()) as i32).max(1);
         if needs_visible_preview(

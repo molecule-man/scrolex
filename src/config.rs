@@ -66,29 +66,34 @@ fn config_file_path() -> Option<PathBuf> {
 // Tests build windows that read these settings. Redirect the file per test: one test's setting must
 // not reach another test's window, nor the reader's own config.
 #[cfg(test)]
+struct ScratchConfig {
+    dir: tempfile::TempDir,
+}
+
+#[cfg(test)]
 thread_local! {
-    static TEST_CONFIG_PATH: std::cell::RefCell<Option<PathBuf>> =
+    static TEST_CONFIG: std::cell::RefCell<Option<ScratchConfig>> =
         const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
 fn test_config_path() -> Option<PathBuf> {
-    TEST_CONFIG_PATH.with(|path| path.borrow().clone())
+    TEST_CONFIG.with(|config| {
+        config
+            .borrow()
+            .as_ref()
+            .map(|config| config.dir.path().join("config.ini"))
+    })
 }
 
-// Point this thread's settings at an empty file of its own. Call this before you build anything
-// that reads them. Test threads are reused, so every call hands out another file.
+// Point this thread's settings at an empty file.
 #[cfg(test)]
 pub(crate) fn use_scratch_config() {
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-    let dir = env::temp_dir().join(format!("scrolex-test-config-{}", std::process::id()));
-    fs::create_dir_all(&dir).expect("scratch config dir");
-    let serial = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let path = dir.join(format!("{serial}.ini"));
-    fs::remove_file(&path).ok();
-
-    TEST_CONFIG_PATH.with(|slot| *slot.borrow_mut() = Some(path));
+    let dir = tempfile::Builder::new()
+        .prefix("scrolex-test-config-")
+        .tempdir()
+        .expect("scratch config dir");
+    TEST_CONFIG.with(|slot| *slot.borrow_mut() = Some(ScratchConfig { dir }));
 }
 
 // Upper bound on render threads: reserve one core for the UI thread, since uninterruptible MuPDF
@@ -211,6 +216,18 @@ pub fn save_config(config: &Config) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replacing_scratch_config_removes_the_previous_directory() {
+        use_scratch_config();
+        let path = config_file_path().unwrap();
+        save_config(&Config::default()).unwrap();
+        let dir = path.parent().unwrap().to_path_buf();
+
+        use_scratch_config();
+
+        assert!(!dir.exists());
+    }
 
     #[test]
     fn cache_budget_scales_with_memory_within_the_setting_range() {
