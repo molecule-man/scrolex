@@ -263,6 +263,16 @@
 												</style>
 											</object>
 										</child>
+										<child>
+											<object class="GtkSeparator"/>
+										</child>
+										<child>
+											<object class="GtkButton" id="btn_menu_about">
+												<signal name="clicked" handler="menu_about" swapped="true"/>
+												<property name="label">About Scrolex</property>
+												<property name="tooltip-text">Version info and issue tracker</property>
+											</object>
+										</child>
 									</object>
 								</property>
 							</object>

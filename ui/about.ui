@@ -1,0 +1,102 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<interface>
+	<object class="GtkWindow" id="about_window">
+		<property name="title">About Scrolex</property>
+		<property name="modal">true</property>
+		<property name="resizable">false</property>
+		<property name="default-width">380</property>
+		<child type="titlebar">
+			<object class="GtkHeaderBar">
+				<property name="show-title-buttons">true</property>
+			</object>
+		</child>
+		<child>
+			<object class="GtkShortcutController">
+				<property name="scope">managed</property>
+				<child>
+					<object class="GtkShortcut">
+						<property name="trigger">Escape</property>
+						<property name="action">action(window.close)</property>
+					</object>
+				</child>
+			</object>
+		</child>
+		<child>
+			<object class="GtkBox">
+				<property name="orientation">vertical</property>
+				<property name="spacing">12</property>
+				<property name="margin-top">24</property>
+				<property name="margin-bottom">24</property>
+				<property name="margin-start">24</property>
+				<property name="margin-end">24</property>
+				<child>
+					<object class="GtkImage">
+						<property name="resource">/com/andr2i/scrolex/icon-128.png</property>
+						<property name="pixel-size">96</property>
+					</object>
+				</child>
+				<child>
+					<object class="GtkLabel">
+						<property name="label">Scrolex</property>
+						<style>
+							<class name="title-1"/>
+						</style>
+					</object>
+				</child>
+				<child>
+					<object class="GtkLabel">
+						<property name="label">Read PDFs and ebooks horizontally</property>
+						<property name="wrap">true</property>
+						<property name="justify">center</property>
+						<style>
+							<class name="dim-label"/>
+						</style>
+					</object>
+				</child>
+				<child>
+					<object class="GtkButton" id="btn_version">
+						<property name="halign">center</property>
+						<property name="tooltip-text">Copy version and system info</property>
+						<property name="cursor">
+							<object class="GdkCursor">
+								<property name="name">pointer</property>
+							</object>
+						</property>
+						<style>
+							<class name="pill"/>
+						</style>
+					</object>
+				</child>
+				<child>
+					<object class="GtkBox">
+						<property name="orientation">vertical</property>
+						<property name="spacing">4</property>
+						<property name="margin-top">8</property>
+						<child>
+							<object class="GtkLinkButton" id="btn_issue">
+								<property name="label">Report an issue</property>
+								<property name="tooltip-text">Open a bug report with version and system info filled in</property>
+								<property name="uri">https://github.com/molecule-man/scrolex/issues/new</property>
+							</object>
+						</child>
+						<child>
+							<object class="GtkLinkButton">
+								<property name="label">Source code</property>
+								<property name="uri">https://github.com/molecule-man/scrolex</property>
+							</object>
+						</child>
+					</object>
+				</child>
+				<child>
+					<object class="GtkLabel">
+						<property name="label">AGPL-3.0-or-later</property>
+						<property name="margin-top">8</property>
+						<style>
+							<class name="dim-label"/>
+						</style>
+					</object>
+				</child>
+			</object>
+		</child>
+	</object>
+</interface>

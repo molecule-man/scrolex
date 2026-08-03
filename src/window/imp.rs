@@ -1969,14 +1969,14 @@ impl Window {
 
     #[template_callback]
     fn menu_search(&self, btn: &Button) {
-        // dismiss the settings popover first
-        if let Some(popover) = btn
-            .ancestor(gtk::Popover::static_type())
-            .and_downcast::<gtk::Popover>()
-        {
-            popover.popdown();
-        }
+        dismiss_menu(btn);
         self.open_search();
+    }
+
+    #[template_callback]
+    fn menu_about(&self, btn: &Button) {
+        dismiss_menu(btn);
+        crate::about::present(self.obj().upcast_ref());
     }
 
     #[template_callback]
@@ -2370,6 +2370,15 @@ fn glide_step(
 // top-left now at `origin`. A bigger value moves the content the other way, hence the minus.
 fn anchored_scroll(value: f64, origin: f64, screen: f64, offset: f64, zoom: f64) -> f64 {
     value - (screen - offset * zoom - origin)
+}
+
+fn dismiss_menu(btn: &Button) {
+    if let Some(popover) = btn
+        .ancestor(gtk::Popover::static_type())
+        .and_downcast::<gtk::Popover>()
+    {
+        popover.popdown();
+    }
 }
 
 // Find the Page widget within a list item's widget subtree.
