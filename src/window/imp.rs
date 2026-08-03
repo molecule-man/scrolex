@@ -137,6 +137,8 @@ pub struct Window {
     #[template_child]
     pub entry_page_num: TemplateChild<gtk::Entry>,
     #[template_child]
+    pub entry_zoom: TemplateChild<gtk::Entry>,
+    #[template_child]
     pub search_bar: TemplateChild<SearchBar>,
     #[template_child]
     pub search_entry: TemplateChild<SearchEntry>,
@@ -941,11 +943,7 @@ impl Window {
 
     #[template_callback]
     fn handle_page_number_icon_pressed(&self, _: gtk::EntryIconPosition, entry: &gtk::Entry) {
-        let Ok(page_num) = entry.text().parse::<u32>() else {
-            return;
-        };
-
-        self.goto_page(page_num);
+        self.handle_page_number_entered(entry);
     }
 
     #[template_callback]
@@ -955,19 +953,25 @@ impl Window {
 
     #[template_callback]
     fn handle_zoom_entry(&self, entry: &gtk::Entry) {
-        let Ok(zoom) = entry.text().parse::<f64>() else {
+        let Ok(percent) = entry.text().parse::<f64>() else {
+            return;
+        };
+        let Some(zoom) = crate::state::zoom_from_percent(percent) else {
             return;
         };
 
-        if zoom < 5.0 {
-            return;
-        }
-
-        self.zoom_to(zoom / 100.0);
+        self.zoom_to(zoom);
     }
 
     fn goto_page(&self, page_num: u32) {
-        self.state.jump_list_add(self.state.page() + 1);
+        let from = self.state.page() + 1;
+        // no scroll, so no jump-list entry either: the back button would offer a jump that never
+        // happened
+        if self.target_page(page_num) == Some(from) {
+            return;
+        }
+
+        self.state.jump_list_add(from);
         self.navigate_to_page(page_num);
     }
 
@@ -977,6 +981,7 @@ impl Window {
             return;
         };
 
+        // scroll_to indexes the model, so clamp to what the model holds, not to the page count
         let page_num = page_num.min(selection.n_items());
 
         self.cancel_scroll_motion();
@@ -986,6 +991,14 @@ impl Window {
             gtk::ListScrollFlags::SELECT | gtk::ListScrollFlags::FOCUS,
             None,
         );
+    }
+
+    // The page a jump to `page_num` lands on, 1-based. From the document, not the model: the model
+    // fills in two stages, and a count that grows under us leaves the jump icon lit for a no-op.
+    fn target_page(&self, page_num: u32) -> Option<u32> {
+        let n_pages = u32::try_from(self.state.try_get()?.n_pages()).ok()?;
+
+        (n_pages > 0).then(|| page_num.clamp(1, n_pages))
     }
 
     fn prev_page(&self) {
@@ -2266,6 +2279,30 @@ impl Window {
     fn zoom_entry_text(&self, zoom_value: f64) -> String {
         format!("{}", zoom_value * 100.0)
     }
+
+    // Dims the page entry's jump icon while pressing it would scroll nowhere. Runs while the
+    // template is still building, so it must not touch an unbound template child.
+    #[template_callback]
+    fn page_jump_enabled(&self, text: &str, page: u32) -> bool {
+        let Ok(page_num) = text.parse::<u32>() else {
+            return false;
+        };
+
+        self.target_page(page_num)
+            .is_some_and(|target| target != page + 1)
+    }
+
+    // Dims the zoom entry's apply icon while pressing it would not change the zoom.
+    #[allow(clippy::unused_self)]
+    #[template_callback]
+    fn zoom_apply_enabled(&self, text: &str, zoom: f64) -> bool {
+        let Ok(percent) = text.parse::<f64>() else {
+            return false;
+        };
+
+        // text and zoom round-trip through a decimal percent, so exact equality misses no-ops
+        crate::state::zoom_from_percent(percent).is_some_and(|target| (target - zoom).abs() > 1e-6)
+    }
 }
 
 // Trait shared by all widgets
@@ -2930,6 +2967,146 @@ mod widget_tests {
             screen.1,
             landed.1,
         );
+        window.close();
+    }
+
+    // outline.pdf has 3 pages
+    fn loaded_window() -> crate::window::Window {
+        let window = window();
+        window.set_default_size(900, 700);
+        window.present();
+        window.state().load(&gtk::gio::File::for_path(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/outline.pdf"
+        )));
+        wait_until(|| window.imp().mapped_page(0).is_some());
+        wait_until(|| window.imp().selection.n_items() == 3);
+
+        window
+    }
+
+    // Issue #53: a live icon that does nothing reads as broken. Covers the binding wiring;
+    // page_jump_enabled_only_where_the_jump_moves covers the decision.
+    #[gtk::test]
+    fn page_jump_icon_follows_the_entry() {
+        let window = loaded_window();
+        let entry = window.imp().entry_page_num.get();
+        let icon = gtk::EntryIconPosition::Secondary;
+
+        assert_eq!(entry.text(), "1");
+        assert!(!entry.icon_is_sensitive(icon), "at rest on page 1");
+        assert!(entry.secondary_icon_tooltip_text().is_some(), "tooltip set");
+
+        entry.set_text("3");
+        assert!(entry.icon_is_sensitive(icon), "another page");
+
+        entry.set_text("1");
+        assert!(!entry.icon_is_sensitive(icon), "back to the current page");
+
+        window.close();
+    }
+
+    // handle_document_load fills the model in two stages, so a restored page leaves one item in it
+    // for a moment. Count from the document, or the icon lights up for the pages not yet in there.
+    #[gtk::test]
+    fn page_jump_icon_ignores_a_half_filled_model() {
+        let window = loaded_window();
+        let imp = window.imp();
+        let entry = imp.entry_page_num.get();
+
+        imp.model.remove_all();
+        imp.model.append(&crate::page::PageNumber::new(1));
+        imp.selection.set_selected(0);
+        wait_until(|| window.state().page() == 1);
+
+        assert_eq!(entry.text(), "2", "the entry follows the selected page");
+        assert!(
+            !entry.icon_is_sensitive(gtk::EntryIconPosition::Secondary),
+            "page 2 of 3 with one item in the model"
+        );
+
+        window.close();
+    }
+
+    #[gtk::test]
+    fn page_jump_enabled_only_where_the_jump_moves() {
+        let window = loaded_window();
+        let imp = window.imp();
+
+        assert!(imp.page_jump_enabled("3", 0), "page 3 while on page 1");
+        assert!(!imp.page_jump_enabled("1", 0), "page 1 while on page 1");
+        assert!(!imp.page_jump_enabled("3", 2), "page 3 while on page 3");
+        assert!(!imp.page_jump_enabled("", 0), "no number");
+        assert!(!imp.page_jump_enabled("abc", 0), "not a number");
+        assert!(imp.page_jump_enabled("9999", 0), "clamped to the last page");
+        assert!(
+            !imp.page_jump_enabled("9999", 2),
+            "clamped to the page we are on"
+        );
+        // 0 lands on page 1
+        assert!(!imp.page_jump_enabled("0", 0), "page 0 while on page 1");
+        assert!(imp.page_jump_enabled("0", 1), "page 0 while on page 2");
+
+        window.close();
+    }
+
+    #[gtk::test]
+    fn zoom_apply_icon_follows_the_entry() {
+        let window = loaded_window();
+        let entry = window.imp().entry_zoom.get();
+        let icon = gtk::EntryIconPosition::Secondary;
+
+        assert_eq!(entry.text(), "100");
+        assert!(!entry.icon_is_sensitive(icon), "at rest at 100%");
+        assert!(entry.secondary_icon_tooltip_text().is_some(), "tooltip set");
+
+        entry.set_text("150");
+        assert!(entry.icon_is_sensitive(icon), "another zoom level");
+
+        entry.set_text("100");
+        assert!(!entry.icon_is_sensitive(icon), "back to the current zoom");
+
+        window.close();
+    }
+
+    #[gtk::test]
+    fn zoom_apply_enabled_only_where_the_zoom_changes() {
+        let window = loaded_window();
+        let imp = window.imp();
+
+        assert!(imp.zoom_apply_enabled("150", 1.0), "150% while at 100%");
+        assert!(!imp.zoom_apply_enabled("100", 1.0), "100% while at 100%");
+        assert!(!imp.zoom_apply_enabled("", 1.0), "no number");
+        assert!(!imp.zoom_apply_enabled("abc", 1.0), "not a number");
+        assert!(!imp.zoom_apply_enabled("4", 1.0), "below the smallest zoom");
+        assert!(imp.zoom_apply_enabled("5", 1.0), "the smallest zoom");
+        assert!(
+            imp.zoom_apply_enabled("9999", 1.0),
+            "clamped to the largest zoom"
+        );
+        assert!(
+            !imp.zoom_apply_enabled("9999", 10.0),
+            "clamped to the current zoom"
+        );
+        assert!(
+            !imp.zoom_apply_enabled(&imp.zoom_entry_text(0.07), 0.07),
+            "7% round-trips as no change"
+        );
+
+        window.close();
+    }
+
+    #[gtk::test]
+    fn a_jump_to_the_current_page_is_not_recorded() {
+        let window = loaded_window();
+        let imp = window.imp();
+
+        imp.goto_page(1);
+        assert_eq!(window.state().prev_page(), 0, "no jump to come back from");
+
+        imp.goto_page(2);
+        assert_eq!(window.state().prev_page(), 1, "came from page 1");
+
         window.close();
     }
 
