@@ -39,7 +39,8 @@ pub(crate) fn preview_cache_budget(pages: usize) -> usize {
     pages * PREVIEW_TARGET_BYTES
 }
 
-type MaxPageSize = Option<(f64, f64)>;
+// Widest width and tallest height in the document. The two need not come from one page.
+type PageExtent = Option<(f64, f64)>;
 
 fn document_size_bytes(f: &gtk::gio::File) -> i64 {
     f.query_info(
@@ -105,14 +106,12 @@ impl State {
         // since nothing below the commit runs until the open succeeds. Staging fetches a remote
         // file exactly once; those bytes are the ones committed for rendering - no re-fetch.
         let (tx, rx) =
-            oneshot::channel::<Option<(crate::mupdf_render::Candidate, i32, MaxPageSize)>>();
+            oneshot::channel::<Option<(crate::mupdf_render::Candidate, i32, PageExtent)>>();
         let uri_probe = uri.clone();
         std::thread::spawn(move || {
             let probed = crate::mupdf_render::stage_candidate(&uri_probe).and_then(|candidate| {
                 match candidate.probe() {
-                    Some((n_pages, max_page_size)) if n_pages > 0 => {
-                        Some((candidate, n_pages, max_page_size))
-                    }
+                    Some((n_pages, extent)) if n_pages > 0 => Some((candidate, n_pages, extent)),
                     _ => None,
                 }
             });
@@ -127,14 +126,14 @@ impl State {
                 if state.imp().load_seq.get() != seq {
                     return; // a newer load superseded this one
                 }
-                let Some((candidate, n_pages, max_page_size)) = probed else {
+                let Some((candidate, n_pages, extent)) = probed else {
                     state.emit_by_name::<()>(
                         "load-failed",
                         &[&"could not open document".to_string()],
                     );
                     return;
                 };
-                state.commit_load(&uri, candidate, n_pages, max_page_size, size_bytes);
+                state.commit_load(&uri, candidate, n_pages, extent, size_bytes);
             }
         ));
     }
@@ -144,7 +143,7 @@ impl State {
         uri: &str,
         candidate: crate::mupdf_render::Candidate,
         n_pages: i32,
-        max_page_size: MaxPageSize,
+        extent: PageExtent,
         size_bytes: i64,
     ) {
         // Committed to the new document: force every thread to reopen (the same path may have
@@ -186,6 +185,7 @@ impl State {
         self.set_prev_page(0);
         self.set_uri(uri);
         self.set_n_pages(n_pages);
+        self.set_tallest_page(extent.map_or(0.0, |(_, height)| height));
         self.zoom_to(1.0);
         self.set_crop(false);
         self.set_page(0);
@@ -214,7 +214,7 @@ impl State {
         }
 
         log::info!(
-            "Loaded document: {n_pages} pages, {size_bytes} bytes, largest sampled page {max_page_size:?} pt, \
+            "Loaded document: {n_pages} pages, {size_bytes} bytes, page extent {extent:?} pt, \
              start page {}, zoom {}, crop {}",
             self.page(),
             self.zoom(),
@@ -400,7 +400,37 @@ impl Default for State {
     }
 }
 
+// Tests open documents, and an open writes the reading position. Redirect the directory per test:
+// a zoom left by one test must not come back in another, nor in the reader's own files.
+#[cfg(test)]
+thread_local! {
+    static TEST_STATE_DIR: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+}
+
+// Point this thread's per-document state at an empty directory. Test threads are reused, so every
+// call hands out another directory.
+#[cfg(test)]
+pub(crate) fn use_scratch_state_dir() {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    let serial = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = env::temp_dir().join(format!(
+        "scrolex-test-state-{}/{serial}",
+        std::process::id()
+    ));
+    fs::remove_dir_all(&dir).ok();
+
+    TEST_STATE_DIR.with(|slot| *slot.borrow_mut() = Some(dir));
+}
+
 fn get_state_file_path(uri: &str) -> Result<PathBuf, env::VarError> {
+    #[cfg(test)]
+    if let Some(mut state_path) = TEST_STATE_DIR.with(|dir| dir.borrow().clone()) {
+        state_path.push(uri);
+        state_path.set_extension("ini");
+        return Ok(state_path);
+    }
+
     let mut state_path = env::var("XDG_STATE_HOME")
         .or_else(|_| env::var("HOME").map(|home| format!("{home}/.local/state")))
         .map(PathBuf::from)?;

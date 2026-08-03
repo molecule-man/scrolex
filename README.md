@@ -43,7 +43,12 @@ https://github.com/user-attachments/assets/225c4b69-eb15-48d0-b978-f7bd747d463e
     environments while preserving their original hues. Dark mode is an
     explicit setting and remains enabled across sessions until turned off.
 
-5. Wayland Support
+5. Fit to Height
+
+    One button in the header sizes the document to the window height. The zoom
+    comes from the tallest page, so it holds for the whole document.
+
+6. Wayland Support
 
     Scrolex supports both Wayland and X11 sessions.
 

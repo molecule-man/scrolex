@@ -117,6 +117,8 @@ pub struct Window {
     #[template_child]
     pub btn_crop: TemplateChild<ToggleButton>,
     #[template_child]
+    pub btn_fit_height: TemplateChild<ToggleButton>,
+    #[template_child]
     pub btn_animate_scroll: TemplateChild<ToggleButton>,
     #[template_child]
     pub spin_threads: TemplateChild<gtk::SpinButton>,
@@ -220,6 +222,10 @@ pub struct Window {
 
     // true when the next allocation must restore zoom_anchor
     zoom_anchor_pending: Cell<bool>,
+
+    // set while a fit-to-height re-zoom waits on idle. A load selects a page and sizes the viewport
+    // in one go, so the flag folds both into one relayout
+    fit_pending: Cell<bool>,
 }
 
 // A document point held still across a zoom: which page, where in it (page points from its
@@ -271,6 +277,7 @@ impl ObjectImpl for Window {
         let cfg = crate::config::load_config();
         self.state.set_preview_cache_pages(cfg.preview_cache_pages);
         self.setup_animate_scroll();
+        self.setup_fit_height();
         self.setup_text_selection();
         self.setup_search();
         self.setup_toc();
@@ -622,8 +629,14 @@ impl Window {
         }
     }
 
-    // Every zoom goes through here. A zoom relayouts the pages, so a coast has to stop first.
+    // Every zoom the reader asks for. It replaces fit-to-height, so the mode turns off.
     fn zoom_to(&self, zoom: f64) {
+        self.state.set_fit_height(false);
+        self.apply_zoom(zoom);
+    }
+
+    // A zoom relayouts the pages, so a coast has to stop first.
+    fn apply_zoom(&self, zoom: f64) {
         self.cancel_coast();
         self.state.zoom_to(zoom);
     }
@@ -653,6 +666,86 @@ impl Window {
         self.zoom_centered(1.0);
     }
 
+    // Re-fit on idle. The triggers (the mode, a load, a resize) arrive during a layout or a scroll,
+    // where a size-request change of our own fights the pass that runs.
+    fn queue_fit_height(&self) {
+        if !self.state.fit_height() || self.fit_pending.replace(true) {
+            return;
+        }
+
+        glib::idle_add_local_once(clone!(
+            #[weak(rename_to = imp)]
+            self,
+            move || {
+                imp.fit_pending.set(false);
+                imp.fit_height();
+            }
+        ));
+    }
+
+    // Zoom so the tallest page is exactly as tall as the viewport. The zoom holds when the geometry
+    // is not known. The next trigger re-fits.
+    fn fit_height(&self) {
+        if !self.state.fit_height() {
+            return;
+        }
+        let Some(zoom) = self.fit_height_zoom() else {
+            return;
+        };
+
+        let vadj = self.vscrolledwindow.vadjustment();
+        log::debug!(
+            target: "scrolex::fit",
+            "fit: page={} tallest_pt={:.1} viewport={:.1} content={:.1} zoom {:.4} -> {zoom:.4}",
+            self.state.page(),
+            self.state.tallest_page(),
+            vadj.page_size(),
+            vadj.upper(),
+            self.state.zoom(),
+        );
+
+        // Hold the page's own top-left, not the viewport centre. The reader reads one page, and a
+        // sideways slide reads as a jump off it.
+        let anchor = self
+            .mapped_page(self.state.page() as i32)
+            .and_then(|page| self.page_origin(&page))
+            .unwrap_or_else(|| self.viewport_center());
+        self.apply_zoom_at(zoom, anchor);
+    }
+
+    // The zoom that makes the tallest page in the document fill the viewport height. None until a
+    // document loads and the window lays it out.
+    //
+    // The tallest page, not the page in view. A fit to the page in view re-zooms on every page turn,
+    // and the pages beside it run past the viewport. The tallest page fits exactly, every other page
+    // is shorter, and the text keeps one size for the whole document.
+    //
+    // The paper, not the crop box, even when crop is on. Crop boxes are per-page, and a sparse page
+    // gets a small one. To find the tallest one costs a render of every page, 13ms each, seconds for
+    // a book. A crop box never exceeds its page, so a fit to the paper also keeps every cropped page
+    // inside the viewport.
+    fn fit_height_zoom(&self) -> Option<f64> {
+        let viewport = self.vscrolledwindow.vadjustment().page_size() - self.list_chrome_height();
+        let tallest = self.state.tallest_page();
+
+        (viewport > 0.0 && tallest > 0.0).then(|| viewport / tallest)
+    }
+
+    // Height the list asks for around a page: the theme pads its rows. A page cannot use that height,
+    // so a fit that leaves it out puts the tallest page past the viewport by exactly that much. The
+    // window measures the padding, so a theme with other padding also fits.
+    fn list_chrome_height(&self) -> f64 {
+        let Some(page) = self.mapped_page(self.state.page() as i32) else {
+            return 0.0;
+        };
+        let Some(row) = page.parent() else {
+            return 0.0;
+        };
+
+        let natural = |widget: &gtk::Widget| widget.measure(gtk::Orientation::Vertical, -1).1;
+        f64::from((natural(&row) - natural(page.upcast_ref())).max(0))
+    }
+
     fn viewport_center(&self) -> (f64, f64) {
         (
             f64::from(self.vscrolledwindow.width()) / 2.0,
@@ -660,13 +753,20 @@ impl Window {
         )
     }
 
+    // Reader-driven zoom about `screen`. It ends fit-to-height.
     fn zoom_at(&self, zoom: f64, screen: (f64, f64)) {
+        self.state.set_fit_height(false);
+        self.apply_zoom_at(zoom, screen);
+    }
+
+    // Zoom about `screen` and hold the document point there still. The zoom mode does not change.
+    fn apply_zoom_at(&self, zoom: f64, screen: (f64, f64)) {
         if self.zoom_anchor.get().is_none() {
             self.zoom_anchor.set(self.capture_zoom_anchor(screen));
         }
 
         let before = self.state.zoom();
-        self.zoom_to(zoom);
+        self.apply_zoom(zoom);
         if self.state.zoom() == before {
             if !self.zoom_gesturing.get() {
                 self.zoom_anchor.set(None);
@@ -1534,6 +1634,9 @@ impl Window {
             glib::ControlFlow::Break
         });
 
+        // the pages of this document have their own size, and a restored page number fires no notify
+        self.queue_fit_height();
+
         // move keyboard focus off the header entry so h/l/arrows work
         self.scrolledwindow.grab_focus();
     }
@@ -1776,6 +1879,43 @@ impl Window {
                     eprintln!("Error saving config: {e}");
                 }
             });
+    }
+
+    // Fit-to-height is a global preference, not a per-document one. The mode exists so that a
+    // document fills the window as soon as it opens.
+    fn setup_fit_height(&self) {
+        self.state
+            .set_fit_height(crate::config::load_config().fit_height);
+
+        self.state
+            .connect_notify_local(Some("fit-height"), |state, _| {
+                let mut config = crate::config::load_config();
+                config.fit_height = state.fit_height();
+                if let Err(e) = crate::config::save_config(&config) {
+                    eprintln!("Error saving config: {e}");
+                }
+            });
+
+        // Everything that moves either side of the fit: the mode itself, the document's tallest page,
+        // and the viewport height. Not the page in view - every page shares the one zoom.
+        for property in ["fit-height", "tallest-page"] {
+            self.state.connect_notify_local(
+                Some(property),
+                clone!(
+                    #[weak(rename_to = imp)]
+                    self,
+                    move |_, _| imp.queue_fit_height()
+                ),
+            );
+        }
+
+        self.vscrolledwindow
+            .vadjustment()
+            .connect_page_size_notify(clone!(
+                #[weak(rename_to = imp)]
+                self,
+                move |_| imp.queue_fit_height()
+            ));
     }
 
     fn setup_text_selection(&self) {
@@ -2731,17 +2871,42 @@ mod widget_tests {
     use std::time::{Duration, Instant};
 
     fn window() -> crate::window::Window {
+        // before the window: it reads the settings while it builds
+        crate::config::use_scratch_config();
+        crate::state::use_scratch_state_dir();
         gtk::gio::resources_register_include!("scrolex-ui.gresource").expect("ui resources");
         crate::state::State::static_type();
         crate::page::PageNumber::static_type();
         crate::page::Page::static_type();
+        load_css();
 
-        gtk::glib::Object::new()
+        let window: crate::window::Window = gtk::glib::Object::new();
+        // the stylesheet keys off this name, as in main
+        window.set_widget_name("main");
+        window.set_default_size(TEST_WINDOW.0, TEST_WINDOW.1);
+        window
+    }
+
+    // Size every test window shares.
+    const TEST_WINDOW: (i32, i32) = (900, 700);
+
+    // The app's own stylesheet, so the tests measure the widgets the reader gets.
+    fn load_css() {
+        static LOADED: std::sync::Once = std::sync::Once::new();
+        LOADED.call_once(|| {
+            let provider = gtk::CssProvider::new();
+            provider.load_from_string(include_str!("../../ui/style.css"));
+            gtk::style_context_add_provider_for_display(
+                &gtk::gdk::Display::default().expect("display"),
+                &provider,
+                gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+            );
+        });
     }
 
     fn wait_until(mut ready: impl FnMut() -> bool) {
         let context = gtk::glib::MainContext::default();
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(10);
         while !ready() {
             assert!(Instant::now() < deadline, "timed out waiting for GTK");
             context.iteration(false);
@@ -2990,6 +3155,209 @@ mod widget_tests {
         wait_until(|| window.imp().selection.n_items() == 3);
 
         window
+    }
+
+    // Three pages of different heights, to show which one the fit measures.
+    const MIXED_HEIGHTS_PDF: &[u8] = b"%PDF-1.4\n\
+1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n\
+2 0 obj\n<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 3 >>\nendobj\n\
+3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] >>\nendobj\n\
+4 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 2000 3000] >>\nendobj\n\
+5 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 400] >>\nendobj\n\
+trailer\n<< /Root 1 0 R >>\n%%EOF";
+
+    fn mixed_heights_document() -> gtk::gio::File {
+        let dir = std::env::temp_dir().join("scrolex_fit_height_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mixed_heights.pdf");
+        std::fs::write(&path, MIXED_HEIGHTS_PDF).unwrap();
+
+        gtk::gio::File::for_path(path)
+    }
+
+    // Zoom that makes the tallest page fill the viewport.
+    fn height_ratio(imp: &super::Window) -> f64 {
+        imp.vscrolledwindow.vadjustment().page_size() / imp.state.tallest_page()
+    }
+
+    fn assert_fits_height(imp: &super::Window) {
+        let ratio = height_ratio(imp);
+        assert!(
+            (imp.state.zoom() - ratio).abs() < 0.01,
+            "zoom {} does not fit the page to the viewport ({ratio} does)",
+            imp.state.zoom(),
+        );
+    }
+
+    // Issue #50: a page shorter than the window leaves the reader to zoom by hand on every document.
+    #[gtk::test]
+    fn fit_height_fills_the_viewport_with_the_page() {
+        let window = loaded_window();
+        let imp = window.imp();
+
+        imp.state.set_fit_height(true);
+        wait_until(|| !imp.fit_pending.get());
+
+        assert_fits_height(imp);
+        assert!(
+            imp.btn_fit_height.is_active(),
+            "the button follows the mode"
+        );
+        window.close();
+    }
+
+    // Height the list asks for to show the page in view, the row's own padding included. Measured,
+    // not allocated: Xvfb has no window manager, so the window re-lays out only when it resizes.
+    fn asked_height(imp: &super::Window) -> f64 {
+        let row = imp
+            .mapped_page(imp.state.page() as i32)
+            .and_then(|page| page.parent())
+            .expect("a page in view");
+
+        f64::from(row.measure(gtk::Orientation::Vertical, -1).1)
+    }
+
+    // Nothing to pan to: the page in view asks for no more than the viewport holds.
+    fn assert_nothing_to_pan(imp: &super::Window) {
+        let (asked, viewport) = (
+            asked_height(imp),
+            imp.vscrolledwindow.vadjustment().page_size(),
+        );
+
+        assert!(
+            asked <= viewport + 1.0,
+            "the list asks for {asked}px, and the viewport holds {viewport}px, so the view pans",
+        );
+    }
+
+    // The page in view is as tall as the viewport, to the pixel.
+    fn assert_fills_the_viewport(imp: &super::Window) {
+        let (asked, viewport) = (
+            asked_height(imp),
+            imp.vscrolledwindow.vadjustment().page_size(),
+        );
+
+        assert!(
+            (asked - viewport).abs() <= 1.0,
+            "the list asks for {asked}px, and the viewport holds {viewport}px",
+        );
+    }
+
+    // The reader has nothing left to pan to: the page is exactly as tall as the viewport. The list
+    // pads its rows, and the fit must leave that padding out.
+    #[gtk::test]
+    fn a_fitted_page_fills_the_viewport_exactly() {
+        let window = loaded_window();
+        let imp = window.imp();
+
+        imp.state.set_fit_height(true);
+        wait_until(|| !imp.fit_pending.get());
+
+        assert_fills_the_viewport(imp);
+        window.close();
+    }
+
+    // Crop boxes are per-page: a sparse page gets a small one. A fit to them re-zooms on every page
+    // turn, and a neighbour with a taller box runs past the viewport.
+    #[gtk::test]
+    fn cropping_does_not_move_the_fit() {
+        let window = loaded_window();
+        let imp = window.imp();
+
+        imp.state.set_fit_height(true);
+        wait_until(|| !imp.fit_pending.get());
+
+        imp.state.set_crop(true);
+
+        // still measured on the paper: the crop box is shorter, so a fit to it zooms further
+        assert_fits_height(imp);
+        assert!(imp.state.fit_height(), "the mode stays on");
+        assert_nothing_to_pan(imp);
+        window.close();
+    }
+
+    // The viewport height is one side of the fit, so a resize must re-zoom. Xvfb has no window
+    // manager to resize the window, so the test writes the viewport that a resize leaves behind.
+    #[gtk::test]
+    fn a_shorter_viewport_queues_a_re_fit() {
+        let window = loaded_window();
+        let imp = window.imp();
+
+        imp.state.set_fit_height(true);
+        wait_until(|| !imp.fit_pending.get());
+
+        let vadj = imp.vscrolledwindow.vadjustment();
+        vadj.configure(
+            vadj.value(),
+            0.0,
+            2000.0,
+            10.0,
+            100.0,
+            vadj.page_size() / 2.0,
+        );
+
+        assert!(imp.fit_pending.get());
+        window.close();
+    }
+
+    // The zoom the reader dials in replaces the fit, so the mode turns itself off.
+    #[gtk::test]
+    fn a_zoom_of_the_readers_own_ends_fit_height() {
+        let window = loaded_window();
+        let imp = window.imp();
+
+        let zooms: [&dyn Fn(); 4] = [
+            &|| imp.zoom_in(),
+            &|| imp.zoom_out(),
+            &|| imp.reset_zoom(),
+            &|| imp.handle_zoom_entry(&imp.entry_zoom.get()),
+        ];
+        for zoom in zooms {
+            imp.state.set_fit_height(true);
+            wait_until(|| !imp.fit_pending.get());
+            imp.entry_zoom.set_text("42");
+
+            zoom();
+
+            assert!(!imp.state.fit_height());
+            assert!(!imp.btn_fit_height.is_active());
+        }
+        window.close();
+    }
+
+    // Pages of different heights: one zoom for the document, set by the tallest page. The page in
+    // view does not move it, so the text keeps its size from page to page.
+    #[gtk::test]
+    fn the_tallest_page_sets_the_fit_for_every_page() {
+        let window = loaded_window();
+        let imp = window.imp();
+        imp.state.set_fit_height(true);
+
+        // another document, opened while the mode is on: the mode is global, so it applies here too
+        window.state().load(&mixed_heights_document());
+        wait_until(|| imp.selection.n_items() == 3);
+        wait_until(|| !imp.fit_pending.get() && imp.mapped_page(0).is_some());
+
+        assert_eq!(
+            imp.state.tallest_page(),
+            3000.0,
+            "the tallest of 200, 3000, 400"
+        );
+        assert_fits_height(imp);
+        let first = imp.state.zoom();
+
+        // page 2 is the tallest in the document: it fills the viewport, and the page turn to it
+        // leaves the zoom where it was
+        imp.navigate_to_page(2);
+        wait_until(|| imp.state.page() == 1 && imp.mapped_page(1).is_some());
+
+        assert!(
+            (imp.state.zoom() - first).abs() < f64::EPSILON,
+            "the page turn moved the zoom from {first} to {}",
+            imp.state.zoom(),
+        );
+        assert_fills_the_viewport(imp);
+        window.close();
     }
 
     // Issue #53: a live icon that does nothing reads as broken. Covers the binding wiring;

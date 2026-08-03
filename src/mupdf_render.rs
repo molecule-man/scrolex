@@ -13,8 +13,6 @@ use gtk::prelude::FileExt;
 use mupdf::{Colorspace, Device, Document, IRect, Matrix, Pixmap, Rect};
 use once_cell::sync::Lazy;
 
-const PROBE_PAGES: i32 = 8;
-
 #[derive(Clone, Copy)]
 struct DarkMode {
     paper: [u8; 3],
@@ -142,10 +140,12 @@ pub(crate) fn stage_candidate(uri: &str) -> Option<Candidate> {
 }
 
 impl Candidate {
-    // One open reading both the page count and the largest of the first PROBE_PAGES page sizes, so a
-    // load needs a single document open (safe to run off the main thread). None if unopenable. The
-    // size is only reported in the load log: walking a long document would be slow, and every render
-    // is sized from its own page.
+    // The page count and the extent of the whole document from one open, which a load can run off
+    // the main thread. The extent is the widest page's width and the tallest page's height, and the
+    // two need not come from one page. None if the document does not open.
+    //
+    // The bounds of one page cost about 50us, so a thousand-page document adds well under a tenth of
+    // a second to the load. Fit-to-height needs the true tallest page, not a sample.
     pub(crate) fn probe(&self) -> Option<(i32, Option<(f64, f64)>)> {
         if let Some(cfg) = crate::emulate::config() {
             return Some((cfg.pages, Some(cfg.page_pt)));
@@ -153,11 +153,11 @@ impl Candidate {
         let _ctx = Colorspace::device_bgr();
         let doc = Document::open(self.path.as_path()).ok()?;
         let n_pages = doc.page_count().ok()?;
-        let max_page_size = (0..n_pages.min(PROBE_PAGES))
+        let extent = (0..n_pages)
             .filter_map(|index| doc.load_page(index).ok()?.bounds().ok())
-            .map(|b| ((b.x1 - b.x0) as f64, (b.y1 - b.y0) as f64))
-            .max_by(|(aw, ah), (bw, bh)| (aw * ah).total_cmp(&(bw * bh)));
-        Some((n_pages, max_page_size))
+            .map(|b| (f64::from(b.x1 - b.x0), f64::from(b.y1 - b.y0)))
+            .reduce(|(aw, ah), (bw, bh)| (aw.max(bw), ah.max(bh)));
+        Some((n_pages, extent))
     }
 
     // Publish the validated temp so workers render these exact bytes. Call after invalidate().
@@ -651,7 +651,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
 trailer\n<< /Root 1 0 R >>\n%%EOF";
 
     #[test]
-    fn probe_reports_the_largest_sampled_page() {
+    fn probe_reports_the_document_extent() {
         let dir = std::env::temp_dir().join("scrolex_mixed_size_test");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("mixed.pdf");
@@ -661,6 +661,41 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         assert_eq!(
             stage_candidate(&uri).unwrap().probe(),
             Some((3, Some((2000.0, 3000.0))))
+        );
+    }
+
+    // Twelve pages, all small but the last, which is tall and narrow. Fit-to-height zooms by the
+    // tallest page in the document. The probe must read every page, and take the width and the height
+    // from whichever page holds each.
+    const TALL_LAST_PAGE_PDF: &[u8] = b"%PDF-1.4\n\
+1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n\
+2 0 obj\n<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R 6 0 R 7 0 R 8 0 R 9 0 R 10 0 R 11 0 R 12 0 R 13 0 R 14 0 R] /Count 12 >>\nendobj\n\
+3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 500 200] >>\nendobj\n\
+4 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 500 200] >>\nendobj\n\
+5 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 500 200] >>\nendobj\n\
+6 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 500 200] >>\nendobj\n\
+7 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 500 200] >>\nendobj\n\
+8 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 500 200] >>\nendobj\n\
+9 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 500 200] >>\nendobj\n\
+10 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 500 200] >>\nendobj\n\
+11 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 500 200] >>\nendobj\n\
+12 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 500 200] >>\nendobj\n\
+13 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 500 200] >>\nendobj\n\
+14 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 900] >>\nendobj\n\
+trailer\n<< /Root 1 0 R >>\n%%EOF";
+
+    #[test]
+    fn probe_reads_every_page_not_a_sample() {
+        let dir = std::env::temp_dir().join("scrolex_tall_last_page_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tall_last.pdf");
+        std::fs::write(&path, TALL_LAST_PAGE_PDF).unwrap();
+        let uri = format!("file://{}", path.display());
+
+        // 500 wide from the small pages, 900 tall from the last one
+        assert_eq!(
+            stage_candidate(&uri).unwrap().probe(),
+            Some((12, Some((500.0, 900.0))))
         );
     }
 
