@@ -46,12 +46,16 @@ pub struct State {
     prev_page: RefCell<u32>,
 
     #[property(get, set)]
+    next_page: RefCell<u32>,
+
+    #[property(get, set)]
     multithread_rendering: Cell<bool>,
 
     // Slow status of the last three main-thread renders.
     pub(crate) slow_main_thread_renders: Cell<[bool; 3]>,
 
     pub(super) jump_stack: Rc<RefCell<jump_stack::JumpStack>>,
+    pub(super) forward_jump_stack: Rc<RefCell<jump_stack::JumpStack>>,
     pub(crate) bbox_cache: Rc<RefCell<HashMap<i32, crate::page::Rectangle>>>,
     pub(crate) links: Rc<RefCell<crate::links::Links>>,
     pub(crate) search: Rc<RefCell<crate::search::Search>>,
