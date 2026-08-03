@@ -1900,7 +1900,7 @@ impl Window {
             move |button| {
                 if button.is_active() {
                     imp.queue_fit_height();
-                } else {
+                } else if imp.state.zoom() != imp.state.manual_zoom() {
                     let anchor = imp
                         .mapped_page(imp.state.page() as i32)
                         .and_then(|page| imp.page_origin(&page))
@@ -3340,6 +3340,22 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
             assert!(!imp.btn_fit_height.is_active());
             assert_eq!(imp.state.manual_zoom(), imp.state.zoom());
         }
+        window.close();
+    }
+
+    #[gtk::test]
+    fn manual_zoom_from_fit_keeps_its_anchor() {
+        let window = loaded_window();
+        let imp = window.imp();
+        imp.state.zoom_to(2.0);
+        imp.btn_fit_height.set_active(true);
+        wait_until(|| !imp.fit_pending.get());
+        imp.zoom_anchor.set(None);
+
+        imp.zoom_in();
+
+        assert!(imp.zoom_anchor.get().is_some());
+        assert!(imp.zoom_anchor_pending.get());
         window.close();
     }
 
