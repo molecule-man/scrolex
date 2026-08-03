@@ -708,8 +708,10 @@ impl Page {
             page.index
         );
 
-        if elapsed > std::time::Duration::from_millis(100) {
-            log::warn!("Rendering took too long: {elapsed:?}. Switching to multithreading mode.");
+        if obj.state().record_main_thread_render(elapsed) {
+            log::warn!(
+                "Two of the last three main-thread renders exceeded 100 ms. Latest: {elapsed:?}. Switching to multithreading mode."
+            );
             obj.state().set_multithread_rendering(true);
         }
     }
