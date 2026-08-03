@@ -728,7 +728,7 @@ impl Window {
     fn fit_height_zoom(&self) -> Option<f64> {
         let viewport = self.vscrolledwindow.vadjustment().page_size()
             - self.fit_chrome_height.get()?
-            - f64::from(self.scrolledwindow.hscrollbar().height());
+            - hscrollbar_reserve(&self.scrolledwindow);
         let tallest = self.state.tallest_page_height();
 
         (viewport > 0.0 && tallest > 0.0).then(|| viewport / tallest)
@@ -2566,6 +2566,23 @@ fn zoom_percent_text(zoom: f64) -> String {
     format!("{}", (zoom * 10_000.0).round() / 100.0)
 }
 
+// Height the overlay scrollbar covers at the bottom of the viewport. Measured, not allocated: GTK
+// drops the allocation of an overlay scrollbar while it conceals it, and a fit that reads the
+// allocation moves with that.
+fn hscrollbar_reserve(scroller: &gtk::ScrolledWindow) -> f64 {
+    let adjustment = scroller.hadjustment();
+    if adjustment.upper() - adjustment.lower() <= adjustment.page_size() {
+        return 0.0;
+    }
+
+    f64::from(
+        scroller
+            .hscrollbar()
+            .measure(gtk::Orientation::Vertical, -1)
+            .1,
+    )
+}
+
 fn dismiss_menu(btn: &Button) {
     if let Some(popover) = btn
         .ancestor(gtk::Popover::static_type())
@@ -3203,11 +3220,26 @@ mod widget_tests {
 5 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 400] >>\nendobj\n\
 trailer\n<< /Root 1 0 R >>\n%%EOF";
 
+    const ONE_PAGE_PDF: &[u8] = b"%PDF-1.4\n\
+1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n\
+2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n\
+3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 300] >>\nendobj\n\
+trailer\n<< /Root 1 0 R >>\n%%EOF";
+
     fn mixed_heights_document() -> gtk::gio::File {
         let dir = std::env::temp_dir().join("scrolex_fit_height_test");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("mixed_heights.pdf");
         std::fs::write(&path, MIXED_HEIGHTS_PDF).unwrap();
+
+        gtk::gio::File::for_path(path)
+    }
+
+    fn one_page_document() -> gtk::gio::File {
+        let dir = std::env::temp_dir().join("scrolex_fit_height_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("one_page.pdf");
+        std::fs::write(&path, ONE_PAGE_PDF).unwrap();
 
         gtk::gio::File::for_path(path)
     }
@@ -3226,7 +3258,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
     // Nothing to pan to: the page in view asks for no more than the viewport holds.
     fn assert_nothing_to_pan(imp: &super::Window) {
         let (asked, viewport) = (
-            asked_height(imp) + f64::from(imp.scrolledwindow.hscrollbar().height()),
+            asked_height(imp) + super::hscrollbar_reserve(&imp.scrolledwindow),
             imp.vscrolledwindow.vadjustment().page_size(),
         );
 
@@ -3239,7 +3271,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
     // The page in view is as tall as the viewport, to the pixel.
     fn assert_fills_the_viewport(imp: &super::Window) {
         let (asked, viewport) = (
-            asked_height(imp) + f64::from(imp.scrolledwindow.hscrollbar().height()),
+            asked_height(imp) + super::hscrollbar_reserve(&imp.scrolledwindow),
             imp.vscrolledwindow.vadjustment().page_size(),
         );
 
@@ -3264,18 +3296,61 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
     }
 
     #[gtk::test]
+    fn a_fitted_page_without_horizontal_overflow_fills_the_viewport() {
+        let window = loaded_window();
+        let imp = window.imp();
+        imp.btn_fit_height.set_active(true);
+
+        window.state().load(&one_page_document());
+        wait_until(|| imp.selection.n_items() == 1);
+        wait_until(|| !imp.fit_pending.get() && imp.mapped_page(0).is_some());
+
+        let hadj = imp.scrolledwindow.hadjustment();
+        assert!(hadj.upper() - hadj.lower() <= hadj.page_size());
+        assert_fills_the_viewport(imp);
+        window.close();
+    }
+
+    // Every term the fit measures, so a re-fit that lands on another zoom names the term that moved.
+    fn fit_terms(imp: &super::Window) -> String {
+        format!(
+            "page_size={} chrome={:?} reserve={} tallest={}",
+            imp.vscrolledwindow.vadjustment().page_size(),
+            imp.fit_chrome_height.get(),
+            super::hscrollbar_reserve(&imp.scrolledwindow),
+            imp.state.tallest_page_height(),
+        )
+    }
+
+    // A fit with no mapped selected page has no row to measure the chrome from. It must reuse the
+    // cached one and stay on the paper, rather than fit the raw viewport.
+    #[gtk::test]
     fn fit_keeps_cached_chrome_without_a_mapped_selected_page() {
         let window = loaded_window();
         let imp = window.imp();
         imp.btn_fit_height.set_active(true);
         wait_until(|| !imp.fit_pending.get());
-        let zoom = imp.state.zoom();
+        let chrome = imp.fit_chrome_height.get().expect("a cached chrome");
+        assert!(chrome > 0.0, "the row pads the page");
 
         imp.state.set_page(imp.state.n_pages() as u32 + 1);
         imp.queue_fit_height();
         wait_until(|| !imp.fit_pending.get());
 
-        assert_eq!(imp.state.zoom(), zoom);
+        assert_eq!(imp.fit_chrome_height.get(), Some(chrome));
+
+        // The layout the fit just left behind, chrome included. Read here, not before the fit: with
+        // no window manager the toplevel follows the content, so a fit can move the viewport it
+        // measured.
+        let viewport = imp.vscrolledwindow.vadjustment().page_size()
+            - chrome
+            - super::hscrollbar_reserve(&imp.scrolledwindow);
+        assert_eq!(
+            imp.state.zoom(),
+            viewport / imp.state.tallest_page_height(),
+            "the fit dropped the cached chrome: {}",
+            fit_terms(imp)
+        );
         window.close();
     }
 
