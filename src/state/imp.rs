@@ -24,14 +24,11 @@ pub struct State {
     #[property(get, set)]
     crop: Cell<bool>,
 
-    // Keep the page as tall as the viewport: the window re-zooms on every change that moves either.
-    #[property(get, set)]
-    fit_height: Cell<bool>,
+    // Zoom that the reader selected.
+    pub(crate) manual_zoom: Cell<f64>,
 
-    // Tallest page in the document, in points. Fit-to-height measures this page, so one zoom holds
-    // for the whole document and no page runs past the viewport. Read once per load.
-    #[property(get, set)]
-    tallest_page: Cell<f64>,
+    // Tallest paper height in points.
+    pub(crate) tallest_page_height: Cell<f64>,
 
     #[property(get, set)]
     animate_scroll: Cell<bool>,

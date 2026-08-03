@@ -22,7 +22,6 @@ pub struct Config {
     pub render_cache_mb: usize,
     pub animate_scroll: bool,
     pub dark_mode: bool,
-    pub fit_height: bool,
     pub dismissed_notice: Option<u64>,
     pub geometry: Option<Geometry>,
 }
@@ -43,7 +42,6 @@ impl Default for Config {
             render_cache_mb: default_render_cache_mb(),
             animate_scroll: true,
             dark_mode: false,
-            fit_height: false,
             dismissed_notice: None,
             geometry: None,
         }
@@ -130,7 +128,6 @@ pub fn load_config() -> Config {
     let mut render_cache_mb = default_render_cache_mb();
     let mut animate_scroll = true;
     let mut dark_mode = false;
-    let mut fit_height = false;
     let mut dismissed_notice = None;
     let mut width = None;
     let mut height = None;
@@ -155,7 +152,6 @@ pub fn load_config() -> Config {
             }
             Some(("animate_scroll", v)) => animate_scroll = v.trim().parse().unwrap_or(true),
             Some(("dark_mode", v)) => dark_mode = v.trim().parse().unwrap_or(false),
-            Some(("fit_height", v)) => fit_height = v.trim().parse().unwrap_or(false),
             Some(("dismissed_notice", v)) => {
                 dismissed_notice = u64::from_str_radix(v.trim(), 16).ok();
             }
@@ -181,7 +177,6 @@ pub fn load_config() -> Config {
         render_cache_mb: render_cache_mb.clamp(MIN_RENDER_CACHE_MB, MAX_RENDER_CACHE_MB),
         animate_scroll,
         dark_mode,
-        fit_height,
         dismissed_notice,
         geometry,
     }
@@ -201,7 +196,6 @@ pub fn save_config(config: &Config) -> io::Result<()> {
     out.push_str(&format!("render_cache_mb={}\n", config.render_cache_mb));
     out.push_str(&format!("animate_scroll={}\n", config.animate_scroll));
     out.push_str(&format!("dark_mode={}\n", config.dark_mode));
-    out.push_str(&format!("fit_height={}\n", config.fit_height));
     if let Some(notice) = config.dismissed_notice {
         out.push_str(&format!("dismissed_notice={notice:016x}\n"));
     }
@@ -236,7 +230,6 @@ mod tests {
             render_cache_mb: 256,
             animate_scroll: false,
             dark_mode: true,
-            fit_height: true,
             dismissed_notice: Some(0x1234_5678_90ab_cdef),
             geometry: Some(Geometry {
                 width: 1000,
@@ -251,7 +244,6 @@ mod tests {
         assert_eq!(loaded.render_cache_mb, 256);
         assert!(!loaded.animate_scroll);
         assert!(loaded.dark_mode);
-        assert!(loaded.fit_height);
         assert_eq!(loaded.dismissed_notice, Some(0x1234_5678_90ab_cdef));
         let g = loaded.geometry.expect("geometry persisted");
         assert_eq!((g.width, g.height, g.maximized), (1000, 700, true));
@@ -263,7 +255,6 @@ mod tests {
             render_cache_mb: DEFAULT_RENDER_CACHE_MB,
             animate_scroll: true,
             dark_mode: false,
-            fit_height: false,
             dismissed_notice: None,
             geometry: None,
         })
@@ -272,7 +263,6 @@ mod tests {
         assert_eq!(loaded.render_threads, max_render_threads());
         assert!(loaded.animate_scroll);
         assert!(!loaded.dark_mode);
-        assert!(!loaded.fit_height);
         assert!(loaded.dismissed_notice.is_none());
         assert!(loaded.geometry.is_none());
     }

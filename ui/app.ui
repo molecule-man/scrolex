@@ -153,9 +153,8 @@
 				</child>
 				<child type="start">
 					<object class="GtkToggleButton" id="btn_fit_height">
-						<property name="active" bind-source="state" bind-property="fit-height" bind-flags="bidirectional|sync-create"/>
 						<property name="icon-name">zoom-fit-best-symbolic</property>
-						<property name="tooltip-text">Fit page to the window height</property>
+						<property name="tooltip-text">Fit document to the window height</property>
 						<property name="cursor">
 							<object class="GdkCursor">
 								<property name="name">pointer</property>

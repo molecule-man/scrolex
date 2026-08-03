@@ -140,24 +140,19 @@ pub(crate) fn stage_candidate(uri: &str) -> Option<Candidate> {
 }
 
 impl Candidate {
-    // The page count and the extent of the whole document from one open, which a load can run off
-    // the main thread. The extent is the widest page's width and the tallest page's height, and the
-    // two need not come from one page. None if the document does not open.
-    //
-    // The bounds of one page cost about 50us, so a thousand-page document adds well under a tenth of
-    // a second to the load. Fit-to-height needs the true tallest page, not a sample.
-    pub(crate) fn probe(&self) -> Option<(i32, Option<(f64, f64)>)> {
+    // Read the page count and the tallest paper height from one document open.
+    pub(crate) fn probe(&self) -> Option<(i32, Option<f64>)> {
         if let Some(cfg) = crate::emulate::config() {
-            return Some((cfg.pages, Some(cfg.page_pt)));
+            return Some((cfg.pages, Some(cfg.page_pt.1)));
         }
         let _ctx = Colorspace::device_bgr();
         let doc = Document::open(self.path.as_path()).ok()?;
         let n_pages = doc.page_count().ok()?;
-        let extent = (0..n_pages)
+        let tallest_page_height = (0..n_pages)
             .filter_map(|index| doc.load_page(index).ok()?.bounds().ok())
-            .map(|b| (f64::from(b.x1 - b.x0), f64::from(b.y1 - b.y0)))
-            .reduce(|(aw, ah), (bw, bh)| (aw.max(bw), ah.max(bh)));
-        Some((n_pages, extent))
+            .map(|bounds| f64::from(bounds.y1 - bounds.y0))
+            .max_by(f64::total_cmp);
+        Some((n_pages, tallest_page_height))
     }
 
     // Publish the validated temp so workers render these exact bytes. Call after invalidate().
@@ -628,7 +623,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         let uri = margin_pdf_uri();
         assert_eq!(
             stage_candidate(&uri).unwrap().probe(),
-            Some((1, Some((200.0, 200.0))))
+            Some((1, Some(200.0)))
         );
         assert_eq!(page_size(&uri, 0), Some((200.0, 200.0)));
         // out-of-range / unopenable degrade rather than panic
@@ -651,7 +646,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
 trailer\n<< /Root 1 0 R >>\n%%EOF";
 
     #[test]
-    fn probe_reports_the_document_extent() {
+    fn probe_reports_the_tallest_page() {
         let dir = std::env::temp_dir().join("scrolex_mixed_size_test");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("mixed.pdf");
@@ -660,13 +655,11 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
 
         assert_eq!(
             stage_candidate(&uri).unwrap().probe(),
-            Some((3, Some((2000.0, 3000.0))))
+            Some((3, Some(3000.0)))
         );
     }
 
-    // Twelve pages, all small but the last, which is tall and narrow. Fit-to-height zooms by the
-    // tallest page in the document. The probe must read every page, and take the width and the height
-    // from whichever page holds each.
+    // The tall page sits after the first eight pages.
     const TALL_LAST_PAGE_PDF: &[u8] = b"%PDF-1.4\n\
 1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n\
 2 0 obj\n<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R 6 0 R 7 0 R 8 0 R 9 0 R 10 0 R 11 0 R 12 0 R 13 0 R 14 0 R] /Count 12 >>\nendobj\n\
@@ -692,10 +685,9 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         std::fs::write(&path, TALL_LAST_PAGE_PDF).unwrap();
         let uri = format!("file://{}", path.display());
 
-        // 500 wide from the small pages, 900 tall from the last one
         assert_eq!(
             stage_candidate(&uri).unwrap().probe(),
-            Some((12, Some((500.0, 900.0))))
+            Some((12, Some(900.0)))
         );
     }
 
