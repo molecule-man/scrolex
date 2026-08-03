@@ -185,8 +185,7 @@ pub struct Window {
     // set when the current scroll sequence must not coast on: mouse wheel, pinch, ctrl+scroll zoom
     kinetic_blocked: Cell<bool>,
 
-    // last horizontal scroll position, to derive travel direction (prefetch reads toward it) from
-    // any scroll path - free-scroll included, not just page steps
+    // Previous horizontal scroll position for diagnostics.
     last_hadj: Cell<f64>,
 
     // the position set_hscroll asked for last, and which input asked for it. If the position ends up
@@ -225,6 +224,9 @@ pub struct Window {
 
     // An idle fit request exists.
     fit_pending: Cell<bool>,
+
+    // Vertical list-row padding in logical pixels.
+    fit_chrome_height: Cell<Option<f64>>,
 }
 
 // A document point held still across a zoom: which page, where in it (page points from its
@@ -321,6 +323,12 @@ impl Window {
             }),
         );
 
+        page.connect_map(clone!(
+            #[weak(rename_to = imp)]
+            self,
+            move |page| imp.cache_fit_chrome_height(page)
+        ));
+
         list_item.set_child(Some(page));
     }
 
@@ -408,6 +416,7 @@ impl Window {
                 let sliding = self.scroll_anim.borrow().is_some();
                 if !sliding {
                     let hadj = self.scrolledwindow.hadjustment();
+                    self.set_scroll_direction_from_delta(dx);
                     self.set_hscroll(self.clamp_scroll(hadj.value() + dx), "touchpad");
                 }
                 log::trace!(
@@ -606,7 +615,9 @@ impl Window {
         };
         if let Some((prev_x, prev_y)) = *self.drag_coords.borrow() {
             let hadjustment = self.scrolledwindow.hadjustment();
-            self.set_hscroll(hadjustment.value() - (x - prev_x), "drag");
+            let delta = prev_x - x;
+            self.set_scroll_direction_from_delta(delta);
+            self.set_hscroll(hadjustment.value() + delta, "drag");
             let vadjustment = self.vscrolledwindow.vadjustment();
             vadjustment.set_value(vadjustment.value() - (y - prev_y));
         }
@@ -713,23 +724,25 @@ impl Window {
     // One paper scale keeps the text size stable across pages.
     // Crop heights cost 13 ms per page, so this calculation excludes them.
     fn fit_height_zoom(&self) -> Option<f64> {
-        let viewport = self.vscrolledwindow.vadjustment().page_size() - self.list_chrome_height();
+        let viewport =
+            self.vscrolledwindow.vadjustment().page_size() - self.fit_chrome_height.get()?;
         let tallest = self.state.tallest_page_height();
 
         (viewport > 0.0 && tallest > 0.0).then(|| viewport / tallest)
     }
 
-    // Exclude row padding from the height available to paper.
-    fn list_chrome_height(&self) -> f64 {
-        let Some(page) = self.mapped_page(self.state.page() as i32) else {
-            return 0.0;
-        };
+    fn cache_fit_chrome_height(&self, page: &page::Page) {
+        if self.fit_chrome_height.get().is_some() {
+            return;
+        }
         let Some(row) = page.parent() else {
-            return 0.0;
+            return;
         };
 
         let natural = |widget: &gtk::Widget| widget.measure(gtk::Orientation::Vertical, -1).1;
-        f64::from((natural(&row) - natural(page.upcast_ref())).max(0))
+        let height = f64::from((natural(&row) - natural(page.upcast_ref())).max(0));
+        self.fit_chrome_height.set(Some(height));
+        self.queue_fit_height();
     }
 
     fn viewport_center(&self) -> (f64, f64) {
@@ -998,6 +1011,7 @@ impl Window {
                     hadj.page_size() * 0.1
                 };
                 let delta = if keyval == Key::Left { -step } else { step };
+                self.set_scroll_direction_from_delta(delta);
                 self.set_hscroll(hadj.value() + delta, "arrow-key");
             }
             Key::Up | Key::Down | Key::k | Key::j => {
@@ -1335,6 +1349,12 @@ impl Window {
     fn set_hscroll(&self, value: f64, cause: &'static str) {
         self.hscroll_intent.set((value, cause));
         self.scrolledwindow.hadjustment().set_value(value);
+    }
+
+    fn set_scroll_direction_from_delta(&self, delta: f64) {
+        if delta.abs() > f64::EPSILON {
+            self.state.set_scroll_forward(delta > 0.0);
+        }
     }
 
     // Note that GtkListView is about to move us (scroll_to, or showing a page that was just
@@ -1675,16 +1695,12 @@ impl Window {
         });
 
         let hadj = self.scrolledwindow.hadjustment();
-        // value-changed: the position moved (any scroll path). Track travel direction for prefetch,
-        // refresh the wanted range, sync the selection.
+        // Refresh the wanted range and sync the selection after each position change.
         hadj.connect_value_changed(clone!(
             #[weak(rename_to = imp)]
             self,
             move |adj| {
                 let prev = imp.last_hadj.replace(adj.value());
-                if (adj.value() - prev).abs() > f64::EPSILON {
-                    imp.state.set_scroll_forward(adj.value() > prev);
-                }
                 // `shift` is the one number that shows a real problem: how far the selected page moved
                 // on screen. REVERSED means it moved back while the reader was going forward.
                 // `off` is how far the position ended up from what `cause` asked for, and UNASKED
@@ -2002,6 +2018,7 @@ impl Window {
 
         if let Some(index) = center {
             if index >= 0 && (index as u32) < n_items {
+                self.state.set_scroll_forward(index > selected);
                 log::debug!(
                     target: "scrolex::pan",
                     "viewport sync: selection {selected} -> {index}",
@@ -2426,7 +2443,6 @@ impl WidgetImpl for Window {
     fn size_allocate(&self, width: i32, height: i32, baseline: i32) {
         self.parent_size_allocate(width, height, baseline);
         self.restore_zoom_anchor();
-        self.queue_fit_height();
     }
 }
 
@@ -2986,6 +3002,21 @@ mod widget_tests {
         assert!((imp.rebase_target(&anim, 45_369.0) - 46_046.0).abs() < f64::EPSILON);
     }
 
+    #[gtk::test]
+    fn a_coordinate_rewrite_does_not_reverse_prefetch() {
+        let window = window();
+        let imp = window.imp();
+        let hadj = imp.scrolledwindow.hadjustment();
+        hadj.configure(500.0, 0.0, 2000.0, 10.0, 100.0, 500.0);
+        imp.state.set_scroll_forward(true);
+
+        hadj.set_value(400.0);
+
+        assert!(imp.state.scroll_forward());
+        imp.set_scroll_direction_from_delta(-1.0);
+        assert!(!imp.state.scroll_forward());
+    }
+
     // Wheeling mid-slide retargets the running slide, and starts from where it was already heading.
     #[gtk::test]
     fn a_retarget_advances_from_the_rebased_target() {
@@ -3198,6 +3229,22 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         wait_until(|| !imp.fit_pending.get());
 
         assert_fills_the_viewport(imp);
+        window.close();
+    }
+
+    #[gtk::test]
+    fn fit_keeps_cached_chrome_without_a_mapped_selected_page() {
+        let window = loaded_window();
+        let imp = window.imp();
+        imp.btn_fit_height.set_active(true);
+        wait_until(|| !imp.fit_pending.get());
+        let zoom = imp.state.zoom();
+
+        imp.state.set_page(imp.state.n_pages() as u32 + 1);
+        imp.queue_fit_height();
+        wait_until(|| !imp.fit_pending.get());
+
+        assert_eq!(imp.state.zoom(), zoom);
         window.close();
     }
 

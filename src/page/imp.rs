@@ -1008,6 +1008,8 @@ impl Page {
 
         if missing.is_empty() {
             self.note_paint(page_num, Paint::Sharp);
+            self.prefetch_previews(page_num);
+            return;
         } else {
             self.schedule_tile_render(page_num, scale, dsf, page_px, missing);
             obj.state()
@@ -1024,7 +1026,6 @@ impl Page {
             );
         }
 
-        self.prefetch_previews(page_num);
         let preview_target_width = ((page.width * obj.state().preview_scale()) as i32).max(1);
         if needs_visible_preview(
             full.as_ref().map(|texture| texture.width()),
@@ -1061,8 +1062,8 @@ impl Page {
                 log::debug!("draw page {page_num}: cache hit");
                 let bbox = self.get_bbox(page, obj.crop());
                 self.append_render(snapshot, &texture, page, &bbox, scale, render_scale);
-                self.prefetch_previews(page_num);
                 self.prefetch_next(page_num, page_bytes as usize);
+                self.prefetch_previews(page_num);
                 return;
             }
             log::debug!("draw page {page_num}: cache stale");
@@ -1119,9 +1120,7 @@ impl Page {
             self.note_paint(page_num, Paint::Placeholder);
         }
 
-        // Prefetch low-resolution textures for surrounding pages. Request one for this page only
-        // when no preview is cached and the completed texture is below the preview target.
-        self.prefetch_previews(page_num);
+        // Request a stand-in for this page. Start look-ahead work after the full render lands.
         let preview_target_width = ((page.width * obj.state().preview_scale()) as i32).max(1);
         if needs_visible_preview(
             stale_render.as_ref().map(|texture| texture.width()),
@@ -1130,7 +1129,6 @@ impl Page {
         ) {
             self.schedule_preview_if_needed(page_num, RenderPriority::VisiblePreview);
         }
-        self.prefetch_next(page_num, page_bytes as usize);
     }
 
     // Full-render pages ahead in the scroll direction so reading on lands on a cached page. Skips
