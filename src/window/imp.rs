@@ -178,8 +178,10 @@ impl Window {
     ) -> glib::Propagation {
         use gtk::gdk::Key;
 
+        let control = gtk::gdk::ModifierType::CONTROL_MASK;
+        let control_shift = control | gtk::gdk::ModifierType::SHIFT_MASK;
         let modifiers = modifier & gtk::accelerator_get_default_mod_mask();
-        if modifiers == gtk::gdk::ModifierType::CONTROL_MASK {
+        if modifiers == control {
             match keyval {
                 Key::t | Key::T => {
                     self.new_tab();
@@ -195,8 +197,21 @@ impl Window {
                     }
                     return glib::Propagation::Stop;
                 }
+                Key::Page_Down | Key::KP_Page_Down | Key::Tab => {
+                    self.switch_document(1);
+                    return glib::Propagation::Stop;
+                }
+                Key::Page_Up | Key::KP_Page_Up => {
+                    self.switch_document(-1);
+                    return glib::Propagation::Stop;
+                }
                 _ => {}
             }
+        }
+        // Most layouts send ISO_Left_Tab for Shift+Tab, but not all of them.
+        if modifiers == control_shift && matches!(keyval, Key::ISO_Left_Tab | Key::Tab) {
+            self.switch_document(-1);
+            return glib::Propagation::Stop;
         }
 
         self.active_document()
@@ -278,6 +293,16 @@ impl Window {
         self.notebook.remove_page(Some(page));
         self.update_tab_bar();
         self.share_cache_budgets();
+    }
+
+    fn switch_document(&self, step: i32) {
+        let count = self.notebook.n_pages() as i32;
+        if count < 2 {
+            return;
+        }
+        let current = self.notebook.current_page().unwrap_or(0) as i32;
+        let next = (current + step).rem_euclid(count);
+        self.notebook.set_current_page(Some(next as u32));
     }
 
     // GtkNotebook neither shrinks a tab nor closes one, so the label carries both.
@@ -1122,6 +1147,74 @@ mod widget_tests {
             .handle_window_key(gtk::gdk::Key::w, gtk::gdk::ModifierType::CONTROL_MASK);
 
         assert!(!window.header().obj().is_visible(), "the window closed");
+    }
+
+    #[gtk::test]
+    fn ctrl_page_keys_switch_tabs_and_wrap() {
+        let window = loaded_window();
+        let header = window.header();
+        header.add_document().expect("a tab");
+        header.add_document().expect("a tab");
+
+        let press = |key| header.handle_window_key(key, gtk::gdk::ModifierType::CONTROL_MASK);
+
+        for key in [gtk::gdk::Key::Page_Down, gtk::gdk::Key::KP_Page_Down] {
+            header.notebook.set_current_page(Some(2));
+            assert_eq!(press(key), gtk::glib::Propagation::Stop);
+            assert_eq!(header.notebook.current_page(), Some(0));
+        }
+        for key in [gtk::gdk::Key::Page_Up, gtk::gdk::Key::KP_Page_Up] {
+            header.notebook.set_current_page(Some(0));
+            assert_eq!(press(key), gtk::glib::Propagation::Stop);
+            assert_eq!(header.notebook.current_page(), Some(2));
+        }
+
+        window.close();
+    }
+
+    #[gtk::test]
+    fn ctrl_tab_walks_the_tabs_both_ways() {
+        let window = loaded_window();
+        let header = window.header();
+        header.add_document().expect("a tab");
+
+        header.notebook.set_current_page(Some(1));
+        assert_eq!(
+            header.handle_window_key(gtk::gdk::Key::Tab, gtk::gdk::ModifierType::CONTROL_MASK),
+            gtk::glib::Propagation::Stop
+        );
+        assert_eq!(header.notebook.current_page(), Some(0));
+
+        let control_shift =
+            gtk::gdk::ModifierType::CONTROL_MASK | gtk::gdk::ModifierType::SHIFT_MASK;
+        for key in [gtk::gdk::Key::ISO_Left_Tab, gtk::gdk::Key::Tab] {
+            header.notebook.set_current_page(Some(0));
+            assert_eq!(
+                header.handle_window_key(key, control_shift),
+                gtk::glib::Propagation::Stop
+            );
+            assert_eq!(header.notebook.current_page(), Some(1));
+        }
+
+        window.close();
+    }
+
+    #[gtk::test]
+    fn a_single_tab_does_not_switch() {
+        let window = loaded_window();
+        let header = window.header();
+        assert_eq!(header.notebook.n_pages(), 1);
+
+        assert_eq!(
+            header.handle_window_key(
+                gtk::gdk::Key::Page_Down,
+                gtk::gdk::ModifierType::CONTROL_MASK,
+            ),
+            gtk::glib::Propagation::Stop
+        );
+
+        assert_eq!(header.notebook.current_page(), Some(0));
+        window.close();
     }
 
     #[gtk::test]
