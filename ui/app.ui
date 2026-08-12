@@ -87,7 +87,8 @@
 					<!--<object class="GtkLabel" id="title">-->
 					<!--	<property name="label">Scrolex</property>-->
 					<!--</object>-->
-				</child>				<child type="start">
+				</child>
+				<child type="start">
 					<object class="GtkButton" id="btn_open">
 						<signal name="clicked" handler="open_document" swapped="true"/>
 						<property name="icon-name">document-open</property>
@@ -98,7 +99,8 @@
 							</object>
 						</property>
 					</object>
-				</child>				<child type="start">
+				</child>
+				<child type="start">
 					<object class="GtkButton" id="btn_new_tab">
 						<signal name="clicked" handler="new_tab" swapped="true"/>
 						<property name="icon-name">tab-new-symbolic</property>
@@ -109,7 +111,8 @@
 							</object>
 						</property>
 					</object>
-				</child>				<child type="start">
+				</child>
+				<child type="start">
 					<object class="GtkToggleButton" id="btn_toc">
 						<property name="icon-name">view-list-symbolic</property>
 						<property name="tooltip-text">Contents (t)</property>
@@ -119,7 +122,8 @@
 							</object>
 						</property>
 					</object>
-				</child>				<child type="end">
+				</child>
+				<child type="end">
 					<object class="GtkMenuButton" id="btn_menu">
 						<property name="icon-name">open-menu-symbolic</property>
 						<property name="tooltip-text">Settings</property>
@@ -249,7 +253,8 @@
 							</object>
 						</property>
 					</object>
-				</child>				<child type="end">
+				</child>
+				<child type="end">
 					<object class="GtkToggleButton" id="btn_crop">
 						<property name="label">Crop Margins</property>
 						<property name="cursor">
@@ -258,7 +263,8 @@
 							</object>
 						</property>
 					</object>
-				</child>				<child type="end">
+				</child>
+				<child type="end">
 					<object class="GtkToggleButton" id="btn_fit_height">
 						<property name="icon-name">zoom-fit-best-symbolic</property>
 						<property name="tooltip-text">Fit document to the window height</property>
@@ -268,7 +274,8 @@
 							</object>
 						</property>
 					</object>
-				</child>				<child type="end">
+				</child>
+				<child type="end">
 					<object class="GtkButton" id="btn_zoom_in">
 						<signal name="clicked" handler="zoom_in" swapped="true"/>
 						<property name="icon-name">zoom-in</property>
@@ -279,7 +286,8 @@
 							</object>
 						</property>
 					</object>
-				</child>				<child type="end">
+				</child>
+				<child type="end">
 					<object class="GtkEntry" id="entry_zoom">
 						<signal name="activate" handler="handle_zoom_entry" swapped="true"/>
 						<signal name="icon-press" handler="handle_zoom_entry_icon" swapped="true"/>
@@ -302,7 +310,8 @@
 							</closure>
 						</binding>
 					</object>
-				</child>				<child type="end">
+				</child>
+				<child type="end">
 					<object class="GtkButton" id="btn_zoom_out">
 						<signal name="clicked" handler="zoom_out" swapped="true"/>
 						<property name="icon-name">zoom-out</property>

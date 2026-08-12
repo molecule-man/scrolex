@@ -30,6 +30,10 @@ impl DocumentView {
         self.imp().state.as_ref()
     }
 
+    pub fn is_loading(&self) -> bool {
+        self.imp().loading_spinner.is_spinning()
+    }
+
     // Actions the header bar and the menu drive.
 
     pub fn zoom_in(&self) {

@@ -2310,10 +2310,11 @@ impl WidgetImpl for DocumentView {
     }
 
     fn unmap(&self) {
-        self.hidden_at.set(Some((
-            self.selection.selected(),
-            self.scrolledwindow.hadjustment().value(),
-        )));
+        let page = self.selection.selected();
+        self.hidden_at.set(
+            (page != gtk::INVALID_LIST_POSITION)
+                .then(|| (page, self.scrolledwindow.hadjustment().value())),
+        );
         self.parent_unmap();
     }
 }
@@ -2759,6 +2760,23 @@ mod widget_tests {
         wait_until(|| !window.is_mapped());
 
         assert_eq!(imp.hidden_at.get().map(|(page, _)| page), Some(2));
+        window.close();
+    }
+
+    #[gtk::test]
+    fn hiding_an_empty_view_records_no_page() {
+        let window = window();
+        window.present();
+        wait_until(|| window.is_mapped());
+        assert_eq!(
+            window.imp().selection.selected(),
+            gtk::INVALID_LIST_POSITION
+        );
+
+        window.set_visible(false);
+        wait_until(|| !window.is_mapped());
+
+        assert!(window.imp().hidden_at.get().is_none());
         window.close();
     }
 

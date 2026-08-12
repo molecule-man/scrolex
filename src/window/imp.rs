@@ -12,8 +12,8 @@ use gtk::{glib, Button, CompositeTemplate, ToggleButton};
 
 use crate::document_view::DocumentView;
 
-// Tabs stop being a useful way to hold documents well before this. The cap also keeps the shared
-// render cache from splitting into slivers too small to hold a page.
+// Tabs stop being a useful way to hold documents well before this. The cap also limits each
+// document's render state and widget tree.
 const MAX_DOCUMENTS: u32 = 16;
 
 // File types MuPDF opens. The chooser offers these before "All files".
@@ -56,6 +56,11 @@ pub struct Window {
 
     // Prevent global animate-scroll updates from calling each other.
     animate_scroll_sync: Cell<bool>,
+
+    render_threads: Cell<usize>,
+    render_cache_mb: Cell<usize>,
+    preview_cache_pages: Cell<usize>,
+    animate_scroll: Cell<bool>,
 }
 
 #[glib::object_subclass]
@@ -97,6 +102,26 @@ impl ObjectImpl for Window {
 
     fn constructed(&self) {
         self.parent_constructed();
+
+        let config = crate::config::load_config();
+        self.render_threads.set(config.render_threads);
+        self.render_cache_mb.set(config.render_cache_mb);
+        self.preview_cache_pages.set(config.preview_cache_pages);
+        self.animate_scroll.set(config.animate_scroll);
+        let current = self.obj().clone();
+        if let Some(window) = self.obj().application().and_then(|application| {
+            application
+                .windows()
+                .into_iter()
+                .filter_map(|window| window.downcast::<super::Window>().ok())
+                .find(|window| window != &current)
+        }) {
+            let imp = window.imp();
+            self.render_threads.set(imp.render_threads.get());
+            self.render_cache_mb.set(imp.render_cache_mb.get());
+            self.preview_cache_pages.set(imp.preview_cache_pages.get());
+            self.animate_scroll.set(imp.animate_scroll.get());
+        }
 
         if let Some(editable) = self.entry_page_num.delegate() {
             editable.connect_insert_text(|entry, s, _| {
@@ -156,7 +181,8 @@ impl Window {
     ) -> glib::Propagation {
         use gtk::gdk::Key;
 
-        if modifier.contains(gtk::gdk::ModifierType::CONTROL_MASK) {
+        let modifiers = modifier & gtk::accelerator_get_default_mod_mask();
+        if modifiers == gtk::gdk::ModifierType::CONTROL_MASK {
             match keyval {
                 Key::t | Key::T => {
                     self.new_tab();
@@ -206,10 +232,9 @@ impl Window {
 
         let document = DocumentView::new();
 
-        let config = crate::config::load_config();
         let state = document.state();
-        state.set_render_threads(config.render_threads);
-        state.set_animate_scroll(config.animate_scroll);
+        state.set_render_threads(self.render_threads.get());
+        state.set_animate_scroll(self.animate_scroll.get());
         state.connect_animate_scroll_notify(clone!(
             #[weak(rename_to = imp)]
             self,
@@ -253,8 +278,6 @@ impl Window {
                 eprintln!("Error saving state for {}: {err}", state.uri());
             }
         }
-        document.release_renders();
-
         self.notebook.remove_page(Some(page));
         self.update_tab_bar();
         self.share_cache_budgets();
@@ -306,6 +329,31 @@ impl Window {
         (0..self.notebook.n_pages())
             .filter_map(|i| self.notebook.nth_page(Some(i)))
             .filter_map(|page| page.downcast::<DocumentView>().ok())
+            .collect()
+    }
+
+    fn application_windows(&self) -> Vec<super::Window> {
+        let mut windows = self.obj().application().map_or_else(
+            || vec![self.obj().clone()],
+            |application| {
+                application
+                    .windows()
+                    .into_iter()
+                    .filter_map(|window| window.downcast::<super::Window>().ok())
+                    .collect()
+            },
+        );
+        let current = self.obj().clone();
+        if !windows.contains(&current) {
+            windows.push(current);
+        }
+        windows
+    }
+
+    fn application_documents(&self) -> Vec<DocumentView> {
+        self.application_windows()
+            .into_iter()
+            .flat_map(|window| window.imp().documents())
             .collect()
     }
 
@@ -394,11 +442,10 @@ impl Window {
         ));
     }
 
-    // An empty document is the tab the reader already looks at, so fill it instead of stacking
-    // another one beside it.
+    // Fill an idle empty tab instead of adding another tab.
     pub(crate) fn open_in_new_tab(&self, file: &gtk::gio::File) {
         let document = match self.active_document() {
-            Some(active) if active.state().n_pages() == 0 => Some(active),
+            Some(active) if active.state().n_pages() == 0 && !active.is_loading() => Some(active),
             _ => self.add_document(),
         };
         if let Some(document) = document {
@@ -478,7 +525,7 @@ impl Window {
     // Load the render-thread setting into the spin button and pool, and persist any user change.
     fn setup_thread_setting(&self) {
         let max = crate::config::max_render_threads();
-        let threads = crate::config::load_config().render_threads;
+        let threads = self.render_threads.get();
         self.spin_threads.set_range(1.0, max as f64);
         self.spin_threads.set_increments(1.0, 1.0);
         self.spin_threads.set_value(threads as f64);
@@ -501,46 +548,59 @@ impl Window {
 
     fn apply_render_threads(&self, n: usize) {
         log::info!("Render threads: {n}");
-        for document in self.documents() {
+        for window in self.application_windows() {
+            window.imp().render_threads.set(n);
+        }
+        for document in self.application_documents() {
             document.state().set_render_threads(n);
         }
         crate::page::set_render_threads(n);
     }
 
     fn setup_cache_setting(&self) {
-        let mb = crate::config::load_config().render_cache_mb;
+        let mb = self.render_cache_mb.get();
         self.spin_cache.set_range(
             crate::config::MIN_RENDER_CACHE_MB as f64,
             crate::config::MAX_RENDER_CACHE_MB as f64,
         );
         self.spin_cache.set_increments(32.0, 64.0);
         self.spin_cache.set_value(mb as f64);
-        self.share_cache_budgets();
+        self.apply_cache_budgets(mb);
 
         self.spin_cache.connect_value_changed(clone!(
             #[weak(rename_to = imp)]
             self,
             move |spin| {
+                let mb = spin.value() as usize;
+                imp.apply_cache_budgets(mb);
                 let mut config = crate::config::load_config();
-                config.render_cache_mb = spin.value() as usize;
+                config.render_cache_mb = mb;
                 if let Err(e) = crate::config::save_config(&config) {
                     eprintln!("Error saving config: {e}");
                 }
-                imp.share_cache_budgets();
             }
         ));
+    }
+
+    fn apply_cache_budgets(&self, render_cache_mb: usize) {
+        let preview_cache_pages = self.preview_cache_pages.get();
+        for window in self.application_windows() {
+            let imp = window.imp();
+            imp.render_cache_mb.set(render_cache_mb);
+            imp.preview_cache_pages.set(preview_cache_pages);
+        }
+        self.share_cache_budgets();
     }
 
     // The configured cache sizes are application totals, not per-document ones. Four tabs must not
     // claim four budgets. Run this whenever the document count or the setting changes.
     pub(crate) fn share_cache_budgets(&self) {
-        let config = crate::config::load_config();
-        let documents = self.documents();
+        let documents = self.application_documents();
         let count = documents.len().max(1);
 
-        let render_bytes = config.render_cache_mb * 1024 * 1024 / count;
+        let render_bytes = self.render_cache_mb.get() * 1024 * 1024 / count;
         // A document with no preview budget re-renders the same preview forever.
-        let preview_pages = (config.preview_cache_pages / count).max(1);
+        let preview_pages = (self.preview_cache_pages.get() / count).max(1);
 
         for document in documents {
             document.state().set_render_cache_bytes(render_bytes);
@@ -553,12 +613,20 @@ impl Window {
             return;
         }
 
-        for document in self.documents() {
+        let windows = self.application_windows();
+        for window in &windows {
+            let imp = window.imp();
+            imp.animate_scroll_sync.set(true);
+            imp.animate_scroll.set(enabled);
+        }
+        for document in self.application_documents() {
             if document.state().animate_scroll() != enabled {
                 document.state().set_animate_scroll(enabled);
             }
         }
-        self.animate_scroll_sync.set(false);
+        for window in windows {
+            window.imp().animate_scroll_sync.set(false);
+        }
 
         let mut config = crate::config::load_config();
         config.animate_scroll = enabled;
@@ -845,6 +913,23 @@ mod widget_tests {
     }
 
     #[gtk::test]
+    fn a_pending_load_keeps_its_tab() {
+        let window = test_window();
+        let first = window.header().active_document().expect("the empty view");
+        first.state().load(&fixture("outline.pdf"));
+        assert!(first.is_loading());
+
+        window.header().open_in_new_tab(&fixture("no_outline.pdf"));
+
+        assert_eq!(window.header().notebook.n_pages(), 2);
+        assert!(
+            first.is_loading(),
+            "the second load did not cancel the first"
+        );
+        window.close();
+    }
+
+    #[gtk::test]
     fn closing_the_active_tab_falls_back_to_its_neighbour() {
         let window = loaded_window();
         let notebook = window.header().notebook.get();
@@ -991,6 +1076,21 @@ mod widget_tests {
             .handle_window_key(gtk::gdk::Key::w, gtk::gdk::ModifierType::CONTROL_MASK);
 
         assert!(!window.header().obj().is_visible(), "the window closed");
+    }
+
+    #[gtk::test]
+    fn ctrl_shift_w_does_not_close_a_tab() {
+        let window = loaded_window();
+        window.header().add_document().expect("a tab");
+
+        let taken = window.header().handle_window_key(
+            gtk::gdk::Key::w,
+            gtk::gdk::ModifierType::CONTROL_MASK | gtk::gdk::ModifierType::SHIFT_MASK,
+        );
+
+        assert_eq!(taken, gtk::glib::Propagation::Proceed);
+        assert_eq!(window.header().notebook.n_pages(), 2);
+        window.close();
     }
 
     #[gtk::test]
