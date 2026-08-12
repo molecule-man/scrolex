@@ -20,24 +20,27 @@ impl Window {
         Object::builder().property("application", app).build()
     }
 
-    // The document the header bar and the menu act on.
-    pub fn document(&self) -> DocumentView {
-        self.imp().document.get()
+    pub fn active_document(&self) -> DocumentView {
+        self.imp().active_document()
+    }
+
+    pub fn documents(&self) -> Vec<DocumentView> {
+        self.imp().documents()
     }
 
     pub fn apply_dark_mode(&self, enabled: bool) {
-        if self.has_css_class("dark-mode") == enabled {
-            return;
-        }
-        if enabled {
-            self.add_css_class("dark-mode");
-        } else {
-            self.remove_css_class("dark-mode");
+        if self.has_css_class("dark-mode") != enabled {
+            if enabled {
+                self.add_css_class("dark-mode");
+            } else {
+                self.remove_css_class("dark-mode");
+            }
         }
 
-        let document = self.document();
-        document.state().invalidate_rendering();
-        document.redraw_pages();
+        for document in self.documents() {
+            document.state().invalidate_rendering();
+            document.redraw_pages();
+        }
     }
 
     pub fn show_error_dialog(&self, message: &str) {

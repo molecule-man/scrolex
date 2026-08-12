@@ -132,11 +132,9 @@ fn build_ui(app: &Application, args: &[OsString]) {
         window.add_css_class("debug");
     }
 
-    let state = window.document().state().clone();
+    let state = window.active_document().state().clone();
 
     app.connect_shutdown(clone!(
-        #[strong]
-        state,
         #[strong]
         window,
         move |_| {
@@ -150,8 +148,10 @@ fn build_ui(app: &Application, args: &[OsString]) {
                 eprintln!("Error saving config: {err}");
             }
 
-            if let Err(err) = state.save() {
-                eprintln!("Error saving state: {err}");
+            for document in window.documents() {
+                if let Err(err) = document.state().save() {
+                    eprintln!("Error saving state for {}: {err}", document.state().uri());
+                }
             }
 
             // The background render threads (bg_job) are detached and may be mid MuPDF render at

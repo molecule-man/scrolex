@@ -56,7 +56,7 @@ pub fn window() -> TestWindow {
     // the stylesheet keys off this name, as in main
     window.set_widget_name("main");
     window.set_default_size(TEST_WINDOW.0, TEST_WINDOW.1);
-    let document = window.document();
+    let document = window.active_document();
     TestWindow { window, document }
 }
 

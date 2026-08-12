@@ -1,6 +1,6 @@
 // Window chrome: the header bar, the settings menu, and the file chooser. The document itself
 // lives in DocumentView.
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::sync::OnceLock;
 
 use glib::clone;
@@ -44,8 +44,14 @@ pub struct Window {
     // The document the header bar acts on.
     active_document: RefCell<Option<DocumentView>>,
 
+    // Every document this window owns.
+    documents: RefCell<Vec<DocumentView>>,
+
     // Two-way header bindings, dropped when the active document changes.
     header_bindings: RefCell<Vec<glib::Binding>>,
+
+    // Prevent global animate-scroll updates from calling each other.
+    animate_scroll_sync: Cell<bool>,
 }
 
 #[glib::object_subclass]
@@ -98,22 +104,22 @@ impl ObjectImpl for Window {
             });
         }
 
+        self.set_active_document(&self.document.get());
         self.setup_thread_setting();
         self.setup_cache_setting();
-        self.setup_animate_scroll();
         self.setup_drop_target();
         self.setup_search_keys();
-        self.connect_document(&self.document.get());
-        self.set_active_document(&self.document.get());
 
-        // Drop the render-pool state when the window closes, so its entries don't linger.
+        // Drop each document's render-pool state when the window closes.
         self.obj().connect_close_request(clone!(
             #[weak(rename_to = imp)]
             self,
             #[upgrade_or]
             glib::Propagation::Proceed,
             move |_| {
-                imp.document.release_renders();
+                for document in imp.documents() {
+                    document.release_renders();
+                }
                 glib::Propagation::Proceed
             }
         ));
@@ -153,6 +159,31 @@ impl Window {
         );
     }
 
+    // Add one document to the window and apply its global settings.
+    pub(crate) fn register_document(&self, document: &DocumentView) {
+        if self.documents.borrow().contains(document) {
+            return;
+        }
+
+        let config = crate::config::load_config();
+        let state = document.state();
+        state.set_render_threads(config.render_threads);
+        state.set_render_cache_mb(config.render_cache_mb);
+        state.set_animate_scroll(config.animate_scroll);
+        state.connect_animate_scroll_notify(clone!(
+            #[weak(rename_to = imp)]
+            self,
+            move |state| imp.apply_animate_scroll(state.animate_scroll())
+        ));
+
+        self.connect_document(document);
+        self.documents.borrow_mut().push(document.clone());
+    }
+
+    pub(crate) fn documents(&self) -> Vec<DocumentView> {
+        self.documents.borrow().clone()
+    }
+
     // The document the header bar and the menu act on.
     pub(crate) fn active_document(&self) -> DocumentView {
         self.active_document
@@ -164,6 +195,7 @@ impl Window {
     // Point the header bar at a document. The lookup chains in app.ui follow the
     // active-document property on their own; the bindings below cannot, so they are rebuilt here.
     pub(crate) fn set_active_document(&self, document: &DocumentView) {
+        self.register_document(document);
         if self.active_document.borrow().as_ref() == Some(document) {
             return;
         }
@@ -308,7 +340,9 @@ impl Window {
 
     fn apply_render_threads(&self, n: usize) {
         log::info!("Render threads: {n}");
-        self.document.state().set_render_threads(n);
+        for document in self.documents() {
+            document.state().set_render_threads(n);
+        }
         crate::page::set_render_threads(n);
     }
 
@@ -320,14 +354,14 @@ impl Window {
         );
         self.spin_cache.set_increments(32.0, 64.0);
         self.spin_cache.set_value(mb as f64);
-        self.document.state().set_render_cache_mb(mb);
+        self.apply_render_cache_mb(mb);
 
         self.spin_cache.connect_value_changed(clone!(
             #[weak(rename_to = imp)]
             self,
             move |spin| {
                 let mb = spin.value() as usize;
-                imp.document.state().set_render_cache_mb(mb);
+                imp.apply_render_cache_mb(mb);
                 let mut config = crate::config::load_config();
                 config.render_cache_mb = mb;
                 if let Err(e) = crate::config::save_config(&config) {
@@ -337,17 +371,29 @@ impl Window {
         ));
     }
 
-    fn setup_animate_scroll(&self) {
-        let state = self.document.state();
-        state.set_animate_scroll(crate::config::load_config().animate_scroll);
+    fn apply_render_cache_mb(&self, mb: usize) {
+        for document in self.documents() {
+            document.state().set_render_cache_mb(mb);
+        }
+    }
 
-        state.connect_notify_local(Some("animate-scroll"), |state, _| {
-            let mut config = crate::config::load_config();
-            config.animate_scroll = state.animate_scroll();
-            if let Err(e) = crate::config::save_config(&config) {
-                eprintln!("Error saving config: {e}");
+    fn apply_animate_scroll(&self, enabled: bool) {
+        if self.animate_scroll_sync.replace(true) {
+            return;
+        }
+
+        for document in self.documents() {
+            if document.state().animate_scroll() != enabled {
+                document.state().set_animate_scroll(enabled);
             }
-        });
+        }
+        self.animate_scroll_sync.set(false);
+
+        let mut config = crate::config::load_config();
+        config.animate_scroll = enabled;
+        if let Err(e) = crate::config::save_config(&config) {
+            eprintln!("Error saving config: {e}");
+        }
     }
 
     #[template_callback]
@@ -453,12 +499,7 @@ impl Window {
         let Ok(page_num) = text.parse::<u32>() else {
             return false;
         };
-        let Some(document) = self.document.try_get() else {
-            return false;
-        };
-        let document: DocumentView = document;
-
-        document
+        self.active_document()
             .target_page(page_num)
             .is_some_and(|target| target != page + 1)
     }
@@ -494,9 +535,83 @@ fn dismiss_menu(btn: &Button) {
 
 #[cfg(test)]
 mod widget_tests {
+    use crate::document_view::DocumentView;
+    use crate::page::PageNumber;
     use crate::test_support::{loaded_window, wait_until};
     use gtk::prelude::*;
-    use gtk::subclass::prelude::ObjectSubclassIsExt;
+    use gtk::subclass::prelude::{ObjectSubclassExt, ObjectSubclassIsExt};
+
+    fn set_document_page(document: &DocumentView, count: u32, selected: u32) {
+        let selection = document.property::<gtk::SingleSelection>("selection");
+        let model = selection
+            .model()
+            .and_downcast::<gtk::gio::ListStore>()
+            .expect("document model");
+        model.remove_all();
+        for page in 0..count {
+            model.append(&PageNumber::new(page as i32));
+        }
+        document.state().set_n_pages(count as i32);
+        selection.set_selected(selected);
+    }
+
+    #[gtk::test]
+    fn header_follows_the_active_document() {
+        let window = loaded_window();
+        let first = window.header().active_document();
+        let second = DocumentView::new();
+        set_document_page(&second, 10, 9);
+        second.state().set_zoom(2.0);
+        second.state().set_crop(true);
+        second.state().set_fit_height(true);
+        second.state().set_prev_page(4);
+
+        window.header().set_active_document(&second);
+        wait_until(|| window.header().entry_page_num.text() == "10");
+
+        assert_eq!(window.header().entry_zoom.text(), "200");
+        assert!(window.header().btn_crop.is_active());
+        assert!(window.header().btn_fit_height.is_active());
+        assert!(
+            !window.header().page_jump_enabled("10", 9),
+            "the current page does not enable the jump icon"
+        );
+
+        window.header().set_active_document(&first);
+        wait_until(|| window.header().entry_page_num.text() == "1");
+        assert_eq!(window.header().entry_zoom.text(), "100");
+        assert!(!window.header().btn_crop.is_active());
+        assert!(!window.header().btn_fit_height.is_active());
+        window.close();
+    }
+
+    #[gtk::test]
+    fn global_settings_apply_to_every_registered_document() {
+        let window = loaded_window();
+        let first = window.header().active_document();
+        let second = DocumentView::new();
+        window.header().set_active_document(&second);
+
+        window.header().spin_threads.set_value(1.0);
+        window.header().spin_cache.set_value(96.0);
+        window.header().btn_animate_scroll.set_active(false);
+
+        for document in [&first, &second] {
+            assert_eq!(document.state().render_threads(), 1);
+            assert_eq!(
+                document.state().render_cache().borrow().budget_bytes(),
+                96 * 1024 * 1024
+            );
+            assert!(!document.state().animate_scroll());
+        }
+
+        let first_epoch = first.state().doc_epoch();
+        let second_epoch = second.state().doc_epoch();
+        window.header().obj().apply_dark_mode(false);
+        assert!(first.state().doc_epoch() > first_epoch);
+        assert!(second.state().doc_epoch() > second_epoch);
+        window.close();
+    }
 
     // The reader can be typing a page number when they reach for Ctrl+F. The controller sits on
     // the window, not the document, so the header entries do not swallow it.

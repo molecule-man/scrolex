@@ -1791,7 +1791,7 @@ impl DocumentView {
     }
 
     fn setup_text_selection(&self) {
-        // The window is what can reach the page widgets.
+        // This view can reach its recycled page widgets.
         self.state.connect_closure(
             "selection-changed",
             false,
