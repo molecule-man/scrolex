@@ -15,15 +15,9 @@ use gtk::glib::Uri;
 use gtk::{gio::ApplicationFlags, glib, glib::clone, Application};
 use gtk::{prelude::*, CssProvider};
 
-//mod bg_job;
-//mod jump_stack;
-//mod links;
-//mod page;
-//mod state;
-//mod window;
 use scrolex::config;
+use scrolex::document_view;
 use scrolex::page;
-use scrolex::window;
 
 const APP_ID: &str = "com.andr2i.scrolex";
 const RELEASE_NOTICE_TITLE: &str = "What's New";
@@ -91,7 +85,7 @@ fn setup_dark_mode(app: &Application) {
             }
 
             for gtk_window in app.windows() {
-                if let Ok(window) = gtk_window.downcast::<window::Window>() {
+                if let Ok(window) = gtk_window.downcast::<document_view::DocumentView>() {
                     window.apply_dark_mode(enabled);
                 }
             }
@@ -129,7 +123,7 @@ fn load_css() {
 }
 
 fn build_ui(app: &Application, args: &[OsString]) {
-    let window = window::Window::new(app);
+    let window = document_view::DocumentView::new(app);
     window.set_widget_name("main");
     window.apply_dark_mode(scrolex::mupdf_render::dark_mode_enabled());
 
@@ -197,7 +191,7 @@ fn build_ui(app: &Application, args: &[OsString]) {
     show_release_notice(&window);
 }
 
-fn show_release_notice(window: &window::Window) {
+fn show_release_notice(window: &document_view::DocumentView) {
     let notice = release_notice_id();
     if config::load_config().dismissed_notice == Some(notice) {
         return;

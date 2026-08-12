@@ -8,14 +8,14 @@ use gtk::{gio, glib, Application};
 use crate::state::State;
 
 glib::wrapper! {
-    pub struct Window(ObjectSubclass<imp::Window>)
+    pub struct DocumentView(ObjectSubclass<imp::DocumentView>)
         @extends gtk::ApplicationWindow, gtk::Window, gtk::Widget,
         @implements gio::ActionGroup, gio::ActionMap, gtk::Accessible, gtk::Buildable,
                     gtk::ConstraintTarget, gtk::Native, gtk::Root, gtk::ShortcutManager;
 }
 
 #[gtk::template_callbacks]
-impl Window {
+impl DocumentView {
     pub fn new(app: &Application) -> Self {
         Object::builder().property("application", app).build()
     }

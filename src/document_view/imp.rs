@@ -100,7 +100,7 @@ struct KineticPan {
 // Object holding the state
 #[derive(CompositeTemplate, Default)]
 #[template(resource = "/com/andr2i/scrolex/app.ui")]
-pub struct Window {
+pub struct DocumentView {
     #[template_child]
     pub state: TemplateChild<State>,
     #[template_child]
@@ -244,10 +244,10 @@ struct ZoomAnchor {
 
 // The central trait for subclassing a GObject
 #[glib::object_subclass]
-impl ObjectSubclass for Window {
+impl ObjectSubclass for DocumentView {
     // `NAME` needs to match `class` attribute of template
     const NAME: &'static str = "MyApp";
-    type Type = super::Window;
+    type Type = super::DocumentView;
     type ParentType = gtk::ApplicationWindow;
 
     fn class_init(klass: &mut Self::Class) {
@@ -261,7 +261,7 @@ impl ObjectSubclass for Window {
     }
 }
 
-impl ObjectImpl for Window {
+impl ObjectImpl for DocumentView {
     fn constructed(&self) {
         self.parent_constructed();
 
@@ -313,7 +313,7 @@ impl ObjectImpl for Window {
 }
 
 #[gtk::template_callbacks]
-impl Window {
+impl DocumentView {
     #[template_callback]
     fn on_factory_setup(&self, list_item: &gtk::ListItem) {
         let page = &page::Page::new(&self.state);
@@ -2487,7 +2487,7 @@ impl Window {
 }
 
 // Trait shared by all widgets
-impl WidgetImpl for Window {
+impl WidgetImpl for DocumentView {
     fn size_allocate(&self, width: i32, height: i32, baseline: i32) {
         self.parent_size_allocate(width, height, baseline);
         self.restore_zoom_anchor();
@@ -2495,10 +2495,10 @@ impl WidgetImpl for Window {
 }
 
 // Trait shared by all windows
-impl WindowImpl for Window {}
+impl WindowImpl for DocumentView {}
 
 // Trait shared by all application windows
-impl ApplicationWindowImpl for Window {}
+impl ApplicationWindowImpl for DocumentView {}
 
 // Accumulate a scroll delta and decide whether to step a page. Returns the new accumulator and the
 // page step (+1 next, -1 prev, 0 none). `notch` is the travel that advances one page; the first
@@ -2926,7 +2926,7 @@ mod widget_tests {
     use gtk::subclass::prelude::ObjectSubclassIsExt;
     use std::time::{Duration, Instant};
 
-    fn window() -> crate::window::Window {
+    fn window() -> crate::document_view::DocumentView {
         // before the window: it reads the settings while it builds
         crate::config::use_scratch_config();
         crate::state::use_scratch_state_dir();
@@ -2936,7 +2936,7 @@ mod widget_tests {
         crate::page::Page::static_type();
         load_css();
 
-        let window: crate::window::Window = gtk::glib::Object::new();
+        let window: crate::document_view::DocumentView = gtk::glib::Object::new();
         // the stylesheet keys off this name, as in main
         window.set_widget_name("main");
         window.set_default_size(TEST_WINDOW.0, TEST_WINDOW.1);
@@ -3050,7 +3050,7 @@ mod widget_tests {
     }
 
     // A slide already running: we last wrote `value`, and aim at `target` a page ahead.
-    fn slide(imp: &super::Window, value: f64, target: f64) {
+    fn slide(imp: &super::DocumentView, value: f64, target: f64) {
         let hadj = imp.scrolledwindow.hadjustment();
         hadj.configure(value, 0.0, 100_000.0, 10.0, 100.0, 1_000.0);
         *imp.scroll_anim.borrow_mut() = Some(super::ScrollAnim {
@@ -3226,7 +3226,7 @@ mod widget_tests {
     }
 
     // outline.pdf has 3 pages
-    fn loaded_window() -> crate::window::Window {
+    fn loaded_window() -> crate::document_view::DocumentView {
         let window = window();
         window.set_default_size(900, 700);
         window.present();
@@ -3275,7 +3275,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
 
     // Height the list asks for to show the page in view, the row's own padding included. Measured,
     // not allocated: Xvfb has no window manager, so the window re-lays out only when it resizes.
-    fn asked_height(imp: &super::Window) -> f64 {
+    fn asked_height(imp: &super::DocumentView) -> f64 {
         let row = imp
             .mapped_page(imp.state.page() as i32)
             .and_then(|page| page.parent())
@@ -3285,7 +3285,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
     }
 
     // Nothing to pan to: the page in view asks for no more than the viewport holds.
-    fn assert_nothing_to_pan(imp: &super::Window) {
+    fn assert_nothing_to_pan(imp: &super::DocumentView) {
         let (asked, viewport) = (
             asked_height(imp) + super::hscrollbar_reserve(&imp.scrolledwindow),
             imp.vscrolledwindow.vadjustment().page_size(),
@@ -3298,7 +3298,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
     }
 
     // The page in view is as tall as the viewport, to the pixel.
-    fn assert_fills_the_viewport(imp: &super::Window) {
+    fn assert_fills_the_viewport(imp: &super::DocumentView) {
         let (asked, viewport) = (
             asked_height(imp) + super::hscrollbar_reserve(&imp.scrolledwindow),
             imp.vscrolledwindow.vadjustment().page_size(),
@@ -3341,7 +3341,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
     }
 
     // Every term the fit measures, so a re-fit that lands on another zoom names the term that moved.
-    fn fit_terms(imp: &super::Window) -> String {
+    fn fit_terms(imp: &super::DocumentView) -> String {
         format!(
             "page_size={} chrome={:?} reserve={} tallest={}",
             imp.vscrolledwindow.vadjustment().page_size(),
