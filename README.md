@@ -43,13 +43,7 @@ https://github.com/user-attachments/assets/225c4b69-eb15-48d0-b978-f7bd747d463e
     environments while preserving their original hues. Dark mode is an
     explicit setting and remains enabled across sessions until turned off.
 
-5. Tabs
-
-    Scrolex opens several documents in one window. The tab bar appears with the
-    second document. Each tab keeps its own page, zoom, and margin setting.
-    Open documents share the configured render cache.
-
-6. Wayland Support
+5. Wayland Support
 
     Scrolex supports both Wayland and X11 sessions.
 

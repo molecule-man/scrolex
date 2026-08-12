@@ -12,6 +12,10 @@ use gtk::{glib, Button, CompositeTemplate, ToggleButton};
 
 use crate::document_view::DocumentView;
 
+// Tabs stop being a useful way to hold documents well before this. The cap also keeps the shared
+// render cache from splitting into slivers too small to hold a page.
+const MAX_DOCUMENTS: u32 = 16;
+
 // File types MuPDF opens. The chooser offers these before "All files".
 const SUPPORTED_SUFFIXES: &[&str] = &[
     "pdf", "xps", "oxps", "epub", "mobi", "fb2", "cbz", "svg", "txt", "png", "jpg", "jpeg", "jp2",
@@ -25,6 +29,8 @@ pub struct Window {
     #[template_child]
     pub notebook: TemplateChild<gtk::Notebook>,
 
+    #[template_child]
+    pub btn_new_tab: TemplateChild<Button>,
     #[template_child]
     pub btn_crop: TemplateChild<ToggleButton>,
     #[template_child]
@@ -188,8 +194,16 @@ impl Window {
         ));
     }
 
-    // Add an empty document and show it. The caller loads a file into it.
-    pub(crate) fn add_document(&self) -> DocumentView {
+    fn at_document_limit(&self) -> bool {
+        self.notebook.n_pages() >= MAX_DOCUMENTS
+    }
+
+    // Add an empty document and show it, or None at the limit. The caller loads a file into it.
+    pub(crate) fn add_document(&self) -> Option<DocumentView> {
+        if self.at_document_limit() {
+            return None;
+        }
+
         let document = DocumentView::new();
 
         let config = crate::config::load_config();
@@ -217,10 +231,10 @@ impl Window {
         // Tabs share the bar and ellipsize as more of them open.
         self.notebook.page(&document).set_tab_expand(true);
         self.notebook.set_current_page(Some(page));
-        self.update_tab_visibility();
+        self.update_tab_bar();
         self.share_cache_budgets();
 
-        document
+        Some(document)
     }
 
     // The window keeps one document at all times, so the last tab does not close. The notebook
@@ -242,7 +256,7 @@ impl Window {
         document.release_renders();
 
         self.notebook.remove_page(Some(page));
-        self.update_tab_visibility();
+        self.update_tab_bar();
         self.share_cache_budgets();
     }
 
@@ -302,8 +316,9 @@ impl Window {
     }
 
     // A single document needs no tab bar.
-    fn update_tab_visibility(&self) {
+    fn update_tab_bar(&self) {
         self.notebook.set_show_tabs(self.notebook.n_pages() > 1);
+        self.btn_new_tab.set_sensitive(!self.at_document_limit());
     }
 
     // Point the header bar at a document. The lookup chains in app.ui follow the
@@ -369,6 +384,9 @@ impl Window {
 
     #[template_callback]
     fn new_tab(&self) {
+        if self.at_document_limit() {
+            return;
+        }
         self.choose_document(clone!(
             #[weak(rename_to = imp)]
             self,
@@ -380,10 +398,12 @@ impl Window {
     // another one beside it.
     pub(crate) fn open_in_new_tab(&self, file: &gtk::gio::File) {
         let document = match self.active_document() {
-            Some(active) if active.state().n_pages() == 0 => active,
+            Some(active) if active.state().n_pages() == 0 => Some(active),
             _ => self.add_document(),
         };
-        document.state().load(file);
+        if let Some(document) = document {
+            document.state().load(file);
+        }
     }
 
     // Ask the reader for a document. A dismissed chooser changes nothing.
@@ -750,7 +770,7 @@ mod widget_tests {
     fn header_follows_the_active_document() {
         let window = loaded_window();
         let first = window.header().active_document().expect("first document");
-        let second = window.header().add_document();
+        let second = window.header().add_document().expect("a tab");
         set_document_page(&second, 10, 9);
         second.state().set_zoom(2.0);
         second.state().set_crop(true);
@@ -829,7 +849,7 @@ mod widget_tests {
         let window = loaded_window();
         let notebook = window.header().notebook.get();
         let first = window.header().active_document().expect("first document");
-        let second = window.header().add_document();
+        let second = window.header().add_document().expect("a tab");
 
         window.header().close_document(&second);
 
@@ -848,8 +868,8 @@ mod widget_tests {
     fn closing_an_inactive_tab_keeps_the_active_one() {
         let window = loaded_window();
         let first = window.header().active_document().expect("first document");
-        window.header().add_document();
-        let third = window.header().add_document();
+        window.header().add_document().expect("a tab");
+        let third = window.header().add_document().expect("a tab");
 
         window.header().close_document(&first);
 
@@ -879,14 +899,14 @@ mod widget_tests {
     #[gtk::test]
     fn closing_a_tab_saves_its_state() {
         let window = loaded_window();
-        let second = window.header().add_document();
+        let second = window.header().add_document().expect("a tab");
         second.state().load(&fixture("no_outline.pdf"));
         wait_until(|| second.state().n_pages() > 0);
         second.state().set_crop(true);
 
         window.header().close_document(&second);
 
-        let reopened = window.header().add_document();
+        let reopened = window.header().add_document().expect("a tab");
         reopened.state().load(&fixture("no_outline.pdf"));
         wait_until(|| reopened.state().n_pages() > 0);
         assert!(reopened.state().crop(), "the closed tab saved its state");
@@ -914,7 +934,7 @@ mod widget_tests {
         );
         assert_eq!(budgets(&first), whole, "one document holds the whole cache");
 
-        let second = window.header().add_document();
+        let second = window.header().add_document().expect("a tab");
         let half = (
             whole.0 / 2,
             crate::state::preview_cache_budget(total_previews / 2),
@@ -932,7 +952,7 @@ mod widget_tests {
     fn ctrl_w_closes_the_active_tab() {
         let window = loaded_window();
         let first = window.header().active_document().expect("first document");
-        window.header().add_document();
+        window.header().add_document().expect("a tab");
         assert_eq!(window.header().notebook.n_pages(), 2);
 
         let taken = window
@@ -974,6 +994,32 @@ mod widget_tests {
     }
 
     #[gtk::test]
+    fn the_tab_limit_stops_at_max_documents() {
+        let window = loaded_window();
+        let header = window.header();
+
+        while header.notebook.n_pages() < super::MAX_DOCUMENTS {
+            assert!(header.btn_new_tab.is_sensitive(), "room for another tab");
+            header.add_document().expect("a tab");
+        }
+
+        assert_eq!(header.notebook.n_pages(), super::MAX_DOCUMENTS);
+        assert!(!header.btn_new_tab.is_sensitive(), "the button dims");
+        assert!(header.add_document().is_none(), "no tab past the limit");
+        assert_eq!(header.notebook.n_pages(), super::MAX_DOCUMENTS);
+
+        // the chooser never opens once the limit is reached
+        header.handle_window_key(gtk::gdk::Key::t, gtk::gdk::ModifierType::CONTROL_MASK);
+        assert_eq!(header.notebook.n_pages(), super::MAX_DOCUMENTS);
+
+        let last = header.active_document().expect("a document");
+        header.close_document(&last);
+        assert!(header.btn_new_tab.is_sensitive(), "closing frees a slot");
+
+        window.close();
+    }
+
+    #[gtk::test]
     fn one_document_hides_the_tab_bar() {
         let window = loaded_window();
         let notebook = window.header().notebook.get();
@@ -981,7 +1027,7 @@ mod widget_tests {
         assert_eq!(notebook.n_pages(), 1);
         assert!(!notebook.shows_tabs(), "one document needs no tab bar");
 
-        window.header().add_document();
+        window.header().add_document().expect("a tab");
         assert_eq!(notebook.n_pages(), 2);
         assert!(notebook.shows_tabs(), "two documents show the tab bar");
 
@@ -992,7 +1038,7 @@ mod widget_tests {
     fn global_settings_apply_to_every_document() {
         let window = loaded_window();
         let first = window.header().active_document().expect("first document");
-        let second = window.header().add_document();
+        let second = window.header().add_document().expect("a tab");
 
         window.header().spin_threads.set_value(1.0);
         window.header().spin_cache.set_value(96.0);
