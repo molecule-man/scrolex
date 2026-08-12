@@ -207,6 +207,9 @@ pub struct DocumentView {
 
     // Vertical list-row padding in logical pixels.
     fit_chrome_height: Cell<Option<f64>>,
+
+    // Page and position from when this view left the screen.
+    hidden_at: Cell<Option<(u32, f64)>>,
 }
 
 // A document point held still across a zoom: which page, where in it (page points from its
@@ -1876,6 +1879,11 @@ impl DocumentView {
     // scrolled off. This anchors wheel/h/l navigation and ignores the layout
     // shifts from crop/zoom recompute, while still following free scroll.
     fn sync_selection_to_viewport(&self) {
+        // A hidden view's viewport shows no reader intent: GTK rewinds it on its own.
+        if !self.obj().is_mapped() {
+            return;
+        }
+
         let (w, h) = (self.scrolledwindow.width(), self.scrolledwindow.height());
         let n_items = self.selection.n_items();
         if w == 0 || n_items == 0 {
@@ -2152,7 +2160,7 @@ impl DocumentView {
             (p, r)
         };
 
-        self.scroll_to_page_no_focus(page);
+        self.scroll_to_page_no_focus(page, "search scroll");
         glib::timeout_add_local_once(
             std::time::Duration::from_millis(60),
             clone!(
@@ -2166,14 +2174,32 @@ impl DocumentView {
         );
     }
 
-    fn scroll_to_page_no_focus(&self, page_index: i32) {
+    // GtkListView drops its scroll anchor when its rows are torn down while hidden. Runs from
+    // size_allocate, so the reader never sees the rewound position.
+    fn restore_hidden_position(&self) {
+        let Some((page, value)) = self.hidden_at.get() else {
+            return;
+        };
+        // rows are not back yet; the next allocation tries again
+        if self.ensure_ready_selection().is_none() {
+            return;
+        }
+        self.hidden_at.set(None);
+
+        let moved = (self.scrolledwindow.hadjustment().value() - value).abs() > 1.0;
+        if moved || self.selection.selected() != page {
+            self.scroll_to_page_no_focus(page as i32, "tab restore");
+        }
+    }
+
+    fn scroll_to_page_no_focus(&self, page_index: i32, cause: &'static str) {
         let Some(selection) = self.ensure_ready_selection() else {
             return;
         };
         let idx = (page_index.max(0) as u32).min(selection.n_items().saturating_sub(1));
         self.cancel_scroll_motion();
         // SELECT only (no FOCUS) so typing focus stays in the entry
-        self.expect_hscroll("search scroll");
+        self.expect_hscroll(cause);
         self.listview
             .scroll_to(idx, gtk::ListScrollFlags::SELECT, None);
     }
@@ -2277,6 +2303,15 @@ impl WidgetImpl for DocumentView {
             content.allocate(width, height, baseline, None);
         }
         self.restore_zoom_anchor();
+        self.restore_hidden_position();
+    }
+
+    fn unmap(&self) {
+        self.hidden_at.set(Some((
+            self.selection.selected(),
+            self.scrolledwindow.hadjustment().value(),
+        )));
+        self.parent_unmap();
     }
 }
 
@@ -2692,6 +2727,22 @@ mod widget_tests {
     use crate::test_support::{loaded_window, type_zoom, wait_until, window};
     use gtk::prelude::*;
     use gtk::subclass::prelude::ObjectSubclassIsExt;
+
+    // The page it left on, so the restore has something to aim at.
+    #[gtk::test]
+    fn hiding_a_view_records_where_the_reader_was() {
+        let window = loaded_window();
+        let imp = window.imp();
+        imp.selection.set_selected(2);
+        wait_until(|| window.state().page() == 2);
+        assert!(imp.hidden_at.get().is_none(), "nothing recorded on screen");
+
+        window.set_visible(false);
+        wait_until(|| !window.is_mapped());
+
+        assert_eq!(imp.hidden_at.get().map(|(page, _)| page), Some(2));
+        window.close();
+    }
 
     #[gtk::test]
     fn empty_view_follows_document_state() {
