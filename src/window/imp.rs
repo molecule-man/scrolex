@@ -46,6 +46,8 @@ pub struct Window {
     #[template_child]
     pub spin_cache: TemplateChild<gtk::SpinButton>,
     #[template_child]
+    pub label_title: TemplateChild<gtk::Label>,
+    #[template_child]
     pub entry_page_num: TemplateChild<gtk::Entry>,
     #[template_child]
     pub entry_zoom: TemplateChild<gtk::Entry>,
@@ -466,6 +468,11 @@ impl Window {
                 .bind_property("has-toc", &*self.btn_toc, "sensitive")
                 .sync_create()
                 .build(),
+            state
+                .bind_property("uri", &*self.obj(), "title")
+                .transform_to(|_, uri: String| Some(window_title(&uri)))
+                .sync_create()
+                .build(),
         ];
 
         self.header_bindings.replace(bindings);
@@ -818,6 +825,18 @@ impl Window {
 
     #[allow(clippy::unused_self)]
     #[template_callback]
+    fn document_title(&self, uri: &str) -> String {
+        display_name(uri)
+    }
+
+    #[allow(clippy::unused_self)]
+    #[template_callback]
+    fn document_tooltip(&self, uri: &str) -> String {
+        document_path(uri)
+    }
+
+    #[allow(clippy::unused_self)]
+    #[template_callback]
     fn page_entry_text(&self, page: i32) -> String {
         format!("{}", page + 1)
     }
@@ -860,7 +879,7 @@ impl WidgetImpl for Window {}
 impl WindowImpl for Window {}
 impl ApplicationWindowImpl for Window {}
 
-// Tab title for a document URI. Empty until the reader opens something.
+// Document name for the tab and the header title. A prompt until the reader opens something.
 fn display_name(uri: &str) -> String {
     if uri.is_empty() {
         return "Open a Document".to_string();
@@ -870,6 +889,15 @@ fn display_name(uri: &str) -> String {
         || uri.to_string(),
         |name| name.to_string_lossy().into_owned(),
     )
+}
+
+// Window title, for the task bar and the window switcher.
+fn window_title(uri: &str) -> String {
+    if uri.is_empty() {
+        return "Scrolex PDF Viewer".to_string();
+    }
+
+    format!("{} — Scrolex", display_name(uri))
 }
 
 // Tab tooltip: the local path where there is one, the URI otherwise.
@@ -961,6 +989,24 @@ mod widget_tests {
         wait_until(|| second.state().n_pages() > 0);
         assert_eq!(tab_title(&notebook, 0), "outline.pdf");
         assert_eq!(tab_title(&notebook, 1), "no_outline.pdf");
+
+        window.close();
+    }
+
+    #[gtk::test]
+    fn the_header_shows_the_active_document_name() {
+        let window = loaded_window();
+        let header = window.header();
+        wait_until(|| header.label_title.label() == "outline.pdf");
+        assert_eq!(window.title(), "outline.pdf — Scrolex");
+
+        header.open_in_new_tab(&fixture("no_outline.pdf"));
+        wait_until(|| header.label_title.label() == "no_outline.pdf");
+        assert_eq!(window.title(), "no_outline.pdf — Scrolex");
+
+        header.notebook.set_current_page(Some(0));
+        wait_until(|| header.label_title.label() == "outline.pdf");
+        assert_eq!(window.title(), "outline.pdf — Scrolex");
 
         window.close();
     }
