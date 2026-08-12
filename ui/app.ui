@@ -101,6 +101,18 @@
 					</object>
 				</child>
 				<child type="start">
+					<object class="GtkButton" id="btn_new_tab">
+						<signal name="clicked" handler="new_tab" swapped="true"/>
+						<property name="icon-name">tab-new-symbolic</property>
+						<property name="tooltip-text">Open a Document in a New Tab</property>
+						<property name="cursor">
+							<object class="GdkCursor">
+								<property name="name">pointer</property>
+							</object>
+						</property>
+					</object>
+				</child>
+				<child type="start">
 					<object class="GtkToggleButton" id="btn_toc">
 						<property name="icon-name">view-list-symbolic</property>
 						<property name="tooltip-text">Contents (t)</property>

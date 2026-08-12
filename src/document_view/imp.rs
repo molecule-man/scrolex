@@ -238,7 +238,15 @@ impl ObjectSubclass for DocumentView {
 }
 
 impl ObjectImpl for DocumentView {
+    // A closed tab is disposed while the window lives on, so its pending work stops here.
     fn dispose(&self) {
+        if let Some(source) = self.search_debounce.take() {
+            source.remove();
+        }
+        // bumps the sweep epoch, which stops the background search
+        self.state.search().borrow_mut().clear();
+        self.obj().release_renders();
+
         if let Some(content) = self.content() {
             content.unparent();
         }

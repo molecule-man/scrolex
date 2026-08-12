@@ -60,15 +60,19 @@ pub fn window() -> TestWindow {
     TestWindow { window, document }
 }
 
+pub fn fixture(name: &str) -> gtk::gio::File {
+    gtk::gio::File::for_path(format!(
+        "{}/tests/fixtures/{name}",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+}
+
 // outline.pdf has 3 pages
 pub fn loaded_window() -> TestWindow {
     let window = window();
     window.set_default_size(900, 700);
     window.present();
-    window.state().load(&gtk::gio::File::for_path(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/outline.pdf"
-    )));
+    window.state().load(&fixture("outline.pdf"));
     wait_until(|| window.imp().mapped_page(0).is_some());
     wait_until(|| window.imp().selection.n_items() == 3);
 

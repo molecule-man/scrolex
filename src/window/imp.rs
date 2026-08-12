@@ -183,12 +183,81 @@ impl Window {
             ),
         );
 
-        let page = self.notebook.append_page(&document, gtk::Widget::NONE);
+        let page = self
+            .notebook
+            .append_page(&document, Some(&self.tab_label(&document)));
+        // Tabs share the bar and ellipsize as more of them open.
+        self.notebook.page(&document).set_tab_expand(true);
         self.notebook.set_current_page(Some(page));
         self.update_tab_visibility();
         self.apply_render_cache_mb(config.render_cache_mb);
 
         document
+    }
+
+    // The window keeps one document at all times, so the last tab does not close. The notebook
+    // picks the replacement tab and its switch-page moves the header.
+    pub(crate) fn close_document(&self, document: &DocumentView) {
+        if self.notebook.n_pages() <= 1 {
+            return;
+        }
+        let Some(page) = self.notebook.page_num(document) else {
+            return;
+        };
+
+        let state = document.state();
+        if !state.uri().is_empty() {
+            if let Err(err) = state.save() {
+                eprintln!("Error saving state for {}: {err}", state.uri());
+            }
+        }
+        document.release_renders();
+
+        self.notebook.remove_page(Some(page));
+        self.update_tab_visibility();
+        self.apply_render_cache_mb(crate::config::load_config().render_cache_mb);
+    }
+
+    // GtkNotebook neither shrinks a tab nor closes one, so the label carries both.
+    fn tab_label(&self, document: &DocumentView) -> gtk::Widget {
+        let name = gtk::Label::new(None);
+        // width-chars is the floor a tab never shrinks past, max-width-chars the ceiling it never
+        // grows past. Between them the name ellipsizes to whatever the tab bar can spare.
+        name.set_ellipsize(gtk::pango::EllipsizeMode::End);
+        name.set_width_chars(10);
+        name.set_max_width_chars(24);
+        name.set_hexpand(true);
+        name.set_xalign(0.0);
+
+        let close = gtk::Button::from_icon_name("window-close-symbolic");
+        close.add_css_class("flat");
+        close.set_focus_on_click(false);
+        close.set_tooltip_text(Some("Close this document"));
+        close.connect_clicked(clone!(
+            #[weak(rename_to = imp)]
+            self,
+            #[weak]
+            document,
+            move |_| imp.close_document(&document)
+        ));
+
+        let label = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+        label.append(&name);
+        label.append(&close);
+
+        let state = document.state();
+        state
+            .bind_property("uri", &name, "label")
+            .transform_to(|_, uri: String| Some(display_name(&uri)))
+            .sync_create()
+            .build();
+        state
+            .bind_property("uri", &label, "tooltip-text")
+            .transform_to(|_, uri: String| Some(document_path(&uri)))
+            .sync_create()
+            .build();
+
+        label.upcast()
     }
 
     pub(crate) fn documents(&self) -> Vec<DocumentView> {
@@ -266,6 +335,31 @@ impl Window {
     }
 
     fn open_document_into(&self, document: &DocumentView) {
+        let document = document.clone();
+        self.choose_document(move |file| document.state().load(&file));
+    }
+
+    #[template_callback]
+    fn new_tab(&self) {
+        self.choose_document(clone!(
+            #[weak(rename_to = imp)]
+            self,
+            move |file| imp.open_in_new_tab(&file)
+        ));
+    }
+
+    // An empty document is the tab the reader already looks at, so fill it instead of stacking
+    // another one beside it.
+    pub(crate) fn open_in_new_tab(&self, file: &gtk::gio::File) {
+        let document = match self.active_document() {
+            Some(active) if active.state().n_pages() == 0 => active,
+            _ => self.add_document(),
+        };
+        document.state().load(file);
+    }
+
+    // Ask the reader for a document. A dismissed chooser changes nothing.
+    fn choose_document(&self, load: impl FnOnce(gtk::gio::File) + 'static) {
         let supported = gtk::FileFilter::new();
         supported.set_name(Some("Supported documents"));
         for suffix in SUPPORTED_SUFFIXES {
@@ -286,17 +380,15 @@ impl Window {
             .build();
 
         let obj = self.obj();
-        let document = document.clone();
         dialog.open(
             Some(obj.as_ref()),
             gtk::gio::Cancellable::NONE,
             clone!(
                 #[strong]
-                document,
-                #[strong]
                 obj,
                 move |file| match file {
-                    Ok(file) => document.state().load(&file),
+                    Ok(file) => load(file),
+                    Err(err) if err.matches(gtk::DialogError::Dismissed) => {}
                     Err(err) => {
                         obj.show_error_dialog(&format!("Error opening file: {err}"));
                     }
@@ -561,6 +653,30 @@ impl WidgetImpl for Window {}
 impl WindowImpl for Window {}
 impl ApplicationWindowImpl for Window {}
 
+// Tab title for a document URI. Empty until the reader opens something.
+fn display_name(uri: &str) -> String {
+    if uri.is_empty() {
+        return "Open a Document".to_string();
+    }
+
+    gtk::gio::File::for_uri(uri).basename().map_or_else(
+        || uri.to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    )
+}
+
+// Tab tooltip: the local path where there is one, the URI otherwise.
+fn document_path(uri: &str) -> String {
+    if uri.is_empty() {
+        return "No document".to_string();
+    }
+
+    gtk::gio::File::for_uri(uri).path().map_or_else(
+        || uri.to_string(),
+        |path| path.to_string_lossy().into_owned(),
+    )
+}
+
 fn dismiss_menu(btn: &Button) {
     if let Some(popover) = btn
         .ancestor(gtk::Popover::static_type())
@@ -574,7 +690,7 @@ fn dismiss_menu(btn: &Button) {
 mod widget_tests {
     use crate::document_view::DocumentView;
     use crate::page::PageNumber;
-    use crate::test_support::{loaded_window, wait_until};
+    use crate::test_support::{fixture, loaded_window, wait_until, window as test_window};
     use gtk::prelude::*;
     use gtk::subclass::prelude::{ObjectSubclassExt, ObjectSubclassIsExt};
 
@@ -623,6 +739,120 @@ mod widget_tests {
         assert_eq!(window.header().entry_zoom.text(), "100");
         assert!(!window.header().btn_crop.is_active());
         assert!(!window.header().btn_fit_height.is_active());
+        window.close();
+    }
+
+    #[gtk::test]
+    fn the_plus_button_opens_a_second_document() {
+        let window = loaded_window();
+        let notebook = window.header().notebook.get();
+
+        window.header().open_in_new_tab(&fixture("no_outline.pdf"));
+
+        assert_eq!(notebook.n_pages(), 2, "a loaded document keeps its own tab");
+        let second = window.header().active_document().expect("the new document");
+        wait_until(|| second.state().n_pages() > 0);
+        assert_eq!(tab_title(&notebook, 0), "outline.pdf");
+        assert_eq!(tab_title(&notebook, 1), "no_outline.pdf");
+
+        window.close();
+    }
+
+    // The name the reader reads on the tab, so a broken binding cannot pass.
+    fn tab_title(notebook: &gtk::Notebook, page: u32) -> String {
+        let child = notebook.nth_page(Some(page)).expect("a page");
+        notebook
+            .tab_label(&child)
+            .and_downcast::<gtk::Box>()
+            .and_then(|label| label.first_child())
+            .and_downcast::<gtk::Label>()
+            .expect("the tab name")
+            .label()
+            .to_string()
+    }
+
+    #[gtk::test]
+    fn an_empty_document_loads_in_place() {
+        let window = test_window();
+        let notebook = window.header().notebook.get();
+        let empty = window.header().active_document().expect("the empty view");
+
+        window.header().open_in_new_tab(&fixture("outline.pdf"));
+
+        assert_eq!(notebook.n_pages(), 1, "the empty view takes the document");
+        wait_until(|| empty.state().n_pages() > 0);
+        assert_eq!(tab_title(&notebook, 0), "outline.pdf");
+
+        window.close();
+    }
+
+    #[gtk::test]
+    fn closing_the_active_tab_falls_back_to_its_neighbour() {
+        let window = loaded_window();
+        let notebook = window.header().notebook.get();
+        let first = window.header().active_document().expect("first document");
+        let second = window.header().add_document();
+
+        window.header().close_document(&second);
+
+        assert_eq!(notebook.n_pages(), 1);
+        assert!(!notebook.shows_tabs(), "one document hides the tab bar");
+        assert_eq!(
+            window.header().active_document().as_ref(),
+            Some(&first),
+            "the header follows the remaining document"
+        );
+
+        window.close();
+    }
+
+    #[gtk::test]
+    fn closing_an_inactive_tab_keeps_the_active_one() {
+        let window = loaded_window();
+        let first = window.header().active_document().expect("first document");
+        window.header().add_document();
+        let third = window.header().add_document();
+
+        window.header().close_document(&first);
+
+        assert_eq!(window.header().notebook.n_pages(), 2);
+        assert_eq!(
+            window.header().active_document().as_ref(),
+            Some(&third),
+            "closing another tab does not move the reader"
+        );
+
+        window.close();
+    }
+
+    #[gtk::test]
+    fn the_last_document_does_not_close() {
+        let window = loaded_window();
+        let only = window.header().active_document().expect("a document");
+
+        window.header().close_document(&only);
+
+        assert_eq!(window.header().notebook.n_pages(), 1);
+        assert_eq!(window.header().active_document().as_ref(), Some(&only));
+
+        window.close();
+    }
+
+    #[gtk::test]
+    fn closing_a_tab_saves_its_state() {
+        let window = loaded_window();
+        let second = window.header().add_document();
+        second.state().load(&fixture("no_outline.pdf"));
+        wait_until(|| second.state().n_pages() > 0);
+        second.state().set_crop(true);
+
+        window.header().close_document(&second);
+
+        let reopened = window.header().add_document();
+        reopened.state().load(&fixture("no_outline.pdf"));
+        wait_until(|| reopened.state().n_pages() > 0);
+        assert!(reopened.state().crop(), "the closed tab saved its state");
+
         window.close();
     }
 
