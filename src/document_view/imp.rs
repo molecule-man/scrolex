@@ -603,7 +603,7 @@ impl DocumentView {
     #[template_callback]
     fn handle_drag_start(&self, _n_press: i32, x: f64, y: f64) {
         self.cancel_scroll_motion();
-        *self.drag_coords.borrow_mut() = self.drag_point_in_window(x, y);
+        *self.drag_coords.borrow_mut() = self.drag_point_in_view(x, y);
 
         if let Some(surface) = self.obj().native().and_then(|n| n.surface()) {
             *self.drag_cursor.borrow_mut() = surface.cursor();
@@ -615,7 +615,7 @@ impl DocumentView {
     fn handle_drag_move(&self, seq: Option<&EventSequence>, gc: &GestureClick) {
         let Some((x, y)) = gc
             .point(seq)
-            .and_then(|(px, py)| self.drag_point_in_window(px, py))
+            .and_then(|(px, py)| self.drag_point_in_view(px, py))
         else {
             return;
         };
@@ -630,9 +630,9 @@ impl DocumentView {
         *self.drag_coords.borrow_mut() = Some((x, y));
     }
 
-    // Pointer in the fixed window frame, not the inner scroller's: panning slides that inner frame,
-    // so deltas measured there feed back into the pan and oscillate.
-    fn drag_point_in_window(&self, x: f64, y: f64) -> Option<(f64, f64)> {
+    // Pointer in this view's fixed frame, not the inner scroller's: panning slides that inner
+    // frame, so deltas measured there feed back into the pan and oscillate.
+    fn drag_point_in_view(&self, x: f64, y: f64) -> Option<(f64, f64)> {
         self.scrolledwindow
             .compute_point(&*self.obj(), &gtk::graphene::Point::new(x as f32, y as f32))
             .map(|p| (f64::from(p.x()), f64::from(p.y())))
