@@ -961,7 +961,8 @@ impl DocumentView {
             Key::o => {
                 self.obj().emit_by_name::<()>("open-requested", &[]);
             }
-            Key::t => {
+            // plain t only: Ctrl+T opens a tab
+            Key::t if !modifier.contains(ModifierType::CONTROL_MASK) => {
                 if !self.toc_pages.borrow().is_empty() {
                     self.toc_revealer
                         .set_reveal_child(!self.toc_revealer.reveals_child());
@@ -1493,8 +1494,10 @@ impl DocumentView {
             self,
             #[upgrade_or]
             glib::Propagation::Proceed,
-            move |_, keyval, _, _| {
-                if keyval == Key::Escape || keyval == Key::t {
+            move |_, keyval, _, modifier| {
+                let closes = keyval == Key::Escape
+                    || (keyval == Key::t && !modifier.contains(ModifierType::CONTROL_MASK));
+                if closes {
                     imp.toc_revealer.set_reveal_child(false);
                     glib::Propagation::Stop
                 } else {
@@ -2727,6 +2730,21 @@ mod widget_tests {
     use crate::test_support::{loaded_window, type_zoom, wait_until, window};
     use gtk::prelude::*;
     use gtk::subclass::prelude::ObjectSubclassIsExt;
+
+    #[gtk::test]
+    fn ctrl_t_leaves_the_contents_panel_to_the_tab_key() {
+        let window = loaded_window();
+        let imp = window.imp();
+        wait_until(|| !imp.toc_pages.borrow().is_empty());
+
+        imp.handle_key_press(gtk::gdk::Key::t, 0, gtk::gdk::ModifierType::CONTROL_MASK);
+        assert!(!imp.toc_revealer.reveals_child(), "Ctrl+T opens a tab");
+
+        imp.handle_key_press(gtk::gdk::Key::t, 0, gtk::gdk::ModifierType::empty());
+        assert!(imp.toc_revealer.reveals_child(), "plain t still toggles");
+
+        window.close();
+    }
 
     // The page it left on, so the restore has something to aim at.
     #[gtk::test]

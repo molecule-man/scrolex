@@ -107,7 +107,7 @@ impl ObjectImpl for Window {
         self.setup_thread_setting();
         self.setup_cache_setting();
         self.setup_drop_target();
-        self.setup_search_keys();
+        self.setup_window_keys();
 
         // Drop each document's render-pool state when the window closes.
         self.obj().connect_close_request(clone!(
@@ -127,10 +127,10 @@ impl ObjectImpl for Window {
 
 #[gtk::template_callbacks]
 impl Window {
-    // Capture phase, on the window: Ctrl+F and F3 must reach the document wherever the focus
-    // sits, including the header entries. Capture also stops Escape from double-firing the
-    // search entry's own stop-search.
-    fn setup_search_keys(&self) {
+    // Capture phase, on the window: the tab and search keys must work wherever the focus sits,
+    // including the header entries and the contents panel. Capture also stops Escape from
+    // double-firing the search entry's own stop-search.
+    fn setup_window_keys(&self) {
         let key = gtk::EventControllerKey::new();
         key.set_propagation_phase(gtk::PropagationPhase::Capture);
         key.connect_key_pressed(clone!(
@@ -138,14 +138,42 @@ impl Window {
             self,
             #[upgrade_or]
             glib::Propagation::Proceed,
-            move |_, keyval, _keycode, modifier| {
-                imp.active_document()
-                    .map_or(glib::Propagation::Proceed, |document| {
-                        document.handle_search_key(keyval, modifier)
-                    })
-            }
+            move |_, keyval, _keycode, modifier| imp.handle_window_key(keyval, modifier)
         ));
         self.obj().add_controller(key);
+    }
+
+    pub(crate) fn handle_window_key(
+        &self,
+        keyval: gtk::gdk::Key,
+        modifier: gtk::gdk::ModifierType,
+    ) -> glib::Propagation {
+        use gtk::gdk::Key;
+
+        if modifier.contains(gtk::gdk::ModifierType::CONTROL_MASK) {
+            match keyval {
+                Key::t | Key::T => {
+                    self.new_tab();
+                    return glib::Propagation::Stop;
+                }
+                // The last document has no tab left to fall back to, so the window goes with it.
+                Key::w | Key::W => {
+                    match self.active_document() {
+                        Some(document) if self.notebook.n_pages() > 1 => {
+                            self.close_document(&document);
+                        }
+                        _ => self.obj().close(),
+                    }
+                    return glib::Propagation::Stop;
+                }
+                _ => {}
+            }
+        }
+
+        self.active_document()
+            .map_or(glib::Propagation::Proceed, |document| {
+                document.handle_search_key(keyval, modifier)
+            })
     }
 
     fn setup_notebook(&self) {
@@ -232,7 +260,7 @@ impl Window {
         let close = gtk::Button::from_icon_name("window-close-symbolic");
         close.add_css_class("flat");
         close.set_focus_on_click(false);
-        close.set_tooltip_text(Some("Close this document"));
+        close.set_tooltip_text(Some("Close this document (Ctrl+W)"));
         close.connect_clicked(clone!(
             #[weak(rename_to = imp)]
             self,
@@ -898,6 +926,51 @@ mod widget_tests {
         assert_eq!(budgets(&first), whole, "closing gives the share back");
 
         window.close();
+    }
+
+    #[gtk::test]
+    fn ctrl_w_closes_the_active_tab() {
+        let window = loaded_window();
+        let first = window.header().active_document().expect("first document");
+        window.header().add_document();
+        assert_eq!(window.header().notebook.n_pages(), 2);
+
+        let taken = window
+            .header()
+            .handle_window_key(gtk::gdk::Key::w, gtk::gdk::ModifierType::CONTROL_MASK);
+
+        assert_eq!(taken, gtk::glib::Propagation::Stop, "the window took it");
+        assert_eq!(window.header().notebook.n_pages(), 1);
+        assert_eq!(window.header().active_document().as_ref(), Some(&first));
+
+        window.close();
+    }
+
+    #[gtk::test]
+    fn ctrl_w_on_the_last_document_closes_the_window() {
+        let window = loaded_window();
+        assert_eq!(window.header().notebook.n_pages(), 1);
+        assert!(window.header().obj().is_visible());
+
+        window
+            .header()
+            .handle_window_key(gtk::gdk::Key::w, gtk::gdk::ModifierType::CONTROL_MASK);
+
+        assert!(!window.header().obj().is_visible(), "the window closed");
+    }
+
+    #[gtk::test]
+    fn ctrl_w_closes_a_window_with_nothing_open() {
+        let window = test_window();
+        window.present();
+        wait_until(|| window.header().obj().is_visible());
+        assert_eq!(window.state().n_pages(), 0, "the empty view");
+
+        window
+            .header()
+            .handle_window_key(gtk::gdk::Key::w, gtk::gdk::ModifierType::CONTROL_MASK);
+
+        assert!(!window.header().obj().is_visible(), "the window closed");
     }
 
     #[gtk::test]

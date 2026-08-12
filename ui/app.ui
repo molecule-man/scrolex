@@ -102,7 +102,7 @@
 					<object class="GtkButton" id="btn_new_tab">
 						<signal name="clicked" handler="new_tab" swapped="true"/>
 						<property name="icon-name">tab-new-symbolic</property>
-						<property name="tooltip-text">Open a Document in a New Tab</property>
+						<property name="tooltip-text">Open a document in a new tab (Ctrl+T)</property>
 						<property name="cursor">
 							<object class="GdkCursor">
 								<property name="name">pointer</property>
