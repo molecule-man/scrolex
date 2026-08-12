@@ -190,7 +190,7 @@ impl Window {
         self.notebook.page(&document).set_tab_expand(true);
         self.notebook.set_current_page(Some(page));
         self.update_tab_visibility();
-        self.apply_render_cache_mb(config.render_cache_mb);
+        self.share_cache_budgets();
 
         document
     }
@@ -215,7 +215,7 @@ impl Window {
 
         self.notebook.remove_page(Some(page));
         self.update_tab_visibility();
-        self.apply_render_cache_mb(crate::config::load_config().render_cache_mb);
+        self.share_cache_budgets();
     }
 
     // GtkNotebook neither shrinks a tab nor closes one, so the label carries both.
@@ -467,26 +467,36 @@ impl Window {
         );
         self.spin_cache.set_increments(32.0, 64.0);
         self.spin_cache.set_value(mb as f64);
-        self.apply_render_cache_mb(mb);
+        self.share_cache_budgets();
 
         self.spin_cache.connect_value_changed(clone!(
             #[weak(rename_to = imp)]
             self,
             move |spin| {
-                let mb = spin.value() as usize;
-                imp.apply_render_cache_mb(mb);
                 let mut config = crate::config::load_config();
-                config.render_cache_mb = mb;
+                config.render_cache_mb = spin.value() as usize;
                 if let Err(e) = crate::config::save_config(&config) {
                     eprintln!("Error saving config: {e}");
                 }
+                imp.share_cache_budgets();
             }
         ));
     }
 
-    fn apply_render_cache_mb(&self, mb: usize) {
-        for document in self.documents() {
-            document.state().set_render_cache_mb(mb);
+    // The configured cache sizes are application totals, not per-document ones. Four tabs must not
+    // claim four budgets. Run this whenever the document count or the setting changes.
+    pub(crate) fn share_cache_budgets(&self) {
+        let config = crate::config::load_config();
+        let documents = self.documents();
+        let count = documents.len().max(1);
+
+        let render_bytes = config.render_cache_mb * 1024 * 1024 / count;
+        // A document with no preview budget re-renders the same preview forever.
+        let preview_pages = (config.preview_cache_pages / count).max(1);
+
+        for document in documents {
+            document.state().set_render_cache_bytes(render_bytes);
+            document.state().set_preview_cache_pages(preview_pages);
         }
     }
 
@@ -852,6 +862,40 @@ mod widget_tests {
         reopened.state().load(&fixture("no_outline.pdf"));
         wait_until(|| reopened.state().n_pages() > 0);
         assert!(reopened.state().crop(), "the closed tab saved its state");
+
+        window.close();
+    }
+
+    #[gtk::test]
+    fn open_documents_share_the_configured_cache() {
+        let window = loaded_window();
+        let first = window.header().active_document().expect("first document");
+        let total_mb = 96;
+        let total_previews = crate::config::load_config().preview_cache_pages;
+        window.header().spin_cache.set_value(total_mb as f64);
+
+        let budgets = |document: &DocumentView| {
+            (
+                document.state().render_cache().borrow().budget_bytes(),
+                document.state().preview_cache().borrow().budget_bytes(),
+            )
+        };
+        let whole = (
+            total_mb * 1024 * 1024,
+            crate::state::preview_cache_budget(total_previews),
+        );
+        assert_eq!(budgets(&first), whole, "one document holds the whole cache");
+
+        let second = window.header().add_document();
+        let half = (
+            whole.0 / 2,
+            crate::state::preview_cache_budget(total_previews / 2),
+        );
+        assert_eq!(budgets(&first), half, "two documents halve it");
+        assert_eq!(budgets(&second), half);
+
+        window.header().close_document(&second);
+        assert_eq!(budgets(&first), whole, "closing gives the share back");
 
         window.close();
     }

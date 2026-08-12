@@ -275,7 +275,7 @@
 												<property name="spacing">8</property>
 												<child>
 													<object class="GtkLabel">
-														<property name="label">Render cache (MB)</property>
+														<property name="label">Total render cache (MB)</property>
 														<property name="halign">start</property>
 														<property name="hexpand">true</property>
 													</object>
@@ -283,7 +283,7 @@
 												<child>
 													<object class="GtkSpinButton" id="spin_cache">
 														<property name="numeric">true</property>
-														<property name="tooltip-text">Memory budget for cached rendered pages</property>
+														<property name="tooltip-text">Memory budget for cached rendered pages, shared by every open document</property>
 														<property name="adjustment">
 															<object class="GtkAdjustment">
 																<property name="lower">32</property>
@@ -298,7 +298,7 @@
 										</child>
 										<child>
 											<object class="GtkLabel">
-												<property name="label">A larger cache keeps more rendered pages in memory.</property>
+												<property name="label">A larger cache keeps more rendered pages in memory. Open documents share it.</property>
 												<property name="wrap">true</property>
 												<property name="max-width-chars">28</property>
 												<property name="xalign">0</property>

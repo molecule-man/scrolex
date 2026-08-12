@@ -257,8 +257,7 @@ impl ObjectImpl for DocumentView {
 
         self.setup_scroll_selection_sync();
         self.setup_pointer_tracking();
-        let cfg = crate::config::load_config();
-        self.state.set_preview_cache_pages(cfg.preview_cache_pages);
+        // The cache budgets are application totals; the window divides them across its documents.
         self.setup_fit_height();
         self.setup_text_selection();
         self.setup_search();
