@@ -1918,22 +1918,15 @@ impl DocumentView {
                 }
             }
         ));
-
-        // Search keys (Ctrl+F / F3 / Esc) that must work regardless of focus. Capture phase lets F3
-        // fire while typing and stops Esc from double-firing the entry's stop-search.
-        let key = gtk::EventControllerKey::new();
-        key.set_propagation_phase(gtk::PropagationPhase::Capture);
-        key.connect_key_pressed(clone!(
-            #[weak(rename_to = imp)]
-            self,
-            #[upgrade_or]
-            glib::Propagation::Proceed,
-            move |_, keyval, _keycode, modifier| imp.handle_search_key(keyval, modifier)
-        ));
-        self.obj().add_controller(key);
     }
 
-    fn handle_search_key(&self, keyval: Key, modifier: ModifierType) -> glib::Propagation {
+    // Search keys (Ctrl+F / F3 / Esc). The window drives these from its own capture-phase
+    // controller, so they work wherever the focus sits, the header entries included.
+    pub(super) fn handle_search_key(
+        &self,
+        keyval: Key,
+        modifier: ModifierType,
+    ) -> glib::Propagation {
         match keyval {
             Key::f if modifier.contains(ModifierType::CONTROL_MASK) => {
                 self.open_search();

@@ -60,6 +60,15 @@ impl DocumentView {
         self.imp().open_search();
     }
 
+    // Ctrl+F, F3, Shift+F3, and Escape, routed from the window.
+    pub fn handle_search_key(
+        &self,
+        keyval: gtk::gdk::Key,
+        modifier: gtk::gdk::ModifierType,
+    ) -> glib::Propagation {
+        self.imp().handle_search_key(keyval, modifier)
+    }
+
     // The page a jump to `page_num` would land on, 1-based. None while no document is open.
     pub fn target_page(&self, page_num: u32) -> Option<u32> {
         self.imp().target_page(page_num)

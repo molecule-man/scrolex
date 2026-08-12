@@ -102,6 +102,7 @@ impl ObjectImpl for Window {
         self.setup_cache_setting();
         self.setup_animate_scroll();
         self.setup_drop_target();
+        self.setup_search_keys();
         self.connect_document(&self.document.get());
         self.set_active_document(&self.document.get());
 
@@ -121,6 +122,24 @@ impl ObjectImpl for Window {
 
 #[gtk::template_callbacks]
 impl Window {
+    // Capture phase, on the window: Ctrl+F and F3 must reach the document wherever the focus
+    // sits, including the header entries. Capture also stops Escape from double-firing the
+    // search entry's own stop-search.
+    fn setup_search_keys(&self) {
+        let key = gtk::EventControllerKey::new();
+        key.set_propagation_phase(gtk::PropagationPhase::Capture);
+        key.connect_key_pressed(clone!(
+            #[weak(rename_to = imp)]
+            self,
+            #[upgrade_or]
+            glib::Propagation::Proceed,
+            move |_, keyval, _keycode, modifier| {
+                imp.active_document().handle_search_key(keyval, modifier)
+            }
+        ));
+        self.obj().add_controller(key);
+    }
+
     // Per-document wiring, done once for every document the window owns.
     fn connect_document(&self, document: &DocumentView) {
         document.connect_closure(
@@ -478,6 +497,29 @@ mod widget_tests {
     use crate::test_support::{loaded_window, wait_until};
     use gtk::prelude::*;
     use gtk::subclass::prelude::ObjectSubclassIsExt;
+
+    // The reader can be typing a page number when they reach for Ctrl+F. The controller sits on
+    // the window, not the document, so the header entries do not swallow it.
+    #[gtk::test]
+    fn search_shortcuts_reach_the_document_from_the_header_entry() {
+        let window = loaded_window();
+        let imp = window.imp();
+        window.header().entry_page_num.grab_focus();
+        assert!(!imp.search_bar.is_search_mode(), "closed at rest");
+
+        let opened =
+            window.handle_search_key(gtk::gdk::Key::f, gtk::gdk::ModifierType::CONTROL_MASK);
+
+        assert_eq!(opened, gtk::glib::Propagation::Stop, "the window took it");
+        assert!(imp.search_bar.is_search_mode(), "search opened");
+
+        let closed =
+            window.handle_search_key(gtk::gdk::Key::Escape, gtk::gdk::ModifierType::empty());
+
+        assert_eq!(closed, gtk::glib::Propagation::Stop);
+        assert!(!imp.search_bar.is_search_mode(), "Escape closed it");
+        window.close();
+    }
 
     // Issue #53: a live icon that does nothing reads as broken. Covers the binding wiring;
     // page_jump_enabled_only_where_the_jump_moves covers the decision.
