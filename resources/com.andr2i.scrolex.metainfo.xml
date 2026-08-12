@@ -85,6 +85,15 @@
     </screenshot>
   </screenshots>
   <releases>
+    <release version="0.11.0" date="2026-08-12">
+      <url>https://github.com/molecule-man/scrolex/releases/tag/0.11.0</url>
+      <description>
+        <ul>
+          <li>Add basic tabs support</li>
+          <li>Show doc name in the top-bar</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.10.0" date="2026-08-03">
       <url>https://github.com/molecule-man/scrolex/releases/tag/0.10.0</url>
       <description>
