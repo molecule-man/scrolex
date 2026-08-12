@@ -21,12 +21,12 @@
 								</property>
 								<binding name="sensitive">
 									<closure type="gboolean" function="can_jump_back">
-										<lookup name="prev_page"><lookup name="state">document</lookup></lookup>
+										<lookup name="prev_page"><lookup name="state" type="DocumentView"><lookup name="active-document">MyApp</lookup></lookup></lookup>
 									</closure>
 								</binding>
 								<binding name="tooltip-text">
 									<closure type="gchararray" function="back_btn_text">
-										<lookup name="prev_page"><lookup name="state">document</lookup></lookup>
+										<lookup name="prev_page"><lookup name="state" type="DocumentView"><lookup name="active-document">MyApp</lookup></lookup></lookup>
 									</closure>
 								</binding>
 							</object>
@@ -42,12 +42,12 @@
 								</property>
 								<binding name="sensitive">
 									<closure type="gboolean" function="can_jump_forward">
-										<lookup name="next_page"><lookup name="state">document</lookup></lookup>
+										<lookup name="next_page"><lookup name="state" type="DocumentView"><lookup name="active-document">MyApp</lookup></lookup></lookup>
 									</closure>
 								</binding>
 								<binding name="tooltip-text">
 									<closure type="gchararray" function="forward_btn_text">
-										<lookup name="next_page"><lookup name="state">document</lookup></lookup>
+										<lookup name="next_page"><lookup name="state" type="DocumentView"><lookup name="active-document">MyApp</lookup></lookup></lookup>
 									</closure>
 								</binding>
 							</object>
@@ -71,14 +71,14 @@
 								<binding name="text">
 									<closure type="gchararray" function="page_entry_text">
 										<lookup name="page_number" type="PageNumber">
-											<lookup name="selected-item"><lookup name="selection">document</lookup></lookup>
+											<lookup name="selected-item"><lookup name="selection" type="DocumentView"><lookup name="active-document">MyApp</lookup></lookup></lookup>
 										</lookup>
 									</closure>
 								</binding>
 								<binding name="secondary-icon-sensitive">
 									<closure type="gboolean" function="page_jump_enabled">
 										<lookup name="text">entry_page_num</lookup>
-										<lookup name="page"><lookup name="state">document</lookup></lookup>
+										<lookup name="page"><lookup name="state" type="DocumentView"><lookup name="active-document">MyApp</lookup></lookup></lookup>
 									</closure>
 								</binding>
 							</object>
@@ -136,13 +136,13 @@
 						<property name="input-purpose">digits</property>
 						<binding name="text">
 							<closure type="gchararray" function="zoom_entry_text">
-								<lookup name="zoom"><lookup name="state">document</lookup></lookup>
+								<lookup name="zoom"><lookup name="state" type="DocumentView"><lookup name="active-document">MyApp</lookup></lookup></lookup>
 							</closure>
 						</binding>
 						<binding name="secondary-icon-sensitive">
 							<closure type="gboolean" function="zoom_apply_enabled">
 								<lookup name="text">entry_zoom</lookup>
-								<lookup name="zoom"><lookup name="state">document</lookup></lookup>
+								<lookup name="zoom"><lookup name="state" type="DocumentView"><lookup name="active-document">MyApp</lookup></lookup></lookup>
 							</closure>
 						</binding>
 					</object>

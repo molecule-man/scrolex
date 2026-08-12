@@ -1,5 +1,8 @@
 // Window chrome: the header bar, the settings menu, and the file chooser. The document itself
 // lives in DocumentView.
+use std::cell::RefCell;
+use std::sync::OnceLock;
+
 use glib::clone;
 use glib::subclass::InitializingObject;
 use gtk::glib::subclass::prelude::*;
@@ -37,6 +40,12 @@ pub struct Window {
     pub entry_page_num: TemplateChild<gtk::Entry>,
     #[template_child]
     pub entry_zoom: TemplateChild<gtk::Entry>,
+
+    // The document the header bar acts on.
+    active_document: RefCell<Option<DocumentView>>,
+
+    // Two-way header bindings, dropped when the active document changes.
+    header_bindings: RefCell<Vec<glib::Binding>>,
 }
 
 #[glib::object_subclass]
@@ -58,6 +67,24 @@ impl ObjectSubclass for Window {
 }
 
 impl ObjectImpl for Window {
+    fn properties() -> &'static [glib::ParamSpec] {
+        static PROPERTIES: OnceLock<Vec<glib::ParamSpec>> = OnceLock::new();
+        PROPERTIES.get_or_init(|| {
+            vec![
+                glib::ParamSpecObject::builder::<DocumentView>("active-document")
+                    .read_only()
+                    .build(),
+            ]
+        })
+    }
+
+    fn property(&self, _id: usize, pspec: &glib::ParamSpec) -> glib::Value {
+        match pspec.name() {
+            "active-document" => self.active_document.borrow().to_value(),
+            name => unimplemented!("unknown property {name}"),
+        }
+    }
+
     fn constructed(&self) {
         self.parent_constructed();
 
@@ -75,17 +102,8 @@ impl ObjectImpl for Window {
         self.setup_cache_setting();
         self.setup_animate_scroll();
         self.setup_drop_target();
-        self.bind_header_to_document();
-
-        self.document.connect_closure(
-            "open-requested",
-            false,
-            glib::closure_local!(
-                #[weak(rename_to = imp)]
-                self,
-                move |_: &DocumentView| imp.open_document()
-            ),
-        );
+        self.connect_document(&self.document.get());
+        self.set_active_document(&self.document.get());
 
         // Drop the render-pool state when the window closes, so its entries don't linger.
         self.obj().connect_close_request(clone!(
@@ -103,40 +121,82 @@ impl ObjectImpl for Window {
 
 #[gtk::template_callbacks]
 impl Window {
-    // Header controls that carry state both ways, or that GtkBuilder cannot chain through a
-    // property lookup. One place, so pointing the header at another document stays one call.
-    fn bind_header_to_document(&self) {
-        let document = self.document.get();
+    // Per-document wiring, done once for every document the window owns.
+    fn connect_document(&self, document: &DocumentView) {
+        document.connect_closure(
+            "open-requested",
+            false,
+            glib::closure_local!(
+                #[weak(rename_to = imp)]
+                self,
+                move |document: &DocumentView| imp.open_document_into(document)
+            ),
+        );
+    }
+
+    // The document the header bar and the menu act on.
+    pub(crate) fn active_document(&self) -> DocumentView {
+        self.active_document
+            .borrow()
+            .clone()
+            .unwrap_or_else(|| self.document.get())
+    }
+
+    // Point the header bar at a document. The lookup chains in app.ui follow the
+    // active-document property on their own; the bindings below cannot, so they are rebuilt here.
+    pub(crate) fn set_active_document(&self, document: &DocumentView) {
+        if self.active_document.borrow().as_ref() == Some(document) {
+            return;
+        }
+        self.active_document.replace(Some(document.clone()));
+        self.obj().notify("active-document");
+        self.bind_header_to_document(document);
+    }
+
+    // Header controls that carry state both ways, which GtkBuilder cannot chain through a
+    // property lookup.
+    fn bind_header_to_document(&self, document: &DocumentView) {
+        for binding in self.header_bindings.take() {
+            binding.unbind();
+        }
         let state = document.state();
 
-        state
-            .bind_property("crop", &*self.btn_crop, "active")
-            .bidirectional()
-            .sync_create()
-            .build();
-        state
-            .bind_property("animate-scroll", &*self.btn_animate_scroll, "active")
-            .bidirectional()
-            .sync_create()
-            .build();
-        document
-            .bind_property("fit-height", &*self.btn_fit_height, "active")
-            .bidirectional()
-            .sync_create()
-            .build();
-        document
-            .bind_property("toc-visible", &*self.btn_toc, "active")
-            .bidirectional()
-            .sync_create()
-            .build();
-        document
-            .bind_property("has-toc", &*self.btn_toc, "sensitive")
-            .sync_create()
-            .build();
+        let bindings = vec![
+            state
+                .bind_property("crop", &*self.btn_crop, "active")
+                .bidirectional()
+                .sync_create()
+                .build(),
+            state
+                .bind_property("animate-scroll", &*self.btn_animate_scroll, "active")
+                .bidirectional()
+                .sync_create()
+                .build(),
+            document
+                .bind_property("fit-height", &*self.btn_fit_height, "active")
+                .bidirectional()
+                .sync_create()
+                .build(),
+            document
+                .bind_property("toc-visible", &*self.btn_toc, "active")
+                .bidirectional()
+                .sync_create()
+                .build(),
+            document
+                .bind_property("has-toc", &*self.btn_toc, "sensitive")
+                .sync_create()
+                .build(),
+        ];
+
+        self.header_bindings.replace(bindings);
     }
 
     #[template_callback]
     fn open_document(&self) {
+        self.open_document_into(&self.active_document());
+    }
+
+    fn open_document_into(&self, document: &DocumentView) {
         let supported = gtk::FileFilter::new();
         supported.set_name(Some("Supported documents"));
         for suffix in SUPPORTED_SUFFIXES {
@@ -157,12 +217,13 @@ impl Window {
             .build();
 
         let obj = self.obj();
+        let document = document.clone();
         dialog.open(
             Some(obj.as_ref()),
             gtk::gio::Cancellable::NONE,
             clone!(
-                #[strong(rename_to = document)]
-                self.document,
+                #[strong]
+                document,
                 #[strong]
                 obj,
                 move |file| match file {
@@ -194,7 +255,7 @@ impl Window {
                     return false;
                 };
 
-                imp.document.state().load(&file);
+                imp.active_document().state().load(&file);
                 true
             }
         ));
@@ -272,22 +333,22 @@ impl Window {
 
     #[template_callback]
     fn zoom_in(&self) {
-        self.document.zoom_in();
+        self.active_document().zoom_in();
     }
 
     #[template_callback]
     fn zoom_out(&self) {
-        self.document.zoom_out();
+        self.active_document().zoom_out();
     }
 
     #[template_callback]
     fn jump_back(&self) {
-        self.document.jump_back();
+        self.active_document().jump_back();
     }
 
     #[template_callback]
     fn jump_forward(&self) {
-        self.document.jump_forward();
+        self.active_document().jump_forward();
     }
 
     #[template_callback]
@@ -296,7 +357,7 @@ impl Window {
             return;
         };
 
-        self.document.goto_page(page_num);
+        self.active_document().goto_page(page_num);
     }
 
     #[template_callback]
@@ -310,7 +371,7 @@ impl Window {
             return;
         };
 
-        self.document.apply_zoom_percent(percent);
+        self.active_document().apply_zoom_percent(percent);
     }
 
     #[template_callback]
@@ -321,7 +382,7 @@ impl Window {
     #[template_callback]
     fn menu_search(&self, btn: &Button) {
         dismiss_menu(btn);
-        self.document.open_search();
+        self.active_document().open_search();
     }
 
     #[template_callback]
