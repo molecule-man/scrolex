@@ -101,18 +101,6 @@
 					</object>
 				</child>
 				<child type="start">
-					<object class="GtkButton" id="btn_new_tab">
-						<signal name="clicked" handler="new_tab" swapped="true"/>
-						<property name="icon-name">tab-new-symbolic</property>
-						<property name="tooltip-text">Open a document in a new tab (Ctrl+T)</property>
-						<property name="cursor">
-							<object class="GdkCursor">
-								<property name="name">pointer</property>
-							</object>
-						</property>
-					</object>
-				</child>
-				<child type="start">
 					<object class="GtkToggleButton" id="btn_toc">
 						<property name="icon-name">view-list-symbolic</property>
 						<property name="tooltip-text">Contents (t)</property>
@@ -142,6 +130,13 @@
 										<property name="margin-bottom">8</property>
 										<property name="margin-start">8</property>
 										<property name="margin-end">8</property>
+										<child>
+											<object class="GtkButton" id="btn_menu_add_tab">
+												<signal name="clicked" handler="menu_add_tab" swapped="true"/>
+												<property name="label">Open in New Tab…</property>
+												<property name="tooltip-text">Open a document in a new tab (Ctrl+T)</property>
+											</object>
+										</child>
 										<child>
 											<object class="GtkButton" id="btn_menu_search">
 												<signal name="clicked" handler="menu_search" swapped="true"/>
@@ -331,6 +326,19 @@
 				<property name="show-tabs">false</property>
 				<property name="show-border">false</property>
 				<property name="scrollable">true</property>
+				<child type="action-end">
+					<object class="GtkButton" id="btn_add_tab">
+						<signal name="clicked" handler="add_tab" swapped="true"/>
+						<property name="icon-name">tab-new-symbolic</property>
+						<property name="tooltip-text">Open a document in a new tab (Ctrl+T)</property>
+						<property name="has-frame">false</property>
+						<property name="cursor">
+							<object class="GdkCursor">
+								<property name="name">pointer</property>
+							</object>
+						</property>
+					</object>
+				</child>
 			</object>
 		</child>
 	</template>

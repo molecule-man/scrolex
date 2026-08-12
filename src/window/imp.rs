@@ -30,7 +30,9 @@ pub struct Window {
     pub notebook: TemplateChild<gtk::Notebook>,
 
     #[template_child]
-    pub btn_new_tab: TemplateChild<Button>,
+    pub btn_add_tab: TemplateChild<Button>,
+    #[template_child]
+    pub btn_menu_add_tab: TemplateChild<Button>,
     #[template_child]
     pub btn_crop: TemplateChild<ToggleButton>,
     #[template_child]
@@ -184,7 +186,7 @@ impl Window {
         if modifiers == control {
             match keyval {
                 Key::t | Key::T => {
-                    self.new_tab();
+                    self.add_tab();
                     return glib::Propagation::Stop;
                 }
                 // The last document has no tab left to fall back to, so the window goes with it.
@@ -415,7 +417,9 @@ impl Window {
     // A single document needs no tab bar.
     fn update_tab_bar(&self) {
         self.notebook.set_show_tabs(self.notebook.n_pages() > 1);
-        self.btn_new_tab.set_sensitive(!self.at_document_limit());
+        let can_add = !self.at_document_limit();
+        self.btn_add_tab.set_sensitive(can_add);
+        self.btn_menu_add_tab.set_sensitive(can_add);
     }
 
     // Point the header bar at a document. The lookup chains in app.ui follow the
@@ -480,7 +484,7 @@ impl Window {
     }
 
     #[template_callback]
-    fn new_tab(&self) {
+    fn add_tab(&self) {
         if self.at_document_limit() {
             return;
         }
@@ -489,6 +493,12 @@ impl Window {
             self,
             move |file| imp.open_in_new_tab(&file)
         ));
+    }
+
+    #[template_callback]
+    fn menu_add_tab(&self, btn: &Button) {
+        dismiss_menu(btn);
+        self.add_tab();
     }
 
     // Fill an idle empty tab instead of adding another tab.
@@ -1236,14 +1246,16 @@ mod widget_tests {
     fn the_tab_limit_stops_at_max_documents() {
         let window = loaded_window();
         let header = window.header();
+        let add_is_sensitive =
+            || header.btn_add_tab.is_sensitive() && header.btn_menu_add_tab.is_sensitive();
 
         while header.notebook.n_pages() < super::MAX_DOCUMENTS {
-            assert!(header.btn_new_tab.is_sensitive(), "room for another tab");
+            assert!(add_is_sensitive(), "room for another tab");
             header.add_document().expect("a tab");
         }
 
         assert_eq!(header.notebook.n_pages(), super::MAX_DOCUMENTS);
-        assert!(!header.btn_new_tab.is_sensitive(), "the button dims");
+        assert!(!add_is_sensitive(), "the buttons dim");
         assert!(header.add_document().is_none(), "no tab past the limit");
         assert_eq!(header.notebook.n_pages(), super::MAX_DOCUMENTS);
 
@@ -1253,7 +1265,7 @@ mod widget_tests {
 
         let last = header.active_document().expect("a document");
         header.close_document(&last);
-        assert!(header.btn_new_tab.is_sensitive(), "closing frees a slot");
+        assert!(add_is_sensitive(), "closing frees a slot");
 
         window.close();
     }
@@ -1269,6 +1281,27 @@ mod widget_tests {
         window.header().add_document().expect("a tab");
         assert_eq!(notebook.n_pages(), 2);
         assert!(notebook.shows_tabs(), "two documents show the tab bar");
+
+        window.close();
+    }
+
+    #[gtk::test]
+    fn add_tab_buttons_show_the_shortcut() {
+        let window = loaded_window();
+        let header = window.header();
+
+        assert_eq!(
+            header.notebook.action_widget(gtk::PackType::End),
+            Some(header.btn_add_tab.get().upcast())
+        );
+        for button in [&header.btn_add_tab, &header.btn_menu_add_tab] {
+            assert!(
+                button
+                    .tooltip_text()
+                    .is_some_and(|text| text.contains("Ctrl+T")),
+                "the tooltip names the shortcut"
+            );
+        }
 
         window.close();
     }
