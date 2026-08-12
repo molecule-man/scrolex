@@ -57,6 +57,9 @@ pub struct Window {
     // Prevent global animate-scroll updates from calling each other.
     animate_scroll_sync: Cell<bool>,
 
+    // Prevent application-wide spin updates from saving the same value again.
+    setting_controls_sync: Cell<bool>,
+
     render_threads: Cell<usize>,
     render_cache_mb: Cell<usize>,
     preview_cache_pages: Cell<usize>,
@@ -108,20 +111,6 @@ impl ObjectImpl for Window {
         self.render_cache_mb.set(config.render_cache_mb);
         self.preview_cache_pages.set(config.preview_cache_pages);
         self.animate_scroll.set(config.animate_scroll);
-        let current = self.obj().clone();
-        if let Some(window) = self.obj().application().and_then(|application| {
-            application
-                .windows()
-                .into_iter()
-                .filter_map(|window| window.downcast::<super::Window>().ok())
-                .find(|window| window != &current)
-        }) {
-            let imp = window.imp();
-            self.render_threads.set(imp.render_threads.get());
-            self.render_cache_mb.set(imp.render_cache_mb.get());
-            self.preview_cache_pages.set(imp.preview_cache_pages.get());
-            self.animate_scroll.set(imp.animate_scroll.get());
-        }
 
         if let Some(editable) = self.entry_page_num.delegate() {
             editable.connect_insert_text(|entry, s, _| {
@@ -150,6 +139,14 @@ impl ObjectImpl for Window {
                 for document in imp.documents() {
                     document.release_renders();
                 }
+                let current = imp.obj().clone();
+                let documents = imp
+                    .application_windows()
+                    .into_iter()
+                    .filter(|window| window != &current)
+                    .flat_map(|window| window.imp().documents())
+                    .collect();
+                imp.share_cache_budgets_between(documents);
                 glib::Propagation::Proceed
             }
         ));
@@ -357,6 +354,33 @@ impl Window {
             .collect()
     }
 
+    pub(crate) fn inherit_application_settings(&self) {
+        let current = self.obj().clone();
+        let Some(source) = self
+            .application_windows()
+            .into_iter()
+            .find(|window| window != &current)
+        else {
+            return;
+        };
+        let source = source.imp();
+        let render_threads = source.render_threads.get();
+        let render_cache_mb = source.render_cache_mb.get();
+        let preview_cache_pages = source.preview_cache_pages.get();
+        let animate_scroll = source.animate_scroll.get();
+
+        self.preview_cache_pages.set(preview_cache_pages);
+        self.apply_render_threads(render_threads);
+        self.apply_cache_budgets(render_cache_mb);
+
+        self.animate_scroll_sync.set(true);
+        self.animate_scroll.set(animate_scroll);
+        for document in self.documents() {
+            document.state().set_animate_scroll(animate_scroll);
+        }
+        self.animate_scroll_sync.set(false);
+    }
+
     // The document the header bar and the menu act on. None while GtkBuilder still builds the
     // template, before the first document exists.
     pub(crate) fn active_document(&self) -> Option<DocumentView> {
@@ -535,6 +559,9 @@ impl Window {
             #[weak(rename_to = imp)]
             self,
             move |spin| {
+                if imp.setting_controls_sync.get() {
+                    return;
+                }
                 let n = spin.value() as usize;
                 imp.apply_render_threads(n);
                 let mut config = crate::config::load_config();
@@ -548,11 +575,18 @@ impl Window {
 
     fn apply_render_threads(&self, n: usize) {
         log::info!("Render threads: {n}");
-        for window in self.application_windows() {
-            window.imp().render_threads.set(n);
+        let windows = self.application_windows();
+        for window in &windows {
+            let imp = window.imp();
+            imp.setting_controls_sync.set(true);
+            imp.render_threads.set(n);
+            imp.spin_threads.set_value(n as f64);
         }
         for document in self.application_documents() {
             document.state().set_render_threads(n);
+        }
+        for window in windows {
+            window.imp().setting_controls_sync.set(false);
         }
         crate::page::set_render_threads(n);
     }
@@ -571,6 +605,9 @@ impl Window {
             #[weak(rename_to = imp)]
             self,
             move |spin| {
+                if imp.setting_controls_sync.get() {
+                    return;
+                }
                 let mb = spin.value() as usize;
                 imp.apply_cache_budgets(mb);
                 let mut config = crate::config::load_config();
@@ -584,10 +621,16 @@ impl Window {
 
     fn apply_cache_budgets(&self, render_cache_mb: usize) {
         let preview_cache_pages = self.preview_cache_pages.get();
-        for window in self.application_windows() {
+        let windows = self.application_windows();
+        for window in &windows {
             let imp = window.imp();
+            imp.setting_controls_sync.set(true);
             imp.render_cache_mb.set(render_cache_mb);
             imp.preview_cache_pages.set(preview_cache_pages);
+            imp.spin_cache.set_value(render_cache_mb as f64);
+        }
+        for window in windows {
+            window.imp().setting_controls_sync.set(false);
         }
         self.share_cache_budgets();
     }
@@ -595,7 +638,10 @@ impl Window {
     // The configured cache sizes are application totals, not per-document ones. Four tabs must not
     // claim four budgets. Run this whenever the document count or the setting changes.
     pub(crate) fn share_cache_budgets(&self) {
-        let documents = self.application_documents();
+        self.share_cache_budgets_between(self.application_documents());
+    }
+
+    fn share_cache_budgets_between(&self, documents: Vec<DocumentView>) {
         let count = documents.len().max(1);
 
         let render_bytes = self.render_cache_mb.get() * 1024 * 1024 / count;
@@ -1155,6 +1201,56 @@ mod widget_tests {
         assert!(first.state().doc_epoch() > first_epoch);
         assert!(second.state().doc_epoch() > second_epoch);
         window.close();
+    }
+
+    #[gtk::test]
+    fn application_windows_keep_settings_and_cache_in_sync() {
+        let bootstrap = test_window();
+        bootstrap.close();
+        let application = gtk::Application::builder()
+            .application_id("com.andr2i.scrolex.tests")
+            .flags(gtk::gio::ApplicationFlags::NON_UNIQUE)
+            .register_session(false)
+            .build();
+        application
+            .register(None::<&gtk::gio::Cancellable>)
+            .unwrap();
+
+        let first = super::super::Window::new(&application);
+        first.present();
+        first.imp().spin_threads.set_value(1.0);
+        first.imp().spin_cache.set_value(96.0);
+        let second = super::super::Window::new(&application);
+        second.present();
+        wait_until(|| first.is_mapped() && second.is_mapped());
+
+        assert_eq!(second.imp().spin_threads.value(), 1.0);
+        assert_eq!(second.imp().spin_cache.value(), 96.0);
+        assert_eq!(
+            first
+                .active_document()
+                .state()
+                .render_cache()
+                .borrow()
+                .budget_bytes(),
+            48 * 1024 * 1024
+        );
+
+        second.imp().spin_cache.set_value(128.0);
+        assert_eq!(first.imp().spin_cache.value(), 128.0);
+
+        second.close();
+        wait_until(|| !second.is_visible());
+        assert_eq!(
+            first
+                .active_document()
+                .state()
+                .render_cache()
+                .borrow()
+                .budget_bytes(),
+            128 * 1024 * 1024
+        );
+        first.close();
     }
 
     // The reader can be typing a page number when they reach for Ctrl+F. The controller sits on

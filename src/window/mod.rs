@@ -17,7 +17,9 @@ glib::wrapper! {
 #[gtk::template_callbacks]
 impl Window {
     pub fn new(app: &Application) -> Self {
-        Object::builder().property("application", app).build()
+        let window: Self = Object::builder().property("application", app).build();
+        window.imp().inherit_application_settings();
+        window
     }
 
     // The window always keeps at least one document.
