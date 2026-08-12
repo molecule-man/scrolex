@@ -20,8 +20,9 @@ impl Window {
         Object::builder().property("application", app).build()
     }
 
+    // The window always keeps at least one document.
     pub fn active_document(&self) -> DocumentView {
-        self.imp().active_document()
+        self.imp().active_document().expect("an open document")
     }
 
     pub fn documents(&self) -> Vec<DocumentView> {

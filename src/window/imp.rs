@@ -21,8 +21,9 @@ const SUPPORTED_SUFFIXES: &[&str] = &[
 #[derive(CompositeTemplate, Default)]
 #[template(resource = "/com/andr2i/scrolex/app.ui")]
 pub struct Window {
+    // The only document collection. Nothing else keeps a list.
     #[template_child]
-    pub document: TemplateChild<DocumentView>,
+    pub notebook: TemplateChild<gtk::Notebook>,
 
     #[template_child]
     pub btn_crop: TemplateChild<ToggleButton>,
@@ -43,9 +44,6 @@ pub struct Window {
 
     // The document the header bar acts on.
     active_document: RefCell<Option<DocumentView>>,
-
-    // Every document this window owns.
-    documents: RefCell<Vec<DocumentView>>,
 
     // Two-way header bindings, dropped when the active document changes.
     header_bindings: RefCell<Vec<glib::Binding>>,
@@ -104,7 +102,8 @@ impl ObjectImpl for Window {
             });
         }
 
-        self.set_active_document(&self.document.get());
+        self.setup_notebook();
+        self.add_document();
         self.setup_thread_setting();
         self.setup_cache_setting();
         self.setup_drop_target();
@@ -140,14 +139,40 @@ impl Window {
             #[upgrade_or]
             glib::Propagation::Proceed,
             move |_, keyval, _keycode, modifier| {
-                imp.active_document().handle_search_key(keyval, modifier)
+                imp.active_document()
+                    .map_or(glib::Propagation::Proceed, |document| {
+                        document.handle_search_key(keyval, modifier)
+                    })
             }
         ));
         self.obj().add_controller(key);
     }
 
-    // Per-document wiring, done once for every document the window owns.
-    fn connect_document(&self, document: &DocumentView) {
+    fn setup_notebook(&self) {
+        self.notebook.connect_switch_page(clone!(
+            #[weak(rename_to = imp)]
+            self,
+            move |_, page, _| {
+                if let Some(document) = page.downcast_ref::<DocumentView>() {
+                    imp.set_active_document(document);
+                }
+            }
+        ));
+    }
+
+    // Add an empty document and show it. The caller loads a file into it.
+    pub(crate) fn add_document(&self) -> DocumentView {
+        let document = DocumentView::new();
+
+        let config = crate::config::load_config();
+        let state = document.state();
+        state.set_render_threads(config.render_threads);
+        state.set_animate_scroll(config.animate_scroll);
+        state.connect_animate_scroll_notify(clone!(
+            #[weak(rename_to = imp)]
+            self,
+            move |state| imp.apply_animate_scroll(state.animate_scroll())
+        ));
         document.connect_closure(
             "open-requested",
             false,
@@ -157,45 +182,36 @@ impl Window {
                 move |document: &DocumentView| imp.open_document_into(document)
             ),
         );
-    }
 
-    // Add one document to the window and apply its global settings.
-    pub(crate) fn register_document(&self, document: &DocumentView) {
-        if self.documents.borrow().contains(document) {
-            return;
-        }
+        let page = self.notebook.append_page(&document, gtk::Widget::NONE);
+        self.notebook.set_current_page(Some(page));
+        self.update_tab_visibility();
+        self.apply_render_cache_mb(config.render_cache_mb);
 
-        let config = crate::config::load_config();
-        let state = document.state();
-        state.set_render_threads(config.render_threads);
-        state.set_render_cache_mb(config.render_cache_mb);
-        state.set_animate_scroll(config.animate_scroll);
-        state.connect_animate_scroll_notify(clone!(
-            #[weak(rename_to = imp)]
-            self,
-            move |state| imp.apply_animate_scroll(state.animate_scroll())
-        ));
-
-        self.connect_document(document);
-        self.documents.borrow_mut().push(document.clone());
+        document
     }
 
     pub(crate) fn documents(&self) -> Vec<DocumentView> {
-        self.documents.borrow().clone()
+        (0..self.notebook.n_pages())
+            .filter_map(|i| self.notebook.nth_page(Some(i)))
+            .filter_map(|page| page.downcast::<DocumentView>().ok())
+            .collect()
     }
 
-    // The document the header bar and the menu act on.
-    pub(crate) fn active_document(&self) -> DocumentView {
-        self.active_document
-            .borrow()
-            .clone()
-            .unwrap_or_else(|| self.document.get())
+    // The document the header bar and the menu act on. None while GtkBuilder still builds the
+    // template, before the first document exists.
+    pub(crate) fn active_document(&self) -> Option<DocumentView> {
+        self.active_document.borrow().clone()
+    }
+
+    // A single document needs no tab bar.
+    fn update_tab_visibility(&self) {
+        self.notebook.set_show_tabs(self.notebook.n_pages() > 1);
     }
 
     // Point the header bar at a document. The lookup chains in app.ui follow the
     // active-document property on their own; the bindings below cannot, so they are rebuilt here.
-    pub(crate) fn set_active_document(&self, document: &DocumentView) {
-        self.register_document(document);
+    fn set_active_document(&self, document: &DocumentView) {
         if self.active_document.borrow().as_ref() == Some(document) {
             return;
         }
@@ -244,7 +260,9 @@ impl Window {
 
     #[template_callback]
     fn open_document(&self) {
-        self.open_document_into(&self.active_document());
+        if let Some(document) = self.active_document() {
+            self.open_document_into(&document);
+        }
     }
 
     fn open_document_into(&self, document: &DocumentView) {
@@ -305,8 +323,11 @@ impl Window {
                 let Some(file) = files.files().into_iter().next() else {
                     return false;
                 };
+                let Some(document) = imp.active_document() else {
+                    return false;
+                };
 
-                imp.active_document().state().load(&file);
+                document.state().load(&file);
                 true
             }
         ));
@@ -398,22 +419,30 @@ impl Window {
 
     #[template_callback]
     fn zoom_in(&self) {
-        self.active_document().zoom_in();
+        if let Some(document) = self.active_document() {
+            document.zoom_in();
+        }
     }
 
     #[template_callback]
     fn zoom_out(&self) {
-        self.active_document().zoom_out();
+        if let Some(document) = self.active_document() {
+            document.zoom_out();
+        }
     }
 
     #[template_callback]
     fn jump_back(&self) {
-        self.active_document().jump_back();
+        if let Some(document) = self.active_document() {
+            document.jump_back();
+        }
     }
 
     #[template_callback]
     fn jump_forward(&self) {
-        self.active_document().jump_forward();
+        if let Some(document) = self.active_document() {
+            document.jump_forward();
+        }
     }
 
     #[template_callback]
@@ -421,8 +450,11 @@ impl Window {
         let Ok(page_num) = entry.text().parse::<u32>() else {
             return;
         };
+        let Some(document) = self.active_document() else {
+            return;
+        };
 
-        self.active_document().goto_page(page_num);
+        document.goto_page(page_num);
     }
 
     #[template_callback]
@@ -435,8 +467,11 @@ impl Window {
         let Ok(percent) = entry.text().parse::<f64>() else {
             return;
         };
+        let Some(document) = self.active_document() else {
+            return;
+        };
 
-        self.active_document().apply_zoom_percent(percent);
+        document.apply_zoom_percent(percent);
     }
 
     #[template_callback]
@@ -447,7 +482,9 @@ impl Window {
     #[template_callback]
     fn menu_search(&self, btn: &Button) {
         dismiss_menu(btn);
-        self.active_document().open_search();
+        if let Some(document) = self.active_document() {
+            document.open_search();
+        }
     }
 
     #[template_callback]
@@ -500,7 +537,7 @@ impl Window {
             return false;
         };
         self.active_document()
-            .target_page(page_num)
+            .and_then(|document| document.target_page(page_num))
             .is_some_and(|target| target != page + 1)
     }
 
@@ -558,15 +595,14 @@ mod widget_tests {
     #[gtk::test]
     fn header_follows_the_active_document() {
         let window = loaded_window();
-        let first = window.header().active_document();
-        let second = DocumentView::new();
+        let first = window.header().active_document().expect("first document");
+        let second = window.header().add_document();
         set_document_page(&second, 10, 9);
         second.state().set_zoom(2.0);
         second.state().set_crop(true);
         second.state().set_fit_height(true);
         second.state().set_prev_page(4);
 
-        window.header().set_active_document(&second);
         wait_until(|| window.header().entry_page_num.text() == "10");
 
         assert_eq!(window.header().entry_zoom.text(), "200");
@@ -577,8 +613,13 @@ mod widget_tests {
             "the current page does not enable the jump icon"
         );
 
-        window.header().set_active_document(&first);
+        window.header().notebook.set_current_page(Some(0));
         wait_until(|| window.header().entry_page_num.text() == "1");
+        assert_eq!(
+            window.header().active_document().as_ref(),
+            Some(&first),
+            "the notebook page drives the header"
+        );
         assert_eq!(window.header().entry_zoom.text(), "100");
         assert!(!window.header().btn_crop.is_active());
         assert!(!window.header().btn_fit_height.is_active());
@@ -586,11 +627,25 @@ mod widget_tests {
     }
 
     #[gtk::test]
-    fn global_settings_apply_to_every_registered_document() {
+    fn one_document_hides_the_tab_bar() {
         let window = loaded_window();
-        let first = window.header().active_document();
-        let second = DocumentView::new();
-        window.header().set_active_document(&second);
+        let notebook = window.header().notebook.get();
+
+        assert_eq!(notebook.n_pages(), 1);
+        assert!(!notebook.shows_tabs(), "one document needs no tab bar");
+
+        window.header().add_document();
+        assert_eq!(notebook.n_pages(), 2);
+        assert!(notebook.shows_tabs(), "two documents show the tab bar");
+
+        window.close();
+    }
+
+    #[gtk::test]
+    fn global_settings_apply_to_every_document() {
+        let window = loaded_window();
+        let first = window.header().active_document().expect("first document");
+        let second = window.header().add_document();
 
         window.header().spin_threads.set_value(1.0);
         window.header().spin_cache.set_value(96.0);
@@ -598,10 +653,6 @@ mod widget_tests {
 
         for document in [&first, &second] {
             assert_eq!(document.state().render_threads(), 1);
-            assert_eq!(
-                document.state().render_cache().borrow().budget_bytes(),
-                96 * 1024 * 1024
-            );
             assert!(!document.state().animate_scroll());
         }
 

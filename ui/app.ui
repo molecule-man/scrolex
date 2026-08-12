@@ -314,8 +314,11 @@
 			</object>
 		</child>
 		<child>
-			<object class="DocumentView" id="document">
+			<object class="GtkNotebook" id="notebook">
 				<property name="vexpand">true</property>
+				<property name="show-tabs">false</property>
+				<property name="show-border">false</property>
+				<property name="scrollable">true</property>
 			</object>
 		</child>
 	</template>
