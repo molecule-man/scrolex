@@ -41,8 +41,7 @@ impl TestWindow {
     }
 }
 
-pub fn window() -> TestWindow {
-    // before the window: it reads the settings while it builds
+pub fn init() {
     crate::config::use_scratch_config();
     crate::state::use_scratch_state_dir();
     gtk::gio::resources_register_include!("scrolex-ui.gresource").expect("ui resources");
@@ -51,6 +50,11 @@ pub fn window() -> TestWindow {
     crate::page::Page::static_type();
     crate::document_view::DocumentView::static_type();
     load_css();
+}
+
+pub fn window() -> TestWindow {
+    // Windows read these isolated settings during construction.
+    init();
 
     let window: crate::window::Window = gtk::glib::Object::new();
     // the stylesheet keys off this name, as in main

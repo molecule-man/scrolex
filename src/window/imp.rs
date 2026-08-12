@@ -862,7 +862,7 @@ fn dismiss_menu(btn: &Button) {
 mod widget_tests {
     use crate::document_view::DocumentView;
     use crate::page::PageNumber;
-    use crate::test_support::{fixture, loaded_window, wait_until, window as test_window};
+    use crate::test_support::{fixture, init, loaded_window, wait_until, window as test_window};
     use gtk::prelude::*;
     use gtk::subclass::prelude::{ObjectSubclassExt, ObjectSubclassIsExt};
 
@@ -1205,8 +1205,7 @@ mod widget_tests {
 
     #[gtk::test]
     fn application_windows_keep_settings_and_cache_in_sync() {
-        let bootstrap = test_window();
-        bootstrap.close();
+        init();
         let application = gtk::Application::builder()
             .application_id("com.andr2i.scrolex.tests")
             .flags(gtk::gio::ApplicationFlags::NON_UNIQUE)
