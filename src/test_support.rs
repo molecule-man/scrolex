@@ -35,6 +35,10 @@ impl TestWindow {
         self.window.set_default_size(width, height);
     }
 
+    pub fn title(&self) -> String {
+        self.window.title().unwrap_or_default().into()
+    }
+
     // Header-bar children the document does not own.
     pub fn header(&self) -> &crate::window::imp::Window {
         self.window.imp()

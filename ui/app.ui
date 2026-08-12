@@ -1,12 +1,54 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <interface>
 	<template class="MyApp" parent="GtkApplicationWindow">
-		<property name="title">Scrolex PDF Viewer</property>
+		<property name="title">Scrolex Document Viewer</property>
 		<property name="default-width">1280</property>
 		<property name="default-height">800</property>
 		<child type="titlebar">
 			<object class="GtkHeaderBar" id="headerbar">
 				<child type="title">
+					<object class="GtkLabel" id="label_title">
+						<property name="ellipsize">end</property>
+						<property name="single-line-mode">true</property>
+						<style>
+							<class name="title"/>
+						</style>
+						<binding name="label">
+							<closure type="gchararray" function="document_title">
+								<lookup name="uri"><lookup name="state" type="DocumentView"><lookup name="active-document">MyApp</lookup></lookup></lookup>
+							</closure>
+						</binding>
+						<binding name="tooltip-text">
+							<closure type="gchararray" function="document_tooltip">
+								<lookup name="uri"><lookup name="state" type="DocumentView"><lookup name="active-document">MyApp</lookup></lookup></lookup>
+							</closure>
+						</binding>
+					</object>
+				</child>
+				<child type="start">
+					<object class="GtkButton" id="btn_open">
+						<signal name="clicked" handler="open_document" swapped="true"/>
+						<property name="icon-name">document-open</property>
+						<property name="tooltip-text">Open Document</property>
+						<property name="cursor">
+							<object class="GdkCursor">
+								<property name="name">pointer</property>
+							</object>
+						</property>
+					</object>
+				</child>
+				<child type="start">
+					<object class="GtkToggleButton" id="btn_toc">
+						<property name="icon-name">view-list-symbolic</property>
+						<property name="tooltip-text">Contents (t)</property>
+						<property name="cursor">
+							<object class="GdkCursor">
+								<property name="name">pointer</property>
+							</object>
+						</property>
+					</object>
+				</child>
+				<child type="start">
 					<object class="GtkBox">
 						<property name="orientation">horizontal</property>
 						<property name="spacing">6</property>
@@ -83,32 +125,6 @@
 								</binding>
 							</object>
 						</child>
-					</object>
-					<!--<object class="GtkLabel" id="title">-->
-					<!--	<property name="label">Scrolex</property>-->
-					<!--</object>-->
-				</child>
-				<child type="start">
-					<object class="GtkButton" id="btn_open">
-						<signal name="clicked" handler="open_document" swapped="true"/>
-						<property name="icon-name">document-open</property>
-						<property name="tooltip-text">Open PDF Document</property>
-						<property name="cursor">
-							<object class="GdkCursor">
-								<property name="name">pointer</property>
-							</object>
-						</property>
-					</object>
-				</child>
-				<child type="start">
-					<object class="GtkToggleButton" id="btn_toc">
-						<property name="icon-name">view-list-symbolic</property>
-						<property name="tooltip-text">Contents (t)</property>
-						<property name="cursor">
-							<object class="GdkCursor">
-								<property name="name">pointer</property>
-							</object>
-						</property>
 					</object>
 				</child>
 				<child type="end">
