@@ -172,7 +172,7 @@ impl Window {
                 .bidirectional()
                 .sync_create()
                 .build(),
-            document
+            state
                 .bind_property("fit-height", &*self.btn_fit_height, "active")
                 .bidirectional()
                 .sync_create()

@@ -24,6 +24,11 @@ pub struct State {
     #[property(get, set)]
     crop: Cell<bool>,
 
+    // Fit the paper to the viewport height, and keep it fitted as the viewport changes. The
+    // intent lives here; the view owns the viewport and works out the zoom it means.
+    #[property(get, set)]
+    fit_height: Cell<bool>,
+
     // Zoom that the reader selected.
     pub(crate) manual_zoom: Cell<f64>,
 

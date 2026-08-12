@@ -207,9 +207,6 @@ pub struct DocumentView {
 
     // Vertical list-row padding in logical pixels.
     fit_chrome_height: Cell<Option<f64>>,
-
-    // Fit the paper to the viewport height, and keep it fitted as the viewport changes.
-    fit_height: Cell<bool>,
 }
 
 // A document point held still across a zoom: which page, where in it (page points from its
@@ -278,7 +275,6 @@ impl ObjectImpl for DocumentView {
                 glib::ParamSpecObject::builder::<SingleSelection>("selection")
                     .read_only()
                     .build(),
-                glib::ParamSpecBoolean::builder("fit-height").build(),
                 glib::ParamSpecBoolean::builder("toc-visible").build(),
                 glib::ParamSpecBoolean::builder("has-toc")
                     .read_only()
@@ -292,7 +288,6 @@ impl ObjectImpl for DocumentView {
         match pspec.name() {
             "state" => self.state.try_get().to_value(),
             "selection" => self.selection.try_get().to_value(),
-            "fit-height" => self.fit_height.get().to_value(),
             "toc-visible" => self
                 .toc_revealer
                 .try_get()
@@ -305,7 +300,6 @@ impl ObjectImpl for DocumentView {
 
     fn set_property(&self, _id: usize, value: &glib::Value, pspec: &glib::ParamSpec) {
         match pspec.name() {
-            "fit-height" => self.set_fit_height(value.get().unwrap()),
             "toc-visible" => self.toc_revealer.set_reveal_child(value.get().unwrap()),
             name => unimplemented!("unknown property {name}"),
         }
@@ -654,7 +648,7 @@ impl DocumentView {
     // Manual zoom turns fit off.
     fn zoom_to(&self, zoom: f64) {
         self.apply_zoom(zoom);
-        self.set_fit_height(false);
+        self.state.set_fit_height(false);
     }
 
     // A zoom relayouts the pages, so a coast has to stop first.
@@ -688,7 +682,7 @@ impl DocumentView {
 
     // Defer the fit until the current layout ends.
     fn queue_fit_height(&self) {
-        if !self.fit_height.get() || self.fit_pending.replace(true) {
+        if !self.state.fit_height() || self.fit_pending.replace(true) {
             return;
         }
 
@@ -704,7 +698,7 @@ impl DocumentView {
 
     // Fit the tallest paper to the viewport.
     fn fit_height(&self) {
-        if !self.fit_height.get() {
+        if !self.state.fit_height() {
             return;
         }
         let Some(zoom) = self.fit_height_zoom() else {
@@ -766,7 +760,7 @@ impl DocumentView {
     // Manual zoom about `screen` turns fit off.
     fn zoom_at(&self, zoom: f64, screen: (f64, f64)) {
         self.apply_zoom_at(zoom, screen);
-        self.set_fit_height(false);
+        self.state.set_fit_height(false);
     }
 
     // Zoom about `screen` and hold the document point there still. The zoom mode does not change.
@@ -1062,7 +1056,7 @@ impl DocumentView {
         if self.fit_height_zoom().is_some_and(|fit_zoom| {
             crate::state::zoom_percent_text(fit_zoom) == crate::state::zoom_percent_text(zoom)
         }) {
-            self.set_fit_height(true);
+            self.state.set_fit_height(true);
             return;
         }
 
@@ -1768,13 +1762,8 @@ impl DocumentView {
     }
 
     // Turning fit on fits now; turning it off restores the zoom the reader last chose.
-    pub(super) fn set_fit_height(&self, enabled: bool) {
-        if self.fit_height.replace(enabled) == enabled {
-            return;
-        }
-        self.obj().notify("fit-height");
-
-        if enabled {
+    fn fit_height_changed(&self) {
+        if self.state.fit_height() {
             self.queue_fit_height();
         } else if self.state.zoom() != self.state.manual_zoom() {
             let anchor = self
@@ -1786,6 +1775,12 @@ impl DocumentView {
     }
 
     fn setup_fit_height(&self) {
+        self.state.connect_fit_height_notify(clone!(
+            #[weak(rename_to = imp)]
+            self,
+            move |_| imp.fit_height_changed()
+        ));
+
         self.vscrolledwindow
             .vadjustment()
             .connect_page_size_notify(clone!(
@@ -3030,7 +3025,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         let window = loaded_window();
         let imp = window.imp();
 
-        imp.set_fit_height(true);
+        imp.state.set_fit_height(true);
         wait_until(|| !imp.fit_pending.get());
 
         assert_fills_the_viewport(imp);
@@ -3041,7 +3036,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
     fn a_fitted_page_without_horizontal_overflow_fills_the_viewport() {
         let window = loaded_window();
         let imp = window.imp();
-        imp.set_fit_height(true);
+        imp.state.set_fit_height(true);
 
         window.state().load(&one_page_document());
         wait_until(|| imp.selection.n_items() == 1);
@@ -3070,7 +3065,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
     fn fit_keeps_cached_chrome_without_a_mapped_selected_page() {
         let window = loaded_window();
         let imp = window.imp();
-        imp.set_fit_height(true);
+        imp.state.set_fit_height(true);
         wait_until(|| !imp.fit_pending.get());
         let chrome = imp.fit_chrome_height.get().expect("a cached chrome");
         assert!(chrome > 0.0, "the row pads the page");
@@ -3102,11 +3097,11 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         let imp = window.imp();
         imp.state.zoom_to(2.0);
 
-        imp.set_fit_height(true);
+        imp.state.set_fit_height(true);
         wait_until(|| !imp.fit_pending.get());
         assert_ne!(imp.state.zoom(), 2.0);
 
-        imp.set_fit_height(false);
+        imp.state.set_fit_height(false);
 
         assert_eq!(imp.state.zoom(), 2.0);
         window.close();
@@ -3116,19 +3111,19 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
     fn entering_the_displayed_fit_zoom_restores_fit_height() {
         let window = loaded_window();
         let imp = window.imp();
-        imp.set_fit_height(true);
+        imp.state.set_fit_height(true);
         wait_until(|| !imp.fit_pending.get());
         let fit_zoom = zoom_percent_text(imp.state.zoom());
 
         imp.zoom_in();
-        assert!(!imp.fit_height.get());
+        assert!(!imp.state.fit_height());
         let manual_zoom = imp.state.manual_zoom();
         type_zoom(&window, &fit_zoom);
 
-        assert!(imp.fit_height.get());
+        assert!(imp.state.fit_height());
         wait_until(|| !imp.fit_pending.get());
         assert_eq!(imp.state.manual_zoom(), manual_zoom);
-        imp.set_fit_height(false);
+        imp.state.set_fit_height(false);
         assert_eq!(imp.state.zoom(), manual_zoom);
         window.close();
     }
@@ -3140,14 +3135,14 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         let window = loaded_window();
         let imp = window.imp();
 
-        imp.set_fit_height(true);
+        imp.state.set_fit_height(true);
         wait_until(|| !imp.fit_pending.get());
         let zoom = imp.state.zoom();
 
         imp.state.set_crop(true);
 
         assert_eq!(imp.state.zoom(), zoom);
-        assert!(imp.fit_height.get(), "the mode stays on");
+        assert!(imp.state.fit_height(), "the mode stays on");
         assert_nothing_to_pan(imp);
         window.close();
     }
@@ -3159,7 +3154,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         let window = loaded_window();
         let imp = window.imp();
 
-        imp.set_fit_height(true);
+        imp.state.set_fit_height(true);
         wait_until(|| !imp.fit_pending.get());
 
         let vadj = imp.vscrolledwindow.vadjustment();
@@ -3189,12 +3184,12 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
             &|| type_zoom(&window, "42"),
         ];
         for zoom in zooms {
-            imp.set_fit_height(true);
+            imp.state.set_fit_height(true);
             wait_until(|| !imp.fit_pending.get());
 
             zoom();
 
-            assert!(!imp.fit_height.get());
+            assert!(!imp.state.fit_height());
             assert_eq!(imp.state.manual_zoom(), imp.state.zoom());
         }
         window.close();
@@ -3205,7 +3200,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         let window = loaded_window();
         let imp = window.imp();
         imp.state.zoom_to(2.0);
-        imp.set_fit_height(true);
+        imp.state.set_fit_height(true);
         wait_until(|| !imp.fit_pending.get());
         imp.zoom_anchor.set(None);
 
@@ -3223,7 +3218,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         let window = window();
         window.present();
         let imp = window.imp();
-        imp.set_fit_height(true);
+        imp.state.set_fit_height(true);
 
         window.state().load(&mixed_heights_document());
         wait_until(|| imp.selection.n_items() == 3);
