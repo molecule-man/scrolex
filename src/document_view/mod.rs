@@ -2,45 +2,85 @@ mod imp;
 
 use glib::Object;
 use gtk::glib::subclass::types::ObjectSubclassIsExt;
-use gtk::prelude::WidgetExt;
-use gtk::{gio, glib, Application};
+use gtk::prelude::*;
+use gtk::{gio, glib};
 
 use crate::state::State;
 
 glib::wrapper! {
     pub struct DocumentView(ObjectSubclass<imp::DocumentView>)
-        @extends gtk::ApplicationWindow, gtk::Window, gtk::Widget,
+        @extends gtk::Widget,
         @implements gio::ActionGroup, gio::ActionMap, gtk::Accessible, gtk::Buildable,
-                    gtk::ConstraintTarget, gtk::Native, gtk::Root, gtk::ShortcutManager;
+                    gtk::ConstraintTarget;
+}
+
+impl Default for DocumentView {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[gtk::template_callbacks]
 impl DocumentView {
-    pub fn new(app: &Application) -> Self {
-        Object::builder().property("application", app).build()
+    pub fn new() -> Self {
+        Object::builder().build()
     }
 
     pub fn state(&self) -> &State {
         self.imp().state.as_ref()
     }
 
-    pub fn apply_dark_mode(&self, enabled: bool) {
-        if self.has_css_class("dark-mode") == enabled {
-            return;
-        }
-        if enabled {
-            self.add_css_class("dark-mode");
-        } else {
-            self.remove_css_class("dark-mode");
-        }
-        self.state().invalidate_rendering();
+    // Actions the header bar and the menu drive.
+
+    pub fn zoom_in(&self) {
+        self.imp().zoom_in();
+    }
+
+    pub fn zoom_out(&self) {
+        self.imp().zoom_out();
+    }
+
+    pub fn jump_back(&self) {
+        self.imp().jump_back();
+    }
+
+    pub fn jump_forward(&self) {
+        self.imp().jump_forward();
+    }
+
+    pub fn goto_page(&self, page_num: u32) {
+        self.imp().goto_page(page_num);
+    }
+
+    pub fn apply_zoom_percent(&self, percent: f64) {
+        self.imp().apply_zoom_percent(percent);
+    }
+
+    pub fn open_search(&self) {
+        self.imp().open_search();
+    }
+
+    // The page a jump to `page_num` would land on, 1-based. None while no document is open.
+    pub fn target_page(&self, page_num: u32) -> Option<u32> {
+        self.imp().target_page(page_num)
+    }
+
+    // Repaint every laid-out page, e.g. after the render colours changed.
+    pub fn redraw_pages(&self) {
         self.imp().redraw_pages();
+    }
+
+    // Release this document's share of the render pool. Call before dropping the view.
+    pub fn release_renders(&self) {
+        let client = self.state().render_client_id();
+        crate::page::clear_all_renders(client);
+        crate::page::set_wanted_pages(client, None);
     }
 
     pub fn show_error_dialog(&self, message: &str) {
         gtk::AlertDialog::builder()
             .message(message)
             .build()
-            .show(Some(self));
+            .show(self.root().and_downcast::<gtk::Window>().as_ref());
     }
 }

@@ -1,5 +1,6 @@
-// Application window behavior, navigation, and viewport/render coordination.
+// One open document: navigation, and viewport/render coordination.
 use std::cell::{Cell, RefCell};
+use std::sync::OnceLock;
 
 use futures::StreamExt;
 use glib::clone;
@@ -8,10 +9,11 @@ use gtk::gdk::{EventSequence, Key, ModifierType, BUTTON_PRIMARY};
 use gtk::glib::closure_local;
 use gtk::glib::subclass::prelude::*;
 use gtk::glib::subclass::types::ObjectSubclassIsExt;
+use gtk::glib::subclass::Signal;
 use gtk::subclass::prelude::*;
 use gtk::{
-    glib, Button, CompositeTemplate, Label, ListView, ScrolledWindow, SearchBar, SearchEntry,
-    SingleSelection, ToggleButton,
+    glib, CompositeTemplate, Label, ListView, ScrolledWindow, SearchBar, SearchEntry,
+    SingleSelection,
 };
 use gtk::{prelude::*, GestureClick};
 
@@ -97,9 +99,9 @@ struct KineticPan {
     last_frame: i64,
 }
 
-// Object holding the state
+// One open document: its state, page list, and everything that reads or moves the viewport.
 #[derive(CompositeTemplate, Default)]
-#[template(resource = "/com/andr2i/scrolex/app.ui")]
+#[template(resource = "/com/andr2i/scrolex/document_view.ui")]
 pub struct DocumentView {
     #[template_child]
     pub state: TemplateChild<State>,
@@ -108,26 +110,6 @@ pub struct DocumentView {
     #[template_child]
     pub selection: TemplateChild<SingleSelection>,
 
-    #[template_child]
-    pub btn_open: TemplateChild<Button>,
-    #[template_child]
-    pub btn_zoom_in: TemplateChild<Button>,
-    #[template_child]
-    pub btn_zoom_out: TemplateChild<Button>,
-    #[template_child]
-    pub btn_crop: TemplateChild<ToggleButton>,
-    #[template_child]
-    pub btn_fit_height: TemplateChild<ToggleButton>,
-    #[template_child]
-    pub btn_animate_scroll: TemplateChild<ToggleButton>,
-    #[template_child]
-    pub spin_threads: TemplateChild<gtk::SpinButton>,
-    #[template_child]
-    pub spin_cache: TemplateChild<gtk::SpinButton>,
-    #[template_child]
-    pub btn_jump_back: TemplateChild<Button>,
-    #[template_child]
-    pub btn_jump_forward: TemplateChild<Button>,
     #[template_child]
     pub scrolledwindow: TemplateChild<ScrolledWindow>,
     // outer scroller that provides the vertical axis the horizontal listview can't; pans a
@@ -139,17 +121,11 @@ pub struct DocumentView {
     #[template_child]
     pub listview: TemplateChild<ListView>,
     #[template_child]
-    pub entry_page_num: TemplateChild<gtk::Entry>,
-    #[template_child]
-    pub entry_zoom: TemplateChild<gtk::Entry>,
-    #[template_child]
     pub search_bar: TemplateChild<SearchBar>,
     #[template_child]
     pub search_entry: TemplateChild<SearchEntry>,
     #[template_child]
     pub search_status: TemplateChild<Label>,
-    #[template_child]
-    pub btn_toc: TemplateChild<ToggleButton>,
     #[template_child]
     pub toc_revealer: TemplateChild<gtk::Revealer>,
     #[template_child]
@@ -231,6 +207,9 @@ pub struct DocumentView {
 
     // Vertical list-row padding in logical pixels.
     fit_chrome_height: Cell<Option<f64>>,
+
+    // Fit the paper to the viewport height, and keep it fitted as the viewport changes.
+    fit_height: Cell<bool>,
 }
 
 // A document point held still across a zoom: which page, where in it (page points from its
@@ -246,9 +225,9 @@ struct ZoomAnchor {
 #[glib::object_subclass]
 impl ObjectSubclass for DocumentView {
     // `NAME` needs to match `class` attribute of template
-    const NAME: &'static str = "MyApp";
+    const NAME: &'static str = "DocumentView";
     type Type = super::DocumentView;
-    type ParentType = gtk::ApplicationWindow;
+    type ParentType = gtk::Widget;
 
     fn class_init(klass: &mut Self::Class) {
         klass.bind_template();
@@ -262,31 +241,23 @@ impl ObjectSubclass for DocumentView {
 }
 
 impl ObjectImpl for DocumentView {
+    fn dispose(&self) {
+        if let Some(content) = self.content() {
+            content.unparent();
+        }
+    }
+
     fn constructed(&self) {
         self.parent_constructed();
 
-        if let Some(editable) = self.entry_page_num.delegate() {
-            editable.connect_insert_text(|entry, s, _| {
-                for c in s.chars() {
-                    if !c.is_numeric() {
-                        entry.stop_signal_emission_by_name("insert-text");
-                    }
-                }
-            });
-        }
-
         self.setup_scroll_selection_sync();
         self.setup_pointer_tracking();
-        self.setup_thread_setting();
-        self.setup_cache_setting();
         let cfg = crate::config::load_config();
         self.state.set_preview_cache_pages(cfg.preview_cache_pages);
-        self.setup_animate_scroll();
         self.setup_fit_height();
         self.setup_text_selection();
         self.setup_search();
         self.setup_toc();
-        self.setup_drop_target();
 
         // Give keyboard focus to the scroll area rather than the header entry
         self.scrolledwindow.set_focusable(true);
@@ -295,20 +266,57 @@ impl ObjectImpl for DocumentView {
         self.obj().connect_map(move |_| {
             scrolledwindow.grab_focus();
         });
+    }
 
-        // Drop this window's render-pool state when it closes, so its entries don't linger.
-        self.obj().connect_close_request(clone!(
-            #[weak(rename_to = imp)]
-            self,
-            #[upgrade_or]
-            glib::Propagation::Proceed,
-            move |_| {
-                let client = imp.state.render_client_id();
-                crate::page::clear_all_renders(client);
-                crate::page::set_wanted_pages(client, None);
-                glib::Propagation::Proceed
-            }
-        ));
+    fn properties() -> &'static [glib::ParamSpec] {
+        static PROPERTIES: OnceLock<Vec<glib::ParamSpec>> = OnceLock::new();
+        PROPERTIES.get_or_init(|| {
+            vec![
+                glib::ParamSpecObject::builder::<State>("state")
+                    .read_only()
+                    .build(),
+                glib::ParamSpecObject::builder::<SingleSelection>("selection")
+                    .read_only()
+                    .build(),
+                glib::ParamSpecBoolean::builder("fit-height").build(),
+                glib::ParamSpecBoolean::builder("toc-visible").build(),
+                glib::ParamSpecBoolean::builder("has-toc")
+                    .read_only()
+                    .build(),
+            ]
+        })
+    }
+
+    // Bindings evaluate while the template is still building, so read through try_get.
+    fn property(&self, _id: usize, pspec: &glib::ParamSpec) -> glib::Value {
+        match pspec.name() {
+            "state" => self.state.try_get().to_value(),
+            "selection" => self.selection.try_get().to_value(),
+            "fit-height" => self.fit_height.get().to_value(),
+            "toc-visible" => self
+                .toc_revealer
+                .try_get()
+                .is_some_and(|r: gtk::Revealer| r.reveals_child())
+                .to_value(),
+            "has-toc" => (!self.toc_pages.borrow().is_empty()).to_value(),
+            name => unimplemented!("unknown property {name}"),
+        }
+    }
+
+    fn set_property(&self, _id: usize, value: &glib::Value, pspec: &glib::ParamSpec) {
+        match pspec.name() {
+            "fit-height" => self.set_fit_height(value.get().unwrap()),
+            "toc-visible" => self.toc_revealer.set_reveal_child(value.get().unwrap()),
+            name => unimplemented!("unknown property {name}"),
+        }
+    }
+
+    fn signals() -> &'static [Signal] {
+        static SIGNALS: OnceLock<Vec<Signal>> = OnceLock::new();
+        SIGNALS.get_or_init(|| {
+            // The reader asked to open a document into this view. The window owns the file chooser.
+            vec![Signal::builder("open-requested").build()]
+        })
     }
 }
 
@@ -603,7 +611,7 @@ impl DocumentView {
         self.cancel_scroll_motion();
         *self.drag_coords.borrow_mut() = self.drag_point_in_window(x, y);
 
-        if let Some(surface) = self.obj().surface() {
+        if let Some(surface) = self.obj().native().and_then(|n| n.surface()) {
             *self.drag_cursor.borrow_mut() = surface.cursor();
             surface.set_cursor(gtk::gdk::Cursor::from_name("grabbing", None).as_ref());
         }
@@ -638,7 +646,7 @@ impl DocumentView {
 
     #[template_callback]
     fn handle_drag_end(&self) {
-        if let Some(surface) = self.obj().surface() {
+        if let Some(surface) = self.obj().native().and_then(|n| n.surface()) {
             surface.set_cursor(self.drag_cursor.borrow().as_ref());
         }
     }
@@ -646,7 +654,7 @@ impl DocumentView {
     // Manual zoom turns fit off.
     fn zoom_to(&self, zoom: f64) {
         self.apply_zoom(zoom);
-        self.btn_fit_height.set_active(false);
+        self.set_fit_height(false);
     }
 
     // A zoom relayouts the pages, so a coast has to stop first.
@@ -666,13 +674,11 @@ impl DocumentView {
         self.zoom_at(zoom, self.viewport_center());
     }
 
-    #[template_callback]
-    fn zoom_out(&self) {
+    pub(super) fn zoom_out(&self) {
         self.zoom_centered(self.state.zoom() / ZOOM_STEP);
     }
 
-    #[template_callback]
-    fn zoom_in(&self) {
+    pub(super) fn zoom_in(&self) {
         self.zoom_centered(self.state.zoom() * ZOOM_STEP);
     }
 
@@ -682,7 +688,7 @@ impl DocumentView {
 
     // Defer the fit until the current layout ends.
     fn queue_fit_height(&self) {
-        if !self.btn_fit_height.is_active() || self.fit_pending.replace(true) {
+        if !self.fit_height.get() || self.fit_pending.replace(true) {
             return;
         }
 
@@ -698,7 +704,7 @@ impl DocumentView {
 
     // Fit the tallest paper to the viewport.
     fn fit_height(&self) {
-        if !self.btn_fit_height.is_active() {
+        if !self.fit_height.get() {
             return;
         }
         let Some(zoom) = self.fit_height_zoom() else {
@@ -727,7 +733,7 @@ impl DocumentView {
 
     // One paper scale keeps the text size stable across pages.
     // Crop heights cost 13 ms per page, so this calculation excludes them.
-    fn fit_height_zoom(&self) -> Option<f64> {
+    pub(super) fn fit_height_zoom(&self) -> Option<f64> {
         let viewport = self.vscrolledwindow.vadjustment().page_size()
             - self.fit_chrome_height.get()?
             - hscrollbar_reserve(&self.scrolledwindow);
@@ -760,7 +766,7 @@ impl DocumentView {
     // Manual zoom about `screen` turns fit off.
     fn zoom_at(&self, zoom: f64, screen: (f64, f64)) {
         self.apply_zoom_at(zoom, screen);
-        self.btn_fit_height.set_active(false);
+        self.set_fit_height(false);
     }
 
     // Zoom about `screen` and hold the document point there still. The zoom mode does not change.
@@ -862,7 +868,7 @@ impl DocumentView {
         fallback
     }
 
-    fn mapped_page(&self, index: i32) -> Option<page::Page> {
+    pub(crate) fn mapped_page(&self, index: i32) -> Option<page::Page> {
         let mut child = self.listview.first_child();
         while let Some(c) = child {
             if let Some(page) = descendant_page(&c) {
@@ -949,10 +955,10 @@ impl DocumentView {
                 self.state.clear_selection();
             }
             Key::o => {
-                self.open_document();
+                self.obj().emit_by_name::<()>("open-requested", &[]);
             }
             Key::t => {
-                if self.btn_toc.is_sensitive() {
+                if !self.toc_pages.borrow().is_empty() {
                     self.toc_revealer
                         .set_reveal_child(!self.toc_revealer.reveals_child());
                 }
@@ -1046,46 +1052,24 @@ impl DocumentView {
         }
     }
 
-    #[template_callback]
-    fn handle_page_number_entered(&self, entry: &gtk::Entry) {
-        let Ok(page_num) = entry.text().parse::<u32>() else {
-            return;
-        };
-
-        self.goto_page(page_num);
-    }
-
-    #[template_callback]
-    fn handle_page_number_icon_pressed(&self, _: gtk::EntryIconPosition, entry: &gtk::Entry) {
-        self.handle_page_number_entered(entry);
-    }
-
-    #[template_callback]
-    fn handle_zoom_entry_icon(&self, _: gtk::EntryIconPosition, entry: &gtk::Entry) {
-        self.handle_zoom_entry(entry);
-    }
-
-    #[template_callback]
-    fn handle_zoom_entry(&self, entry: &gtk::Entry) {
-        let Ok(percent) = entry.text().parse::<f64>() else {
-            return;
-        };
+    // A zoom the reader typed. Asking for the fit zoom turns fit mode back on rather than
+    // freezing that number, so the fit survives the next viewport change.
+    pub(super) fn apply_zoom_percent(&self, percent: f64) {
         let Some(zoom) = crate::state::zoom_from_percent(percent) else {
             return;
         };
 
-        if self
-            .fit_height_zoom()
-            .is_some_and(|fit_zoom| zoom_percent_text(fit_zoom) == zoom_percent_text(zoom))
-        {
-            self.btn_fit_height.set_active(true);
+        if self.fit_height_zoom().is_some_and(|fit_zoom| {
+            crate::state::zoom_percent_text(fit_zoom) == crate::state::zoom_percent_text(zoom)
+        }) {
+            self.set_fit_height(true);
             return;
         }
 
         self.zoom_to(zoom);
     }
 
-    fn goto_page(&self, page_num: u32) {
+    pub(super) fn goto_page(&self, page_num: u32) {
         let from = self.state.page() + 1;
         // no scroll, so no jump-list entry either: the back button would offer a jump that never
         // happened
@@ -1117,7 +1101,7 @@ impl DocumentView {
 
     // The page a jump to `page_num` lands on, 1-based. From the document, not the model: the model
     // fills in two stages, and a count that grows under us leaves the jump icon lit for a no-op.
-    fn target_page(&self, page_num: u32) -> Option<u32> {
+    pub(super) fn target_page(&self, page_num: u32) -> Option<u32> {
         let n_pages = u32::try_from(self.state.try_get()?.n_pages()).ok()?;
 
         (n_pages > 0).then(|| page_num.clamp(1, n_pages))
@@ -1464,8 +1448,8 @@ impl DocumentView {
             self.toc_list.append(&row);
             pages.push(item.page);
         }
-        self.btn_toc.set_sensitive(!pages.is_empty());
         self.toc_pages.replace(pages);
+        self.obj().notify("has-toc");
         self.toc_revealer.set_reveal_child(false);
     }
 
@@ -1494,6 +1478,7 @@ impl DocumentView {
                 } else {
                     imp.scrolledwindow.grab_focus();
                 }
+                imp.obj().notify("toc-visible");
             }
         ));
 
@@ -1531,75 +1516,10 @@ impl DocumentView {
         self.scrolledwindow.add_controller(click);
     }
 
-    fn setup_drop_target(&self) {
-        let drop_target = gtk::DropTarget::new(
-            gtk::gdk::FileList::static_type(),
-            gtk::gdk::DragAction::COPY,
-        );
-
-        drop_target.connect_drop(clone!(
-            #[weak(rename_to = imp)]
-            self,
-            #[upgrade_or]
-            false,
-            move |_, value, _, _| {
-                let Ok(files) = value.get::<gtk::gdk::FileList>() else {
-                    return false;
-                };
-                let Some(file) = files.files().into_iter().next() else {
-                    return false;
-                };
-
-                imp.state.load(&file);
-                true
-            }
-        ));
-
-        self.obj().add_controller(drop_target);
-    }
-
+    // The empty view's Open button. The window owns the file chooser.
     #[template_callback]
     fn open_document(&self) {
-        const SUPPORTED_SUFFIXES: &[&str] = &[
-            "pdf", "xps", "oxps", "epub", "mobi", "fb2", "cbz", "svg", "txt", "png", "jpg", "jpeg",
-            "jp2", "jpx", "gif", "tif", "tiff", "bmp", "pnm", "pgm", "ppm", "pbm", "pam",
-        ];
-        let supported = gtk::FileFilter::new();
-        supported.set_name(Some("Supported documents"));
-        for suffix in SUPPORTED_SUFFIXES {
-            supported.add_suffix(suffix);
-        }
-        let all = gtk::FileFilter::new();
-        all.set_name(Some("All files"));
-        all.add_pattern("*");
-        let filters = gtk::gio::ListStore::new::<gtk::FileFilter>();
-        filters.append(&supported);
-        filters.append(&all);
-
-        let dialog = gtk::FileDialog::builder()
-            .title("Open Document")
-            .modal(true)
-            .filters(&filters)
-            .default_filter(&supported)
-            .build();
-
-        let obj = self.obj();
-        dialog.open(
-            Some(obj.as_ref()),
-            gtk::gio::Cancellable::NONE,
-            clone!(
-                #[strong(rename_to = state)]
-                self.state,
-                #[strong]
-                obj,
-                move |file| match file {
-                    Ok(file) => state.load(&file),
-                    Err(err) => {
-                        obj.show_error_dialog(&format!("Error opening file: {err}"));
-                    }
-                },
-            ),
-        );
+        self.obj().emit_by_name::<()>("open-requested", &[]);
     }
 
     #[template_callback]
@@ -1842,86 +1762,30 @@ impl DocumentView {
         crate::page::set_wanted_pages(self.state.render_client_id(), range);
     }
 
-    // Load the render-thread setting into the spin button and pool, and persist any user change.
-    fn setup_thread_setting(&self) {
-        let max = crate::config::max_render_threads();
-        let threads = crate::config::load_config().render_threads;
-        self.spin_threads.set_range(1.0, max as f64);
-        self.spin_threads.set_increments(1.0, 1.0);
-        self.spin_threads.set_value(threads as f64);
-        self.apply_render_threads(threads);
-
-        self.spin_threads.connect_value_changed(clone!(
-            #[weak(rename_to = imp)]
-            self,
-            move |spin| {
-                let n = spin.value() as usize;
-                imp.apply_render_threads(n);
-                let mut config = crate::config::load_config();
-                config.render_threads = n;
-                if let Err(e) = crate::config::save_config(&config) {
-                    eprintln!("Error saving config: {e}");
-                }
-            }
-        ));
+    // The template's single child, which holds the whole document UI.
+    fn content(&self) -> Option<gtk::Widget> {
+        self.obj().first_child()
     }
 
-    fn setup_cache_setting(&self) {
-        let mb = crate::config::load_config().render_cache_mb;
-        self.spin_cache.set_range(
-            crate::config::MIN_RENDER_CACHE_MB as f64,
-            crate::config::MAX_RENDER_CACHE_MB as f64,
-        );
-        self.spin_cache.set_increments(32.0, 64.0);
-        self.spin_cache.set_value(mb as f64);
-        self.state.set_render_cache_mb(mb);
+    // Turning fit on fits now; turning it off restores the zoom the reader last chose.
+    pub(super) fn set_fit_height(&self, enabled: bool) {
+        if self.fit_height.replace(enabled) == enabled {
+            return;
+        }
+        self.obj().notify("fit-height");
 
-        self.spin_cache.connect_value_changed(clone!(
-            #[weak(rename_to = imp)]
-            self,
-            move |spin| {
-                let mb = spin.value() as usize;
-                imp.state.set_render_cache_mb(mb);
-                let mut config = crate::config::load_config();
-                config.render_cache_mb = mb;
-                if let Err(e) = crate::config::save_config(&config) {
-                    eprintln!("Error saving config: {e}");
-                }
-            }
-        ));
-    }
-
-    fn setup_animate_scroll(&self) {
-        self.state
-            .set_animate_scroll(crate::config::load_config().animate_scroll);
-
-        self.state
-            .connect_notify_local(Some("animate-scroll"), |state, _| {
-                let mut config = crate::config::load_config();
-                config.animate_scroll = state.animate_scroll();
-                if let Err(e) = crate::config::save_config(&config) {
-                    eprintln!("Error saving config: {e}");
-                }
-            });
+        if enabled {
+            self.queue_fit_height();
+        } else if self.state.zoom() != self.state.manual_zoom() {
+            let anchor = self
+                .mapped_page(self.state.page() as i32)
+                .and_then(|page| self.page_origin(&page))
+                .unwrap_or_else(|| self.viewport_center());
+            self.apply_zoom_at(self.state.manual_zoom(), anchor);
+        }
     }
 
     fn setup_fit_height(&self) {
-        self.btn_fit_height.connect_toggled(clone!(
-            #[weak(rename_to = imp)]
-            self,
-            move |button| {
-                if button.is_active() {
-                    imp.queue_fit_height();
-                } else if imp.state.zoom() != imp.state.manual_zoom() {
-                    let anchor = imp
-                        .mapped_page(imp.state.page() as i32)
-                        .and_then(|page| imp.page_origin(&page))
-                        .unwrap_or_else(|| imp.viewport_center());
-                    imp.apply_zoom_at(imp.state.manual_zoom(), anchor);
-                }
-            }
-        ));
-
         self.vscrolledwindow
             .vadjustment()
             .connect_page_size_notify(clone!(
@@ -1953,12 +1817,6 @@ impl DocumentView {
             move |_, _, _, _| imp.state.clear_selection()
         ));
         self.scrolledwindow.add_controller(click);
-    }
-
-    fn apply_render_threads(&self, n: usize) {
-        log::info!("Render threads: {n}");
-        self.state.set_render_threads(n);
-        crate::page::set_render_threads(n);
     }
 
     // Count pages that fit fully across the viewport width; prefetch depth is derived from it.
@@ -2102,7 +1960,7 @@ impl DocumentView {
         }
     }
 
-    fn open_search(&self) {
+    pub(super) fn open_search(&self) {
         self.search_bar.set_search_mode(true);
         self.search_entry.grab_focus();
         self.search_entry.select_region(0, -1);
@@ -2132,18 +1990,6 @@ impl DocumentView {
         }
         self.update_search_status();
         self.scrolledwindow.grab_focus();
-    }
-
-    #[template_callback]
-    fn menu_search(&self, btn: &Button) {
-        dismiss_menu(btn);
-        self.open_search();
-    }
-
-    #[template_callback]
-    fn menu_about(&self, btn: &Button) {
-        dismiss_menu(btn);
-        crate::about::present(self.obj().upcast_ref());
     }
 
     #[template_callback]
@@ -2403,15 +2249,13 @@ impl DocumentView {
         self.search_status.set_text(&text);
     }
 
-    #[template_callback]
-    fn jump_back(&self) {
+    pub(super) fn jump_back(&self) {
         if let Some(page) = self.state.jump_list_back(self.state.page() + 1) {
             self.navigate_to_page(page);
         }
     }
 
-    #[template_callback]
-    fn jump_forward(&self) {
+    pub(super) fn jump_forward(&self) {
         if let Some(page) = self.state.jump_list_forward(self.state.page() + 1) {
             self.navigate_to_page(page);
         }
@@ -2419,86 +2263,27 @@ impl DocumentView {
 
     #[allow(clippy::unused_self)]
     #[template_callback]
-    fn can_jump_back(&self, prev_page: u32) -> bool {
-        prev_page > 0
-    }
-
-    #[allow(clippy::unused_self)]
-    #[template_callback]
-    fn back_btn_text(&self, prev_page: u32) -> String {
-        format!("Jump back to page {prev_page}")
-    }
-
-    #[allow(clippy::unused_self)]
-    #[template_callback]
-    fn can_jump_forward(&self, next_page: u32) -> bool {
-        next_page > 0
-    }
-
-    #[allow(clippy::unused_self)]
-    #[template_callback]
-    fn forward_btn_text(&self, next_page: u32) -> String {
-        format!("Jump forward to page {next_page}")
-    }
-
-    #[allow(clippy::unused_self)]
-    #[template_callback]
     fn document_is_empty(&self, n_pages: i32) -> bool {
         n_pages == 0
-    }
-
-    #[allow(clippy::unused_self)]
-    #[template_callback]
-    fn page_entry_text(&self, page: i32) -> String {
-        format!("{}", page + 1)
-    }
-
-    #[allow(clippy::unused_self)]
-    #[template_callback]
-    fn zoom_entry_text(&self, zoom_value: f64) -> String {
-        zoom_percent_text(zoom_value)
-    }
-
-    // Dims the page entry's jump icon while pressing it would scroll nowhere. Runs while the
-    // template is still building, so it must not touch an unbound template child.
-    #[template_callback]
-    fn page_jump_enabled(&self, text: &str, page: u32) -> bool {
-        let Ok(page_num) = text.parse::<u32>() else {
-            return false;
-        };
-
-        self.target_page(page_num)
-            .is_some_and(|target| target != page + 1)
-    }
-
-    // Dims the zoom entry's apply icon while pressing it would not change the zoom.
-    #[allow(clippy::unused_self)]
-    #[template_callback]
-    fn zoom_apply_enabled(&self, text: &str, zoom: f64) -> bool {
-        let Ok(percent) = text.parse::<f64>() else {
-            return false;
-        };
-
-        // compared at the precision the entry shows, so applying what is already displayed counts as
-        // no change
-        crate::state::zoom_from_percent(percent)
-            .is_some_and(|target| zoom_percent_text(target) != zoom_percent_text(zoom))
     }
 }
 
 // Trait shared by all widgets
 impl WidgetImpl for DocumentView {
+    fn measure(&self, orientation: gtk::Orientation, for_size: i32) -> (i32, i32, i32, i32) {
+        self.content()
+            .map_or((0, 0, -1, -1), |c| c.measure(orientation, for_size))
+    }
+
+    // No layout manager here on purpose: GTK skips this vfunc for a widget that has one, and
+    // restore_zoom_anchor must run after the resized pages are allocated and before they paint.
     fn size_allocate(&self, width: i32, height: i32, baseline: i32) {
-        self.parent_size_allocate(width, height, baseline);
+        if let Some(content) = self.content() {
+            content.allocate(width, height, baseline, None);
+        }
         self.restore_zoom_anchor();
     }
 }
-
-// Trait shared by all windows
-impl WindowImpl for DocumentView {}
-
-// Trait shared by all application windows
-impl ApplicationWindowImpl for DocumentView {}
 
 // Accumulate a scroll delta and decide whether to step a page. Returns the new accumulator and the
 // page step (+1 next, -1 prev, 0 none). `notch` is the travel that advances one page; the first
@@ -2590,11 +2375,6 @@ fn anchored_scroll(value: f64, origin: f64, screen: f64, offset: f64, zoom: f64)
     value - (screen - offset * zoom - origin)
 }
 
-// Zoom as a percent for the entry, at most two decimals so that it fully fits into entry input
-fn zoom_percent_text(zoom: f64) -> String {
-    format!("{}", (zoom * 10_000.0).round() / 100.0)
-}
-
 // Height the overlay scrollbar covers at the bottom of the viewport. Measured, not allocated: GTK
 // drops the allocation of an overlay scrollbar while it conceals it, and a fit that reads the
 // allocation moves with that.
@@ -2610,15 +2390,6 @@ fn hscrollbar_reserve(scroller: &gtk::ScrolledWindow) -> f64 {
             .measure(gtk::Orientation::Vertical, -1)
             .1,
     )
-}
-
-fn dismiss_menu(btn: &Button) {
-    if let Some(popover) = btn
-        .ancestor(gtk::Popover::static_type())
-        .and_downcast::<gtk::Popover>()
-    {
-        popover.popdown();
-    }
 }
 
 // Find the Page widget within a list item's widget subtree.
@@ -2921,54 +2692,11 @@ mod tests {
 
 #[cfg(test)]
 mod widget_tests {
-    use super::{anchored_scroll, zoom_percent_text, KINETIC_MIN_VELOCITY};
+    use super::{anchored_scroll, KINETIC_MIN_VELOCITY};
+    use crate::state::zoom_percent_text;
+    use crate::test_support::{loaded_window, type_zoom, wait_until, window};
     use gtk::prelude::*;
     use gtk::subclass::prelude::ObjectSubclassIsExt;
-    use std::time::{Duration, Instant};
-
-    fn window() -> crate::document_view::DocumentView {
-        // before the window: it reads the settings while it builds
-        crate::config::use_scratch_config();
-        crate::state::use_scratch_state_dir();
-        gtk::gio::resources_register_include!("scrolex-ui.gresource").expect("ui resources");
-        crate::state::State::static_type();
-        crate::page::PageNumber::static_type();
-        crate::page::Page::static_type();
-        load_css();
-
-        let window: crate::document_view::DocumentView = gtk::glib::Object::new();
-        // the stylesheet keys off this name, as in main
-        window.set_widget_name("main");
-        window.set_default_size(TEST_WINDOW.0, TEST_WINDOW.1);
-        window
-    }
-
-    // Size every test window shares.
-    const TEST_WINDOW: (i32, i32) = (900, 700);
-
-    // The app's own stylesheet, so the tests measure the widgets the reader gets.
-    fn load_css() {
-        static LOADED: std::sync::Once = std::sync::Once::new();
-        LOADED.call_once(|| {
-            let provider = gtk::CssProvider::new();
-            provider.load_from_string(include_str!("../../ui/style.css"));
-            gtk::style_context_add_provider_for_display(
-                &gtk::gdk::Display::default().expect("display"),
-                &provider,
-                gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
-            );
-        });
-    }
-
-    fn wait_until(mut ready: impl FnMut() -> bool) {
-        let context = gtk::glib::MainContext::default();
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !ready() {
-            assert!(Instant::now() < deadline, "timed out waiting for GTK");
-            context.iteration(false);
-            std::thread::sleep(Duration::from_millis(1));
-        }
-    }
 
     #[gtk::test]
     fn empty_view_follows_document_state() {
@@ -3225,21 +2953,6 @@ mod widget_tests {
         window.close();
     }
 
-    // outline.pdf has 3 pages
-    fn loaded_window() -> crate::document_view::DocumentView {
-        let window = window();
-        window.set_default_size(900, 700);
-        window.present();
-        window.state().load(&gtk::gio::File::for_path(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/outline.pdf"
-        )));
-        wait_until(|| window.imp().mapped_page(0).is_some());
-        wait_until(|| window.imp().selection.n_items() == 3);
-
-        window
-    }
-
     // Three pages of different heights, to show which one the fit measures.
     const MIXED_HEIGHTS_PDF: &[u8] = b"%PDF-1.4\n\
 1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n\
@@ -3317,7 +3030,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         let window = loaded_window();
         let imp = window.imp();
 
-        imp.btn_fit_height.set_active(true);
+        imp.set_fit_height(true);
         wait_until(|| !imp.fit_pending.get());
 
         assert_fills_the_viewport(imp);
@@ -3328,7 +3041,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
     fn a_fitted_page_without_horizontal_overflow_fills_the_viewport() {
         let window = loaded_window();
         let imp = window.imp();
-        imp.btn_fit_height.set_active(true);
+        imp.set_fit_height(true);
 
         window.state().load(&one_page_document());
         wait_until(|| imp.selection.n_items() == 1);
@@ -3357,7 +3070,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
     fn fit_keeps_cached_chrome_without_a_mapped_selected_page() {
         let window = loaded_window();
         let imp = window.imp();
-        imp.btn_fit_height.set_active(true);
+        imp.set_fit_height(true);
         wait_until(|| !imp.fit_pending.get());
         let chrome = imp.fit_chrome_height.get().expect("a cached chrome");
         assert!(chrome > 0.0, "the row pads the page");
@@ -3389,11 +3102,11 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         let imp = window.imp();
         imp.state.zoom_to(2.0);
 
-        imp.btn_fit_height.set_active(true);
+        imp.set_fit_height(true);
         wait_until(|| !imp.fit_pending.get());
         assert_ne!(imp.state.zoom(), 2.0);
 
-        imp.btn_fit_height.set_active(false);
+        imp.set_fit_height(false);
 
         assert_eq!(imp.state.zoom(), 2.0);
         window.close();
@@ -3403,20 +3116,19 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
     fn entering_the_displayed_fit_zoom_restores_fit_height() {
         let window = loaded_window();
         let imp = window.imp();
-        imp.btn_fit_height.set_active(true);
+        imp.set_fit_height(true);
         wait_until(|| !imp.fit_pending.get());
-        let fit_zoom = imp.zoom_entry_text(imp.state.zoom());
+        let fit_zoom = zoom_percent_text(imp.state.zoom());
 
         imp.zoom_in();
-        assert!(!imp.btn_fit_height.is_active());
+        assert!(!imp.fit_height.get());
         let manual_zoom = imp.state.manual_zoom();
-        imp.entry_zoom.set_text(&fit_zoom);
-        imp.handle_zoom_entry(&imp.entry_zoom.get());
+        type_zoom(&window, &fit_zoom);
 
-        assert!(imp.btn_fit_height.is_active());
+        assert!(imp.fit_height.get());
         wait_until(|| !imp.fit_pending.get());
         assert_eq!(imp.state.manual_zoom(), manual_zoom);
-        imp.btn_fit_height.set_active(false);
+        imp.set_fit_height(false);
         assert_eq!(imp.state.zoom(), manual_zoom);
         window.close();
     }
@@ -3428,14 +3140,14 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         let window = loaded_window();
         let imp = window.imp();
 
-        imp.btn_fit_height.set_active(true);
+        imp.set_fit_height(true);
         wait_until(|| !imp.fit_pending.get());
         let zoom = imp.state.zoom();
 
         imp.state.set_crop(true);
 
         assert_eq!(imp.state.zoom(), zoom);
-        assert!(imp.btn_fit_height.is_active(), "the mode stays on");
+        assert!(imp.fit_height.get(), "the mode stays on");
         assert_nothing_to_pan(imp);
         window.close();
     }
@@ -3447,7 +3159,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         let window = loaded_window();
         let imp = window.imp();
 
-        imp.btn_fit_height.set_active(true);
+        imp.set_fit_height(true);
         wait_until(|| !imp.fit_pending.get());
 
         let vadj = imp.vscrolledwindow.vadjustment();
@@ -3474,16 +3186,15 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
             &|| imp.zoom_in(),
             &|| imp.zoom_out(),
             &|| imp.reset_zoom(),
-            &|| imp.handle_zoom_entry(&imp.entry_zoom.get()),
+            &|| type_zoom(&window, "42"),
         ];
         for zoom in zooms {
-            imp.btn_fit_height.set_active(true);
+            imp.set_fit_height(true);
             wait_until(|| !imp.fit_pending.get());
-            imp.entry_zoom.set_text("42");
 
             zoom();
 
-            assert!(!imp.btn_fit_height.is_active());
+            assert!(!imp.fit_height.get());
             assert_eq!(imp.state.manual_zoom(), imp.state.zoom());
         }
         window.close();
@@ -3494,7 +3205,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         let window = loaded_window();
         let imp = window.imp();
         imp.state.zoom_to(2.0);
-        imp.btn_fit_height.set_active(true);
+        imp.set_fit_height(true);
         wait_until(|| !imp.fit_pending.get());
         imp.zoom_anchor.set(None);
 
@@ -3512,7 +3223,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         let window = window();
         window.present();
         let imp = window.imp();
-        imp.btn_fit_height.set_active(true);
+        imp.set_fit_height(true);
 
         window.state().load(&mixed_heights_document());
         wait_until(|| imp.selection.n_items() == 3);
@@ -3539,143 +3250,24 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         window.close();
     }
 
-    // Issue #53: a live icon that does nothing reads as broken. Covers the binding wiring;
-    // page_jump_enabled_only_where_the_jump_moves covers the decision.
-    #[gtk::test]
-    fn page_jump_icon_follows_the_entry() {
-        let window = loaded_window();
-        let entry = window.imp().entry_page_num.get();
-        let icon = gtk::EntryIconPosition::Secondary;
-
-        assert_eq!(entry.text(), "1");
-        assert!(!entry.icon_is_sensitive(icon), "at rest on page 1");
-        assert!(entry.secondary_icon_tooltip_text().is_some(), "tooltip set");
-
-        entry.set_text("3");
-        assert!(entry.icon_is_sensitive(icon), "another page");
-
-        entry.set_text("1");
-        assert!(!entry.icon_is_sensitive(icon), "back to the current page");
-
-        window.close();
-    }
-
-    // handle_document_load fills the model in two stages, so a restored page leaves one item in it
-    // for a moment. Count from the document, or the icon lights up for the pages not yet in there.
-    #[gtk::test]
-    fn page_jump_icon_ignores_a_half_filled_model() {
-        let window = loaded_window();
-        let imp = window.imp();
-        let entry = imp.entry_page_num.get();
-
-        imp.model.remove_all();
-        imp.model.append(&crate::page::PageNumber::new(1));
-        imp.selection.set_selected(0);
-        wait_until(|| window.state().page() == 1);
-
-        assert_eq!(entry.text(), "2", "the entry follows the selected page");
-        assert!(
-            !entry.icon_is_sensitive(gtk::EntryIconPosition::Secondary),
-            "page 2 of 3 with one item in the model"
-        );
-
-        window.close();
-    }
-
-    #[gtk::test]
-    fn page_jump_enabled_only_where_the_jump_moves() {
-        let window = loaded_window();
-        let imp = window.imp();
-
-        assert!(imp.page_jump_enabled("3", 0), "page 3 while on page 1");
-        assert!(!imp.page_jump_enabled("1", 0), "page 1 while on page 1");
-        assert!(!imp.page_jump_enabled("3", 2), "page 3 while on page 3");
-        assert!(!imp.page_jump_enabled("", 0), "no number");
-        assert!(!imp.page_jump_enabled("abc", 0), "not a number");
-        assert!(imp.page_jump_enabled("9999", 0), "clamped to the last page");
-        assert!(
-            !imp.page_jump_enabled("9999", 2),
-            "clamped to the page we are on"
-        );
-        // 0 lands on page 1
-        assert!(!imp.page_jump_enabled("0", 0), "page 0 while on page 1");
-        assert!(imp.page_jump_enabled("0", 1), "page 0 while on page 2");
-
-        window.close();
-    }
-
-    #[gtk::test]
-    fn zoom_apply_icon_follows_the_entry() {
-        let window = loaded_window();
-        let entry = window.imp().entry_zoom.get();
-        let icon = gtk::EntryIconPosition::Secondary;
-
-        assert_eq!(entry.text(), "100");
-        assert!(!entry.icon_is_sensitive(icon), "at rest at 100%");
-        assert!(entry.secondary_icon_tooltip_text().is_some(), "tooltip set");
-
-        entry.set_text("150");
-        assert!(entry.icon_is_sensitive(icon), "another zoom level");
-
-        entry.set_text("100");
-        assert!(!entry.icon_is_sensitive(icon), "back to the current zoom");
-
-        window.close();
-    }
-
-    #[gtk::test]
-    fn zoom_apply_enabled_only_where_the_zoom_changes() {
-        let window = loaded_window();
-        let imp = window.imp();
-
-        assert!(imp.zoom_apply_enabled("150", 1.0), "150% while at 100%");
-        assert!(!imp.zoom_apply_enabled("100", 1.0), "100% while at 100%");
-        assert!(!imp.zoom_apply_enabled("", 1.0), "no number");
-        assert!(!imp.zoom_apply_enabled("abc", 1.0), "not a number");
-        assert!(!imp.zoom_apply_enabled("4", 1.0), "below the smallest zoom");
-        assert!(imp.zoom_apply_enabled("5", 1.0), "the smallest zoom");
-        assert!(
-            imp.zoom_apply_enabled("9999", 1.0),
-            "clamped to the largest zoom"
-        );
-        assert!(
-            !imp.zoom_apply_enabled("9999", 10.0),
-            "clamped to the current zoom"
-        );
-        assert!(
-            !imp.zoom_apply_enabled(&imp.zoom_entry_text(0.07), 0.07),
-            "7% round-trips as no change"
-        );
-        // the entry rounds, so what it shows for an odd zoom must still read as no change
-        let odd = 3.331_061_493_552_564;
-        assert_eq!(imp.zoom_entry_text(odd), "333.11");
-        assert!(
-            !imp.zoom_apply_enabled(&imp.zoom_entry_text(odd), odd),
-            "the rounded percent the entry shows"
-        );
-        assert!(
-            imp.zoom_apply_enabled("333.2", odd),
-            "a percent that differs at two decimals"
-        );
-
-        window.close();
-    }
-
     // Issue #51: a zoom step lands on values like 333.1061493552564 percent, which does not fit the
     // entry.
     #[test]
     fn zoom_percent_text_keeps_at_most_two_decimals() {
-        assert_eq!(zoom_percent_text(3.331_061_493_552_564), "333.11");
-        assert_eq!(zoom_percent_text(1.0), "100");
-        assert_eq!(zoom_percent_text(10.0), "1000");
-        assert_eq!(zoom_percent_text(0.05), "5");
+        assert_eq!(
+            crate::state::zoom_percent_text(3.331_061_493_552_564),
+            "333.11"
+        );
+        assert_eq!(crate::state::zoom_percent_text(1.0), "100");
+        assert_eq!(crate::state::zoom_percent_text(10.0), "1000");
+        assert_eq!(crate::state::zoom_percent_text(0.05), "5");
         // 0.07 * 100 is 7.000000000000001 in binary
-        assert_eq!(zoom_percent_text(0.07), "7");
-        assert_eq!(zoom_percent_text(1.5), "150");
-        assert_eq!(zoom_percent_text(0.125), "12.5");
+        assert_eq!(crate::state::zoom_percent_text(0.07), "7");
+        assert_eq!(crate::state::zoom_percent_text(1.5), "150");
+        assert_eq!(crate::state::zoom_percent_text(0.125), "12.5");
         // the entry is six characters wide, and 1000 is the largest zoom
         for zoom in [0.05, 0.07, 0.333, 1.0, 3.331_061_493_552_564, 9.9999, 10.0] {
-            let text = zoom_percent_text(zoom);
+            let text = crate::state::zoom_percent_text(zoom);
             assert!(text.len() <= 6, "{zoom} shows as {text}");
         }
     }

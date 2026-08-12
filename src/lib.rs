@@ -12,3 +12,6 @@ pub mod render_cache;
 pub mod search;
 pub mod selection;
 pub mod state;
+#[cfg(test)]
+pub mod test_support;
+pub mod window;

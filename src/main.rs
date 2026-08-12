@@ -16,8 +16,8 @@ use gtk::{gio::ApplicationFlags, glib, glib::clone, Application};
 use gtk::{prelude::*, CssProvider};
 
 use scrolex::config;
-use scrolex::document_view;
 use scrolex::page;
+use scrolex::window;
 
 const APP_ID: &str = "com.andr2i.scrolex";
 const RELEASE_NOTICE_TITLE: &str = "What's New";
@@ -42,6 +42,7 @@ fn main() -> glib::ExitCode {
     // register types for usage in templates
     page::PageNumber::static_type();
     page::Page::static_type();
+    scrolex::document_view::DocumentView::static_type();
 
     gtk::gio::resources_register_include!("scrolex-ui.gresource")
         .expect("Failed to register resources");
@@ -85,7 +86,7 @@ fn setup_dark_mode(app: &Application) {
             }
 
             for gtk_window in app.windows() {
-                if let Ok(window) = gtk_window.downcast::<document_view::DocumentView>() {
+                if let Ok(window) = gtk_window.downcast::<window::Window>() {
                     window.apply_dark_mode(enabled);
                 }
             }
@@ -123,7 +124,7 @@ fn load_css() {
 }
 
 fn build_ui(app: &Application, args: &[OsString]) {
-    let window = document_view::DocumentView::new(app);
+    let window = window::Window::new(app);
     window.set_widget_name("main");
     window.apply_dark_mode(scrolex::mupdf_render::dark_mode_enabled());
 
@@ -131,7 +132,7 @@ fn build_ui(app: &Application, args: &[OsString]) {
         window.add_css_class("debug");
     }
 
-    let state = window.state();
+    let state = window.document().state().clone();
 
     app.connect_shutdown(clone!(
         #[strong]
@@ -191,7 +192,7 @@ fn build_ui(app: &Application, args: &[OsString]) {
     show_release_notice(&window);
 }
 
-fn show_release_notice(window: &document_view::DocumentView) {
+fn show_release_notice(window: &window::Window) {
     let notice = release_notice_id();
     if config::load_config().dismissed_notice == Some(notice) {
         return;
