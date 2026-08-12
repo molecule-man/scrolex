@@ -67,6 +67,8 @@ JPEG, TIFF, …) open as well. DjVu is not supported.
 | Key / Action    | Description                              |
 | --------------- | ---------------------------------------- |
 | `o` / Ctrl + o  | Open a document                          |
+| Ctrl + t        | Open a document in a new tab             |
+| Ctrl + w        | Close the current tab or window          |
 | `t`             | Toggle table of contents                 |
 | `l` / PageDown  | Next page                                |
 | `h` / PageUp    | Previous page                            |

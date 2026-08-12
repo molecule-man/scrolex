@@ -36,6 +36,11 @@ pub(crate) fn zoom_from_percent(percent: f64) -> Option<f64> {
     (zoom >= MIN_ZOOM).then(|| zoom.min(MAX_ZOOM))
 }
 
+// Zoom as a percent for the entry, at most two decimals so that it fully fits into entry input
+pub(crate) fn zoom_percent_text(zoom: f64) -> String {
+    format!("{}", (zoom * 10_000.0).round() / 100.0)
+}
+
 // Preview cache byte budget for a given number of resident previews.
 pub(crate) fn preview_cache_budget(pages: usize) -> usize {
     pages * PREVIEW_TARGET_BYTES
@@ -401,11 +406,8 @@ impl State {
         self.imp().preview_inflight.borrow_mut().clear();
     }
 
-    pub(crate) fn set_render_cache_mb(&self, mb: usize) {
-        self.imp()
-            .render_cache
-            .borrow_mut()
-            .set_budget(mb * 1024 * 1024);
+    pub(crate) fn set_render_cache_bytes(&self, bytes: usize) {
+        self.imp().render_cache.borrow_mut().set_budget(bytes);
     }
 
     pub(crate) fn preview_inflight(&self) -> Rc<RefCell<HashSet<i32>>> {

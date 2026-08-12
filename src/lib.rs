@@ -1,6 +1,7 @@
 pub mod about;
 pub mod bg_job;
 pub mod config;
+pub mod document_view;
 pub mod emulate;
 pub mod jump_stack;
 pub mod links;
@@ -11,7 +12,6 @@ pub mod render_cache;
 pub mod search;
 pub mod selection;
 pub mod state;
+#[cfg(test)]
+pub mod test_support;
 pub mod window;
-//pub use crate::links::Links;
-//
-//pub use window::Window;

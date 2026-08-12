@@ -1,11 +1,11 @@
-mod imp;
+pub mod imp;
 
 use glib::Object;
 use gtk::glib::subclass::types::ObjectSubclassIsExt;
 use gtk::prelude::WidgetExt;
 use gtk::{gio, glib, Application};
 
-use crate::state::State;
+use crate::document_view::DocumentView;
 
 glib::wrapper! {
     pub struct Window(ObjectSubclass<imp::Window>)
@@ -17,24 +17,33 @@ glib::wrapper! {
 #[gtk::template_callbacks]
 impl Window {
     pub fn new(app: &Application) -> Self {
-        Object::builder().property("application", app).build()
+        let window: Self = Object::builder().property("application", app).build();
+        window.imp().inherit_application_settings();
+        window
     }
 
-    pub fn state(&self) -> &State {
-        self.imp().state.as_ref()
+    // The window always keeps at least one document.
+    pub fn active_document(&self) -> DocumentView {
+        self.imp().active_document().expect("an open document")
+    }
+
+    pub fn documents(&self) -> Vec<DocumentView> {
+        self.imp().documents()
     }
 
     pub fn apply_dark_mode(&self, enabled: bool) {
-        if self.has_css_class("dark-mode") == enabled {
-            return;
+        if self.has_css_class("dark-mode") != enabled {
+            if enabled {
+                self.add_css_class("dark-mode");
+            } else {
+                self.remove_css_class("dark-mode");
+            }
         }
-        if enabled {
-            self.add_css_class("dark-mode");
-        } else {
-            self.remove_css_class("dark-mode");
+
+        for document in self.documents() {
+            document.state().invalidate_rendering();
+            document.redraw_pages();
         }
-        self.state().invalidate_rendering();
-        self.imp().redraw_pages();
     }
 
     pub fn show_error_dialog(&self, message: &str) {
