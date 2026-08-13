@@ -1937,20 +1937,16 @@ fn get_bbox(uri: &str, page: &PageInfo, crop: bool) -> Rectangle {
     }
 }
 
-// Grow the content box by a 5pt margin, enforce a half-page minimum in each axis, and clamp to the
-// page. Pure geometry so the crop behaviour is tested without a rendering backend.
+// Crop the left and right margins only. Grow the content box by a 5pt margin, enforce a half-page
+// minimum width, and clamp to the page. Pure geometry so the crop behaviour is tested without a
+// rendering backend.
 fn apply_crop(content: Rectangle, width: f64, height: f64) -> Rectangle {
     let x1 = content.x1 - 5.0;
-    let y1 = content.y1 - 5.0;
     let mut x2 = content.x2 + 5.0;
-    let mut y2 = content.y2 + 5.0;
     if x2 - x1 < width / 2.0 {
         x2 = x1 + width / 2.0;
     }
-    if y2 - y1 < height / 2.0 {
-        y2 = y1 + height / 2.0;
-    }
-    Rectangle::new(x1.max(0.0), y1.max(0.0), x2.min(width), y2.min(height))
+    Rectangle::new(x1.max(0.0), 0.0, x2.min(width), height)
 }
 
 #[cfg(test)]
@@ -2230,29 +2226,30 @@ startxref
     fn apply_crop_adds_margin() {
         let r = apply_crop(Rectangle::new(50.0, 15.0, 200.0, 40.0), 250.0, 50.0);
         assert!((r.x1 - 45.0).abs() < EPSILON);
-        assert!((r.y1 - 10.0).abs() < EPSILON);
         assert!((r.x2 - 205.0).abs() < EPSILON);
-        assert!((r.y2 - 45.0).abs() < EPSILON);
+    }
+
+    #[test]
+    fn apply_crop_keeps_full_height() {
+        let r = apply_crop(Rectangle::new(50.0, 15.0, 200.0, 40.0), 250.0, 50.0);
+        assert!((r.y1 - 0.0).abs() < EPSILON);
+        assert!((r.y2 - 50.0).abs() < EPSILON);
     }
 
     #[test]
     fn apply_crop_enforces_half_page_min() {
-        // tiny content grows to at least half the page in each axis
+        // tiny content grows to at least half the page width
         let r = apply_crop(Rectangle::new(9.5, 6.0, 20.0, 8.0), 250.0, 50.0);
         assert!((r.x1 - 4.5).abs() < EPSILON);
-        assert!((r.y1 - 1.0).abs() < EPSILON);
         assert!((r.x2 - 129.5).abs() < EPSILON); // 4.5 + 250/2
-        assert!((r.y2 - 26.0).abs() < EPSILON); // 1.0 + 50/2
     }
 
     #[test]
     fn apply_crop_clamps_to_page() {
-        // margins pushing past the edges clamp back to [0,w] x [0,h]
+        // margins pushing past the edges clamp back to [0,w]
         let r = apply_crop(Rectangle::new(2.0, 2.0, 248.0, 48.0), 250.0, 50.0);
         assert!((r.x1 - 0.0).abs() < EPSILON);
-        assert!((r.y1 - 0.0).abs() < EPSILON);
         assert!((r.x2 - 250.0).abs() < EPSILON);
-        assert!((r.y2 - 50.0).abs() < EPSILON);
     }
 
     // Two pages, the second far larger. At a zoom the first page renders fine, the second is capped.
