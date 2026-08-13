@@ -70,6 +70,7 @@ JPEG, TIFF, …) open as well. DjVu is not supported.
 | Ctrl + t        | Open a document in a new tab             |
 | Ctrl + w        | Close the current tab or window          |
 | `t`             | Toggle table of contents                 |
+| F11             | Toggle full screen                       |
 | `l` / PageDown  | Next page                                |
 | `h` / PageUp    | Previous page                            |
 | Home            | First page                               |
@@ -88,7 +89,7 @@ JPEG, TIFF, …) open as well. DjVu is not supported.
 | `N` / Shift + F3 | Previous match                          |
 | Drag            | Select text (also copied to the primary selection) |
 | Ctrl + c        | Copy the selected text to the clipboard  |
-| Esc             | Close search / drop the selection        |
+| Esc             | Close search / drop the selection / leave full screen |
 
 ## Installation
 

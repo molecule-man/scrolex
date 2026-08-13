@@ -159,9 +159,9 @@ impl ObjectImpl for Window {
 
 #[gtk::template_callbacks]
 impl Window {
-    // Capture phase, on the window: the tab and search keys must work wherever the focus sits,
-    // including the header entries and the contents panel. Capture also stops Escape from
-    // double-firing the search entry's own stop-search.
+    // Capture phase, on the window: the tab, fullscreen, and search keys must work wherever the
+    // focus sits, including the header entries and the contents panel. Capture also stops Escape
+    // from double-firing the search entry's own stop-search.
     fn setup_window_keys(&self) {
         let key = gtk::EventControllerKey::new();
         key.set_propagation_phase(gtk::PropagationPhase::Capture);
@@ -185,6 +185,11 @@ impl Window {
         let control = gtk::gdk::ModifierType::CONTROL_MASK;
         let control_shift = control | gtk::gdk::ModifierType::SHIFT_MASK;
         let modifiers = modifier & gtk::accelerator_get_default_mod_mask();
+        if modifiers.is_empty() && keyval == Key::F11 {
+            let window = self.obj();
+            window.set_fullscreened(!window.is_fullscreen());
+            return glib::Propagation::Stop;
+        }
         if modifiers == control {
             match keyval {
                 Key::t | Key::T => {
@@ -218,10 +223,22 @@ impl Window {
             return glib::Propagation::Stop;
         }
 
-        self.active_document()
-            .map_or(glib::Propagation::Proceed, |document| {
-                document.handle_search_key(keyval, modifier)
-            })
+        let doc = self.active_document();
+        let taken_doc = doc.as_ref().map_or(glib::Propagation::Proceed, |document| {
+            document.handle_search_key(keyval, modifier)
+        });
+        if matches!(taken_doc, glib::Propagation::Stop) {
+            return taken_doc;
+        }
+
+        let selected = doc.is_some_and(|doc| doc.state().has_selection());
+        if modifiers.is_empty() && keyval == Key::Escape && !selected && self.obj().is_fullscreen()
+        {
+            self.obj().set_fullscreened(false);
+            return glib::Propagation::Stop;
+        }
+
+        taken_doc
     }
 
     fn setup_notebook(&self) {
@@ -1203,6 +1220,31 @@ mod widget_tests {
             .handle_window_key(gtk::gdk::Key::w, gtk::gdk::ModifierType::CONTROL_MASK);
 
         assert!(!window.header().obj().is_visible(), "the window closed");
+    }
+
+    #[gtk::test]
+    fn f11_does_not_reach_the_document() {
+        let window = loaded_window();
+        let header = window.header();
+
+        let propagation =
+            header.handle_window_key(gtk::gdk::Key::F11, gtk::gdk::ModifierType::empty());
+
+        assert_eq!(propagation, gtk::glib::Propagation::Stop);
+        window.close();
+    }
+
+    #[gtk::test]
+    fn escape_reaches_the_document_when_not_fullscreen() {
+        let window = loaded_window();
+        let header = window.header();
+        assert!(!header.obj().is_fullscreen());
+
+        let propagation =
+            header.handle_window_key(gtk::gdk::Key::Escape, gtk::gdk::ModifierType::empty());
+
+        assert_eq!(propagation, gtk::glib::Propagation::Proceed);
+        window.close();
     }
 
     #[gtk::test]
