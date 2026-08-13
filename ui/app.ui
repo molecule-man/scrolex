@@ -168,6 +168,13 @@
 											</object>
 										</child>
 										<child>
+											<object class="GtkToggleButton" id="btn_fullscreen">
+												<property name="label">Full Screen</property>
+												<property name="tooltip-text">Enter Fullscreen mode (F11)</property>
+												<property name="active" bind-source="MyApp" bind-property="fullscreened" bind-flags="sync-create|bidirectional"/>
+											</object>
+										</child>
+										<child>
 											<object class="GtkToggleButton" id="btn_animate_scroll">
 												<property name="label">Animate Scroll</property>
 												<property name="tooltip-text">Slide by one page on scroll instead of jumping</property>
