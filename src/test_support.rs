@@ -1,4 +1,6 @@
 // Shared harness for the widget tests in window and document_view.
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Once;
 use std::time::{Duration, Instant};
 
 use gtk::prelude::*;
@@ -6,6 +8,8 @@ use gtk::subclass::prelude::ObjectSubclassIsExt;
 
 // Size every test window shares.
 pub const TEST_WINDOW: (i32, i32) = (900, 700);
+
+static PORTAL_WARNINGS: AtomicUsize = AtomicUsize::new(0);
 
 // A window under test. The assertions mostly read the document, so it derefs to that; the window
 // and the header bar have their own accessors.
@@ -46,6 +50,7 @@ impl TestWindow {
 }
 
 pub fn init() {
+    install_log_writer();
     crate::config::use_scratch_config();
     crate::state::use_scratch_state_dir();
     gtk::gio::resources_register_include!("scrolex-ui.gresource").expect("ui resources");
@@ -54,6 +59,34 @@ pub fn init() {
     crate::page::Page::static_type();
     crate::document_view::DocumentView::static_type();
     load_css();
+}
+
+fn install_log_writer() {
+    static INSTALLED: Once = Once::new();
+    INSTALLED.call_once(|| {
+        gtk::glib::log_set_writer_func(|level, fields| {
+            let field = |key| {
+                fields
+                    .iter()
+                    .find(|field| field.key() == key)
+                    .and_then(gtk::glib::LogField::value_str)
+            };
+            let portal_warning = field("GLIB_DOMAIN") == Some("Gdk")
+                && field("MESSAGE").is_some_and(|message| {
+                    message.starts_with("Cannot get portal org.freedesktop.portal.Inhibit version:")
+                });
+            if portal_warning {
+                PORTAL_WARNINGS.fetch_add(1, Ordering::Relaxed);
+                gtk::glib::LogWriterOutput::Handled
+            } else {
+                gtk::glib::log_writer_default(level, fields)
+            }
+        });
+    });
+}
+
+pub fn portal_warning_count() -> usize {
+    PORTAL_WARNINGS.load(Ordering::Relaxed)
 }
 
 pub fn window() -> TestWindow {

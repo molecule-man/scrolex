@@ -942,7 +942,9 @@ fn dismiss_menu(btn: &Button) {
 mod widget_tests {
     use crate::document_view::DocumentView;
     use crate::page::PageNumber;
-    use crate::test_support::{fixture, init, loaded_window, wait_until, window as test_window};
+    use crate::test_support::{
+        fixture, init, loaded_window, portal_warning_count, wait_until, window as test_window,
+    };
     use gtk::prelude::*;
     use gtk::subclass::prelude::{ObjectSubclassExt, ObjectSubclassIsExt};
 
@@ -1420,6 +1422,7 @@ mod widget_tests {
     #[gtk::test]
     fn application_windows_keep_settings_and_cache_in_sync() {
         init();
+        let warnings = portal_warning_count();
         let application = gtk::Application::builder()
             .application_id("com.andr2i.scrolex.tests")
             .flags(gtk::gio::ApplicationFlags::NON_UNIQUE)
@@ -1464,6 +1467,11 @@ mod widget_tests {
             128 * 1024 * 1024
         );
         first.close();
+
+        assert!(
+            portal_warning_count() - warnings <= 1,
+            "GtkApplication emitted the portal warning more than once",
+        );
     }
 
     // The reader can be typing a page number when they reach for Ctrl+F. The controller sits on

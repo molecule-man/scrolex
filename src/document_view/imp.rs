@@ -2409,21 +2409,16 @@ fn anchored_scroll(value: f64, origin: f64, screen: f64, offset: f64, zoom: f64)
     value - (screen - offset * zoom - origin)
 }
 
-// Height the overlay scrollbar covers at the bottom of the viewport. Measured, not allocated: GTK
-// drops the allocation of an overlay scrollbar while it conceals it, and a fit that reads the
-// allocation moves with that.
+// Height the horizontal scrollbar takes from the pages.
 fn hscrollbar_reserve(scroller: &gtk::ScrolledWindow) -> f64 {
     let adjustment = scroller.hadjustment();
     if adjustment.upper() - adjustment.lower() <= adjustment.page_size() {
         return 0.0;
     }
 
-    f64::from(
-        scroller
-            .hscrollbar()
-            .measure(gtk::Orientation::Vertical, -1)
-            .1,
-    )
+    scroller.child().map_or(0.0, |child| {
+        f64::from((scroller.height() - child.height()).max(0))
+    })
 }
 
 // Find the Page widget within a list item's widget subtree.
@@ -3129,10 +3124,77 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         wait_until(|| imp.selection.n_items() == 1);
         wait_until(|| !imp.fit_pending.get() && imp.mapped_page(0).is_some());
 
+        // Wait until the layout drops the horizontal overflow from the prior document.
         let hadj = imp.scrolledwindow.hadjustment();
-        assert!(hadj.upper() - hadj.lower() <= hadj.page_size());
+        wait_until(|| hadj.upper() - hadj.lower() <= hadj.page_size());
         assert_fills_the_viewport(imp);
         window.close();
+    }
+
+    struct OverlayScrollingSetting {
+        settings: gtk::Settings,
+        value: bool,
+    }
+
+    impl Drop for OverlayScrollingSetting {
+        fn drop(&mut self) {
+            self.settings.set_gtk_overlay_scrolling(self.value);
+        }
+    }
+
+    // The reserve equals the height that GTK removes from the content.
+    #[gtk::test]
+    fn the_reserve_matches_the_height_the_scrollbar_takes() {
+        let settings = gtk::Settings::default().expect("gtk settings");
+        let _setting = OverlayScrollingSetting {
+            value: settings.is_gtk_overlay_scrolling(),
+            settings: settings.clone(),
+        };
+        let mut measured = Vec::new();
+
+        for overlay in [true, false] {
+            settings.set_gtk_overlay_scrolling(overlay);
+
+            // Keep horizontal overflow at every test window size.
+            let content = gtk::DrawingArea::new();
+            content.set_content_width(20000);
+            content.set_content_height(300);
+
+            let inner = gtk::ScrolledWindow::new();
+            inner.set_policy(gtk::PolicyType::Automatic, gtk::PolicyType::Never);
+            inner.set_propagate_natural_height(true);
+            inner.set_child(Some(&content));
+
+            let outer = gtk::ScrolledWindow::new();
+            outer.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+            outer.set_child(Some(&inner));
+
+            let window = gtk::Window::new();
+            window.set_default_size(400, 400);
+            window.set_child(Some(&outer));
+            window.present();
+
+            let hadj = inner.hadjustment();
+            wait_until(|| hadj.upper() - hadj.lower() > hadj.page_size() && content.height() > 0);
+
+            measured.push((
+                overlay,
+                super::hscrollbar_reserve(&inner),
+                f64::from(inner.height() - content.height()),
+                inner.hscrollbar().css_classes(),
+            ));
+            window.close();
+        }
+
+        for (overlay, reserve, taken, classes) in measured {
+            assert_eq!(
+                reserve, taken,
+                "gtk-overlay-scrolling={overlay}, classes {classes:?}",
+            );
+            if !overlay {
+                assert!(taken > 0.0, "the traditional scrollbar takes height");
+            }
+        }
     }
 
     // Every term the fit measures, so a re-fit that lands on another zoom names the term that moved.
