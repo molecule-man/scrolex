@@ -85,6 +85,15 @@
     </screenshot>
   </screenshots>
   <releases>
+    <release version="0.11.2" date="2026-08-14">
+      <url>https://github.com/molecule-man/scrolex/releases/tag/0.11.2</url>
+      <description>
+        <ul>
+          <li>Crop only horizontal margins</li>
+          <li>Add option to always open external files in tabs</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.11.1" date="2026-08-13">
       <url>https://github.com/molecule-man/scrolex/releases/tag/0.11.1</url>
       <description>
