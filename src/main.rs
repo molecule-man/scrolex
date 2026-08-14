@@ -8,10 +8,8 @@
 #![deny(clippy::all, clippy::if_not_else, clippy::enum_glob_use)]
 
 use std::ffi::OsString;
-use std::path::PathBuf;
 
 use gtk::gdk::Display;
-use gtk::glib::Uri;
 use gtk::{gio::ApplicationFlags, glib, glib::clone, Application};
 use gtk::{prelude::*, CssProvider};
 
@@ -56,8 +54,13 @@ fn main() -> glib::ExitCode {
         load_css();
     });
     setup_dark_mode(&app);
+    setup_open_in_tabs(&app);
     app.connect_command_line(|app, cmd| {
-        build_ui(app, &cmd.arguments());
+        let args = cmd.arguments();
+        let file = document_arg(&args).map(|arg| cmd.create_file_for_arg(arg));
+        if !open_in_active_window(app, &args, file.as_ref()) {
+            build_ui(app, &args, file.as_ref());
+        }
         glib::ExitCode::SUCCESS
     });
     app.run_with_args(&std::env::args().collect::<Vec<_>>())
@@ -95,6 +98,72 @@ fn setup_dark_mode(app: &Application) {
     app.add_action(&action);
 }
 
+fn setup_open_in_tabs(app: &Application) {
+    let enabled = config::load_config().always_open_in_tabs;
+    let action = gtk::gio::SimpleAction::new_stateful("open-in-tabs", None, &enabled.to_variant());
+    action.connect_activate(|action, _| {
+        let enabled = !action
+            .state()
+            .and_then(|v| v.get::<bool>())
+            .unwrap_or(false);
+        action.set_state(&enabled.to_variant());
+
+        let mut settings = config::load_config();
+        settings.always_open_in_tabs = enabled;
+        if let Err(err) = config::save_config(&settings) {
+            eprintln!("Error saving config: {err}");
+        }
+    });
+    app.add_action(&action);
+}
+
+// With tabs requested, a second launch adds a tab to the last active window. A full window,
+// no open window, or no file argument creates a separate window.
+fn open_in_active_window(
+    app: &Application,
+    args: &[OsString],
+    file: Option<&gtk::gio::File>,
+) -> bool {
+    let wants_tab = tab_flag(args).unwrap_or_else(|| config::load_config().always_open_in_tabs);
+    if !wants_tab || scrolex::emulate::config().is_some() {
+        return false;
+    }
+
+    let Some(window) = app
+        .active_window()
+        .or_else(|| app.windows().into_iter().next())
+        .and_downcast::<window::Window>()
+    else {
+        return false;
+    };
+
+    let Some(file) = file else {
+        return false;
+    };
+    if !window.open_in_new_tab(file) {
+        return false;
+    }
+
+    window.present();
+    true
+}
+
+fn tab_flag(args: &[OsString]) -> Option<bool> {
+    args.iter()
+        .rev()
+        .find_map(|arg| match arg.to_string_lossy().as_ref() {
+            "--tab" => Some(true),
+            "--new-window" => Some(false),
+            _ => None,
+        })
+}
+
+fn document_arg(args: &[OsString]) -> Option<&OsString> {
+    args.iter()
+        .skip(1)
+        .find(|a| !a.to_string_lossy().starts_with('-'))
+}
+
 fn init_logging() {
     let verbose = std::env::args().any(|a| a == "-v" || a == "--verbose");
     let default_filter = if verbose { "scrolex=debug" } else { "warn" };
@@ -123,7 +192,7 @@ fn load_css() {
     );
 }
 
-fn build_ui(app: &Application, args: &[OsString]) {
+fn build_ui(app: &Application, args: &[OsString], file: Option<&gtk::gio::File>) {
     let window = window::Window::new(app);
     window.set_widget_name("main");
     window.apply_dark_mode(scrolex::mupdf_render::dark_mode_enabled());
@@ -165,20 +234,8 @@ fn build_ui(app: &Application, args: &[OsString]) {
 
     if scrolex::emulate::config().is_some() {
         state.load(&gtk::gio::File::for_uri(scrolex::emulate::URI));
-    } else if let Some(fname) = args
-        .iter()
-        .skip(1)
-        .find(|a| !a.to_string_lossy().starts_with('-'))
-    {
-        match from_str_to_uri(fname) {
-            Ok(uri) => state.load(&gtk::gio::File::for_uri(&uri)),
-            Err(err) => {
-                window.show_error_dialog(&format!(
-                    "Invalid file name: {}. Error: {err}",
-                    fname.display()
-                ));
-            }
-        }
+    } else if let Some(file) = file {
+        state.load(file);
     }
 
     if let Some(geometry) = config::load_config().geometry {
@@ -241,25 +298,36 @@ fn content_id(parts: &[&str]) -> u64 {
     hash
 }
 
-fn from_str_to_uri(oss: &OsString) -> Result<String, std::io::Error> {
-    if let Ok(u) = Uri::parse(&oss.to_string_lossy(), glib::UriFlags::NONE) {
-        return Ok(u.to_string());
-    }
-
-    let path = PathBuf::from(&oss).canonicalize()?;
-    if path.is_file() {
-        return Ok(format!("file://{}", path.to_string_lossy()));
-    }
-
-    Err(std::io::Error::new(
-        std::io::ErrorKind::NotFound,
-        format!("File not found: {}", oss.display()),
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn args(items: &[&str]) -> Vec<OsString> {
+        items.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn tab_flag_overrides_the_setting_and_the_last_one_wins() {
+        assert_eq!(tab_flag(&args(["scrolex", "a.pdf"].as_slice())), None);
+        assert_eq!(tab_flag(&args(&["scrolex", "--tab", "a.pdf"])), Some(true));
+        assert_eq!(
+            tab_flag(&args(&["scrolex", "--new-window", "a.pdf"])),
+            Some(false)
+        );
+        assert_eq!(
+            tab_flag(&args(&["scrolex", "--tab", "--new-window", "a.pdf"])),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn document_arg_skips_flags() {
+        assert_eq!(
+            document_arg(&args(&["scrolex", "--tab", "-v", "a.pdf", "b.pdf"])),
+            Some(&OsString::from("a.pdf"))
+        );
+        assert_eq!(document_arg(&args(&["scrolex", "--tab"])), None);
+    }
 
     #[test]
     fn release_notice_id_is_stable_and_content_based() {

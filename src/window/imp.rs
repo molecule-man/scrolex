@@ -515,7 +515,9 @@ impl Window {
         self.choose_document(clone!(
             #[weak(rename_to = imp)]
             self,
-            move |file| imp.open_in_new_tab(&file)
+            move |file| {
+                imp.open_in_new_tab(&file);
+            }
         ));
     }
 
@@ -525,15 +527,17 @@ impl Window {
         self.add_tab();
     }
 
-    // Fill an idle empty tab instead of adding another tab.
-    pub(crate) fn open_in_new_tab(&self, file: &gtk::gio::File) {
+    // Fill an idle empty tab instead of adding another tab. Returns false if tab limit is reached.
+    pub(crate) fn open_in_new_tab(&self, file: &gtk::gio::File) -> bool {
         let document = match self.active_document() {
             Some(active) if active.state().n_pages() == 0 && !active.is_loading() => Some(active),
             _ => self.add_document(),
         };
-        if let Some(document) = document {
-            document.state().load(file);
-        }
+        let Some(document) = document else {
+            return false;
+        };
+        document.state().load(file);
+        true
     }
 
     // Ask the reader for a document. A dismissed chooser changes nothing.
@@ -593,16 +597,23 @@ impl Window {
                 let Some(file) = files.files().into_iter().next() else {
                     return false;
                 };
-                let Some(document) = imp.active_document() else {
-                    return false;
-                };
-
-                document.state().load(&file);
-                true
+                imp.open_dropped_file(&file)
             }
         ));
 
         self.obj().add_controller(drop_target);
+    }
+
+    fn open_dropped_file(&self, file: &gtk::gio::File) -> bool {
+        if crate::config::load_config().always_open_in_tabs {
+            return self.open_in_new_tab(file);
+        }
+
+        let Some(document) = self.active_document() else {
+            return false;
+        };
+        document.state().load(file);
+        true
     }
 
     // Load the render-thread setting into the spin button and pool, and persist any user change.
@@ -1001,13 +1012,40 @@ mod widget_tests {
         let window = loaded_window();
         let notebook = window.header().notebook.get();
 
-        window.header().open_in_new_tab(&fixture("no_outline.pdf"));
+        assert!(window.header().open_in_new_tab(&fixture("no_outline.pdf")));
 
         assert_eq!(notebook.n_pages(), 2, "a loaded document keeps its own tab");
         let second = window.header().active_document().expect("the new document");
         wait_until(|| second.state().n_pages() > 0);
         assert_eq!(tab_title(&notebook, 0), "outline.pdf");
         assert_eq!(tab_title(&notebook, 1), "no_outline.pdf");
+
+        window.close();
+    }
+
+    #[gtk::test]
+    fn a_dropped_file_replaces_the_document_when_tab_mode_is_off() {
+        let window = loaded_window();
+        let header = window.header();
+
+        assert!(header.open_dropped_file(&fixture("no_outline.pdf")));
+        wait_until(|| header.label_title.label() == "no_outline.pdf");
+        assert_eq!(header.notebook.n_pages(), 1);
+
+        window.close();
+    }
+
+    #[gtk::test]
+    fn a_dropped_file_opens_a_tab_when_tab_mode_is_on() {
+        let window = loaded_window();
+        let header = window.header();
+        let mut config = crate::config::load_config();
+        config.always_open_in_tabs = true;
+        crate::config::save_config(&config).expect("tab mode setting");
+
+        assert!(header.open_dropped_file(&fixture("no_outline.pdf")));
+        wait_until(|| header.label_title.label() == "no_outline.pdf");
+        assert_eq!(header.notebook.n_pages(), 2);
 
         window.close();
     }
@@ -1351,6 +1389,11 @@ mod widget_tests {
 
         // the chooser never opens once the limit is reached
         header.handle_window_key(gtk::gdk::Key::t, gtk::gdk::ModifierType::CONTROL_MASK);
+        assert_eq!(header.notebook.n_pages(), super::MAX_DOCUMENTS);
+
+        // tab limit is reached
+        set_document_page(&header.active_document().expect("a document"), 1, 0);
+        assert!(!header.open_in_new_tab(&fixture("outline.pdf")));
         assert_eq!(header.notebook.n_pages(), super::MAX_DOCUMENTS);
 
         let last = header.active_document().expect("a document");

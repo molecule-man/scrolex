@@ -161,6 +161,13 @@
 											</object>
 										</child>
 										<child>
+											<object class="GtkToggleButton" id="btn_open_in_tabs">
+												<property name="action-name">app.open-in-tabs</property>
+												<property name="label">Always Open Files in Tabs</property>
+												<property name="tooltip-text">Open a file from outside the app in a tab of this window instead of a new window</property>
+											</object>
+										</child>
+										<child>
 											<object class="GtkToggleButton" id="btn_dark_mode">
 												<property name="action-name">app.dark-mode</property>
 												<property name="label">Dark Mode</property>
