@@ -31,6 +31,10 @@ impl Window {
         self.imp().documents()
     }
 
+    pub fn open_in_new_tab(&self, file: &gio::File) -> bool {
+        self.imp().open_in_new_tab(file)
+    }
+
     pub fn apply_dark_mode(&self, enabled: bool) {
         if self.has_css_class("dark-mode") != enabled {
             if enabled {
