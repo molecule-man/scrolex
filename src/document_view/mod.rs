@@ -7,6 +7,20 @@ use gtk::{gio, glib};
 
 use crate::state::State;
 
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ZoomChoice {
+    pub label: String,
+    action: ZoomChoiceAction,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum ZoomChoiceAction {
+    Scale(f64),
+    FitHeight(f64),
+    FitPages { first: i32, count: usize, zoom: f64 },
+    FitVisible,
+}
+
 glib::wrapper! {
     pub struct DocumentView(ObjectSubclass<imp::DocumentView>)
         @extends gtk::Widget,
@@ -46,6 +60,18 @@ impl DocumentView {
 
     pub fn fit_width(&self) {
         self.imp().fit_width();
+    }
+
+    pub fn reset_zoom(&self) {
+        self.imp().reset_zoom();
+    }
+
+    pub(crate) fn zoom_choices(&self) -> Vec<ZoomChoice> {
+        self.imp().zoom_choices()
+    }
+
+    pub(crate) fn apply_zoom_choice(&self, choice: &ZoomChoice) {
+        self.imp().apply_zoom_choice(choice);
     }
 
     pub fn jump_back(&self) {

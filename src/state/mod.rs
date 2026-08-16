@@ -36,6 +36,10 @@ pub(crate) fn zoom_from_percent(percent: f64) -> Option<f64> {
     (zoom >= MIN_ZOOM).then(|| zoom.min(MAX_ZOOM))
 }
 
+pub(crate) fn zoom_is_supported(zoom: f64) -> bool {
+    (MIN_ZOOM..=MAX_ZOOM).contains(&zoom)
+}
+
 // Zoom as a percent for the entry, at most two decimals so that it fully fits into entry input
 pub(crate) fn zoom_percent_text(zoom: f64) -> String {
     format!("{}", (zoom * 10_000.0).round() / 100.0)
@@ -45,8 +49,6 @@ pub(crate) fn zoom_percent_text(zoom: f64) -> String {
 pub(crate) fn preview_cache_budget(pages: usize) -> usize {
     pages * PREVIEW_TARGET_BYTES
 }
-
-type TallestPageHeight = Option<f64>;
 
 fn document_size_bytes(f: &gtk::gio::File) -> i64 {
     f.query_info(
@@ -112,6 +114,12 @@ impl State {
         self.imp().tallest_page_height.get()
     }
 
+    pub(crate) fn page_size(&self, index: i32) -> Option<crate::mupdf_render::PageSize> {
+        usize::try_from(index)
+            .ok()
+            .and_then(|index| self.imp().page_sizes.borrow().get(index).copied().flatten())
+    }
+
     pub(crate) fn jump_list_add(&self, page: u32) {
         self.set_prev_page(page);
         self.imp().jump_stack.borrow_mut().push(page);
@@ -172,15 +180,17 @@ impl State {
         // A failed open leaves the current document (and its in-flight render markers) intact,
         // since nothing below the commit runs until the open succeeds. Staging fetches a remote
         // file exactly once; those bytes are the ones committed for rendering - no re-fetch.
-        let (tx, rx) =
-            oneshot::channel::<Option<(crate::mupdf_render::Candidate, i32, TallestPageHeight)>>();
+        let (tx, rx) = oneshot::channel::<
+            Option<(
+                crate::mupdf_render::Candidate,
+                crate::mupdf_render::DocumentInfo,
+            )>,
+        >();
         let uri_probe = uri.clone();
         std::thread::spawn(move || {
             let probed = crate::mupdf_render::stage_candidate(&uri_probe).and_then(|candidate| {
-                match candidate.probe() {
-                    Some((n_pages, tallest)) if n_pages > 0 => Some((candidate, n_pages, tallest)),
-                    _ => None,
-                }
+                let info = candidate.probe()?;
+                (!info.page_sizes.is_empty()).then_some((candidate, info))
             });
             let _ = tx.send(probed);
         });
@@ -193,14 +203,14 @@ impl State {
                 if state.imp().load_seq.get() != seq {
                     return; // a newer load superseded this one
                 }
-                let Some((candidate, n_pages, tallest)) = probed else {
+                let Some((candidate, info)) = probed else {
                     state.emit_by_name::<()>(
                         "load-failed",
                         &[&"could not open document".to_string()],
                     );
                     return;
                 };
-                state.commit_load(&uri, candidate, n_pages, tallest, size_bytes);
+                state.commit_load(&uri, candidate, info, size_bytes);
             }
         ));
     }
@@ -209,10 +219,11 @@ impl State {
         &self,
         uri: &str,
         candidate: crate::mupdf_render::Candidate,
-        n_pages: i32,
-        tallest_page_height: TallestPageHeight,
+        info: crate::mupdf_render::DocumentInfo,
         size_bytes: i64,
     ) {
+        let n_pages = info.page_sizes.len() as i32;
+        let tallest_page_height = info.tallest_page_height();
         // Committed to the new document: force every thread to reopen (the same path may have
         // changed on disk), publish the validated bytes for the render workers, then reset
         // per-document state.
@@ -254,6 +265,7 @@ impl State {
         self.set_next_page(0);
         self.set_uri(uri);
         self.set_n_pages(n_pages);
+        self.imp().page_sizes.replace(info.page_sizes);
         self.imp()
             .tallest_page_height
             .set(tallest_page_height.unwrap_or(0.0));

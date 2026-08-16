@@ -282,7 +282,7 @@
 				<child type="end">
 					<object class="GtkToggleButton" id="btn_crop">
 						<property name="icon-name">image-crop-symbolic</property>
-						<property name="tooltip-text">Crop horizontal page margins</property>
+						<property name="tooltip-text">Keep horizontal page margins cropped</property>
 						<property name="cursor">
 							<object class="GdkCursor">
 								<property name="name">pointer</property>
@@ -293,19 +293,7 @@
 				<child type="end">
 					<object class="GtkToggleButton" id="btn_fit_height">
 						<property name="icon-name">zoom-fit-height-symbolic</property>
-						<property name="tooltip-text">Fit document to the window height</property>
-						<property name="cursor">
-							<object class="GdkCursor">
-								<property name="name">pointer</property>
-							</object>
-						</property>
-					</object>
-				</child>
-				<child type="end">
-					<object class="GtkButton" id="btn_fit_width">
-						<signal name="clicked" handler="fit_width" swapped="true"/>
-						<property name="icon-name">zoom-fit-width-symbolic</property>
-						<property name="tooltip-text">Fit the visible pages across the window width (w)</property>
+						<property name="tooltip-text">Keep pages fitted to the window height</property>
 						<property name="cursor">
 							<object class="GdkCursor">
 								<property name="name">pointer</property>
@@ -326,27 +314,58 @@
 					</object>
 				</child>
 				<child type="end">
-					<object class="GtkEntry" id="entry_zoom">
-						<signal name="activate" handler="handle_zoom_entry" swapped="true"/>
-						<signal name="icon-press" handler="handle_zoom_entry_icon" swapped="true"/>
-						<property name="secondary-icon-name">object-select-symbolic</property>
-						<property name="secondary-icon-tooltip-text">Apply the zoom level you typed (Enter)</property>
-						<property name="halign">end</property>
-						<property name="valign">baseline-center</property>
-						<property name="width-chars">6</property>
-						<property name="max-width-chars">6</property>
-						<property name="input-purpose">digits</property>
-						<binding name="text">
-							<closure type="gchararray" function="zoom_entry_text">
-								<lookup name="zoom"><lookup name="state" type="DocumentView"><lookup name="active-document">MyApp</lookup></lookup></lookup>
-							</closure>
-						</binding>
-						<binding name="secondary-icon-sensitive">
-							<closure type="gboolean" function="zoom_apply_enabled">
-								<lookup name="text">entry_zoom</lookup>
-								<lookup name="zoom"><lookup name="state" type="DocumentView"><lookup name="active-document">MyApp</lookup></lookup></lookup>
-							</closure>
-						</binding>
+					<object class="GtkBox">
+						<style>
+							<class name="linked"/>
+						</style>
+						<child>
+							<object class="GtkEntry" id="entry_zoom">
+								<signal name="activate" handler="handle_zoom_entry" swapped="true"/>
+								<signal name="icon-press" handler="handle_zoom_entry_icon" swapped="true"/>
+								<property name="secondary-icon-name">object-select-symbolic</property>
+								<property name="secondary-icon-tooltip-text">Apply the zoom level you typed (Enter)</property>
+								<property name="halign">end</property>
+								<property name="valign">baseline-center</property>
+								<property name="width-chars">6</property>
+								<property name="max-width-chars">6</property>
+								<property name="input-purpose">digits</property>
+								<binding name="text">
+									<closure type="gchararray" function="zoom_entry_text">
+										<lookup name="zoom"><lookup name="state" type="DocumentView"><lookup name="active-document">MyApp</lookup></lookup></lookup>
+									</closure>
+								</binding>
+								<binding name="secondary-icon-sensitive">
+									<closure type="gboolean" function="zoom_apply_enabled">
+										<lookup name="text">entry_zoom</lookup>
+										<lookup name="zoom"><lookup name="state" type="DocumentView"><lookup name="active-document">MyApp</lookup></lookup></lookup>
+									</closure>
+								</binding>
+							</object>
+						</child>
+						<child>
+							<object class="GtkMenuButton" id="btn_zoom_menu">
+								<property name="icon-name">pan-down-symbolic</property>
+								<property name="tooltip-text">Zoom options</property>
+								<property name="cursor">
+									<object class="GdkCursor">
+										<property name="name">pointer</property>
+									</object>
+								</property>
+								<property name="popover">
+									<object class="GtkPopover" id="zoom_popover">
+										<property name="child">
+											<object class="GtkBox" id="zoom_options">
+												<property name="orientation">vertical</property>
+												<property name="margin-top">6</property>
+												<property name="margin-bottom">6</property>
+												<property name="margin-start">6</property>
+												<property name="margin-end">6</property>
+											</object>
+										</property>
+									</object>
+								</property>
+							</object>
+						</child>
 					</object>
 				</child>
 				<child type="end">

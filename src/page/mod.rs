@@ -25,7 +25,7 @@ impl Rectangle {
         Self { x1, y1, x2, y2 }
     }
 
-    fn size(&self) -> (f64, f64) {
+    pub(crate) fn size(&self) -> (f64, f64) {
         (self.x2 - self.x1, self.y2 - self.y1)
     }
 

@@ -425,11 +425,14 @@ impl Page {
     // the page can't be read.
     fn page_info(&self) -> Option<PageInfo> {
         let index = self.obj().index();
-        let (width, height) = crate::mupdf_render::page_size(&self.obj().uri(), index)?;
+        let size = self.state.borrow().page_size(index).or_else(|| {
+            crate::mupdf_render::page_size(&self.obj().uri(), index)
+                .map(|(width, height)| crate::mupdf_render::PageSize { width, height })
+        })?;
         Some(PageInfo {
             index,
-            width,
-            height,
+            width: size.width,
+            height: size.height,
         })
     }
 
