@@ -7,6 +7,12 @@ use gtk::{gio, glib};
 
 use crate::state::State;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReaderKeyContext {
+    Document,
+    NumericEntry,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ZoomChoice {
     pub label: String,
@@ -101,6 +107,15 @@ impl DocumentView {
         modifier: gtk::gdk::ModifierType,
     ) -> glib::Propagation {
         self.imp().handle_search_key(keyval, modifier)
+    }
+
+    pub(crate) fn handle_reader_key(
+        &self,
+        keyval: gtk::gdk::Key,
+        modifier: gtk::gdk::ModifierType,
+        context: ReaderKeyContext,
+    ) -> glib::Propagation {
+        self.imp().handle_reader_key(keyval, modifier, context)
     }
 
     // The page a jump to `page_num` would land on, 1-based. None while no document is open.

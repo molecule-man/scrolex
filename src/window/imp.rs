@@ -10,7 +10,7 @@ use gtk::prelude::*;
 use gtk::subclass::prelude::*;
 use gtk::{glib, Button, CompositeTemplate, ToggleButton};
 
-use crate::document_view::DocumentView;
+use crate::document_view::{DocumentView, ReaderKeyContext};
 
 // Tabs stop being a useful way to hold documents well before this. The cap also limits each
 // document's render state and widget tree.
@@ -171,9 +171,7 @@ impl ObjectImpl for Window {
 
 #[gtk::template_callbacks]
 impl Window {
-    // Capture phase, on the window: the tab, fullscreen, and search keys must work wherever the
-    // focus sits, including the header entries and the contents panel. Capture also stops Escape
-    // from double-firing the search entry's own stop-search.
+    // Capture phase keeps shortcuts active outside the document widget tree.
     fn setup_window_keys(&self) {
         let key = gtk::EventControllerKey::new();
         key.set_propagation_phase(gtk::PropagationPhase::Capture);
@@ -241,6 +239,27 @@ impl Window {
         });
         if matches!(taken_doc, glib::Propagation::Stop) {
             return taken_doc;
+        }
+
+        if let Some(document) = doc.as_ref() {
+            let focus = gtk::prelude::GtkWindowExt::focus(&*self.obj());
+            let outside_document = focus
+                .as_ref()
+                .is_none_or(|focus| !widget_is_within(focus, document.upcast_ref()));
+            let edits_text = focus
+                .as_ref()
+                .is_some_and(|focus| focus.is::<gtk::Editable>());
+            if outside_document {
+                let context = if edits_text {
+                    ReaderKeyContext::NumericEntry
+                } else {
+                    ReaderKeyContext::Document
+                };
+                let taken = document.handle_reader_key(keyval, modifier, context);
+                if matches!(taken, glib::Propagation::Stop) {
+                    return taken;
+                }
+            }
         }
 
         let selected = doc.is_some_and(|doc| doc.state().has_selection());
@@ -986,6 +1005,17 @@ fn document_path(uri: &str) -> String {
     )
 }
 
+fn widget_is_within(widget: &gtk::Widget, ancestor: &gtk::Widget) -> bool {
+    let mut current = Some(widget.clone());
+    while let Some(widget) = current {
+        if widget == *ancestor {
+            return true;
+        }
+        current = widget.parent();
+    }
+    false
+}
+
 fn dismiss_menu(btn: &Button) {
     if let Some(popover) = btn
         .ancestor(gtk::Popover::static_type())
@@ -1114,6 +1144,32 @@ mod widget_tests {
         assert!(labels.iter().any(|label| label.contains("(W)")));
         assert!(!labels.iter().any(|label| label.contains("fit 4 pages")));
         assert!(labels.iter().any(|label| label.starts_with('✓')));
+        window.close();
+    }
+
+    #[gtk::test]
+    fn reader_shortcuts_work_from_the_header() {
+        let window = loaded_window();
+        let document = window.header().active_document().expect("a document");
+        document.apply_zoom_percent(50.0);
+        wait_until(|| document.state().zoom() == 0.5);
+
+        window.header().entry_zoom.grab_focus();
+        let focus =
+            gtk::prelude::GtkWindowExt::focus(&*window.header().obj()).expect("header entry focus");
+        assert!(focus.is::<gtk::Editable>());
+        assert!(!super::widget_is_within(&focus, document.upcast_ref()));
+        let taken = window
+            .header()
+            .handle_window_key(gtk::gdk::Key::w, gtk::gdk::ModifierType::empty());
+
+        assert_eq!(taken, glib::Propagation::Stop);
+        assert_ne!(document.state().zoom(), 0.5);
+
+        let taken = window
+            .header()
+            .handle_window_key(gtk::gdk::Key::Left, gtk::gdk::ModifierType::empty());
+        assert_eq!(taken, glib::Propagation::Proceed);
         window.close();
     }
 

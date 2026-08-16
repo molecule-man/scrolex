@@ -17,7 +17,7 @@ use gtk::{
 };
 use gtk::{prelude::*, GestureClick};
 
-use super::{ZoomChoice, ZoomChoiceAction};
+use super::{ReaderKeyContext, ZoomChoice, ZoomChoiceAction};
 use crate::page;
 use crate::state::State;
 
@@ -1225,114 +1225,94 @@ impl DocumentView {
     }
 
     #[template_callback]
-    fn handle_key_press(
+    pub(super) fn handle_key_press(
         &self,
         keyval: Key,
         _keycode: u32,
         modifier: ModifierType,
     ) -> glib::Propagation {
+        self.handle_reader_key(keyval, modifier, ReaderKeyContext::Document)
+    }
+
+    pub(super) fn handle_reader_key(
+        &self,
+        keyval: Key,
+        modifier: ModifierType,
+        context: ReaderKeyContext,
+    ) -> glib::Propagation {
+        let control = modifier.contains(ModifierType::CONTROL_MASK);
         match keyval {
-            Key::c
-                if modifier.contains(ModifierType::CONTROL_MASK) && self.state.has_selection() =>
-            {
-                self.copy_selection();
+            Key::c if control && self.state.has_selection() => {
+                run_reader_action(context, false, || self.copy_selection())
             }
             Key::Escape if self.state.has_selection() => {
-                self.state.clear_selection();
+                run_reader_action(context, false, || self.state.clear_selection())
             }
-            Key::o => {
-                self.obj().emit_by_name::<()>("open-requested", &[]);
-            }
-            // plain t only: Ctrl+T opens a tab
-            Key::t if !modifier.contains(ModifierType::CONTROL_MASK) => {
+            Key::o => run_reader_action(context, true, || {
+                self.obj().emit_by_name::<()>("open-requested", &[])
+            }),
+            Key::t if !control => run_reader_action(context, true, || {
                 if !self.toc_pages.borrow().is_empty() {
                     self.toc_revealer
                         .set_reveal_child(!self.toc_revealer.reveals_child());
                 }
+            }),
+            Key::f => run_reader_action(context, true, || self.open_search()),
+            Key::w => run_reader_action(context, true, || self.fit_width()),
+            Key::l | Key::Page_Down => run_reader_action(context, true, || self.next_page()),
+            Key::h | Key::Page_Up => run_reader_action(context, true, || self.prev_page()),
+            Key::Home => run_reader_action(context, false, || self.goto_page(1)),
+            Key::End => run_reader_action(context, false, || self.goto_page(u32::MAX)),
+            Key::bracketleft => run_reader_action(context, true, || self.zoom_out()),
+            Key::bracketright => run_reader_action(context, true, || self.zoom_in()),
+            // Ctrl+plus needs Shift on most layouts, so Ctrl+equal zooms in too.
+            Key::plus | Key::equal | Key::KP_Add if control => {
+                run_reader_action(context, true, || self.zoom_in())
             }
-            Key::f => {
-                self.open_search();
+            Key::minus | Key::KP_Subtract if control => {
+                run_reader_action(context, true, || self.zoom_out())
             }
-            Key::w => {
-                self.fit_width();
+            Key::_0 | Key::KP_0 if control => {
+                run_reader_action(context, true, || self.reset_zoom())
             }
-            Key::l | Key::Page_Down => {
-                self.next_page();
+            Key::n if self.state.search().borrow().total() > 0 => {
+                run_reader_action(context, true, || self.next_match())
             }
-            Key::h | Key::Page_Up => {
-                self.prev_page();
+            Key::N if self.state.search().borrow().total() > 0 => {
+                run_reader_action(context, true, || self.prev_match())
             }
-            Key::Home => {
-                self.goto_page(1);
-            }
-            Key::End => {
-                // clamps to the last page in navigate_to_page
-                self.goto_page(u32::MAX);
-            }
-            Key::bracketleft => {
-                self.zoom_out();
-            }
-            Key::bracketright => {
-                self.zoom_in();
-            }
-            // Ctrl+plus needs Shift on most layouts, so Ctrl+equal zooms in too
-            Key::plus | Key::equal | Key::KP_Add
-                if modifier.contains(ModifierType::CONTROL_MASK) =>
-            {
-                self.zoom_in();
-            }
-            Key::minus | Key::KP_Subtract if modifier.contains(ModifierType::CONTROL_MASK) => {
-                self.zoom_out();
-            }
-            Key::_0 | Key::KP_0 if modifier.contains(ModifierType::CONTROL_MASK) => {
-                self.reset_zoom();
-            }
-            Key::n | Key::N => {
-                if self.state.search().borrow().total() == 0 {
-                    return glib::Propagation::Proceed;
-                }
-                if keyval == Key::N {
-                    self.prev_match();
-                } else {
-                    self.next_match();
-                }
-            }
-            Key::Left | Key::Right => {
-                // fine horizontal scroll; handled here rather than relying on the scrolled window's
-                // own key bindings, which only fire when it directly holds focus
-                //
-                // Like a drag, this fine nudge takes over the horizontal position, so drop any
-                // in-flight page slide; otherwise scroll_tick would overwrite the nudge each frame.
-                // (h/l intentionally keep the slide running - they step pages and retarget it.)
-                *self.scroll_anim.borrow_mut() = None;
-                let hadj = self.scrolledwindow.hadjustment();
-                let step = if hadj.step_increment() > 0.0 {
-                    hadj.step_increment()
-                } else {
-                    hadj.page_size() * 0.1
-                };
-                let delta = if keyval == Key::Left { -step } else { step };
-                self.set_scroll_direction_from_delta(delta);
-                self.set_hscroll(hadj.value() + delta, "arrow-key");
-            }
-            Key::Up | Key::Down | Key::k | Key::j => {
-                // vertical pan of a zoomed-in page. The outer scroller owns the vertical axis (the
-                // horizontal listview doesn't scroll its cross axis); k/Up pan up, j/Down pan down.
-                // the nudge owns the axis; a coast would overwrite it next frame
-                self.vscroll_anim.set(None);
-                let vadj = self.vscrolledwindow.vadjustment();
-                let step = if vadj.step_increment() > 0.0 {
-                    vadj.step_increment()
-                } else {
-                    vadj.page_size() * 0.1
-                };
-                let up = keyval == Key::Up || keyval == Key::k;
-                vadj.set_value(vadj.value() + if up { -step } else { step });
-            }
-            _ => return glib::Propagation::Proceed,
+            Key::Left => run_reader_action(context, false, || self.pan_horizontal(-1.0)),
+            Key::Right => run_reader_action(context, false, || self.pan_horizontal(1.0)),
+            Key::Up => run_reader_action(context, false, || self.pan_vertical(-1.0)),
+            Key::Down => run_reader_action(context, false, || self.pan_vertical(1.0)),
+            Key::k => run_reader_action(context, true, || self.pan_vertical(-1.0)),
+            Key::j => run_reader_action(context, true, || self.pan_vertical(1.0)),
+            _ => glib::Propagation::Proceed,
         }
+    }
 
-        glib::Propagation::Stop
+    fn pan_horizontal(&self, direction: f64) {
+        *self.scroll_anim.borrow_mut() = None;
+        let hadj = self.scrolledwindow.hadjustment();
+        let step = if hadj.step_increment() > 0.0 {
+            hadj.step_increment()
+        } else {
+            hadj.page_size() * 0.1
+        };
+        let delta = step * direction;
+        self.set_scroll_direction_from_delta(delta);
+        self.set_hscroll(hadj.value() + delta, "arrow-key");
+    }
+
+    fn pan_vertical(&self, direction: f64) {
+        self.vscroll_anim.set(None);
+        let vadj = self.vscrolledwindow.vadjustment();
+        let step = if vadj.step_increment() > 0.0 {
+            vadj.step_increment()
+        } else {
+            vadj.page_size() * 0.1
+        };
+        vadj.set_value(vadj.value() + step * direction);
     }
 
     // The only writer of the clipboard; a drag publishes to the primary selection instead.
@@ -2710,6 +2690,18 @@ fn fit_width_zoom(viewport: f64, paper_points: f64, gaps: f64) -> Option<f64> {
     (viewport > gaps && paper_points > 0.0).then(|| (viewport - gaps) / paper_points)
 }
 
+fn run_reader_action(
+    context: ReaderKeyContext,
+    allowed_in_numeric_entry: bool,
+    action: impl FnOnce(),
+) -> glib::Propagation {
+    if context == ReaderKeyContext::NumericEntry && !allowed_in_numeric_entry {
+        return glib::Propagation::Proceed;
+    }
+    action();
+    glib::Propagation::Stop
+}
+
 fn page_range_start(n_pages: usize, selected: usize, count: usize) -> Option<usize> {
     (count > 0 && n_pages >= count).then(|| selected.min(n_pages - count))
 }
@@ -2771,10 +2763,10 @@ fn descendant_page(widget: &gtk::Widget) -> Option<page::Page> {
 mod tests {
     use super::{
         accumulate_step, add_zoom_choice, fit_width_zoom, glide_step, kinetic_step,
-        page_range_start, KINETIC_TAU_US, SCROLL_ANIM_MAX_US, SCROLL_ANIM_TAU_US, WHEEL_NOTCH,
-        WHEEL_TRIGGER,
+        page_range_start, run_reader_action, KINETIC_TAU_US, SCROLL_ANIM_MAX_US,
+        SCROLL_ANIM_TAU_US, WHEEL_NOTCH, WHEEL_TRIGGER,
     };
-    use crate::document_view::ZoomChoiceAction;
+    use crate::document_view::{ReaderKeyContext, ZoomChoiceAction};
 
     #[test]
     fn width_fit_scales_papers_but_not_gaps() {
@@ -2823,6 +2815,18 @@ mod tests {
             choices[0].action,
             ZoomChoiceAction::FitPages { count: 4, .. }
         ));
+    }
+
+    #[test]
+    fn numeric_entry_policy_controls_reader_actions() {
+        let ran = std::cell::Cell::new(false);
+        let result = run_reader_action(ReaderKeyContext::NumericEntry, false, || ran.set(true));
+        assert_eq!(result, gtk::glib::Propagation::Proceed);
+        assert!(!ran.get());
+
+        let result = run_reader_action(ReaderKeyContext::NumericEntry, true, || ran.set(true));
+        assert_eq!(result, gtk::glib::Propagation::Stop);
+        assert!(ran.get());
     }
 
     // Drive the glide toward a fixed target at a steady frame rate; return frames until it settles.
