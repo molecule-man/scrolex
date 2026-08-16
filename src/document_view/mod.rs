@@ -7,6 +7,26 @@ use gtk::{gio, glib};
 
 use crate::state::State;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReaderKeyContext {
+    Document,
+    NumericEntry,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ZoomChoice {
+    pub label: String,
+    action: ZoomChoiceAction,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum ZoomChoiceAction {
+    Scale(f64),
+    FitHeight(f64),
+    FitPages { first: i32, count: usize, zoom: f64 },
+    FitVisible,
+}
+
 glib::wrapper! {
     pub struct DocumentView(ObjectSubclass<imp::DocumentView>)
         @extends gtk::Widget,
@@ -44,6 +64,22 @@ impl DocumentView {
         self.imp().zoom_out();
     }
 
+    pub fn fit_width(&self) {
+        self.imp().fit_width();
+    }
+
+    pub fn reset_zoom(&self) {
+        self.imp().reset_zoom();
+    }
+
+    pub(crate) fn zoom_choices(&self) -> Vec<ZoomChoice> {
+        self.imp().zoom_choices()
+    }
+
+    pub(crate) fn apply_zoom_choice(&self, choice: &ZoomChoice) {
+        self.imp().apply_zoom_choice(choice);
+    }
+
     pub fn jump_back(&self) {
         self.imp().jump_back();
     }
@@ -71,6 +107,15 @@ impl DocumentView {
         modifier: gtk::gdk::ModifierType,
     ) -> glib::Propagation {
         self.imp().handle_search_key(keyval, modifier)
+    }
+
+    pub(crate) fn handle_reader_key(
+        &self,
+        keyval: gtk::gdk::Key,
+        modifier: gtk::gdk::ModifierType,
+        context: ReaderKeyContext,
+    ) -> glib::Propagation {
+        self.imp().handle_reader_key(keyval, modifier, context)
     }
 
     // The page a jump to `page_num` would land on, 1-based. None while no document is open.

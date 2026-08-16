@@ -35,6 +35,8 @@ pub struct State {
     // Tallest paper height in points.
     pub(crate) tallest_page_height: Cell<f64>,
 
+    pub(crate) page_sizes: RefCell<Vec<Option<crate::mupdf_render::PageSize>>>,
+
     #[property(get, set)]
     animate_scroll: Cell<bool>,
 

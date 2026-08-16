@@ -112,6 +112,27 @@ pub(crate) struct Candidate {
     temp: Option<tempfile::TempPath>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct PageSize {
+    pub width: f64,
+    pub height: f64,
+}
+
+#[derive(Debug, PartialEq)]
+pub(crate) struct DocumentInfo {
+    pub page_sizes: Vec<Option<PageSize>>,
+}
+
+impl DocumentInfo {
+    pub fn tallest_page_height(&self) -> Option<f64> {
+        self.page_sizes
+            .iter()
+            .flatten()
+            .map(|size| size.height)
+            .max_by(f64::total_cmp)
+    }
+}
+
 // Stage `uri`: own path if local, else a temp copy of the bytes.
 pub(crate) fn stage_candidate(uri: &str) -> Option<Candidate> {
     // Emulate mode has no real file to stage; hand back a placeholder candidate.
@@ -140,19 +161,32 @@ pub(crate) fn stage_candidate(uri: &str) -> Option<Candidate> {
 }
 
 impl Candidate {
-    // Read the page count and the tallest paper height from one document open.
-    pub(crate) fn probe(&self) -> Option<(i32, Option<f64>)> {
+    // Read all paper sizes from one document open.
+    pub(crate) fn probe(&self) -> Option<DocumentInfo> {
         if let Some(cfg) = crate::emulate::config() {
-            return Some((cfg.pages, Some(cfg.page_pt.1)));
+            return Some(DocumentInfo {
+                page_sizes: vec![
+                    Some(PageSize {
+                        width: cfg.page_pt.0,
+                        height: cfg.page_pt.1,
+                    });
+                    cfg.pages as usize
+                ],
+            });
         }
         let _ctx = Colorspace::device_bgr();
         let doc = Document::open(self.path.as_path()).ok()?;
         let n_pages = doc.page_count().ok()?;
-        let tallest_page_height = (0..n_pages)
-            .filter_map(|index| doc.load_page(index).ok()?.bounds().ok())
-            .map(|bounds| f64::from(bounds.y1 - bounds.y0))
-            .max_by(f64::total_cmp);
-        Some((n_pages, tallest_page_height))
+        let page_sizes = (0..n_pages)
+            .map(|index| {
+                let bounds = doc.load_page(index).ok()?.bounds().ok()?;
+                Some(PageSize {
+                    width: f64::from(bounds.x1 - bounds.x0),
+                    height: f64::from(bounds.y1 - bounds.y0),
+                })
+            })
+            .collect();
+        Some(DocumentInfo { page_sizes })
     }
 
     // Publish the validated temp so workers render these exact bytes. Call after invalidate().
@@ -623,7 +657,12 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         let uri = margin_pdf_uri();
         assert_eq!(
             stage_candidate(&uri).unwrap().probe(),
-            Some((1, Some(200.0)))
+            Some(DocumentInfo {
+                page_sizes: vec![Some(PageSize {
+                    width: 200.0,
+                    height: 200.0,
+                })],
+            })
         );
         assert_eq!(page_size(&uri, 0), Some((200.0, 200.0)));
         // out-of-range / unopenable degrade rather than panic
@@ -655,7 +694,22 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
 
         assert_eq!(
             stage_candidate(&uri).unwrap().probe(),
-            Some((3, Some(3000.0)))
+            Some(DocumentInfo {
+                page_sizes: vec![
+                    Some(PageSize {
+                        width: 200.0,
+                        height: 200.0,
+                    }),
+                    Some(PageSize {
+                        width: 2000.0,
+                        height: 3000.0,
+                    }),
+                    Some(PageSize {
+                        width: 400.0,
+                        height: 400.0,
+                    }),
+                ],
+            })
         );
     }
 
@@ -685,10 +739,9 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         std::fs::write(&path, TALL_LAST_PAGE_PDF).unwrap();
         let uri = format!("file://{}", path.display());
 
-        assert_eq!(
-            stage_candidate(&uri).unwrap().probe(),
-            Some((12, Some(900.0)))
-        );
+        let info = stage_candidate(&uri).unwrap().probe().unwrap();
+        assert_eq!(info.page_sizes.len(), 12);
+        assert_eq!(info.tallest_page_height(), Some(900.0));
     }
 
     // A 300x200 page with /Rotate 90 (displayed 200x300) and the word "Hello" near the top-left of

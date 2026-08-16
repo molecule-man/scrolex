@@ -40,5 +40,7 @@ assets = [
 	["resources/icon-128.png", "usr/share/icons/hicolor/128x128/apps/com.andr2i.scrolex.png", "644"],
 	["resources/icon-256.png", "usr/share/icons/hicolor/256x256/apps/com.andr2i.scrolex.png", "644"],
 	["resources/icon-512.png", "usr/share/icons/hicolor/512x512/apps/com.andr2i.scrolex.png", "644"],
-	["resources/com.andr2i.scrolex.metainfo.xml", "usr/share/metainfo/", "644"]
+	["resources/com.andr2i.scrolex.metainfo.xml", "usr/share/metainfo/", "644"],
+	["THIRD_PARTY_LICENSES.md", "usr/share/licenses/scrolex/", "644"],
+	["licenses/Qogir-icon-theme-GPL-3.0.txt", "usr/share/licenses/scrolex/", "644"]
 ]

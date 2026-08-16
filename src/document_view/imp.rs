@@ -17,6 +17,7 @@ use gtk::{
 };
 use gtk::{prelude::*, GestureClick};
 
+use super::{ReaderKeyContext, ZoomChoice, ZoomChoiceAction};
 use crate::page;
 use crate::state::State;
 
@@ -97,6 +98,23 @@ struct KineticPan {
     vel: f64,
     // previous tick's frame time; -1 until the first tick
     last_frame: i64,
+}
+
+#[derive(Clone)]
+struct ZoomChoiceDraft {
+    zoom: f64,
+    descriptions: Vec<String>,
+    action: ZoomChoiceAction,
+    action_priority: u8,
+    current: bool,
+    shortcut: bool,
+}
+
+struct WidthFit {
+    zoom: f64,
+    first: i32,
+    count: usize,
+    first_top: f64,
 }
 
 // One open document: its state, page list, and everything that reads or moves the viewport.
@@ -686,8 +704,115 @@ impl DocumentView {
         self.zoom_centered(self.state.zoom() * ZOOM_STEP);
     }
 
-    fn reset_zoom(&self) {
+    pub(super) fn reset_zoom(&self) {
         self.zoom_centered(1.0);
+    }
+
+    pub(super) fn zoom_choices(&self) -> Vec<ZoomChoice> {
+        let mut choices = Vec::new();
+        for zoom in [0.75, 1.0, 1.5, 2.0] {
+            add_zoom_choice(
+                &mut choices,
+                zoom,
+                None,
+                ZoomChoiceAction::Scale(zoom),
+                0,
+                false,
+                false,
+            );
+        }
+
+        for count in [4, 3] {
+            if let Some((first, zoom)) = self.page_count_fit(count) {
+                add_zoom_choice(
+                    &mut choices,
+                    zoom,
+                    Some(format!("fit {count} pages")),
+                    ZoomChoiceAction::FitPages { first, count, zoom },
+                    2,
+                    false,
+                    false,
+                );
+            }
+        }
+
+        if let Some(zoom) = self.fit_height_zoom() {
+            add_zoom_choice(
+                &mut choices,
+                zoom,
+                Some("fit to height".to_string()),
+                ZoomChoiceAction::FitHeight(zoom),
+                1,
+                false,
+                false,
+            );
+        }
+
+        if let Some(fit) = self.visible_width_fit() {
+            let page_word = if fit.count == 1 { "page" } else { "pages" };
+            add_zoom_choice(
+                &mut choices,
+                fit.zoom,
+                Some(format!("fit {} {page_word}", fit.count)),
+                ZoomChoiceAction::FitVisible,
+                3,
+                false,
+                true,
+            );
+        }
+
+        let current = self.state.zoom();
+        add_zoom_choice(
+            &mut choices,
+            current,
+            None,
+            ZoomChoiceAction::Scale(current),
+            0,
+            true,
+            false,
+        );
+
+        choices.sort_by(|a, b| a.zoom.total_cmp(&b.zoom));
+        choices
+            .into_iter()
+            .filter(|choice| crate::state::zoom_is_supported(choice.zoom))
+            .map(|choice| {
+                let mut label = String::new();
+                if choice.current {
+                    label.push_str("✓  ");
+                }
+                label.push_str(&crate::state::zoom_percent_text(choice.zoom));
+                label.push('%');
+                if !choice.descriptions.is_empty() {
+                    label.push_str("  ");
+                    label.push_str(&choice.descriptions.join(", "));
+                }
+                if choice.shortcut {
+                    label.push_str("  (W)");
+                }
+                ZoomChoice {
+                    label,
+                    action: choice.action,
+                }
+            })
+            .collect()
+    }
+
+    pub(super) fn apply_zoom_choice(&self, choice: &ZoomChoice) {
+        match choice.action {
+            ZoomChoiceAction::Scale(zoom) => self.zoom_centered(zoom),
+            ZoomChoiceAction::FitHeight(zoom) => {
+                let anchor = self
+                    .mapped_page(self.state.page() as i32)
+                    .and_then(|page| self.page_origin(&page))
+                    .unwrap_or_else(|| self.viewport_center());
+                self.zoom_at(zoom, anchor);
+            }
+            ZoomChoiceAction::FitPages { first, count, zoom } => {
+                self.apply_page_count_fit(first, count, zoom, true);
+            }
+            ZoomChoiceAction::FitVisible => self.fit_width(),
+        }
     }
 
     // Defer the fit until the current layout ends.
@@ -744,6 +869,163 @@ impl DocumentView {
         let tallest = self.state.tallest_page_height();
 
         (viewport > 0.0 && tallest > 0.0).then(|| viewport / tallest)
+    }
+
+    pub(super) fn fit_width(&self) {
+        if self.zoom_anchor_pending.get() {
+            return;
+        }
+        let zoom = self.state.zoom();
+        let Some(fit) = self.visible_width_fit() else {
+            return;
+        };
+
+        self.cancel_scroll_motion();
+        self.zoom_anchor.set(Some(ZoomAnchor {
+            page: fit.first,
+            offset: (0.0, 0.0),
+            screen: (0.0, fit.first_top),
+        }));
+        self.zoom_at(fit.zoom, (0.0, fit.first_top));
+        if self.state.zoom() == zoom {
+            let Some(first) = self.mapped_page(fit.first) else {
+                return;
+            };
+            let Some((first_left, _)) = self.page_origin(&first) else {
+                return;
+            };
+            let hadj = self.scrolledwindow.hadjustment();
+            let target = self.clamp_scroll(hadj.value() + first_left);
+            self.set_hscroll(target, "fit-width");
+        }
+    }
+
+    fn visible_width_fit(&self) -> Option<WidthFit> {
+        let viewport = self.scrolledwindow.hadjustment().page_size();
+        let current_zoom = self.state.zoom();
+        if viewport <= 0.0 || current_zoom <= 0.0 {
+            return None;
+        }
+        let pages = self.pages_for_width_fit(viewport);
+        let first = pages.first()?;
+        let (first_left, first_top) = self.page_origin(first)?;
+        let last = pages.last()?;
+        let (last_left, _) = self.page_origin(last)?;
+        let paper_px: f64 = pages.iter().map(|page| f64::from(page.width())).sum();
+        let span = last_left + f64::from(last.width()) - first_left;
+        let gaps = (span - paper_px).max(0.0);
+        let paper_points = paper_px / current_zoom;
+        let zoom = fit_width_zoom(viewport, paper_points, gaps)?;
+        Some(WidthFit {
+            zoom,
+            first: first.index(),
+            count: pages.len(),
+            first_top,
+        })
+    }
+
+    fn page_count_fit(&self, count: usize) -> Option<(i32, f64)> {
+        let n_pages = usize::try_from(self.state.n_pages()).ok()?;
+        let selected = self.state.page() as usize;
+        let first = page_range_start(n_pages, selected, count)?;
+        let paper_points = (first..first + count).try_fold(0.0, |sum, index| {
+            let index = i32::try_from(index).ok()?;
+            let size = self.state.page_size(index)?;
+            let width = if self.state.crop() {
+                self.state
+                    .bbox_cache()
+                    .borrow()
+                    .get(&index)
+                    .map(|bbox| bbox.size().0)
+                    .unwrap_or(size.width)
+            } else {
+                size.width
+            };
+            Some(sum + width)
+        })?;
+        let viewport = self.scrolledwindow.hadjustment().page_size();
+        let gaps = self.page_gap() * (count.saturating_sub(1)) as f64;
+        let zoom = fit_width_zoom(viewport, paper_points, gaps)?;
+        Some((first as i32, zoom))
+    }
+
+    fn page_gap(&self) -> f64 {
+        let mut pages = self.pages_for_width_fit(f64::MAX);
+        pages.sort_by_key(|page| page.index());
+        let gaps: Vec<f64> = pages
+            .windows(2)
+            .filter_map(|pair| {
+                let (left, _) = self.page_origin(&pair[0])?;
+                let (next_left, _) = self.page_origin(&pair[1])?;
+                Some((next_left - left - f64::from(pair[0].width())).max(0.0))
+            })
+            .collect();
+        if gaps.is_empty() {
+            0.0
+        } else {
+            gaps.iter().sum::<f64>() / gaps.len() as f64
+        }
+    }
+
+    fn apply_page_count_fit(&self, first: i32, count: usize, zoom: f64, realize: bool) {
+        if self.zoom_anchor_pending.get() {
+            return;
+        }
+        let Some(page) = self.mapped_page(first) else {
+            if realize {
+                self.listview
+                    .scroll_to(first as u32, gtk::ListScrollFlags::NONE, None);
+                glib::idle_add_local_once(clone!(
+                    #[weak(rename_to = imp)]
+                    self,
+                    move || imp.apply_page_count_fit(first, count, zoom, false)
+                ));
+            }
+            return;
+        };
+        let Some((first_left, first_top)) = self.page_origin(&page) else {
+            return;
+        };
+        let before = self.state.zoom();
+        self.cancel_scroll_motion();
+        self.zoom_anchor.set(Some(ZoomAnchor {
+            page: first,
+            offset: (0.0, 0.0),
+            screen: (0.0, first_top),
+        }));
+        self.zoom_at(zoom, (0.0, first_top));
+        if self.state.zoom() == before {
+            let hadj = self.scrolledwindow.hadjustment();
+            let target = self.clamp_scroll(hadj.value() + first_left);
+            self.set_hscroll(target, "fit-pages");
+        }
+        log::debug!(target: "scrolex::fit", "fit {count} pages from page {first}");
+    }
+
+    fn pages_for_width_fit(&self, viewport: f64) -> Vec<page::Page> {
+        let mut pages = Vec::new();
+        let mut child = self.listview.first_child();
+        while let Some(widget) = child {
+            if let Some(page) = descendant_page(&widget) {
+                if page.is_mapped() && page.width() > 0 {
+                    if let Some((left, _)) = self.page_origin(&page) {
+                        let center = left + f64::from(page.width()) / 2.0;
+                        if center >= 0.0 && center <= viewport {
+                            pages.push((left, page));
+                        }
+                    }
+                }
+            }
+            child = widget.next_sibling();
+        }
+        pages.sort_by(|(left_a, _), (left_b, _)| left_a.total_cmp(left_b));
+        if pages.is_empty() {
+            return self
+                .mapped_page(self.state.page() as i32)
+                .into_iter()
+                .collect();
+        }
+        pages.into_iter().map(|(_, page)| page).collect()
     }
 
     fn cache_fit_chrome_height(&self, page: &page::Page) {
@@ -943,111 +1225,94 @@ impl DocumentView {
     }
 
     #[template_callback]
-    fn handle_key_press(
+    pub(super) fn handle_key_press(
         &self,
         keyval: Key,
         _keycode: u32,
         modifier: ModifierType,
     ) -> glib::Propagation {
+        self.handle_reader_key(keyval, modifier, ReaderKeyContext::Document)
+    }
+
+    pub(super) fn handle_reader_key(
+        &self,
+        keyval: Key,
+        modifier: ModifierType,
+        context: ReaderKeyContext,
+    ) -> glib::Propagation {
+        let control = modifier.contains(ModifierType::CONTROL_MASK);
         match keyval {
-            Key::c
-                if modifier.contains(ModifierType::CONTROL_MASK) && self.state.has_selection() =>
-            {
-                self.copy_selection();
+            Key::c if control && self.state.has_selection() => {
+                run_reader_action(context, false, || self.copy_selection())
             }
             Key::Escape if self.state.has_selection() => {
-                self.state.clear_selection();
+                run_reader_action(context, false, || self.state.clear_selection())
             }
-            Key::o => {
-                self.obj().emit_by_name::<()>("open-requested", &[]);
-            }
-            // plain t only: Ctrl+T opens a tab
-            Key::t if !modifier.contains(ModifierType::CONTROL_MASK) => {
+            Key::o => run_reader_action(context, true, || {
+                self.obj().emit_by_name::<()>("open-requested", &[])
+            }),
+            Key::t if !control => run_reader_action(context, true, || {
                 if !self.toc_pages.borrow().is_empty() {
                     self.toc_revealer
                         .set_reveal_child(!self.toc_revealer.reveals_child());
                 }
+            }),
+            Key::f => run_reader_action(context, true, || self.open_search()),
+            Key::w => run_reader_action(context, true, || self.fit_width()),
+            Key::l | Key::Page_Down => run_reader_action(context, true, || self.next_page()),
+            Key::h | Key::Page_Up => run_reader_action(context, true, || self.prev_page()),
+            Key::Home => run_reader_action(context, false, || self.goto_page(1)),
+            Key::End => run_reader_action(context, false, || self.goto_page(u32::MAX)),
+            Key::bracketleft => run_reader_action(context, true, || self.zoom_out()),
+            Key::bracketright => run_reader_action(context, true, || self.zoom_in()),
+            // Ctrl+plus needs Shift on most layouts, so Ctrl+equal zooms in too.
+            Key::plus | Key::equal | Key::KP_Add if control => {
+                run_reader_action(context, true, || self.zoom_in())
             }
-            Key::f => {
-                self.open_search();
+            Key::minus | Key::KP_Subtract if control => {
+                run_reader_action(context, true, || self.zoom_out())
             }
-            Key::l | Key::Page_Down => {
-                self.next_page();
+            Key::_0 | Key::KP_0 if control => {
+                run_reader_action(context, true, || self.reset_zoom())
             }
-            Key::h | Key::Page_Up => {
-                self.prev_page();
+            Key::n if self.state.search().borrow().total() > 0 => {
+                run_reader_action(context, true, || self.next_match())
             }
-            Key::Home => {
-                self.goto_page(1);
+            Key::N if self.state.search().borrow().total() > 0 => {
+                run_reader_action(context, true, || self.prev_match())
             }
-            Key::End => {
-                // clamps to the last page in navigate_to_page
-                self.goto_page(u32::MAX);
-            }
-            Key::bracketleft => {
-                self.zoom_out();
-            }
-            Key::bracketright => {
-                self.zoom_in();
-            }
-            // Ctrl+plus needs Shift on most layouts, so Ctrl+equal zooms in too
-            Key::plus | Key::equal | Key::KP_Add
-                if modifier.contains(ModifierType::CONTROL_MASK) =>
-            {
-                self.zoom_in();
-            }
-            Key::minus | Key::KP_Subtract if modifier.contains(ModifierType::CONTROL_MASK) => {
-                self.zoom_out();
-            }
-            Key::_0 | Key::KP_0 if modifier.contains(ModifierType::CONTROL_MASK) => {
-                self.reset_zoom();
-            }
-            Key::n | Key::N => {
-                if self.state.search().borrow().total() == 0 {
-                    return glib::Propagation::Proceed;
-                }
-                if keyval == Key::N {
-                    self.prev_match();
-                } else {
-                    self.next_match();
-                }
-            }
-            Key::Left | Key::Right => {
-                // fine horizontal scroll; handled here rather than relying on the scrolled window's
-                // own key bindings, which only fire when it directly holds focus
-                //
-                // Like a drag, this fine nudge takes over the horizontal position, so drop any
-                // in-flight page slide; otherwise scroll_tick would overwrite the nudge each frame.
-                // (h/l intentionally keep the slide running - they step pages and retarget it.)
-                *self.scroll_anim.borrow_mut() = None;
-                let hadj = self.scrolledwindow.hadjustment();
-                let step = if hadj.step_increment() > 0.0 {
-                    hadj.step_increment()
-                } else {
-                    hadj.page_size() * 0.1
-                };
-                let delta = if keyval == Key::Left { -step } else { step };
-                self.set_scroll_direction_from_delta(delta);
-                self.set_hscroll(hadj.value() + delta, "arrow-key");
-            }
-            Key::Up | Key::Down | Key::k | Key::j => {
-                // vertical pan of a zoomed-in page. The outer scroller owns the vertical axis (the
-                // horizontal listview doesn't scroll its cross axis); k/Up pan up, j/Down pan down.
-                // the nudge owns the axis; a coast would overwrite it next frame
-                self.vscroll_anim.set(None);
-                let vadj = self.vscrolledwindow.vadjustment();
-                let step = if vadj.step_increment() > 0.0 {
-                    vadj.step_increment()
-                } else {
-                    vadj.page_size() * 0.1
-                };
-                let up = keyval == Key::Up || keyval == Key::k;
-                vadj.set_value(vadj.value() + if up { -step } else { step });
-            }
-            _ => return glib::Propagation::Proceed,
+            Key::Left => run_reader_action(context, false, || self.pan_horizontal(-1.0)),
+            Key::Right => run_reader_action(context, false, || self.pan_horizontal(1.0)),
+            Key::Up => run_reader_action(context, false, || self.pan_vertical(-1.0)),
+            Key::Down => run_reader_action(context, false, || self.pan_vertical(1.0)),
+            Key::k => run_reader_action(context, true, || self.pan_vertical(-1.0)),
+            Key::j => run_reader_action(context, true, || self.pan_vertical(1.0)),
+            _ => glib::Propagation::Proceed,
         }
+    }
 
-        glib::Propagation::Stop
+    fn pan_horizontal(&self, direction: f64) {
+        *self.scroll_anim.borrow_mut() = None;
+        let hadj = self.scrolledwindow.hadjustment();
+        let step = if hadj.step_increment() > 0.0 {
+            hadj.step_increment()
+        } else {
+            hadj.page_size() * 0.1
+        };
+        let delta = step * direction;
+        self.set_scroll_direction_from_delta(delta);
+        self.set_hscroll(hadj.value() + delta, "arrow-key");
+    }
+
+    fn pan_vertical(&self, direction: f64) {
+        self.vscroll_anim.set(None);
+        let vadj = self.vscrolledwindow.vadjustment();
+        let step = if vadj.step_increment() > 0.0 {
+            vadj.step_increment()
+        } else {
+            vadj.page_size() * 0.1
+        };
+        vadj.set_value(vadj.value() + step * direction);
     }
 
     // The only writer of the clipboard; a drag publishes to the primary selection instead.
@@ -2421,6 +2686,64 @@ fn hscrollbar_reserve(scroller: &gtk::ScrolledWindow) -> f64 {
     })
 }
 
+fn fit_width_zoom(viewport: f64, paper_points: f64, gaps: f64) -> Option<f64> {
+    (viewport > gaps && paper_points > 0.0).then(|| (viewport - gaps) / paper_points)
+}
+
+fn run_reader_action(
+    context: ReaderKeyContext,
+    allowed_in_numeric_entry: bool,
+    action: impl FnOnce(),
+) -> glib::Propagation {
+    if context == ReaderKeyContext::NumericEntry && !allowed_in_numeric_entry {
+        return glib::Propagation::Proceed;
+    }
+    action();
+    glib::Propagation::Stop
+}
+
+fn page_range_start(n_pages: usize, selected: usize, count: usize) -> Option<usize> {
+    (count > 0 && n_pages >= count).then(|| selected.min(n_pages - count))
+}
+
+fn add_zoom_choice(
+    choices: &mut Vec<ZoomChoiceDraft>,
+    zoom: f64,
+    description: Option<String>,
+    action: ZoomChoiceAction,
+    action_priority: u8,
+    current: bool,
+    shortcut: bool,
+) {
+    let percent = crate::state::zoom_percent_text(zoom);
+    if let Some(choice) = choices
+        .iter_mut()
+        .find(|choice| crate::state::zoom_percent_text(choice.zoom) == percent)
+    {
+        if let Some(description) = description {
+            if !choice.descriptions.contains(&description) {
+                choice.descriptions.push(description);
+            }
+        }
+        if action_priority > choice.action_priority {
+            choice.action = action;
+            choice.action_priority = action_priority;
+        }
+        choice.current |= current;
+        choice.shortcut |= shortcut;
+        return;
+    }
+
+    choices.push(ZoomChoiceDraft {
+        zoom,
+        descriptions: description.into_iter().collect(),
+        action,
+        action_priority,
+        current,
+        shortcut,
+    });
+}
+
 // Find the Page widget within a list item's widget subtree.
 fn descendant_page(widget: &gtk::Widget) -> Option<page::Page> {
     if let Some(page) = widget.downcast_ref::<page::Page>() {
@@ -2439,9 +2762,72 @@ fn descendant_page(widget: &gtk::Widget) -> Option<page::Page> {
 #[cfg(test)]
 mod tests {
     use super::{
-        accumulate_step, glide_step, kinetic_step, KINETIC_TAU_US, SCROLL_ANIM_MAX_US,
+        accumulate_step, add_zoom_choice, fit_width_zoom, glide_step, kinetic_step,
+        page_range_start, run_reader_action, KINETIC_TAU_US, SCROLL_ANIM_MAX_US,
         SCROLL_ANIM_TAU_US, WHEEL_NOTCH, WHEEL_TRIGGER,
     };
+    use crate::document_view::{ReaderKeyContext, ZoomChoiceAction};
+
+    #[test]
+    fn width_fit_scales_papers_but_not_gaps() {
+        let zoom = fit_width_zoom(1000.0, 700.0, 12.0).unwrap();
+        assert!((700.0 * zoom + 12.0 - 1000.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn page_fit_uses_the_final_pages_at_the_document_end() {
+        assert_eq!(page_range_start(10, 2, 4), Some(2));
+        assert_eq!(page_range_start(10, 9, 4), Some(6));
+        assert_eq!(page_range_start(3, 0, 4), None);
+    }
+
+    #[test]
+    fn equal_displayed_percentages_share_one_zoom_choice() {
+        let mut choices = Vec::new();
+        add_zoom_choice(
+            &mut choices,
+            1.0,
+            None,
+            ZoomChoiceAction::Scale(1.0),
+            0,
+            true,
+            false,
+        );
+        add_zoom_choice(
+            &mut choices,
+            1.000_01,
+            Some("fit 4 pages".to_string()),
+            ZoomChoiceAction::FitPages {
+                first: 0,
+                count: 4,
+                zoom: 1.000_01,
+            },
+            2,
+            false,
+            true,
+        );
+
+        assert_eq!(choices.len(), 1);
+        assert!(choices[0].current);
+        assert!(choices[0].shortcut);
+        assert_eq!(choices[0].descriptions, ["fit 4 pages"]);
+        assert!(matches!(
+            choices[0].action,
+            ZoomChoiceAction::FitPages { count: 4, .. }
+        ));
+    }
+
+    #[test]
+    fn numeric_entry_policy_controls_reader_actions() {
+        let ran = std::cell::Cell::new(false);
+        let result = run_reader_action(ReaderKeyContext::NumericEntry, false, || ran.set(true));
+        assert_eq!(result, gtk::glib::Propagation::Proceed);
+        assert!(!ran.get());
+
+        let result = run_reader_action(ReaderKeyContext::NumericEntry, true, || ran.set(true));
+        assert_eq!(result, gtk::glib::Propagation::Stop);
+        assert!(ran.get());
+    }
 
     // Drive the glide toward a fixed target at a steady frame rate; return frames until it settles.
     fn glide_frames(mut value: f64, target: f64, dt_us: i64, tau_us: f64) -> usize {
@@ -3045,6 +3431,12 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
 3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 300] >>\nendobj\n\
 trailer\n<< /Root 1 0 R >>\n%%EOF";
 
+    const NARROW_PAGE_PDF: &[u8] = b"%PDF-1.4\n\
+1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n\
+2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n\
+3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 20 300] >>\nendobj\n\
+trailer\n<< /Root 1 0 R >>\n%%EOF";
+
     fn mixed_heights_document() -> gtk::gio::File {
         let dir = std::env::temp_dir().join("scrolex_fit_height_test");
         std::fs::create_dir_all(&dir).unwrap();
@@ -3059,6 +3451,15 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("one_page.pdf");
         std::fs::write(&path, ONE_PAGE_PDF).unwrap();
+
+        gtk::gio::File::for_path(path)
+    }
+
+    fn narrow_page_document() -> gtk::gio::File {
+        let dir = std::env::temp_dir().join("scrolex_fit_width_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("narrow_page.pdf");
+        std::fs::write(&path, NARROW_PAGE_PDF).unwrap();
 
         gtk::gio::File::for_path(path)
     }
@@ -3098,6 +3499,65 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
             (asked - viewport).abs() <= 1.0,
             "the list asks for {asked}px, and the viewport holds {viewport}px",
         );
+    }
+
+    #[gtk::test]
+    fn width_fit_aligns_the_visible_range_without_slots() {
+        let window = window();
+        window.present();
+        let imp = window.imp();
+        window.state().load(&mixed_heights_document());
+        wait_until(|| imp.selection.n_items() == 3);
+
+        imp.state.zoom_to(0.1);
+        wait_until(|| (0..3).all(|index| imp.mapped_page(index).is_some()));
+        let viewport = imp.scrolledwindow.hadjustment().page_size();
+        let pages = imp.pages_for_width_fit(viewport);
+        assert_eq!(pages.len(), 3);
+        let first = pages.first().unwrap().index();
+        let last = pages.last().unwrap().index();
+
+        imp.fit_width();
+        let fitted_zoom = imp.state.zoom();
+        imp.fit_width();
+        assert_eq!(
+            imp.state.zoom(),
+            fitted_zoom,
+            "a repeated action must wait for the first layout"
+        );
+        wait_until(|| !imp.zoom_anchor_pending.get());
+
+        let first_page = imp.mapped_page(first).unwrap();
+        let last_page = imp.mapped_page(last).unwrap();
+        let first_left = imp.page_origin(&first_page).unwrap().0;
+        let last_right = imp.page_origin(&last_page).unwrap().0 + f64::from(last_page.width());
+        assert!(first_left.abs() <= 1.0, "first edge is {first_left}");
+        assert!(
+            (last_right - viewport).abs() <= 2.0,
+            "last edge is {last_right}"
+        );
+        assert!(first_page.width() < imp.mapped_page(1).unwrap().width());
+        assert_eq!(imp.state.manual_zoom(), imp.state.zoom());
+        window.close();
+    }
+
+    #[gtk::test]
+    fn width_fit_aligns_when_the_target_exceeds_the_zoom_limit() {
+        let window = window();
+        window.present();
+        let imp = window.imp();
+        window.state().load(&narrow_page_document());
+        wait_until(|| imp.mapped_page(0).is_some());
+
+        imp.state.zoom_to(10.0);
+        wait_until(|| imp.mapped_page(0).is_some_and(|page| page.width() >= 200));
+        imp.hscroll_intent.set((f64::NAN, "test"));
+
+        imp.fit_width();
+
+        assert_eq!(imp.state.zoom(), 10.0);
+        assert_eq!(imp.hscroll_intent.get().1, "fit-width");
+        window.close();
     }
 
     // The reader has nothing left to pan to: the page is exactly as tall as the viewport. The list

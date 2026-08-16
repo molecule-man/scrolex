@@ -10,7 +10,7 @@ use gtk::prelude::*;
 use gtk::subclass::prelude::*;
 use gtk::{glib, Button, CompositeTemplate, ToggleButton};
 
-use crate::document_view::DocumentView;
+use crate::document_view::{DocumentView, ReaderKeyContext};
 
 // Tabs stop being a useful way to hold documents well before this. The cap also limits each
 // document's render state and widget tree.
@@ -37,6 +37,12 @@ pub struct Window {
     pub btn_crop: TemplateChild<ToggleButton>,
     #[template_child]
     pub btn_fit_height: TemplateChild<ToggleButton>,
+    #[template_child]
+    pub btn_zoom_menu: TemplateChild<gtk::MenuButton>,
+    #[template_child]
+    pub zoom_popover: TemplateChild<gtk::Popover>,
+    #[template_child]
+    pub zoom_options: TemplateChild<gtk::Box>,
     #[template_child]
     pub btn_animate_scroll: TemplateChild<ToggleButton>,
     #[template_child]
@@ -133,6 +139,12 @@ impl ObjectImpl for Window {
         self.setup_drop_target();
         self.setup_window_keys();
 
+        self.zoom_popover.connect_map(clone!(
+            #[weak(rename_to = imp)]
+            self,
+            move |_| imp.rebuild_zoom_options()
+        ));
+
         // Drop each document's render-pool state when the window closes.
         self.obj().connect_close_request(clone!(
             #[weak(rename_to = imp)]
@@ -159,9 +171,7 @@ impl ObjectImpl for Window {
 
 #[gtk::template_callbacks]
 impl Window {
-    // Capture phase, on the window: the tab, fullscreen, and search keys must work wherever the
-    // focus sits, including the header entries and the contents panel. Capture also stops Escape
-    // from double-firing the search entry's own stop-search.
+    // Capture phase keeps shortcuts active outside the document widget tree.
     fn setup_window_keys(&self) {
         let key = gtk::EventControllerKey::new();
         key.set_propagation_phase(gtk::PropagationPhase::Capture);
@@ -229,6 +239,27 @@ impl Window {
         });
         if matches!(taken_doc, glib::Propagation::Stop) {
             return taken_doc;
+        }
+
+        if let Some(document) = doc.as_ref() {
+            let focus = gtk::prelude::GtkWindowExt::focus(&*self.obj());
+            let outside_document = focus
+                .as_ref()
+                .is_none_or(|focus| !widget_is_within(focus, document.upcast_ref()));
+            let edits_text = focus
+                .as_ref()
+                .is_some_and(|focus| focus.is::<gtk::Editable>());
+            if outside_document {
+                let context = if edits_text {
+                    ReaderKeyContext::NumericEntry
+                } else {
+                    ReaderKeyContext::Document
+                };
+                let taken = document.handle_reader_key(keyval, modifier, context);
+                if matches!(taken, glib::Propagation::Stop) {
+                    return taken;
+                }
+            }
         }
 
         let selected = doc.is_some_and(|doc| doc.state().has_selection());
@@ -431,6 +462,40 @@ impl Window {
     // template, before the first document exists.
     pub(crate) fn active_document(&self) -> Option<DocumentView> {
         self.active_document.borrow().clone()
+    }
+
+    fn rebuild_zoom_options(&self) {
+        while let Some(child) = self.zoom_options.first_child() {
+            self.zoom_options.remove(&child);
+        }
+        let Some(document) = self.active_document() else {
+            return;
+        };
+
+        for choice in document.zoom_choices() {
+            let label = gtk::Label::builder()
+                .label(&choice.label)
+                .xalign(0.0)
+                .build();
+            let button = Button::builder()
+                .child(&label)
+                .has_frame(false)
+                .hexpand(true)
+                .build();
+            button.connect_clicked(clone!(
+                #[strong]
+                document,
+                #[strong]
+                choice,
+                #[weak(rename_to = popover)]
+                self.zoom_popover,
+                move |_| {
+                    popover.popdown();
+                    document.apply_zoom_choice(&choice);
+                }
+            ));
+            self.zoom_options.append(&button);
+        }
     }
 
     // A single document needs no tab bar.
@@ -940,6 +1005,17 @@ fn document_path(uri: &str) -> String {
     )
 }
 
+fn widget_is_within(widget: &gtk::Widget, ancestor: &gtk::Widget) -> bool {
+    let mut current = Some(widget.clone());
+    while let Some(widget) = current {
+        if widget == *ancestor {
+            return true;
+        }
+        current = widget.parent();
+    }
+    false
+}
+
 fn dismiss_menu(btn: &Button) {
     if let Some(popover) = btn
         .ancestor(gtk::Popover::static_type())
@@ -971,6 +1047,130 @@ mod widget_tests {
         }
         document.state().set_n_pages(count as i32);
         selection.set_selected(selected);
+    }
+
+    #[gtk::test]
+    fn toolbar_buttons_use_the_embedded_icons() {
+        let window = loaded_window();
+
+        assert_eq!(
+            window.header().btn_crop.icon_name().as_deref(),
+            Some("image-crop-symbolic")
+        );
+        assert_eq!(
+            window.header().btn_crop.tooltip_text().as_deref(),
+            Some("Keep horizontal page margins cropped")
+        );
+        assert_eq!(
+            window.header().btn_fit_height.icon_name().as_deref(),
+            Some("zoom-fit-height-symbolic")
+        );
+        assert_eq!(
+            window.header().btn_fit_height.tooltip_text().as_deref(),
+            Some("Keep pages fitted to the window height")
+        );
+        assert_eq!(
+            window.header().btn_zoom_menu.tooltip_text().as_deref(),
+            Some("Zoom options")
+        );
+
+        for name in ["image-crop-symbolic.svg", "zoom-fit-height-symbolic.svg"] {
+            let path = format!("/com/andr2i/scrolex/icons/scalable/actions/{name}");
+            let icon = gtk::gio::resources_lookup_data(&path, gtk::gio::ResourceLookupFlags::NONE)
+                .expect("fit icon resource");
+            assert!(!icon.is_empty());
+        }
+    }
+
+    #[gtk::test]
+    fn zoom_menu_resets_zoom_and_ends_fit_height() {
+        let window = loaded_window();
+        let document = window.header().active_document().expect("a document");
+        document.state().set_zoom(2.0);
+        document.state().set_fit_height(true);
+
+        let choice = document
+            .zoom_choices()
+            .into_iter()
+            .find(|choice| choice.label.contains("100%"))
+            .expect("100% choice");
+        document.apply_zoom_choice(&choice);
+
+        assert_eq!(document.state().zoom(), 1.0);
+        assert!(!document.state().fit_height());
+        window.close();
+    }
+
+    #[gtk::test]
+    fn zoom_menu_fits_visible_pages_to_width() {
+        let window = loaded_window();
+        let document = window.header().active_document().expect("a document");
+        document.apply_zoom_percent(50.0);
+        wait_until(|| window.header().entry_zoom.text() == "50");
+
+        let choice = document
+            .zoom_choices()
+            .into_iter()
+            .find(|choice| choice.label.contains("(W)"))
+            .expect("W choice");
+        document.apply_zoom_choice(&choice);
+
+        assert_ne!(document.state().zoom(), 0.5);
+        window.close();
+    }
+
+    #[gtk::test]
+    fn zoom_menu_lists_fixed_and_calculated_choices() {
+        let window = loaded_window();
+        window.header().rebuild_zoom_options();
+
+        let mut labels = Vec::new();
+        let mut child = window.header().zoom_options.first_child();
+        while let Some(widget) = child {
+            let button = widget.downcast_ref::<gtk::Button>().expect("zoom button");
+            let label = button
+                .child()
+                .and_downcast::<gtk::Label>()
+                .expect("zoom label");
+            labels.push(label.text().to_string());
+            child = widget.next_sibling();
+        }
+
+        for percent in ["75%", "100%", "150%", "200%"] {
+            assert!(labels.iter().any(|label| label.contains(percent)));
+        }
+        assert!(labels.iter().any(|label| label.contains("fit 3 pages")));
+        assert!(labels.iter().any(|label| label.contains("fit to height")));
+        assert!(labels.iter().any(|label| label.contains("(W)")));
+        assert!(!labels.iter().any(|label| label.contains("fit 4 pages")));
+        assert!(labels.iter().any(|label| label.starts_with('✓')));
+        window.close();
+    }
+
+    #[gtk::test]
+    fn reader_shortcuts_work_from_the_header() {
+        let window = loaded_window();
+        let document = window.header().active_document().expect("a document");
+        document.apply_zoom_percent(50.0);
+        wait_until(|| document.state().zoom() == 0.5);
+
+        window.header().entry_zoom.grab_focus();
+        let focus =
+            gtk::prelude::GtkWindowExt::focus(&*window.header().obj()).expect("header entry focus");
+        assert!(focus.is::<gtk::Editable>());
+        assert!(!super::widget_is_within(&focus, document.upcast_ref()));
+        let taken = window
+            .header()
+            .handle_window_key(gtk::gdk::Key::w, gtk::gdk::ModifierType::empty());
+
+        assert_eq!(taken, glib::Propagation::Stop);
+        assert_ne!(document.state().zoom(), 0.5);
+
+        let taken = window
+            .header()
+            .handle_window_key(gtk::gdk::Key::Left, gtk::gdk::ModifierType::empty());
+        assert_eq!(taken, glib::Propagation::Proceed);
+        window.close();
     }
 
     #[gtk::test]

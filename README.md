@@ -73,6 +73,7 @@ JPEG, TIFF, …) open as well. DjVu is not supported.
 | F11             | Toggle full screen                       |
 | `l` / PageDown  | Next page                                |
 | `h` / PageUp    | Previous page                            |
+| `w`             | Zoom pages to fit the window's width     |
 | Home            | First page                               |
 | End             | Last page                                |
 | `→`             | Scroll right                             |
