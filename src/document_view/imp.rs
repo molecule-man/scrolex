@@ -746,6 +746,76 @@ impl DocumentView {
         (viewport > 0.0 && tallest > 0.0).then(|| viewport / tallest)
     }
 
+    pub(super) fn fit_width(&self) {
+        if self.zoom_anchor_pending.get() {
+            return;
+        }
+        let viewport = self.scrolledwindow.hadjustment().page_size();
+        let zoom = self.state.zoom();
+        if viewport <= 0.0 || zoom <= 0.0 {
+            return;
+        }
+        let pages = self.pages_for_width_fit(viewport);
+        let Some(first) = pages.first() else {
+            return;
+        };
+        let Some((first_left, first_top)) = self.page_origin(first) else {
+            return;
+        };
+        let Some(last) = pages.last() else {
+            return;
+        };
+        let Some((last_left, _)) = self.page_origin(last) else {
+            return;
+        };
+        let paper_px: f64 = pages.iter().map(|page| f64::from(page.width())).sum();
+        let span = last_left + f64::from(last.width()) - first_left;
+        let gaps = (span - paper_px).max(0.0);
+        let paper_points = paper_px / zoom;
+        let Some(target_zoom) = fit_width_zoom(viewport, paper_points, gaps) else {
+            return;
+        };
+
+        self.cancel_scroll_motion();
+        self.zoom_anchor.set(Some(ZoomAnchor {
+            page: first.index(),
+            offset: (0.0, 0.0),
+            screen: (0.0, first_top),
+        }));
+        self.zoom_at(target_zoom, (0.0, first_top));
+        if self.state.zoom() == zoom {
+            let hadj = self.scrolledwindow.hadjustment();
+            let target = self.clamp_scroll(hadj.value() + first_left);
+            self.set_hscroll(target, "fit-width");
+        }
+    }
+
+    fn pages_for_width_fit(&self, viewport: f64) -> Vec<page::Page> {
+        let mut pages = Vec::new();
+        let mut child = self.listview.first_child();
+        while let Some(widget) = child {
+            if let Some(page) = descendant_page(&widget) {
+                if page.is_mapped() && page.width() > 0 {
+                    if let Some((left, _)) = self.page_origin(&page) {
+                        let center = left + f64::from(page.width()) / 2.0;
+                        if center >= 0.0 && center <= viewport {
+                            pages.push((left, page));
+                        }
+                    }
+                }
+            }
+            child = widget.next_sibling();
+        }
+        pages.sort_by(|(left_a, _), (left_b, _)| left_a.total_cmp(left_b));
+        if pages.is_empty() {
+            return self
+                .mapped_page(self.state.page() as i32)
+                .into_iter()
+                .collect();
+        }
+        pages.into_iter().map(|(_, page)| page).collect()
+    }
+
     fn cache_fit_chrome_height(&self, page: &page::Page) {
         if self.fit_chrome_height.get().is_some() {
             return;
@@ -970,6 +1040,9 @@ impl DocumentView {
             }
             Key::f => {
                 self.open_search();
+            }
+            Key::w => {
+                self.fit_width();
             }
             Key::l | Key::Page_Down => {
                 self.next_page();
@@ -2421,6 +2494,10 @@ fn hscrollbar_reserve(scroller: &gtk::ScrolledWindow) -> f64 {
     })
 }
 
+fn fit_width_zoom(viewport: f64, paper_points: f64, gaps: f64) -> Option<f64> {
+    (viewport > gaps && paper_points > 0.0).then(|| (viewport - gaps) / paper_points)
+}
+
 // Find the Page widget within a list item's widget subtree.
 fn descendant_page(widget: &gtk::Widget) -> Option<page::Page> {
     if let Some(page) = widget.downcast_ref::<page::Page>() {
@@ -2439,9 +2516,15 @@ fn descendant_page(widget: &gtk::Widget) -> Option<page::Page> {
 #[cfg(test)]
 mod tests {
     use super::{
-        accumulate_step, glide_step, kinetic_step, KINETIC_TAU_US, SCROLL_ANIM_MAX_US,
-        SCROLL_ANIM_TAU_US, WHEEL_NOTCH, WHEEL_TRIGGER,
+        accumulate_step, fit_width_zoom, glide_step, kinetic_step, KINETIC_TAU_US,
+        SCROLL_ANIM_MAX_US, SCROLL_ANIM_TAU_US, WHEEL_NOTCH, WHEEL_TRIGGER,
     };
+
+    #[test]
+    fn width_fit_scales_papers_but_not_gaps() {
+        let zoom = fit_width_zoom(1000.0, 700.0, 12.0).unwrap();
+        assert!((700.0 * zoom + 12.0 - 1000.0).abs() < f64::EPSILON);
+    }
 
     // Drive the glide toward a fixed target at a steady frame rate; return frames until it settles.
     fn glide_frames(mut value: f64, target: f64, dt_us: i64, tau_us: f64) -> usize {
@@ -3045,6 +3128,12 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
 3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 300] >>\nendobj\n\
 trailer\n<< /Root 1 0 R >>\n%%EOF";
 
+    const NARROW_PAGE_PDF: &[u8] = b"%PDF-1.4\n\
+1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n\
+2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n\
+3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 20 300] >>\nendobj\n\
+trailer\n<< /Root 1 0 R >>\n%%EOF";
+
     fn mixed_heights_document() -> gtk::gio::File {
         let dir = std::env::temp_dir().join("scrolex_fit_height_test");
         std::fs::create_dir_all(&dir).unwrap();
@@ -3059,6 +3148,15 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("one_page.pdf");
         std::fs::write(&path, ONE_PAGE_PDF).unwrap();
+
+        gtk::gio::File::for_path(path)
+    }
+
+    fn narrow_page_document() -> gtk::gio::File {
+        let dir = std::env::temp_dir().join("scrolex_fit_width_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("narrow_page.pdf");
+        std::fs::write(&path, NARROW_PAGE_PDF).unwrap();
 
         gtk::gio::File::for_path(path)
     }
@@ -3098,6 +3196,65 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
             (asked - viewport).abs() <= 1.0,
             "the list asks for {asked}px, and the viewport holds {viewport}px",
         );
+    }
+
+    #[gtk::test]
+    fn width_fit_aligns_the_visible_range_without_slots() {
+        let window = window();
+        window.present();
+        let imp = window.imp();
+        window.state().load(&mixed_heights_document());
+        wait_until(|| imp.selection.n_items() == 3);
+
+        imp.state.zoom_to(0.1);
+        wait_until(|| (0..3).all(|index| imp.mapped_page(index).is_some()));
+        let viewport = imp.scrolledwindow.hadjustment().page_size();
+        let pages = imp.pages_for_width_fit(viewport);
+        assert_eq!(pages.len(), 3);
+        let first = pages.first().unwrap().index();
+        let last = pages.last().unwrap().index();
+
+        imp.fit_width();
+        let fitted_zoom = imp.state.zoom();
+        imp.fit_width();
+        assert_eq!(
+            imp.state.zoom(),
+            fitted_zoom,
+            "a repeated action must wait for the first layout"
+        );
+        wait_until(|| !imp.zoom_anchor_pending.get());
+
+        let first_page = imp.mapped_page(first).unwrap();
+        let last_page = imp.mapped_page(last).unwrap();
+        let first_left = imp.page_origin(&first_page).unwrap().0;
+        let last_right = imp.page_origin(&last_page).unwrap().0 + f64::from(last_page.width());
+        assert!(first_left.abs() <= 1.0, "first edge is {first_left}");
+        assert!(
+            (last_right - viewport).abs() <= 2.0,
+            "last edge is {last_right}"
+        );
+        assert!(first_page.width() < imp.mapped_page(1).unwrap().width());
+        assert_eq!(imp.state.manual_zoom(), imp.state.zoom());
+        window.close();
+    }
+
+    #[gtk::test]
+    fn width_fit_aligns_when_the_target_exceeds_the_zoom_limit() {
+        let window = window();
+        window.present();
+        let imp = window.imp();
+        window.state().load(&narrow_page_document());
+        wait_until(|| imp.mapped_page(0).is_some());
+
+        imp.state.zoom_to(10.0);
+        wait_until(|| imp.mapped_page(0).is_some_and(|page| page.width() >= 200));
+        imp.hscroll_intent.set((f64::NAN, "test"));
+
+        imp.fit_width();
+
+        assert_eq!(imp.state.zoom(), 10.0);
+        assert_eq!(imp.hscroll_intent.get().1, "fit-width");
+        window.close();
     }
 
     // The reader has nothing left to pan to: the page is exactly as tall as the viewport. The list

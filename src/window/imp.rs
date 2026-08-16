@@ -38,6 +38,8 @@ pub struct Window {
     #[template_child]
     pub btn_fit_height: TemplateChild<ToggleButton>,
     #[template_child]
+    pub btn_fit_width: TemplateChild<Button>,
+    #[template_child]
     pub btn_animate_scroll: TemplateChild<ToggleButton>,
     #[template_child]
     pub btn_toc: TemplateChild<ToggleButton>,
@@ -759,6 +761,13 @@ impl Window {
     }
 
     #[template_callback]
+    fn fit_width(&self) {
+        if let Some(document) = self.active_document() {
+            document.fit_width();
+        }
+    }
+
+    #[template_callback]
     fn zoom_out(&self) {
         if let Some(document) = self.active_document() {
             document.zoom_out();
@@ -971,6 +980,35 @@ mod widget_tests {
         }
         document.state().set_n_pages(count as i32);
         selection.set_selected(selected);
+    }
+
+    #[gtk::test]
+    fn toolbar_buttons_use_the_embedded_icons() {
+        let window = loaded_window();
+
+        assert_eq!(
+            window.header().btn_crop.icon_name().as_deref(),
+            Some("image-crop-symbolic")
+        );
+        assert_eq!(
+            window.header().btn_fit_height.icon_name().as_deref(),
+            Some("zoom-fit-height-symbolic")
+        );
+        assert_eq!(
+            window.header().btn_fit_width.icon_name().as_deref(),
+            Some("zoom-fit-width-symbolic")
+        );
+
+        for name in [
+            "image-crop-symbolic.svg",
+            "zoom-fit-height-symbolic.svg",
+            "zoom-fit-width-symbolic.svg",
+        ] {
+            let path = format!("/com/andr2i/scrolex/icons/scalable/actions/{name}");
+            let icon = gtk::gio::resources_lookup_data(&path, gtk::gio::ResourceLookupFlags::NONE)
+                .expect("fit icon resource");
+            assert!(!icon.is_empty());
+        }
     }
 
     #[gtk::test]

@@ -44,6 +44,10 @@ impl DocumentView {
         self.imp().zoom_out();
     }
 
+    pub fn fit_width(&self) {
+        self.imp().fit_width();
+    }
+
     pub fn jump_back(&self) {
         self.imp().jump_back();
     }

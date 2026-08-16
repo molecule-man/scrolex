@@ -33,6 +33,8 @@ modules:
       - install -Dm644 resources/com.andr2i.scrolex.desktop /app/share/applications/com.andr2i.scrolex.desktop
       - install -Dm644 resources/com.andr2i.scrolex.metainfo.xml /app/share/metainfo/com.andr2i.scrolex.metainfo.xml
       - install -Dm644 LICENSE /app/share/licenses/com.andr2i.scrolex/LICENSE
+      - install -Dm644 THIRD_PARTY_LICENSES.md /app/share/licenses/com.andr2i.scrolex/THIRD_PARTY_LICENSES.md
+      - install -Dm644 licenses/Qogir-icon-theme-GPL-3.0.txt /app/share/licenses/com.andr2i.scrolex/Qogir-icon-theme-GPL-3.0.txt
       - install -Dm644 cargo/vendor/mupdf-sys-*/mupdf/COPYING /app/share/licenses/com.andr2i.scrolex/mupdf-COPYING
     sources:
       - type: git

@@ -281,7 +281,8 @@
 				</child>
 				<child type="end">
 					<object class="GtkToggleButton" id="btn_crop">
-						<property name="label">Crop Margins</property>
+						<property name="icon-name">image-crop-symbolic</property>
+						<property name="tooltip-text">Crop horizontal page margins</property>
 						<property name="cursor">
 							<object class="GdkCursor">
 								<property name="name">pointer</property>
@@ -291,8 +292,20 @@
 				</child>
 				<child type="end">
 					<object class="GtkToggleButton" id="btn_fit_height">
-						<property name="icon-name">zoom-fit-best-symbolic</property>
+						<property name="icon-name">zoom-fit-height-symbolic</property>
 						<property name="tooltip-text">Fit document to the window height</property>
+						<property name="cursor">
+							<object class="GdkCursor">
+								<property name="name">pointer</property>
+							</object>
+						</property>
+					</object>
+				</child>
+				<child type="end">
+					<object class="GtkButton" id="btn_fit_width">
+						<signal name="clicked" handler="fit_width" swapped="true"/>
+						<property name="icon-name">zoom-fit-width-symbolic</property>
+						<property name="tooltip-text">Fit the visible pages across the window width (w)</property>
 						<property name="cursor">
 							<object class="GdkCursor">
 								<property name="name">pointer</property>
