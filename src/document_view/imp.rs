@@ -950,7 +950,11 @@ impl DocumentView {
     }
 
     fn page_gap(&self) -> f64 {
-        let mut pages = self.pages_for_width_fit(f64::MAX);
+        let mut pages: Vec<page::Page> = self
+            .mapped_pages_left_to_right()
+            .into_iter()
+            .map(|(_, page)| page)
+            .collect();
         pages.sort_by_key(|page| page.index());
         let gaps: Vec<f64> = pages
             .windows(2)
@@ -1003,29 +1007,44 @@ impl DocumentView {
     }
 
     fn pages_for_width_fit(&self, viewport: f64) -> Vec<page::Page> {
+        let shown: Vec<(f64, page::Page)> = self
+            .mapped_pages_left_to_right()
+            .into_iter()
+            .filter_map(|(left, page)| {
+                let width = f64::from(page.width());
+                let visible = (left + width).min(viewport) - left.max(0.0);
+                (visible > 0.0).then(|| (visible / width, page))
+            })
+            .collect();
+        if shown.is_empty() {
+            return self
+                .mapped_page(self.state.page() as i32)
+                .into_iter()
+                .collect();
+        }
+
+        let fractions: Vec<f64> = shown.iter().map(|(fraction, _)| *fraction).collect();
+        shown[width_fit_range(&fractions)]
+            .iter()
+            .map(|(_, page)| page.clone())
+            .collect()
+    }
+
+    fn mapped_pages_left_to_right(&self) -> Vec<(f64, page::Page)> {
         let mut pages = Vec::new();
         let mut child = self.listview.first_child();
         while let Some(widget) = child {
             if let Some(page) = descendant_page(&widget) {
                 if page.is_mapped() && page.width() > 0 {
                     if let Some((left, _)) = self.page_origin(&page) {
-                        let center = left + f64::from(page.width()) / 2.0;
-                        if center >= 0.0 && center <= viewport {
-                            pages.push((left, page));
-                        }
+                        pages.push((left, page));
                     }
                 }
             }
             child = widget.next_sibling();
         }
         pages.sort_by(|(left_a, _), (left_b, _)| left_a.total_cmp(left_b));
-        if pages.is_empty() {
-            return self
-                .mapped_page(self.state.page() as i32)
-                .into_iter()
-                .collect();
-        }
-        pages.into_iter().map(|(_, page)| page).collect()
+        pages
     }
 
     fn cache_fit_chrome_height(&self, page: &page::Page) {
@@ -2690,6 +2709,28 @@ fn fit_width_zoom(viewport: f64, paper_points: f64, gaps: f64) -> Option<f64> {
     (viewport > gaps && paper_points > 0.0).then(|| (viewport - gaps) / paper_points)
 }
 
+fn width_fit_range(fractions: &[f64]) -> std::ops::Range<usize> {
+    let total: f64 = fractions.iter().sum();
+    let count = (total.round() as usize).clamp(1, fractions.len());
+    let start = widest_window(fractions, count);
+    start..start + count
+}
+
+fn widest_window(fractions: &[f64], count: usize) -> usize {
+    fractions
+        .windows(count)
+        .map(|window| window.iter().sum::<f64>())
+        .enumerate()
+        .fold((0, f64::NEG_INFINITY), |best, (start, sum)| {
+            if sum > best.1 + 1e-6 {
+                (start, sum)
+            } else {
+                best
+            }
+        })
+        .0
+}
+
 fn run_reader_action(
     context: ReaderKeyContext,
     allowed_in_numeric_entry: bool,
@@ -2763,8 +2804,8 @@ fn descendant_page(widget: &gtk::Widget) -> Option<page::Page> {
 mod tests {
     use super::{
         accumulate_step, add_zoom_choice, fit_width_zoom, glide_step, kinetic_step,
-        page_range_start, run_reader_action, KINETIC_TAU_US, SCROLL_ANIM_MAX_US,
-        SCROLL_ANIM_TAU_US, WHEEL_NOTCH, WHEEL_TRIGGER,
+        page_range_start, run_reader_action, widest_window, width_fit_range, KINETIC_TAU_US,
+        SCROLL_ANIM_MAX_US, SCROLL_ANIM_TAU_US, WHEEL_NOTCH, WHEEL_TRIGGER,
     };
     use crate::document_view::{ReaderKeyContext, ZoomChoiceAction};
 
@@ -2772,6 +2813,20 @@ mod tests {
     fn width_fit_scales_papers_but_not_gaps() {
         let zoom = fit_width_zoom(1000.0, 700.0, 12.0).unwrap();
         assert!((700.0 * zoom + 12.0 - 1000.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn width_fit_takes_the_run_with_the_most_paper_on_screen() {
+        assert_eq!(widest_window(&[0.4, 1.0, 0.4], 2), 0);
+        assert_eq!(widest_window(&[0.2, 1.0, 0.8], 2), 1);
+        assert_eq!(widest_window(&[1.0, 0.8], 2), 0);
+        assert_eq!(widest_window(&[0.4, 1.0, 0.4], 1), 1);
+    }
+
+    #[test]
+    fn width_fit_counts_all_visible_page_parts() {
+        assert_eq!(width_fit_range(&[1.0, 0.8]), 0..2);
+        assert_eq!(width_fit_range(&[0.4, 1.0, 0.4]), 0..2);
     }
 
     #[test]
