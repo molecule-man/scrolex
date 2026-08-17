@@ -96,14 +96,7 @@ JPEG, TIFF, …) open as well. DjVu is not supported.
 
 ### 1. Install from Flathub
 
-Scrolex is on [Flathub](https://flathub.org/apps/com.andr2i.scrolex). If the
-Flathub remote isn't configured yet, add it:
-
-```bash
-flatpak remote-add --if-not-exists --user flathub https://dl.flathub.org/repo/flathub.flatpakrepo
-```
-
-Then install and run:
+Scrolex is on [Flathub](https://flathub.org/apps/com.andr2i.scrolex). 
 
 ```bash
 flatpak install --user flathub com.andr2i.scrolex
@@ -113,9 +106,15 @@ flatpak run com.andr2i.scrolex
 Drop `--user` from all commands to install system-wide instead (requires
 root).
 
+If installation fails you might have the Flathub remote configured yet. Add it:
+
+```bash
+flatpak remote-add --if-not-exists --user flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+```
+
 ### 2. Download from GitHub Releases
 
-GTK 4.12 or newer must already be installed. On Arch:
+GTK 4.14 or newer must already be installed. On Arch:
 
 ```bash
 sudo pacman -S gtk4
@@ -147,7 +146,7 @@ sudo apt install ./scrolex_<version>.deb
 
 ### 5. Build from source
 
-Needs GTK 4.12 or newer plus a C/C++ toolchain and `clang`, since the `mupdf`
+Needs GTK 4.14 or newer plus a C/C++ toolchain and `clang`, since the `mupdf`
 crate compiles its bundled C library and generates bindings with bindgen. On
 Arch:
 
