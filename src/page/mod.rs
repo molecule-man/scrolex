@@ -1,5 +1,8 @@
 // Page widgets and shared rendering controls.
 mod imp;
+
+#[cfg(test)]
+pub(crate) use imp::device_scale;
 mod page_number_imp;
 
 pub(crate) use imp::clear_all_renders;
