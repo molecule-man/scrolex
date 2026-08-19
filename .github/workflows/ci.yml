@@ -62,8 +62,10 @@ jobs:
       if: matrix.os == 'windows-latest'
       shell: cmd
       run: |
-        set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
-        for /f "usebackq tokens=*" %%i in (`"%VSWHERE%" -latest -property installationPath`) do set VSPATH=%%i
+        rem -products is required: vswhere skips Build Tools installs without it.
+        pushd "%ProgramFiles(x86)%\Microsoft Visual Studio\Installer"
+        for /f "usebackq tokens=*" %%i in (`vswhere.exe -latest -products "*" -property installationPath`) do set "VSPATH=%%i"
+        popd
         call "%VSPATH%\VC\Auxiliary\Build\vcvars64.bat"
         echo INCLUDE=%INCLUDE%>> %GITHUB_ENV%
         echo LIB=%LIB%>> %GITHUB_ENV%
