@@ -12,6 +12,7 @@ jobs:
     name: test
     env:
       RUST_BACKTRACE: 1
+      GVSBUILD_VERSION: 2026.8.0
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -21,9 +22,9 @@ jobs:
             rust: stable
           # - os: ubuntu-24.04
           #   rust: nightly
-          # - os: windows
-          #   rust: stable
-          # - os: windows
+          - os: windows-latest
+            rust: stable
+          # - os: windows-latest
           #   rust: nightly
 
     steps:
@@ -35,23 +36,61 @@ jobs:
       run: |
         ci/ubuntu-install-packages
 
+    - name: Install LLVM and pkg-config (Windows)
+      if: matrix.os == 'windows-latest'
+      run: choco install -y --no-progress llvm pkgconfiglite
+
+    - name: Cache GTK4 runtime (Windows)
+      if: matrix.os == 'windows-latest'
+      id: gtk-cache
+      uses: actions/cache@v4
+      with:
+        path: C:\gtk
+        key: gvsbuild-gtk4-${{ env.GVSBUILD_VERSION }}
+
+    - name: Download GTK4 runtime (Windows)
+      if: matrix.os == 'windows-latest' && steps.gtk-cache.outputs.cache-hit != 'true'
+      run: |
+        $url = "https://github.com/wingtk/gvsbuild/releases/download/$env:GVSBUILD_VERSION/GTK4_Gvsbuild_${env:GVSBUILD_VERSION}_x64.zip"
+        Invoke-WebRequest -Uri $url -OutFile gtk4.zip
+        7z x gtk4.zip -oC:\gtk
+
+    - name: Set GTK environment (Windows)
+      if: matrix.os == 'windows-latest'
+      run: |
+        "C:\gtk\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+        @(
+          "PKG_CONFIG_PATH=C:\gtk\lib\pkgconfig"
+          "LIB=C:\gtk\lib;$env:LIB"
+          "INCLUDE=C:\gtk\include;$env:INCLUDE"
+          "LIBCLANG_PATH=C:\Program Files\LLVM\bin"
+        ) | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
     - name: Install Rust
       uses: dtolnay/rust-toolchain@master
       with:
         toolchain: ${{ matrix.rust }}
         components: rustfmt, clippy
 
+    # Formatting is platform independent, and the Windows runner checks out CRLF.
     - name: Check formatting
+      if: matrix.os == 'ubuntu-24.04'
       run: cargo fmt --all -- --check
 
     - name: Run Clippy
       run: cargo clippy --all-targets --all-features -- -D warnings
 
     - name: Check Flatpak cargo sources are in sync with Cargo.lock
+      if: matrix.os == 'ubuntu-24.04'
       run: ci/check-cargo-sources
 
     - name: Build
       run: cargo build --verbose
 
-    - name: Run tests
+    - name: Run tests (Ubuntu)
+      if: matrix.os == 'ubuntu-24.04'
       run: xvfb-run --auto-servernum cargo test --verbose
+
+    - name: Run tests (Windows)
+      if: matrix.os == 'windows-latest'
+      run: cargo test --verbose
