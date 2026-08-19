@@ -11,7 +11,7 @@ description = "A Horizontally Scrolled PDF Viewer"
 [dependencies]
 env_logger = "0.11.5"
 futures = "0.3.30"
-glib = { version = "0.22", features = ["log"] }
+glib = { version = "0.22", features = ["log", "v2_72"] }
 gtk = { version = "0.11", package = "gtk4", features = ["v4_14"] }
 log = "0.4"
 mupdf = "0.8"
@@ -22,11 +22,14 @@ tempfile = "3"
 glib-build-tools = "0.22"
 
 [features]
-# Gates the bench target so normal builds skip criterion and its 35 crates.
-bench = []
+# Gates criterion and its 35 crates out of every build that is not a benchmark run.
+# criterion sits in [dependencies] because cargo cannot make a dev-dependency optional.
+bench = ["dep:criterion"]
 
-[dev-dependencies]
-criterion = { version = "0.8", features = ["html_reports"] }
+[dependencies.criterion]
+version = "0.8"
+features = ["html_reports"]
+optional = true
 
 [[bench]]
 name = "benchmarks"
