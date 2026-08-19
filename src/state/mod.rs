@@ -13,7 +13,7 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
-use std::{env, fs};
+use std::fs;
 
 use crate::page;
 
@@ -257,7 +257,7 @@ impl State {
 
         self.emit_by_name::<()>("before-load", &[]);
 
-        let state_path = get_state_file_path(uri).unwrap();
+        let state_path = get_state_file_path(uri);
 
         self.imp().jump_stack.borrow_mut().reset();
         self.imp().forward_jump_stack.borrow_mut().reset();
@@ -309,7 +309,7 @@ impl State {
     }
 
     pub fn save(&self) -> io::Result<()> {
-        let state_path = get_state_file_path(&self.uri()).unwrap();
+        let state_path = get_state_file_path(&self.uri());
         let state_dir = state_path.parent().unwrap();
 
         if !state_dir.exists() {
@@ -503,7 +503,23 @@ pub(crate) fn use_scratch_state_dir() {
     TEST_STATE.with(|slot| *slot.borrow_mut() = Some(ScratchState { dir }));
 }
 
-fn get_state_file_path(uri: &str) -> Result<PathBuf, env::VarError> {
+// A uri maps to nested directories under the state dir. Windows forbids : ? " < > | * and \\ in a
+// name, and every uri starts with a scheme colon, so those are replaced there. Paths on other
+// platforms keep their existing layout.
+#[cfg(not(windows))]
+fn uri_components(uri: &str) -> PathBuf {
+    PathBuf::from(uri)
+}
+
+#[cfg(windows)]
+fn uri_components(uri: &str) -> PathBuf {
+    uri.split('/')
+        .filter(|part| !part.is_empty())
+        .map(|part| part.replace([':', '?', '"', '<', '>', '|', '*', '\\'], "_"))
+        .collect()
+}
+
+fn get_state_file_path(uri: &str) -> PathBuf {
     #[cfg(test)]
     if let Some(mut state_path) = TEST_STATE.with(|state| {
         state
@@ -511,20 +527,17 @@ fn get_state_file_path(uri: &str) -> Result<PathBuf, env::VarError> {
             .as_ref()
             .map(|state| state.dir.path().to_path_buf())
     }) {
-        state_path.push(uri);
+        state_path.push(uri_components(uri));
         state_path.set_extension("ini");
-        return Ok(state_path);
+        return state_path;
     }
 
-    let mut state_path = env::var("XDG_STATE_HOME")
-        .or_else(|_| env::var("HOME").map(|home| format!("{home}/.local/state")))
-        .map(PathBuf::from)?;
-
+    let mut state_path = glib::user_state_dir();
     state_path.push("pdf-viewer");
-    state_path.push(uri);
+    state_path.push(uri_components(uri));
     state_path.set_extension("ini");
 
-    Ok(state_path)
+    state_path
 }
 
 #[cfg(test)]
@@ -532,6 +545,18 @@ mod tests {
     use super::*;
     use gtk::prelude::Cast;
     use std::time::Duration;
+
+    // Windows rejects a colon in a filename, and every uri carries a scheme colon.
+    #[test]
+    fn a_state_path_for_a_file_uri_can_be_written() {
+        use_scratch_state_dir();
+        let path = get_state_file_path("file:///D:/a/scrolex/tests/fixtures/no_outline.pdf");
+
+        fs::create_dir_all(path.parent().expect("a parent")).expect("create the state directory");
+        fs::write(&path, "zoom=1\n").expect("write the state file");
+
+        assert!(path.exists());
+    }
 
     #[gtk::test]
     fn one_slow_main_thread_render_does_not_require_workers() {
@@ -597,7 +622,7 @@ mod tests {
         let state = State::new();
         state.set_uri("scratch.pdf");
         state.save().unwrap();
-        let path = get_state_file_path(&state.uri()).unwrap();
+        let path = get_state_file_path(&state.uri());
         let dir = path.parent().unwrap().to_path_buf();
 
         use_scratch_state_dir();
@@ -625,7 +650,7 @@ mod tests {
 
         state.save().unwrap();
 
-        let path = get_state_file_path(&state.uri()).unwrap();
+        let path = get_state_file_path(&state.uri());
         let saved = fs::read_to_string(path).unwrap();
         assert!(saved.lines().any(|line| line == "zoom=2"));
     }
