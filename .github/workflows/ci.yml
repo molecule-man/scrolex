@@ -57,14 +57,24 @@ jobs:
         Invoke-WebRequest -Uri $url -OutFile gtk4.zip
         7z x gtk4.zip -oC:\gtk
 
+    # bindgen runs libclang over MuPDF headers, so it needs the CRT and SDK include paths.
+    - name: Set MSVC environment (Windows)
+      if: matrix.os == 'windows-latest'
+      shell: cmd
+      run: |
+        set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
+        for /f "usebackq tokens=*" %%i in (`"%VSWHERE%" -latest -property installationPath`) do set VSPATH=%%i
+        call "%VSPATH%\VC\Auxiliary\Build\vcvars64.bat"
+        echo INCLUDE=%INCLUDE%>> %GITHUB_ENV%
+        echo LIB=%LIB%>> %GITHUB_ENV%
+        echo LIBPATH=%LIBPATH%>> %GITHUB_ENV%
+
     - name: Set GTK environment (Windows)
       if: matrix.os == 'windows-latest'
       run: |
         "C:\gtk\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
         @(
           "PKG_CONFIG_PATH=C:\gtk\lib\pkgconfig"
-          "LIB=C:\gtk\lib;$env:LIB"
-          "INCLUDE=C:\gtk\include;$env:INCLUDE"
           "LIBCLANG_PATH=C:\Program Files\LLVM\bin"
         ) | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
