@@ -109,6 +109,19 @@ fn page_buffer_bytes(page_pt: (f64, f64), scale: f64, dsf: f64) -> f64 {
     width * height * 4.0
 }
 
+// Surface scale includes fractional display density.
+pub(crate) fn device_scale(widget: &impl IsA<gtk::Widget>) -> f64 {
+    let widget = widget.as_ref();
+    widget
+        .native()
+        .and_then(|native| native.surface())
+        .map_or_else(
+            || f64::from(widget.scale_factor()),
+            |surface| surface.scale(),
+        )
+        .max(1.0)
+}
+
 // Scale to render this page at: the zoom, or the biggest scale that still fits the caps. A big page
 // at deep zoom is then rendered small and upscaled - soft, but every zoom stays reachable.
 fn render_scale(page_pt: (f64, f64), zoom: f64, dsf: f64) -> f64 {
@@ -126,6 +139,24 @@ fn render_dimensions(page_pt: (f64, f64), scale: f64, dsf: f64) -> (i32, i32) {
         ((page_pt.0 * scale * dsf) as i32).max(1),
         ((page_pt.1 * scale * dsf) as i32).max(1),
     )
+}
+
+// Log each scale pair once for display diagnostics.
+fn log_device_scale(page: &super::Page) {
+    thread_local! {
+        static LAST: Cell<(i32, u64)> = const { Cell::new((0, 0)) };
+    }
+    let Some(surface) = page.native().and_then(|native| native.surface()) else {
+        return;
+    };
+    let scale = surface.scale();
+    let current = (page.scale_factor(), scale.to_bits());
+    if LAST.with(|last| last.replace(current)) != current {
+        log::info!(
+            "device scale: widget_scale_factor={} surface_scale={scale}",
+            current.0
+        );
+    }
 }
 
 fn tile_regions(
@@ -224,11 +255,9 @@ pub struct Page {
     bbox: RefCell<Rectangle>,
     cursor_guard: Cell<bool>,
 
-    // false until the widget has been mapped and its final device scale factor is in effect.
-    // Rendering before then would use a provisional scale factor (the compositor assigns the real
-    // one right after map) and be thrown away and re-rendered - expensive on HiDPI. While false,
-    // the page paints blank.
+    // False prevents a discarded render at a provisional display scale.
     scale_known: Cell<bool>,
+    surface_scale_connection: RefCell<Option<(gtk::gdk::Surface, glib::SignalHandlerId)>>,
 
     // last snapshot's (page index, paint, zoom); see note_paint
     painted: Cell<Option<(i32, Paint, f64)>>,
@@ -282,6 +311,12 @@ impl ObjectImpl for Page {
         self.obj().connect_unmap(|page| page.imp().unpin_render());
 
         self.obj().set_size_request(600, 800);
+    }
+
+    fn dispose(&self) {
+        if let Some((surface, connection)) = self.surface_scale_connection.take() {
+            surface.disconnect(connection);
+        }
     }
 
     fn signals() -> &'static [Signal] {
@@ -338,18 +373,15 @@ impl Page {
         self.tiled.set(false);
     }
 
-    // Mark the device scale factor as known once it has settled after map, so rendering starts at
-    // the final scale.
+    // Track the display scale after map.
     fn setup_scale_tracking(&self) {
         let obj = self.obj();
 
-        // The compositor assigns the surface's scale factor right after map, so
-        // defer one main-loop iteration before allowing the first render; by
-        // then the scale-factor notification (higher priority than idle) has
-        // been applied. Recycled list widgets keep the flag set across remaps.
+        // The compositor assigns the surface scale after map.
+        // Scale notifications run before idle callbacks, so one idle cycle exposes the assigned scale.
         obj.connect_map(|page| {
-            // recycled list widgets keep the flag set across remaps; only the
-            // genuine first map needs to defer
+            page.imp().track_surface_scale();
+
             if page.imp().scale_known.get() {
                 return;
             }
@@ -357,19 +389,45 @@ impl Page {
                 #[weak]
                 page,
                 move || {
-                    page.imp().scale_known.set(true);
-                    page.queue_draw();
+                    page.imp().display_scale_changed();
                 }
             ));
         });
 
-        // A scale-factor change (e.g. moving to a monitor with a different
-        // scale) is authoritative: the current cached texture is now stale, and
-        // the snapshot's dimension check re-renders it at the new scale.
-        obj.connect_scale_factor_notify(|page| {
-            page.imp().scale_known.set(true);
-            page.queue_draw();
-        });
+        obj.connect_scale_factor_notify(|page| page.imp().display_scale_changed());
+    }
+
+    fn display_scale_changed(&self) {
+        let page = self.obj();
+        self.scale_known.set(true);
+        log_device_scale(&page);
+        // The next snapshot rejects cached textures that use a different display scale.
+        page.queue_draw();
+    }
+
+    fn track_surface_scale(&self) {
+        let page = self.obj();
+        let Some(surface) = page.native().and_then(|native| native.surface()) else {
+            return;
+        };
+        let mut connection = self.surface_scale_connection.borrow_mut();
+        if connection
+            .as_ref()
+            .is_some_and(|(tracked, _)| tracked == &surface)
+        {
+            return;
+        }
+        if let Some((tracked, id)) = connection.take() {
+            tracked.disconnect(id);
+        }
+        let id = surface.connect_scale_notify(clone!(
+            #[weak]
+            page,
+            move |_| {
+                page.imp().display_scale_changed();
+            }
+        ));
+        *connection = Some((surface, id));
     }
 
     fn setup_state_listeners(&self) {
@@ -663,10 +721,10 @@ impl Page {
     fn render_snapshot(&self, snapshot: &gtk::Snapshot, page: &PageInfo) {
         let start = std::time::Instant::now();
         let obj = self.obj();
-        let scale_factor = obj.scale_factor() as f64;
+        let dsf = device_scale(&*obj);
 
         let scale = obj.zoom();
-        let render_scale = render_scale((page.width, page.height), scale, scale_factor);
+        let render_scale = render_scale((page.width, page.height), scale, dsf);
 
         if render_scale < scale {
             // Viewport regions are rendered off the UI thread; entering this path also keeps later
@@ -686,7 +744,7 @@ impl Page {
             &obj.uri(),
             page.index,
             render_scale,
-            scale_factor,
+            dsf,
             Some((page.width, page.height)),
         ) {
             Some(texture) => {
@@ -707,7 +765,7 @@ impl Page {
 
         let elapsed = start.elapsed();
         log::debug!(
-            "Rendered page {} [on-demand (visible), sync] on main thread in {elapsed:?} (scale_factor={scale_factor})",
+            "Rendered page {} [on-demand (visible), sync] on main thread in {elapsed:?} (device_scale={dsf})",
             page.index
         );
 
@@ -746,7 +804,7 @@ impl Page {
         bbox: &Rectangle,
         scale: f64,
     ) {
-        let dsf = self.obj().scale_factor().max(1) as f64;
+        let dsf = device_scale(&*self.obj());
         let ((ox, oy), (fw, fh)) =
             page_footprint((texture.width(), texture.height()), bbox, scale, dsf);
         let (bw, bh) = bbox.size();
@@ -1046,18 +1104,18 @@ impl Page {
 
         let (width, height) = (page.width, page.height);
         let scale = obj.zoom();
-        let scale_factor = obj.scale_factor() as f64;
-        let render_scale = render_scale((width, height), scale, scale_factor);
+        let dsf = device_scale(&*obj);
+        let render_scale = render_scale((width, height), scale, dsf);
         let cached_bbox = self.get_cached_bbox(page, obj.crop());
         if render_scale < scale {
             self.tiled.set(true);
-            self.tiled_snapshot(snapshot, page, &cached_bbox, scale, scale_factor);
+            self.tiled_snapshot(snapshot, page, &cached_bbox, scale, dsf);
             return;
         }
         self.tiled.set(false);
         obj.state().render_cache().borrow_mut().pin_page(page_num);
-        let expected = render_dimensions((width, height), render_scale, scale_factor);
-        let page_bytes = page_buffer_bytes((width, height), render_scale, scale_factor);
+        let expected = render_dimensions((width, height), render_scale, dsf);
+        let page_bytes = page_buffer_bytes((width, height), render_scale, dsf);
 
         let cache = obj.state().render_cache();
         let cached = cache.borrow_mut().get(page_num);
@@ -1078,12 +1136,7 @@ impl Page {
 
         // Flung-past pages are dropped at the queue (see set_wanted_pages), so this doesn't saturate
         // the workers mid-scroll.
-        self.schedule_render(
-            page_num,
-            render_scale,
-            scale_factor,
-            RenderPriority::Visible,
-        );
+        self.schedule_render(page_num, render_scale, dsf, RenderPriority::Visible);
 
         // remember that this widget is the one waiting for page_num, so the
         // render repaints it when it lands
@@ -1147,7 +1200,7 @@ impl Page {
         }
         let dir = if state.scroll_forward() { 1 } else { -1 };
         let scale = obj.zoom();
-        let scale_factor = obj.scale_factor() as f64;
+        let dsf = device_scale(&*obj);
         let cache = state.render_cache();
 
         let visible = state.visible_page_count().max(1) as usize;
@@ -1160,20 +1213,14 @@ impl Page {
             if page_num < 0 || page_num >= n_pages {
                 continue;
             }
-            self.schedule_render(page_num, scale, scale_factor, RenderPriority::Prefetch);
+            self.schedule_render(page_num, scale, dsf, RenderPriority::Prefetch);
         }
     }
 
     // Queue a full render of `page_num`. Skipped if one is in flight, or if the cache holds the page
     // at the capped scale already - callers pass the zoom, so only this point knows that scale. The
     // marker records the epoch, so the completion can tell whether the slot is still its own.
-    fn schedule_render(
-        &self,
-        page_num: i32,
-        scale: f64,
-        scale_factor: f64,
-        priority: RenderPriority,
-    ) {
+    fn schedule_render(&self, page_num: i32, scale: f64, dsf: f64, priority: RenderPriority) {
         let obj = self.obj();
         // Cheap bail before reading page bounds: a page redrawn while its render runs comes back here
         // on every snapshot.
@@ -1194,10 +1241,10 @@ impl Page {
         // Capped and skipped before the marker goes in. A page marked in flight with no render to
         // release it would stay wedged.
         let scale = match page_pt {
-            Some(size) => render_scale(size, scale, scale_factor),
+            Some(size) => render_scale(size, scale, dsf),
             None => scale,
         };
-        let pixel_scale = scale * scale_factor;
+        let pixel_scale = scale * dsf;
         if obj
             .state()
             .render_cache()
@@ -1247,7 +1294,7 @@ impl Page {
                     request_render(
                         &uri_job,
                         scale,
-                        scale_factor,
+                        dsf,
                         page_num,
                         priority,
                         page_pt,
@@ -1264,7 +1311,7 @@ impl Page {
         &self,
         page_num: i32,
         scale: f64,
-        scale_factor: f64,
+        dsf: f64,
         page_px: (i32, i32),
         regions: Vec<crate::mupdf_render::PixelRect>,
     ) {
@@ -1283,7 +1330,7 @@ impl Page {
         let uri = obj.uri();
         let client = obj.state().render_client_id();
         let doc_epoch = obj.state().doc_epoch();
-        let pixel_scale = scale * scale_factor;
+        let pixel_scale = scale * dsf;
         let (resp_sender, resp_receiver) = oneshot::channel::<Vec<RenderedRegion>>();
         let obj_clone = obj.clone();
         glib::spawn_future_local(async move {
@@ -1322,7 +1369,7 @@ impl Page {
                     request_region_render(
                         &uri_job,
                         scale,
-                        scale_factor,
+                        dsf,
                         page_num,
                         page_px,
                         regions,
@@ -1645,7 +1692,7 @@ fn request_render(
         );
         let render_ms = start.elapsed().as_millis();
         log::debug!(
-            "Rendered page {page_num} [{}] on background thread in {render_ms}ms (scale_factor={device_scale_factor})",
+            "Rendered page {page_num} [{}] on background thread in {render_ms}ms (device_scale={device_scale_factor})",
             priority.label()
         );
         let _ = resp_sender.send(RenderedPixels {
@@ -1661,7 +1708,7 @@ fn request_render(
         crate::mupdf_render::render_page_pixels(uri, page_num, scale, device_scale_factor, page_pt);
     let render_ms = start.elapsed().as_millis();
     log::debug!(
-        "Rendered page {page_num} [{}] on background thread in {render_ms}ms (scale_factor={device_scale_factor})",
+        "Rendered page {page_num} [{}] on background thread in {render_ms}ms (device_scale={device_scale_factor})",
         priority.label()
     );
 
@@ -1736,7 +1783,7 @@ fn request_region_render(
     };
     let render_ms = start.elapsed().as_millis();
     log::debug!(
-        "Rendered {} regions of page {page_num} [{}] serially on background thread in {render_ms}ms (scale_factor={device_scale_factor})",
+        "Rendered {} regions of page {page_num} [{}] serially on background thread in {render_ms}ms (device_scale={device_scale_factor})",
         regions.len(),
         RenderPriority::Visible.label(),
     );
@@ -2090,28 +2137,34 @@ mod tests {
     }
 
     #[test]
-    fn page_footprint_maps_texture_1to1_at_integer_scale() {
-        // dsf=1, no crop: origin at 0, footprint == texture pixels (the 1:1 sharpness invariant)
-        let full = Rectangle::new(0.0, 0.0, 400.0, 600.0);
-        assert_eq!(
-            page_footprint((800, 1200), &full, 1.0, 1.0),
-            ((0.0, 0.0), (800.0, 1200.0))
-        );
+    fn page_footprint_maps_texture_one_to_one() {
+        // Texture dimensions preserve one-to-one placement after render_dimensions truncates each axis.
+        let a4 = (595.0, 842.0);
+        for dsf in [1.0, 1.5, 2.0, 2.25] {
+            let tex = render_dimensions(a4, 1.0, dsf);
+            let bbox = Rectangle::new(0.0, 0.0, a4.0, a4.1);
+            let ((ox, oy), (fw, fh)) = page_footprint(tex, &bbox, 1.0, dsf);
+            assert_eq!((ox, oy), (0.0, 0.0), "dsf={dsf}");
+            assert!((fw * dsf - f64::from(tex.0)).abs() < EPSILON, "dsf={dsf}");
+            assert!((fh * dsf - f64::from(tex.1)).abs() < EPSILON, "dsf={dsf}");
+        }
     }
 
     #[test]
     fn page_footprint_snaps_crop_offset_to_device_grid() {
-        // fractional crop margins would land the 1:1 texture off-grid and blur it; snap them
+        // Off-grid crop margins blur the texture.
         let cropped = Rectangle::new(3.3, 2.6, 400.0, 600.0);
-        // dsf=1 -> whole-pixel grid
         assert_eq!(
             page_footprint((800, 1200), &cropped, 1.0, 1.0).0,
             (-3.0, -3.0)
         );
-        // dsf=2 -> half-pixel grid, footprint halves
         assert_eq!(
             page_footprint((800, 1200), &cropped, 1.0, 2.0),
             ((-3.5, -2.5), (400.0, 600.0))
+        );
+        assert_eq!(
+            page_footprint((800, 1200), &cropped, 1.0, 1.5).0,
+            (-5.0 / 1.5, -4.0 / 1.5)
         );
     }
 

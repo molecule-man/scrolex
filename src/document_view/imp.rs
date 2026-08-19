@@ -3965,7 +3965,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
 
         imp.state.zoom_to(10.0);
         wait_until(|| imp.mapped_page(0).is_some_and(|page| page.uses_tiles()));
-        let dsf = f64::from(imp.mapped_page(0).unwrap().scale_factor());
+        let dsf = crate::page::device_scale(&imp.mapped_page(0).unwrap());
         let mut found = None;
         wait_until(|| {
             let cache = imp.state.render_cache();
