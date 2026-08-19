@@ -585,7 +585,7 @@ mod tests {
     #[ignore]
     fn bench() {
         let path = std::env::var("PDF_PATH").expect("PDF_PATH not set");
-        let uri = format!("file://{path}");
+        let uri = crate::test_support::file_uri(&path);
         let scale: f64 = std::env::var("SCALE")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -624,7 +624,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("margins.pdf");
         std::fs::write(&path, MARGIN_PDF).unwrap();
-        format!("file://{}", path.display())
+        crate::test_support::file_uri(&path)
     }
 
     #[test]
@@ -695,7 +695,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("mixed.pdf");
         std::fs::write(&path, MIXED_SIZE_PDF).unwrap();
-        let uri = format!("file://{}", path.display());
+        let uri = crate::test_support::file_uri(&path);
 
         assert_eq!(
             stage_candidate(&uri).unwrap().probe(),
@@ -742,7 +742,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("tall_last.pdf");
         std::fs::write(&path, TALL_LAST_PAGE_PDF).unwrap();
-        let uri = format!("file://{}", path.display());
+        let uri = crate::test_support::file_uri(&path);
 
         let info = stage_candidate(&uri).unwrap().probe().unwrap();
         assert_eq!(info.page_sizes.len(), 12);
@@ -766,7 +766,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("rot.pdf");
         std::fs::write(&path, ROTATED_TEXT_PDF).unwrap();
-        let uri = format!("file://{}", path.display());
+        let uri = crate::test_support::file_uri(&path);
 
         // rotation applied: displayed dimensions are swapped
         assert_eq!(page_size(&uri, 0), Some((200.0, 300.0)));

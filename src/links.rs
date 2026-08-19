@@ -84,7 +84,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("link.pdf");
         std::fs::write(&path, LINK_PDF).unwrap();
-        let uri = format!("file://{}", path.display());
+        let uri = crate::test_support::file_uri(&path);
 
         let mut links = Links::default();
         // PDF rect [50 60 150 90] flips to top-left y (50,110)-(150,140) on a 200-tall page.
