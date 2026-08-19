@@ -21,12 +21,17 @@ tempfile = "3"
 [build-dependencies]
 glib-build-tools = "0.22"
 
+[features]
+# Gates the bench target so normal builds skip criterion and its 35 crates.
+bench = []
+
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }
 
 [[bench]]
 name = "benchmarks"
 harness = false
+required-features = ["bench"]
 
 [profile.deb]
 inherits = "release"
