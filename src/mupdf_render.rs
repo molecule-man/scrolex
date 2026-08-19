@@ -175,7 +175,7 @@ impl Candidate {
             });
         }
         let _ctx = Colorspace::device_bgr();
-        let doc = Document::open(self.path.as_path()).ok()?;
+        let doc = open_document(&self.path)?;
         let n_pages = doc.page_count().ok()?;
         let page_sizes = (0..n_pages)
             .map(|index| {
@@ -202,6 +202,11 @@ impl Candidate {
 }
 
 // Local path for `uri`: own path if local, else the staged temp copy (miss → fetch as fallback).
+// MuPDF takes a UTF-8 path on Windows, where Path does not convert on its own.
+pub(crate) fn open_document(path: &std::path::Path) -> Option<Document> {
+    Document::open(path.to_str()?).ok()
+}
+
 pub(crate) fn local_path(uri: &str) -> Option<PathBuf> {
     let file = gtk::gio::File::for_uri(uri);
     if let Some(path) = file.path() {
@@ -240,7 +245,7 @@ pub fn with_doc<T>(uri: &str, f: impl FnOnce(&Document) -> Option<T>) -> Option<
             .is_some_and(|(u, g, _)| u == uri && *g == generation);
         if !fresh {
             let path = local_path(uri)?;
-            let doc = Document::open(path.as_path()).ok()?;
+            let doc = open_document(&path)?;
             *slot = Some((uri.to_string(), generation, doc));
         }
         f(&slot.as_ref().unwrap().2)
