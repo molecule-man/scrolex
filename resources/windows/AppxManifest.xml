@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Package
+  xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+  xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+  IgnorableNamespaces="uap rescap">
+
+  <!-- Name and Publisher hold local-test values. The Store assigns the real pair when you
+       reserve the app name. Publisher must equal the signing certificate subject exactly.
+       ci\win-msix.ps1 writes Version from Cargo.toml. -->
+  <Identity
+    Name="Andr2i.Scrolex"
+    Publisher="CN=Andrii Berezhynskyi"
+    Version="0.0.0.0"
+    ProcessorArchitecture="x64" />
+
+  <Properties>
+    <DisplayName>Scrolex</DisplayName>
+    <PublisherDisplayName>Andrii Berezhynskyi</PublisherDisplayName>
+    <Logo>assets\StoreLogo.png</Logo>
+    <Description>A horizontally scrolled PDF and ebook viewer.</Description>
+  </Properties>
+
+  <Dependencies>
+    <!-- 10.0.17763.0 is Windows 10 1809, the oldest release still serviced. -->
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.17763.0" MaxVersionTested="10.0.26100.0" />
+  </Dependencies>
+
+  <Resources>
+    <Resource Language="en-us" />
+  </Resources>
+
+  <!-- A packaged win32 binary needs full trust. The Store allows it with a justification. -->
+  <Capabilities>
+    <rescap:Capability Name="runFullTrust" />
+  </Capabilities>
+
+  <Applications>
+    <Application Id="Scrolex" Executable="scrolex.exe" EntryPoint="Windows.FullTrustApplication">
+      <uap:VisualElements
+        DisplayName="Scrolex"
+        Description="A horizontally scrolled PDF and ebook viewer."
+        BackgroundColor="transparent"
+        Square150x150Logo="assets\Square150x150Logo.png"
+        Square44x44Logo="assets\Square44x44Logo.png">
+        <uap:DefaultTile
+          Wide310x150Logo="assets\Wide310x150Logo.png"
+          Square71x71Logo="assets\Square71x71Logo.png"
+          Square310x310Logo="assets\Square310x310Logo.png" />
+      </uap:VisualElements>
+      <Extensions>
+        <!-- Document types only. MuPDF also opens png, jpg and txt, and claiming those
+             would take over file types the user expects other apps to own. -->
+        <uap:Extension Category="windows.fileTypeAssociation">
+          <uap:FileTypeAssociation Name="document">
+            <uap:DisplayName>Document</uap:DisplayName>
+            <uap:Logo>assets\Square44x44Logo.png</uap:Logo>
+            <uap:SupportedFileTypes>
+              <uap:FileType>.pdf</uap:FileType>
+              <uap:FileType>.epub</uap:FileType>
+              <uap:FileType>.mobi</uap:FileType>
+              <uap:FileType>.fb2</uap:FileType>
+              <uap:FileType>.cbz</uap:FileType>
+              <uap:FileType>.xps</uap:FileType>
+              <uap:FileType>.oxps</uap:FileType>
+            </uap:SupportedFileTypes>
+          </uap:FileTypeAssociation>
+        </uap:Extension>
+      </Extensions>
+    </Application>
+  </Applications>
+</Package>
