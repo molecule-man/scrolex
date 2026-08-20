@@ -119,18 +119,6 @@ jobs:
         #   os: macos-latest
         #   rust: nightly
         #   target: x86_64-apple-darwin
-        # - build: win-msvc
-        #   os: windows-latest
-        #   rust: nightly
-        #   target: x86_64-pc-windows-msvc
-        # - build: win-gnu
-        #   os: windows-latest
-        #   rust: nightly-x86_64-gnu
-        #   target: x86_64-pc-windows-gnu
-        # - build: win32-msvc
-        #   os: windows-latest
-        #   rust: nightly
-        #   target: i686-pc-windows-msvc
 
     steps:
     - name: Checkout repository
@@ -221,18 +209,8 @@ jobs:
         cp LICENSE README.md "$ARCHIVE"/
         cp -r ./resources/ "$ARCHIVE"/
 
-    - name: Build archive (Windows)
+    - name: Build archive
       shell: bash
-      if: matrix.os == 'windows-latest'
-      run: |
-        7z a "$ARCHIVE.zip" "$ARCHIVE"
-        certutil -hashfile "$ARCHIVE.zip" SHA256 > "$ARCHIVE.zip.sha256"
-        echo "ASSET=$ARCHIVE.zip" >> $GITHUB_ENV
-        echo "ASSET_SUM=$ARCHIVE.zip.sha256" >> $GITHUB_ENV
-
-    - name: Build archive (Unix)
-      shell: bash
-      if: matrix.os != 'windows-latest'
       run: |
         tar czf "$ARCHIVE.tar.gz" "$ARCHIVE"
         shasum -a 256 "$ARCHIVE.tar.gz" > "$ARCHIVE.tar.gz.sha256"
@@ -355,3 +333,95 @@ jobs:
       run: |
         version="${{ needs.create-release.outputs.version }}"
         gh release upload "$version" "$BUNDLE" "$SUM"
+
+  build-release-windows:
+    name: build-release-windows
+    needs: ['create-release']
+    runs-on: windows-latest
+    env:
+      RUST_BACKTRACE: 1
+      GVSBUILD_VERSION: 2026.8.0
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    # pkg-config.exe ships inside the gvsbuild zip, so only libclang is missing.
+    - name: Install LLVM
+      run: choco install -y --no-progress llvm
+
+    - name: Cache GTK4 runtime
+      id: gtk-cache
+      uses: actions/cache@v4
+      with:
+        path: C:\gtk
+        key: gvsbuild-gtk4-${{ env.GVSBUILD_VERSION }}
+
+    - name: Download GTK4 runtime
+      if: steps.gtk-cache.outputs.cache-hit != 'true'
+      run: |
+        $url = "https://github.com/wingtk/gvsbuild/releases/download/$env:GVSBUILD_VERSION/GTK4_Gvsbuild_${env:GVSBUILD_VERSION}_x64.zip"
+        Invoke-WebRequest -Uri $url -OutFile gtk4.zip
+        7z x gtk4.zip -oC:\gtk
+
+    # bindgen runs libclang over MuPDF headers, so it needs the CRT and SDK include paths.
+    - name: Set MSVC environment
+      shell: cmd
+      run: |
+        rem -products is required: vswhere skips Build Tools installs without it.
+        pushd "%ProgramFiles(x86)%\Microsoft Visual Studio\Installer"
+        for /f "usebackq tokens=*" %%i in (`vswhere.exe -latest -products "*" -property installationPath`) do set "VSPATH=%%i"
+        popd
+        call "%VSPATH%\VC\Auxiliary\Build\vcvars64.bat"
+        echo INCLUDE=%INCLUDE%>> %GITHUB_ENV%
+        echo LIB=%LIB%>> %GITHUB_ENV%
+        echo LIBPATH=%LIBPATH%>> %GITHUB_ENV%
+
+    - name: Set GTK environment
+      run: |
+        "C:\gtk\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+        @(
+          "PKG_CONFIG_PATH=C:\gtk\lib\pkgconfig"
+          "LIBCLANG_PATH=C:\Program Files\LLVM\bin"
+        ) | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: stable
+
+    - name: Build release binary
+      run: cargo build --verbose --release
+
+    - name: Bundle the GTK runtime into a portable zip
+      run: powershell -ExecutionPolicy Bypass -File ci\win-bundle.ps1
+
+    # Get-FileHash, not shasum: powershell is always there, and this writes the same
+    # "<hash>  <file>" line that shasum -a 256 writes for the other platforms.
+    - name: Create sha256 sum of the zip
+      run: |
+        $version = "${{ needs.create-release.outputs.version }}"
+        $name = "scrolex-$version-x86_64-windows.zip"
+        $asset = "dist\$name"
+        if (-not (Test-Path $asset)) { throw "the bundle step did not produce $asset" }
+        $hash = (Get-FileHash $asset -Algorithm SHA256).Hash.ToLower()
+        "$hash  $name" | Out-File -FilePath "$asset.sha256" -Encoding ascii
+        @("ASSET=$asset", "ASSET_SUM=$asset.sha256") |
+          Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+    - name: Upload release archive
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: gh release upload "${{ needs.create-release.outputs.version }}" "$env:ASSET" "$env:ASSET_SUM"
+
+    # After the zip is uploaded, so a missing SDK cannot cost the release asset.
+    # The msix is not a release asset. It goes to the Store, which re-signs it.
+    - name: Build the msix
+      run: powershell -ExecutionPolicy Bypass -File ci\win-msix.ps1
+
+    - name: Upload the msix as a workflow artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: msix
+        path: dist/*.msix
+        if-no-files-found: error

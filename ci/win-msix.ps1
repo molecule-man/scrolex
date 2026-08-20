@@ -25,8 +25,9 @@ $makepri  = Join-Path $sdk 'makepri.exe'
 $signtool = Join-Path $sdk 'signtool.exe'
 
 $version = (Select-String -Path "$repo\Cargo.toml" -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
-# MSIX wants four parts and the Store rejects a non-zero revision.
-$appxVersion = "$version.0"
+# MSIX wants four numeric parts and the Store rejects a non-zero revision. A pre-release
+# tag like 0.11.4-rc1 has no legal msix form, so the suffix drops.
+$appxVersion = ($version -split '-')[0] + '.0'
 
 $stage = Join-Path $repo 'dist\msix'
 if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
