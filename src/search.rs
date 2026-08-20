@@ -129,7 +129,7 @@ pub fn spawn_search(
         let Some(path) = crate::mupdf_render::local_path(&uri) else {
             return;
         };
-        let Ok(doc) = mupdf::Document::open(path.as_path()) else {
+        let Some(doc) = crate::mupdf_render::open_document(&path) else {
             return;
         };
 

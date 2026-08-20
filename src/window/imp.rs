@@ -1074,7 +1074,11 @@ mod widget_tests {
             Some("Zoom options")
         );
 
-        for name in ["image-crop-symbolic.svg", "zoom-fit-height-symbolic.svg"] {
+        for name in [
+            "image-crop-symbolic.svg",
+            "zoom-fit-height-symbolic.svg",
+            "x-office-document-symbolic.svg",
+        ] {
             let path = format!("/com/andr2i/scrolex/icons/scalable/actions/{name}");
             let icon = gtk::gio::resources_lookup_data(&path, gtk::gio::ResourceLookupFlags::NONE)
                 .expect("fit icon resource");

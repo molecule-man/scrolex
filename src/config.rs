@@ -1,7 +1,7 @@
 // Global (cross-document) user settings, persisted as a small INI under the user's config dir.
 
 use std::path::PathBuf;
-use std::{env, fs, io, thread};
+use std::{fs, io, thread};
 
 // Render threads = resident MuPDF Documents (one per thread), each accruing an unreclaimable
 // per-page cache, so this dial trades memory for parallelism. Rendering scales near-linearly to ~4
@@ -56,10 +56,7 @@ fn config_file_path() -> Option<PathBuf> {
         return Some(path);
     }
 
-    let mut path = env::var("XDG_CONFIG_HOME")
-        .or_else(|_| env::var("HOME").map(|home| format!("{home}/.config")))
-        .map(PathBuf::from)
-        .ok()?;
+    let mut path = gtk::glib::user_config_dir();
     path.push("scrolex");
     path.push("config.ini");
     Some(path)

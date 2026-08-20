@@ -1,6 +1,6 @@
 [package]
 name = "scrolex"
-version = "0.11.3"
+version = "0.11.4-rc1"
 edition = "2021"
 authors = ["Andrii Berezhynskyi <microsolutions_harebrain@aleeas.com>"]
 license = "AGPL-3.0-or-later"
@@ -11,7 +11,7 @@ description = "A Horizontally Scrolled PDF Viewer"
 [dependencies]
 env_logger = "0.11.5"
 futures = "0.3.30"
-glib = { version = "0.22", features = ["log"] }
+glib = { version = "0.22", features = ["log", "v2_72"] }
 gtk = { version = "0.11", package = "gtk4", features = ["v4_14"] }
 log = "0.4"
 mupdf = "0.8"
@@ -21,12 +21,20 @@ tempfile = "3"
 [build-dependencies]
 glib-build-tools = "0.22"
 
-[dev-dependencies]
-criterion = { version = "0.8", features = ["html_reports"] }
+[features]
+# Gates criterion and its 35 crates out of every build that is not a benchmark run.
+# criterion sits in [dependencies] because cargo cannot make a dev-dependency optional.
+bench = ["dep:criterion"]
+
+[dependencies.criterion]
+version = "0.8"
+features = ["html_reports"]
+optional = true
 
 [[bench]]
 name = "benchmarks"
 harness = false
+required-features = ["bench"]
 
 [profile.deb]
 inherits = "release"

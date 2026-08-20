@@ -2322,7 +2322,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("mixed.pdf");
         std::fs::write(&path, MIXED_SIZE_PDF).unwrap();
-        let uri = format!("file://{}", path.display());
+        let uri = crate::test_support::file_uri(&path);
 
         let state = crate::state::State::new();
         state.set_uri(uri);
@@ -2358,7 +2358,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("small.pdf");
         std::fs::write(&path, SMALL_RENDERABLE_PDF).unwrap();
-        let uri = format!("file://{}", path.display());
+        let uri = crate::test_support::file_uri(&path);
 
         let surface = crate::mupdf_render::render_page_surface(&uri, 0, 1.0, 1.0, None)
             .expect("mupdf should render the fixture");
@@ -2383,7 +2383,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
     #[ignore]
     fn bench_render_throughput() {
         let path = env::var("PDF_PATH").expect("PDF_PATH not set");
-        let uri = format!("file://{path}");
+        let uri = crate::test_support::file_uri(&path);
         let start: i32 = env::var("PAGE_NUMBER")
             .ok()
             .and_then(|s| s.parse().ok())

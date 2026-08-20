@@ -92,7 +92,7 @@ JPEG, TIFF, …) open as well. DjVu is not supported.
 | Ctrl + c        | Copy the selected text to the clipboard  |
 | Esc             | Close search / drop the selection / leave full screen |
 
-## Installation
+## Installation. Linux
 
 ### 1. Install from Flathub
 
@@ -167,6 +167,17 @@ cargo build --release
 After building, you will find the binary at the location
 `target/release/scrolex`. You can move the binary to a directory in your
 `$PATH`.
+
+## Installation. Windows
+
+Download `scrolex-<version>-x86_64-windows.zip` from the [GitHub releases
+page][1], extract it anywhere, and run `scrolex.exe`.
+
+The zip carries its own GTK runtime, so you need nothing else. It installs
+nothing. The data files Scrolex creates while running are stored in `%LOCALAPPDATA%`.
+
+Windows shows a SmartScreen warning, because the executable is not signed yet.
+Select **More info**, then **Run anyway**.
 
 ## License
 

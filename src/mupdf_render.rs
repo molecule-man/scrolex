@@ -175,7 +175,7 @@ impl Candidate {
             });
         }
         let _ctx = Colorspace::device_bgr();
-        let doc = Document::open(self.path.as_path()).ok()?;
+        let doc = open_document(&self.path)?;
         let n_pages = doc.page_count().ok()?;
         let page_sizes = (0..n_pages)
             .map(|index| {
@@ -202,6 +202,11 @@ impl Candidate {
 }
 
 // Local path for `uri`: own path if local, else the staged temp copy (miss → fetch as fallback).
+// MuPDF takes a UTF-8 path on Windows, where Path does not convert on its own.
+pub(crate) fn open_document(path: &std::path::Path) -> Option<Document> {
+    Document::open(path.to_str()?).ok()
+}
+
 pub(crate) fn local_path(uri: &str) -> Option<PathBuf> {
     let file = gtk::gio::File::for_uri(uri);
     if let Some(path) = file.path() {
@@ -240,7 +245,7 @@ pub fn with_doc<T>(uri: &str, f: impl FnOnce(&Document) -> Option<T>) -> Option<
             .is_some_and(|(u, g, _)| u == uri && *g == generation);
         if !fresh {
             let path = local_path(uri)?;
-            let doc = Document::open(path.as_path()).ok()?;
+            let doc = open_document(&path)?;
             *slot = Some((uri.to_string(), generation, doc));
         }
         f(&slot.as_ref().unwrap().2)
@@ -580,7 +585,7 @@ mod tests {
     #[ignore]
     fn bench() {
         let path = std::env::var("PDF_PATH").expect("PDF_PATH not set");
-        let uri = format!("file://{path}");
+        let uri = crate::test_support::file_uri(&path);
         let scale: f64 = std::env::var("SCALE")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -619,7 +624,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("margins.pdf");
         std::fs::write(&path, MARGIN_PDF).unwrap();
-        format!("file://{}", path.display())
+        crate::test_support::file_uri(&path)
     }
 
     #[test]
@@ -690,7 +695,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("mixed.pdf");
         std::fs::write(&path, MIXED_SIZE_PDF).unwrap();
-        let uri = format!("file://{}", path.display());
+        let uri = crate::test_support::file_uri(&path);
 
         assert_eq!(
             stage_candidate(&uri).unwrap().probe(),
@@ -737,7 +742,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("tall_last.pdf");
         std::fs::write(&path, TALL_LAST_PAGE_PDF).unwrap();
-        let uri = format!("file://{}", path.display());
+        let uri = crate::test_support::file_uri(&path);
 
         let info = stage_candidate(&uri).unwrap().probe().unwrap();
         assert_eq!(info.page_sizes.len(), 12);
@@ -761,7 +766,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("rot.pdf");
         std::fs::write(&path, ROTATED_TEXT_PDF).unwrap();
-        let uri = format!("file://{}", path.display());
+        let uri = crate::test_support::file_uri(&path);
 
         // rotation applied: displayed dimensions are swapped
         assert_eq!(page_size(&uri, 0), Some((200.0, 300.0)));

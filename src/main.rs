@@ -1,3 +1,6 @@
+// Windows shows a console for a console-subsystem binary. Release builds are GUI only; debug
+// builds keep the console so RUST_LOG output stays visible.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 #![warn(
     rust_2018_idioms,
     future_incompatible,
@@ -164,13 +167,32 @@ fn document_arg(args: &[OsString]) -> Option<&OsString> {
         .find(|a| !a.to_string_lossy().starts_with('-'))
 }
 
+// Truncated on every launch, so it holds one session and never grows.
+#[cfg(all(windows, not(debug_assertions)))]
+fn session_log_file() -> Option<std::fs::File> {
+    let mut path = glib::user_state_dir();
+    path.push("scrolex");
+    std::fs::create_dir_all(&path).ok()?;
+    path.push("scrolex.log");
+    std::fs::File::create(path).ok()
+}
+
 fn init_logging() {
     let verbose = std::env::args().any(|a| a == "-v" || a == "--verbose");
     let default_filter = if verbose { "scrolex=debug" } else { "warn" };
 
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default_filter))
-        .format_timestamp_millis()
-        .init();
+    let mut builder =
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(default_filter));
+    builder.format_timestamp_millis();
+
+    // A windows release build has no console, so stderr goes nowhere and a bug report carries no
+    // log. Write the session to a file instead. A debug build has a console, so it keeps stderr.
+    #[cfg(all(windows, not(debug_assertions)))]
+    if let Some(file) = session_log_file() {
+        builder.target(env_logger::Target::Pipe(Box::new(file)));
+    }
+
+    builder.init();
     gtk::glib::log_set_default_handler(gtk::glib::rust_log_handler);
 
     log::info!(

@@ -141,6 +141,12 @@ pub fn load_css() {
     });
 }
 
+// GIO builds the platform's file URI. format!("file://{path}") is wrong on Windows, where a path
+// starts with a drive letter and uses backslashes.
+pub fn file_uri(path: impl AsRef<std::path::Path>) -> String {
+    gtk::gio::File::for_path(path.as_ref()).uri().to_string()
+}
+
 pub fn wait_until(mut ready: impl FnMut() -> bool) {
     let context = gtk::glib::MainContext::default();
     let deadline = Instant::now() + Duration::from_secs(10);
