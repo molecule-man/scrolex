@@ -21,16 +21,16 @@ parts:
     plugin: nil
     build-packages:
       - curl
-    override-build: |
+    # Runs at pull, because the rust plugin calls rustup in its own pull step.
+    override-pull: |
       curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-        | sh -s -- -y --no-modify-path --profile minimal --default-toolchain none
+        | sh -s -- -y --no-modify-path --profile minimal --default-toolchain stable
       ln -sf "$HOME/.cargo/bin/rustup" /usr/local/bin/rustup
       ln -sf "$HOME/.cargo/bin/cargo" /usr/local/bin/cargo
 
   scrolex:
     after: [rust-deps]
     plugin: rust
-    rust-channel: stable
     source: .
     parse-info: [usr/share/metainfo/com.andr2i.scrolex.metainfo.xml]
     build-packages:
@@ -39,6 +39,8 @@ parts:
       - libclang-dev
       # build.rs calls glib-compile-resources.
       - libglib2.0-dev-bin
+      # mupdf builds its docx template with unzip.
+      - unzip
     override-build: |
       craftctl default
       # Cargo.toml is the one place ci/bump-version writes the version.
