@@ -334,6 +334,58 @@ jobs:
         version="${{ needs.create-release.outputs.version }}"
         gh release upload "$version" "$BUNDLE" "$SUM"
 
+  build-release-snap:
+    name: build-release-snap
+    needs: ['create-release']
+    runs-on: ubuntu-24.04
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Build the snap
+      id: build
+      uses: snapcore/action-build@v1
+
+    - name: Rename the snap and create its sha256 sum
+      shell: bash
+      run: |
+        version="${{ needs.create-release.outputs.version }}"
+        SNAP=scrolex_$version.snap
+        mv "${{ steps.build.outputs.snap }}" "$SNAP"
+        sum="$SNAP.sha256"
+        shasum -a 256 "$SNAP" > "$sum"
+        echo "SNAP=$SNAP" >> $GITHUB_ENV
+        echo "SUM=$sum" >> $GITHUB_ENV
+
+    - name: Upload release archive
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      shell: bash
+      run: |
+        version="${{ needs.create-release.outputs.version }}"
+        gh release upload "$version" "$SNAP" "$SUM"
+
+    - name: Check for store credentials
+      shell: bash
+      env:
+        CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
+      run: |
+        if [ -n "$CREDENTIALS" ]; then
+          echo "HAS_CREDENTIALS=true" >> $GITHUB_ENV
+        else
+          echo "no SNAPCRAFT_STORE_CREDENTIALS secret; the store upload is skipped"
+        fi
+
+    - name: Publish to the edge channel
+      if: env.HAS_CREDENTIALS == 'true'
+      uses: snapcore/action-publish@v1
+      env:
+        SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
+      with:
+        snap: ${{ env.SNAP }}
+        release: edge
+
   build-release-windows:
     name: build-release-windows
     needs: ['create-release']
