@@ -16,8 +16,21 @@ apps:
       - removable-media
 
 parts:
+  # The core24 rust plugin needs rustup. It looks for a part with this name.
+  rust-deps:
+    plugin: nil
+    build-packages:
+      - curl
+    override-build: |
+      curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --no-modify-path --profile minimal --default-toolchain none
+      ln -sf "$HOME/.cargo/bin/rustup" /usr/local/bin/rustup
+      ln -sf "$HOME/.cargo/bin/cargo" /usr/local/bin/cargo
+
   scrolex:
+    after: [rust-deps]
     plugin: rust
+    rust-channel: stable
     source: .
     parse-info: [usr/share/metainfo/com.andr2i.scrolex.metainfo.xml]
     build-packages:
