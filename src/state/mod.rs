@@ -9,11 +9,11 @@ use gtk::subclass::prelude::*;
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
-use std::fs;
 
 use crate::page;
 
