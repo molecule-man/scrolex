@@ -5,6 +5,14 @@ license: AGPL-3.0-or-later
 confinement: strict
 grade: stable
 
+# The GtkApplication id is not derived from the snap name, so snapd needs
+# explicit permission to own it on the session bus.
+slots:
+  dbus-scrolex:
+    interface: dbus
+    bus: session
+    name: com.andr2i.scrolex
+
 apps:
   scrolex:
     command: bin/scrolex
@@ -14,6 +22,8 @@ apps:
     plugs:
       - home
       - removable-media
+    slots:
+      - dbus-scrolex
 
 parts:
   # The core24 rust plugin needs rustup. It looks for a part with this name.
