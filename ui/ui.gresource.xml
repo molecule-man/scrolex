@@ -6,6 +6,7 @@
 		<file preprocess="xml-stripblanks">about.ui</file>
 		<file>icons/scalable/actions/image-crop-symbolic.svg</file>
 		<file>icons/scalable/actions/zoom-fit-height-symbolic.svg</file>
+		<file>icons/scalable/actions/x-office-document-symbolic.svg</file>
 		<file>icon-128.png</file>
 	</gresource>
 </gresources>
