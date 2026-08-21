@@ -110,3 +110,19 @@ jobs:
     - name: Run tests (Windows)
       if: matrix.os == 'windows-latest'
       run: cargo test --verbose
+
+  audit:
+    name: audit
+    runs-on: ubuntu-24.04
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Install cargo-audit
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-audit
+
+    # Reads Cargo.lock only. No GTK or MuPDF toolchain needed.
+    - name: Audit dependencies
+      run: cargo audit
