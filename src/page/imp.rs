@@ -1864,7 +1864,7 @@ fn blank_rendered_page(
 
 fn solid_page_data(stride: i32, height: i32, color: [u8; 3]) -> Box<[u8]> {
     let mut data = vec![0xffu8; (stride * height) as usize];
-    for pixel in data.chunks_exact_mut(4) {
+    for pixel in data.as_chunks_mut::<4>().0 {
         pixel[..3].copy_from_slice(&[color[2], color[1], color[0]]);
     }
     data.into_boxed_slice()
@@ -2368,7 +2368,9 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         surface
             .with_data(|d| {
                 colored = d
-                    .chunks_exact(4)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
                     .any(|p| p[0] != 255 || p[1] != 255 || p[2] != 255)
             })
             .unwrap();

@@ -495,7 +495,7 @@ fn pack_pixmap(
         for y in 0..target_h as usize {
             let first_padding_pixel = if y < rows { cols } else { 0 };
             let row = &mut data[y * dst_stride..][first_padding_pixel * 4..target_w as usize * 4];
-            for pixel in row.chunks_exact_mut(4) {
+            for pixel in row.as_chunks_mut::<4>().0 {
                 pixel[..3].copy_from_slice(&[mode.paper[2], mode.paper[1], mode.paper[0]]);
             }
         }
