@@ -85,6 +85,14 @@
     </screenshot>
   </screenshots>
   <releases>
+    <release version="0.11.5" date="2026-08-21">
+      <url>https://github.com/molecule-man/scrolex/releases/tag/0.11.5</url>
+      <description>
+        <ul>
+          <li>Introduce snap packaging</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.11.4" date="2026-08-20">
       <url>https://github.com/molecule-man/scrolex/releases/tag/0.11.4</url>
       <description>
