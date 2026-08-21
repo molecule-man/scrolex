@@ -11,6 +11,7 @@ Scrolex lets you see more pages at once, making it ideal for large monitors and
 wide screens.
 
 <a href="https://flathub.org/apps/com.andr2i.scrolex"><img width="190" alt="Get it on Flathub" src="https://flathub.org/api/badge?locale=en"></a>
+<a href="https://snapcraft.io/scrolex"><img width="190" alt="Get it from the Snap Store" src="https://snapcraft.io/static/images/badges/en/snap-store-black.svg"></a>
 <a href="https://apps.microsoft.com/detail/9p1k2szlqqlk"><img width="230" alt="Get it from Microsoft Store" src="https://get.microsoft.com/images/en-us%20dark.svg"></a>
 
 https://github.com/user-attachments/assets/225c4b69-eb15-48d0-b978-f7bd747d463e
@@ -95,9 +96,19 @@ JPEG, TIFF, …) open as well. DjVu is not supported.
 
 ## Installation. Linux
 
-### 1. Install from Flathub
+### 1. Install from the Snap Store (Ubuntu)
 
-Scrolex is on [Flathub](https://flathub.org/apps/com.andr2i.scrolex). 
+Scrolex is on [Snapcraft](https://snapcraft.io/scrolex).
+
+```bash
+sudo snap install scrolex
+```
+
+Linux Mint blocks snap by default so use Flathub if you are on Mint.
+
+### 2. Install from Flathub (Fedora, openSUSE, Mint, SteamOS, others)
+
+Scrolex is on [Flathub](https://flathub.org/apps/com.andr2i.scrolex).
 
 ```bash
 flatpak install --user flathub com.andr2i.scrolex
@@ -113,17 +124,6 @@ If installation fails, the Flathub remote is possibly not configured. Add it:
 flatpak remote-add --if-not-exists --user flathub https://dl.flathub.org/repo/flathub.flatpakrepo
 ```
 
-### 2. Download from GitHub Releases
-
-GTK 4.14 or newer must already be installed. On Arch:
-
-```bash
-sudo pacman -S gtk4
-```
-
-Then download the latest x86-64 pre-built binary archive from the [GitHub
-releases page][1], extract it, and run the `scrolex` executable.
-
 ### 3. Install from AUR (Arch Linux)
 
 If you're using Arch Linux or any Arch-based distribution, you can install
@@ -133,7 +133,7 @@ Scrolex from the Arch User Repository (AUR).
 yay -S scrolex-bin
 ```
 
-### 4. Download and install .deb package from GitHub Releases
+### 4. Download and install .deb package from GitHub Releases (Debian 13 or newer)
 
 The `.deb` package supports Debian 13 or newer and Ubuntu 24.04 or newer.
 Download it from the [GitHub releases page][1], then install it with APT so its
@@ -145,7 +145,18 @@ curl -LO "https://github.com/molecule-man/scrolex/releases/download/<version>/sc
 sudo apt install ./scrolex_<version>.deb
 ```
 
-### 5. Build from source
+### 5. Download from GitHub Releases (any distribution)
+
+GTK 4.14 or newer must already be installed. On Arch:
+
+```bash
+sudo pacman -S gtk4
+```
+
+Then download the latest x86-64 pre-built binary archive from the [GitHub
+releases page][1], extract it, and run the `scrolex` executable.
+
+### 6. Build from source
 
 Needs GTK 4.14 or newer plus a C/C++ toolchain and `clang`, since the `mupdf`
 crate compiles its bundled C library and generates bindings with bindgen. On
