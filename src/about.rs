@@ -1,5 +1,3 @@
-use std::path::Path;
-
 use gtk::glib;
 use gtk::prelude::*;
 
@@ -49,20 +47,20 @@ fn debug_info() -> String {
     format_debug_info(
         &gtk_version(),
         os_name().as_deref(),
-        installed_as_flatpak(),
+        install_method(),
         &gdk_backend(),
         std::env::var("XDG_CURRENT_DESKTOP").ok().as_deref(),
     )
 }
 
 fn issue_url() -> String {
-    build_issue_url(os_name().as_deref(), installed_as_flatpak())
+    build_issue_url(os_name().as_deref(), install_method())
 }
 
 fn format_debug_info(
     gtk_version: &str,
     os: Option<&str>,
-    flatpak: bool,
+    install: Option<&str>,
     backend: &str,
     desktop: Option<&str>,
 ) -> String {
@@ -70,7 +68,7 @@ fn format_debug_info(
         format!("scrolex {VERSION}"),
         format!("GTK {gtk_version}"),
         format!("OS: {}", os.unwrap_or("unknown")),
-        format!("Install: {}", install_method(flatpak)),
+        format!("Install: {}", install.unwrap_or("unknown")),
         format!("Backend: {backend}"),
     ];
     if let Some(desktop) = desktop {
@@ -81,7 +79,7 @@ fn format_debug_info(
 
 // The bug report template is a GitHub issue form: every field can be prefilled with a query
 // parameter named after its id.
-fn build_issue_url(os: Option<&str>, flatpak: bool) -> String {
+fn build_issue_url(os: Option<&str>, install: Option<&str>) -> String {
     let mut url = format!(
         "{NEW_ISSUE_URL}?template=bug_report.yml&version={}",
         escape(&format!("scrolex {VERSION}"))
@@ -89,10 +87,8 @@ fn build_issue_url(os: Option<&str>, flatpak: bool) -> String {
     if let Some(os) = os {
         url.push_str(&format!("&os={}", escape(os)));
     }
-    // The dropdown accepts only its own options, and outside flatpak we can't tell how scrolex was
-    // installed, so leave it for the reporter to pick.
-    if flatpak {
-        url.push_str(&format!("&install-method={}", escape("Flatpak")));
+    if let Some(install) = install {
+        url.push_str(&format!("&install-method={}", escape(install)));
     }
     url
 }
@@ -101,16 +97,28 @@ fn escape(value: &str) -> String {
     glib::Uri::escape_string(value, None, false).to_string()
 }
 
-fn install_method(flatpak: bool) -> &'static str {
-    if flatpak {
-        "Flatpak"
-    } else {
-        "unknown (not flatpak)"
-    }
+// The dropdown of the bug report form accepts only its own options, so the returned text must
+// match one of them. None leaves the choice to the reporter.
+#[cfg(not(windows))]
+fn install_method() -> Option<&'static str> {
+    std::path::Path::new("/.flatpak-info")
+        .exists()
+        .then_some("Flatpak")
 }
 
-fn installed_as_flatpak() -> bool {
-    Path::new("/.flatpak-info").exists()
+#[cfg(windows)]
+fn install_method() -> Option<&'static str> {
+    installed_from_store().then_some("Microsoft Store")
+}
+
+// The Store installs the msix package under C:\Program Files\WindowsApps. A zip runs from
+// wherever the user extracted it.
+#[cfg(windows)]
+fn installed_from_store() -> bool {
+    std::env::current_exe().is_ok_and(|exe| {
+        exe.components()
+            .any(|part| part.as_os_str().eq_ignore_ascii_case("WindowsApps"))
+    })
 }
 
 fn gdk_backend() -> String {
@@ -138,6 +146,7 @@ fn gtk_version() -> String {
     )
 }
 
+#[cfg(not(windows))]
 fn os_name() -> Option<String> {
     // Inside flatpak /etc/os-release describes the runtime; the host one is bind-mounted.
     ["/run/host/os-release", "/etc/os-release"]
@@ -146,6 +155,46 @@ fn os_name() -> Option<String> {
         .and_then(|content| parse_pretty_name(&content))
 }
 
+// Windows has no os-release file. `cmd /c ver` prints the build number without an extra
+// dependency. CREATE_NO_WINDOW keeps the console hidden.
+#[cfg(windows)]
+fn os_name() -> Option<String> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    let output = std::process::Command::new("cmd")
+        .args(["/c", "ver"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .ok()?;
+    Some(
+        parse_windows_version(&String::from_utf8_lossy(&output.stdout))
+            .unwrap_or_else(|| "Windows".to_string()),
+    )
+}
+
+// "Microsoft Windows [Version 10.0.26100.4061]" -> "Windows 11 (10.0.26100.4061)".
+// Every platform compiles it so that the tests cover it.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn parse_windows_version(ver_output: &str) -> Option<String> {
+    const FIRST_WINDOWS_11_BUILD: u32 = 22000;
+
+    let version = ver_output
+        .split_once("Version ")?
+        .1
+        .split(']')
+        .next()?
+        .trim();
+    let build: u32 = version.split('.').nth(2)?.parse().ok()?;
+    let name = if build < FIRST_WINDOWS_11_BUILD {
+        "Windows 10"
+    } else {
+        "Windows 11"
+    };
+    Some(format!("{name} ({version})"))
+}
+
+#[cfg_attr(windows, allow(dead_code))]
 fn parse_pretty_name(os_release: &str) -> Option<String> {
     os_release.lines().find_map(|line| {
         line.strip_prefix("PRETTY_NAME=")
@@ -159,7 +208,7 @@ mod tests {
 
     #[test]
     fn issue_url_prefills_version_and_os() {
-        let url = build_issue_url(Some("Arch Linux"), false);
+        let url = build_issue_url(Some("Arch Linux"), None);
         assert!(url.contains("template=bug_report.yml"), "{url}");
         assert!(
             url.contains(&format!("version=scrolex%20{VERSION}")),
@@ -170,15 +219,21 @@ mod tests {
     }
 
     #[test]
-    fn issue_url_prefills_flatpak_install_method() {
-        let url = build_issue_url(None, true);
-        assert!(url.contains("install-method=Flatpak"), "{url}");
+    fn issue_url_prefills_the_install_method() {
+        let url = build_issue_url(None, Some("Microsoft Store"));
+        assert!(url.contains("install-method=Microsoft%20Store"), "{url}");
         assert!(!url.contains("&os="), "{url}");
     }
 
     #[test]
     fn debug_info_lists_environment() {
-        let info = format_debug_info("4.14.0", Some("Fedora 40"), true, "Wayland", Some("GNOME"));
+        let info = format_debug_info(
+            "4.14.0",
+            Some("Fedora 40"),
+            Some("Flatpak"),
+            "Wayland",
+            Some("GNOME"),
+        );
         assert_eq!(
             info,
             format!(
@@ -189,9 +244,9 @@ mod tests {
 
     #[test]
     fn debug_info_tolerates_unknown_environment() {
-        let info = format_debug_info("4.14.0", None, false, "unknown", None);
+        let info = format_debug_info("4.14.0", None, None, "unknown", None);
         assert!(info.contains("OS: unknown"), "{info}");
-        assert!(info.contains("Install: unknown (not flatpak)"), "{info}");
+        assert!(info.contains("Install: unknown"), "{info}");
         assert!(!info.contains("Desktop:"), "{info}");
     }
 
@@ -211,5 +266,19 @@ mod tests {
     #[test]
     fn pretty_name_missing() {
         assert_eq!(parse_pretty_name("ID=arch\n"), None);
+    }
+
+    #[test]
+    fn windows_version_is_named_by_build() {
+        let win11 = parse_windows_version("\nMicrosoft Windows [Version 10.0.26100.4061]\n");
+        assert_eq!(win11.as_deref(), Some("Windows 11 (10.0.26100.4061)"));
+
+        let win10 = parse_windows_version("Microsoft Windows [Version 10.0.19045.4291]");
+        assert_eq!(win10.as_deref(), Some("Windows 10 (10.0.19045.4291)"));
+    }
+
+    #[test]
+    fn windows_version_missing() {
+        assert_eq!(parse_windows_version("Microsoft Windows"), None);
     }
 }
