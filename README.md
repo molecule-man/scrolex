@@ -11,6 +11,7 @@ Scrolex lets you see more pages at once, making it ideal for large monitors and
 wide screens.
 
 <a href="https://flathub.org/apps/com.andr2i.scrolex"><img width="190" alt="Get it on Flathub" src="https://flathub.org/api/badge?locale=en"></a>
+<a href="https://apps.microsoft.com/detail/9p1k2szlqqlk"><img width="230" alt="Get it from Microsoft Store" src="https://get.microsoft.com/images/en-us%20dark.svg"></a>
 
 https://github.com/user-attachments/assets/225c4b69-eb15-48d0-b978-f7bd747d463e
 
@@ -106,7 +107,7 @@ flatpak run com.andr2i.scrolex
 Drop `--user` from all commands to install system-wide instead (requires
 root).
 
-If installation fails you might have the Flathub remote configured yet. Add it:
+If installation fails, the Flathub remote is possibly not configured. Add it:
 
 ```bash
 flatpak remote-add --if-not-exists --user flathub https://dl.flathub.org/repo/flathub.flatpakrepo
@@ -169,6 +170,19 @@ After building, you will find the binary at the location
 `$PATH`.
 
 ## Installation. Windows
+
+### 1. Install from the Microsoft Store
+
+Scrolex is on the [Microsoft Store](https://apps.microsoft.com/detail/9p1k2szlqqlk).
+The Store installs the app and keeps it updated.
+
+You can also install it from a terminal:
+
+```powershell
+winget install --id 9P1K2SZLQQLK --source msstore
+```
+
+### 2. Download the zip from GitHub Releases
 
 Download `scrolex-<version>-x86_64-windows.zip` from the [GitHub releases
 page][1], extract it anywhere, and run `scrolex.exe`.
