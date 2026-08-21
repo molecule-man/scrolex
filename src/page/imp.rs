@@ -4,9 +4,9 @@
 use std::cell::{Cell, RefCell};
 use std::collections::hash_map::Entry;
 use std::rc::Rc;
-use std::sync::OnceLock;
+use std::sync::{LazyLock, OnceLock};
 
-use futures::channel::oneshot;
+use futures_channel::oneshot;
 use gtk::cairo::{FontSlant, FontWeight};
 use gtk::gdk::prelude::*;
 use gtk::gdk::{MemoryFormat, MemoryTexture, BUTTON_PRIMARY, RGBA};
@@ -16,7 +16,6 @@ use gtk::glib::subclass::{prelude::*, Signal};
 use gtk::graphene;
 use gtk::prelude::*;
 use gtk::subclass::prelude::*;
-use once_cell::sync::Lazy;
 
 use super::Rectangle;
 use crate::bg_job::{RenderPool, RenderPriority};
@@ -58,7 +57,7 @@ const PREVIEW_SLOW_STREAK_LIMIT: u32 = 5;
 thread_local!(
     // Pool caps: visible-preview, visible, preview, prefetch. Fast-scroll flooding is bounded by the
     // wanted-range filter (out-of-view full renders dropped on pop), so caps can be generous.
-    static RENDER_QUEUE: Lazy<RenderPool> = Lazy::new(|| {
+    static RENDER_QUEUE: LazyLock<RenderPool> = LazyLock::new(|| {
         RenderPool::new(
             crate::config::DEFAULT_RENDER_THREADS,
             8,

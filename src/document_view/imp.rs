@@ -2,7 +2,7 @@
 use std::cell::{Cell, RefCell};
 use std::sync::OnceLock;
 
-use futures::StreamExt;
+use futures_util::StreamExt;
 use glib::clone;
 use glib::subclass::InitializingObject;
 use gtk::gdk::{EventSequence, Key, ModifierType, BUTTON_PRIMARY};

@@ -1,6 +1,6 @@
 // Public state API for document loading, persistence, and rendering coordination.
 mod imp;
-use futures::channel::oneshot;
+use futures_channel::oneshot;
 use gtk::gio::prelude::*;
 use gtk::glib;
 use gtk::glib::clone;

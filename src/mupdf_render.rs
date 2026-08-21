@@ -5,13 +5,12 @@ use std::cell::RefCell;
 use std::collections::{hash_map::Entry, HashMap};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
 
 use gtk::cairo::{Format, ImageSurface};
 use gtk::gio::prelude::InputStreamExtManual;
 use gtk::prelude::FileExt;
 use mupdf::{Colorspace, Device, Document, IRect, Matrix, Pixmap, Rect};
-use once_cell::sync::Lazy;
 
 #[derive(Clone, Copy)]
 struct DarkMode {
@@ -26,7 +25,7 @@ const DARK_MODE: DarkMode = DarkMode {
 
 static DARK_MODE_ENABLED: AtomicBool = AtomicBool::new(false);
 
-static GREY_LUT: Lazy<[[u8; 3]; 256]> = Lazy::new(|| {
+static GREY_LUT: LazyLock<[[u8; 3]; 256]> = LazyLock::new(|| {
     std::array::from_fn(|value| recolor(value as u8, value as u8, value as u8, DARK_MODE))
 });
 
@@ -38,7 +37,8 @@ static GENERATION: AtomicU64 = AtomicU64::new(0);
 // Stage their bytes to a temp file once, keyed by uri; cleared on invalidate() so a changed remote
 // file re-stages. Shutdown skips destructors (main.rs _exit), so the last session's staged file
 // lingers in the temp dir - harmless, and left for the OS temp cleaner.
-static STAGED: Lazy<Mutex<HashMap<String, PathBuf>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+static STAGED: LazyLock<Mutex<HashMap<String, PathBuf>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 thread_local! {
     // (uri, generation-at-open, Document). One Document per thread: it's bound to the thread's

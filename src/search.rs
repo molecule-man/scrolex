@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use futures::channel::mpsc;
+use futures_channel::mpsc;
 use mupdf::text_page::SearchHitResponse;
 use mupdf::TextPageFlags;
 

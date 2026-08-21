@@ -9,13 +9,16 @@ repository = "https://github.com/molecule-man/scrolex"
 description = "A Horizontally Scrolled PDF Viewer"
 
 [dependencies]
-env_logger = "0.11.5"
-futures = "0.3.30"
+env_logger = { version = "0.11.5", default-features = false, features = [
+	"auto-color",
+	"humantime",
+] }
+futures-channel = "0.3.30"
+futures-util = "0.3.30"
 glib = { version = "0.22", features = ["log", "v2_72"] }
 gtk = { version = "0.11", package = "gtk4", features = ["v4_14"] }
 log = "0.4"
 mupdf = "0.8"
-once_cell = "1.19.0"
 tempfile = "3"
 
 [build-dependencies]
