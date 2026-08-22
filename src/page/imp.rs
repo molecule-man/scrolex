@@ -304,7 +304,7 @@ impl ObjectImpl for Page {
         self.parent_constructed();
 
         self.setup_scale_tracking();
-        self.setup_state_listeners();
+        self.setup_viewport_listeners();
         self.setup_text_selection();
         self.setup_link_handling();
 
@@ -430,7 +430,7 @@ impl Page {
         *connection = Some((surface, id));
     }
 
-    fn setup_state_listeners(&self) {
+    fn setup_viewport_listeners(&self) {
         let obj = self.obj().clone();
         obj.property_expression("viewport")
             .chain_property::<crate::state::Viewport>("crop")

@@ -1164,11 +1164,11 @@ impl DocumentView {
 
     // Zoom about `screen` and hold the document point there still. The zoom mode does not change.
     fn apply_zoom_at(&self, zoom: f64, screen: (f64, f64)) {
-        self.apply_zoom_at_with(zoom, screen, |state, zoom| state.zoom_to(zoom));
+        self.apply_zoom_at_with(zoom, screen, |viewport, zoom| viewport.zoom_to(zoom));
     }
 
     fn apply_fit_zoom_at(&self, zoom: f64, screen: (f64, f64)) {
-        self.apply_zoom_at_with(zoom, screen, |state, zoom| state.fit_zoom_to(zoom));
+        self.apply_zoom_at_with(zoom, screen, |viewport, zoom| viewport.fit_zoom_to(zoom));
     }
 
     fn apply_zoom_at_with(
@@ -3306,7 +3306,7 @@ mod widget_tests {
     }
 
     #[gtk::test]
-    fn empty_view_follows_document_state() {
+    fn empty_view_follows_the_page_count() {
         let window = window();
         let imp = window.imp();
 
