@@ -19,7 +19,7 @@ use gtk::{prelude::*, GestureClick};
 
 use super::{ReaderKeyContext, ZoomChoice, ZoomChoiceAction};
 use crate::page;
-use crate::state::State;
+use crate::state::Document;
 
 // Time constant of the exponential glide toward the target page position. Larger = slower and
 // smoother; the perceived slide runs a few times this long. The glide is a low-pass follow, which
@@ -122,7 +122,7 @@ struct WidthFit {
 #[template(resource = "/com/andr2i/scrolex/document_view.ui")]
 pub struct DocumentView {
     #[template_child]
-    pub state: TemplateChild<State>,
+    pub state: TemplateChild<Document>,
     #[template_child]
     pub model: TemplateChild<gtk::gio::ListStore>,
     #[template_child]
@@ -297,7 +297,7 @@ impl ObjectImpl for DocumentView {
         static PROPERTIES: OnceLock<Vec<glib::ParamSpec>> = OnceLock::new();
         PROPERTIES.get_or_init(|| {
             vec![
-                glib::ParamSpecObject::builder::<State>("state")
+                glib::ParamSpecObject::builder::<Document>("state")
                     .read_only()
                     .build(),
                 glib::ParamSpecObject::builder::<SingleSelection>("selection")
@@ -1083,7 +1083,12 @@ impl DocumentView {
         self.apply_zoom_at_with(zoom, screen, |state, zoom| state.fit_zoom_to(zoom));
     }
 
-    fn apply_zoom_at_with(&self, zoom: f64, screen: (f64, f64), apply: impl FnOnce(&State, f64)) {
+    fn apply_zoom_at_with(
+        &self,
+        zoom: f64,
+        screen: (f64, f64),
+        apply: impl FnOnce(&Document, f64),
+    ) {
         if self.zoom_anchor.get().is_none() {
             self.zoom_anchor.set(self.capture_zoom_anchor(screen));
         }
@@ -1833,7 +1838,7 @@ impl DocumentView {
     }
 
     #[template_callback]
-    fn handle_document_load(&self, state: &State) {
+    fn handle_document_load(&self, state: &Document) {
         self.hide_loading();
 
         let n_pages = state.n_pages() as u32;
@@ -2095,7 +2100,7 @@ impl DocumentView {
             closure_local!(
                 #[weak(rename_to = imp)]
                 self,
-                move |_: &State, page: i32| imp.redraw_page(page)
+                move |_: &Document, page: i32| imp.redraw_page(page)
             ),
         );
 

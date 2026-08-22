@@ -5,7 +5,7 @@ use gtk::glib::subclass::types::ObjectSubclassIsExt;
 use gtk::prelude::*;
 use gtk::{gio, glib};
 
-use crate::state::State;
+use crate::state::Document;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ReaderKeyContext {
@@ -46,7 +46,7 @@ impl DocumentView {
         Object::builder().build()
     }
 
-    pub fn state(&self) -> &State {
+    pub fn state(&self) -> &Document {
         self.imp().state.as_ref()
     }
 

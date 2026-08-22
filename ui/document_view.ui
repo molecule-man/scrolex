@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <interface>
-	<object class="DocState" id="state">
+	<object class="Document" id="state">
 		<signal name="load-started" handler="on_load_started" swapped="true"/>
 		<signal name="load-failed" handler="on_load_failed" swapped="true"/>
 		<signal name="before-load" handler="clear_model" swapped="true"/>

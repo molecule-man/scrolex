@@ -54,7 +54,7 @@ pub fn init() {
     crate::config::use_scratch_config();
     crate::state::use_scratch_state_dir();
     gtk::gio::resources_register_include!("scrolex-ui.gresource").expect("ui resources");
-    crate::state::State::static_type();
+    crate::state::Document::static_type();
     crate::page::PageNumber::static_type();
     crate::page::Page::static_type();
     crate::document_view::DocumentView::static_type();

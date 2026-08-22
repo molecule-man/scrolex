@@ -29,12 +29,12 @@ fn document_size_bytes(f: &gtk::gio::File) -> i64 {
 }
 
 glib::wrapper! {
-    pub struct State(ObjectSubclass<imp::State>);
+    pub struct Document(ObjectSubclass<imp::Document>);
 }
 
-impl State {
+impl Document {
     pub(crate) fn new() -> Self {
-        // the preview-cache budget and other builder-instance setup live in State's `constructed`,
+        // the preview-cache budget and other builder-instance setup live in Document's `constructed`,
         // which runs here too
         glib::Object::builder()
             .property("zoom", 1.0)
@@ -409,7 +409,7 @@ impl State {
     }
 }
 
-impl Default for State {
+impl Default for Document {
     fn default() -> Self {
         Self::new()
     }
@@ -424,7 +424,7 @@ mod tests {
 
     #[gtk::test]
     fn one_slow_main_thread_render_does_not_require_workers() {
-        let state = State::new();
+        let state = Document::new();
 
         assert!(!state.record_main_thread_render(Duration::from_millis(101)));
         assert!(!state.record_main_thread_render(Duration::from_millis(20)));
@@ -433,7 +433,7 @@ mod tests {
 
     #[gtk::test]
     fn two_consecutive_slow_main_thread_renders_require_workers() {
-        let state = State::new();
+        let state = Document::new();
 
         assert!(!state.record_main_thread_render(Duration::from_millis(101)));
         assert!(state.record_main_thread_render(Duration::from_millis(101)));
@@ -442,7 +442,7 @@ mod tests {
 
     #[gtk::test]
     fn two_alternating_slow_main_thread_renders_require_workers() {
-        let state = State::new();
+        let state = Document::new();
 
         assert!(!state.record_main_thread_render(Duration::from_millis(101)));
         assert!(!state.record_main_thread_render(Duration::from_millis(20)));
@@ -451,7 +451,7 @@ mod tests {
 
     #[gtk::test]
     fn jump_history_moves_in_both_directions() {
-        let state = State::new();
+        let state = Document::new();
         state.jump_list_add(1);
         state.jump_list_add(2);
 
@@ -470,7 +470,7 @@ mod tests {
 
     #[gtk::test]
     fn a_page_jump_clears_forward_history() {
-        let state = State::new();
+        let state = Document::new();
         state.jump_list_add(1);
         assert_eq!(state.jump_list_back(2), Some(1));
 
@@ -482,7 +482,7 @@ mod tests {
 
     #[gtk::test]
     fn zoom_bounds_hold_whatever_the_document() {
-        let state = State::new();
+        let state = Document::new();
         // no page size may narrow this range
         state.zoom_to(50.0);
         assert_eq!(state.zoom(), MAX_ZOOM);
@@ -493,7 +493,7 @@ mod tests {
     #[gtk::test]
     fn fit_zoom_does_not_replace_the_saved_manual_zoom() {
         use_scratch_state_dir();
-        let state = State::new();
+        let state = Document::new();
         state.set_uri("fit-zoom-test.pdf");
         state.zoom_to(2.0);
         state.fit_zoom_to(0.5);
@@ -505,7 +505,7 @@ mod tests {
 
     #[gtk::test]
     fn zoom_retains_full_render_as_a_transition_texture() {
-        let state = State::new();
+        let state = Document::new();
         let bytes = glib::Bytes::from_owned(vec![255u8; 16]);
         let texture =
             gtk::gdk::MemoryTexture::new(2, 2, gtk::gdk::MemoryFormat::B8g8r8x8, &bytes, 8);
@@ -528,7 +528,7 @@ mod tests {
     }
 
     // Pages announced for repaint, in order.
-    fn watch_repaints(state: &State) -> Rc<RefCell<Vec<i32>>> {
+    fn watch_repaints(state: &Document) -> Rc<RefCell<Vec<i32>>> {
         let repainted = Rc::new(RefCell::new(Vec::new()));
         state.connect_closure(
             "selection-changed",
@@ -536,7 +536,7 @@ mod tests {
             glib::closure_local!(
                 #[strong]
                 repainted,
-                move |_: &State, page: i32| repainted.borrow_mut().push(page)
+                move |_: &Document, page: i32| repainted.borrow_mut().push(page)
             ),
         );
         repainted
@@ -544,7 +544,7 @@ mod tests {
 
     #[gtk::test]
     fn one_selection_at_a_time_and_both_pages_repaint() {
-        let state = State::new();
+        let state = Document::new();
         let repainted = watch_repaints(&state);
 
         state.set_selection(Some(selection_on(3, "first")));
@@ -566,7 +566,7 @@ mod tests {
 
     #[gtk::test]
     fn clearing_repaints_the_page_that_held_the_selection() {
-        let state = State::new();
+        let state = Document::new();
         state.set_selection(Some(selection_on(4, "text")));
         let repainted = watch_repaints(&state);
 
@@ -583,7 +583,7 @@ mod tests {
 
     #[gtk::test]
     fn an_empty_selection_has_no_text_to_copy() {
-        let state = State::new();
+        let state = Document::new();
         state.set_selection(Some(selection_on(1, "")));
         assert_eq!(state.selected_text(), None);
     }

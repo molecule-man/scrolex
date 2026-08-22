@@ -244,7 +244,7 @@ fn preview_window(capacity: usize) -> i32 {
 #[properties(wrapper_type = super::Page)]
 pub struct Page {
     #[property(get, set)]
-    state: RefCell<crate::state::State>,
+    state: RefCell<crate::state::Document>,
 
     #[property(get, set)]
     pub(crate) binding: RefCell<Option<glib::Binding>>,
@@ -433,12 +433,12 @@ impl Page {
     fn setup_state_listeners(&self) {
         let obj = self.obj().clone();
         obj.property_expression("state")
-            .chain_property::<crate::state::State>("crop")
+            .chain_property::<crate::state::Document>("crop")
             .watch(gtk::Widget::NONE, move || obj.imp().resize());
 
         let obj = self.obj().clone();
         obj.property_expression("state")
-            .chain_property::<crate::state::State>("zoom")
+            .chain_property::<crate::state::Document>("zoom")
             .watch(gtk::Widget::NONE, move || obj.imp().resize());
     }
 
@@ -1875,7 +1875,7 @@ fn solid_page_data(stride: i32, height: i32, color: [u8; 3]) -> Box<[u8]> {
 // stale zoom or dropped queue request releases its own slot and redraws only a widget still bound to
 // this page, allowing it to request the current viewport and scale.
 fn accept_render<T, E>(
-    state: &crate::state::State,
+    state: &crate::state::Document,
     page_num: i32,
     epoch: u64,
     doc_epoch: u64,
@@ -1912,7 +1912,7 @@ fn accept_render<T, E>(
 
 // Log cache state and repaint whichever widget currently waits for this page, which may differ from
 // the widget that submitted the render after list-item recycling.
-fn finish_render(state: &crate::state::State, page_num: i32) {
+fn finish_render(state: &crate::state::Document, page_num: i32) {
     log::debug!(
         "memory: rss={:.0}MB preview_scale={:.3} render_cache={:?} preview_cache={:?}",
         current_rss_mb(),
@@ -2324,7 +2324,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         std::fs::write(&path, MIXED_SIZE_PDF).unwrap();
         let uri = crate::test_support::file_uri(&path);
 
-        let state = crate::state::State::new();
+        let state = crate::state::Document::new();
         state.set_uri(uri);
         state.set_n_pages(2);
         let page = crate::page::Page::new(&state);

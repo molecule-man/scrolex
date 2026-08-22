@@ -63,7 +63,7 @@ glib::wrapper! {
 }
 
 impl Page {
-    pub fn new(state: &crate::state::State) -> Self {
+    pub fn new(state: &crate::state::Document) -> Self {
         glib::Object::builder().property("state", state).build()
     }
 

@@ -248,7 +248,7 @@ fn build_ui(app: &Application, args: &[OsString], file: Option<&gtk::gio::File>)
             // The background render threads (bg_job) are detached and may be mid MuPDF render at
             // this point; a MuPDF render can't be interrupted. Terminating normally would let the
             // C library destructors free MuPDF/cairo/pixman globals out from under a
-            // still-running render thread, which segfaults. State is saved above, so exit
+            // still-running render thread, which segfaults. The reading position is saved above, so exit
             // immediately without running those destructors and let the OS reclaim everything.
             unsafe { libc_exit(0) };
         }

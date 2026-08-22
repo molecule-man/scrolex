@@ -12,12 +12,12 @@ use std::sync::OnceLock;
 
 use crate::jump_stack;
 
-// Source of per-window render-client ids, assigned to each State on construction.
+// Source of per-window render-client ids, assigned to each Document on construction.
 static NEXT_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Default, glib::Properties)]
-#[properties(wrapper_type = super::State)]
-pub struct State {
+#[properties(wrapper_type = super::Document)]
+pub struct Document {
     #[property(get, set)]
     zoom: Cell<f64>,
 
@@ -97,13 +97,13 @@ pub struct State {
     // numbers), the default; flipped when the user scrolls back.
     pub(crate) scroll_forward: Cell<bool>,
     // bumped on zoom; a render captures it at schedule and drops out on completion if it changed, so
-    // an old-scale render can't cache/rebook. Per-State so one window's zoom never invalidates
+    // an old-scale render can't cache/rebook. Per-Document so one window's zoom never invalidates
     // another's in-flight renders.
     pub(crate) render_epoch: Cell<u64>,
     // this window's id in the render pool's wanted-range filter, so windows don't filter each other
     pub(crate) render_client_id: Cell<u64>,
     // Bumped when the document or its rendering mode changes; a render captures it at schedule and
-    // drops out on completion if it changed. Per-State so one window never invalidates another's
+    // drops out on completion if it changed. Per-Document so one window never invalidates another's
     // in-flight renders.
     pub(crate) doc_epoch: Cell<u64>,
 
@@ -118,25 +118,25 @@ pub struct State {
 }
 
 #[glib::object_subclass]
-impl ObjectSubclass for State {
-    const NAME: &'static str = "DocState";
-    type Type = super::State;
+impl ObjectSubclass for Document {
+    const NAME: &'static str = "Document";
+    type Type = super::Document;
 }
 
 #[glib::derived_properties]
-impl ObjectImpl for State {
+impl ObjectImpl for Document {
     fn constructed(&self) {
         self.parent_constructed();
         self.render_client_id
             .set(NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed));
-        // animated scrolling is on by default; the builder-created instance doesn't run State::new,
+        // animated scrolling is on by default; the builder-created instance doesn't run Document::new,
         // so set it here
         self.obj().set_animate_scroll(true);
 
         // Previews are tiny; give their cache its own small budget rather than the default
         // (full-render) one. Sized for the default resident-preview count; the window resizes it
-        // from config. Must live here, not in State::new: the builder-created instance the window
-        // uses doesn't run State::new.
+        // from config. Must live here, not in Document::new: the builder-created instance the window
+        // uses doesn't run Document::new.
         *self.preview_cache.borrow_mut() = crate::render_cache::RenderCache::new(
             super::preview_cache_budget(crate::config::DEFAULT_PREVIEW_CACHE_PAGES),
         );
@@ -149,7 +149,7 @@ impl ObjectImpl for State {
         // images, but drop queued renders whose scale is now wrong. In-flight markers stay: their
         // renders are still running and holding buffers, so the page waits for that completion
         // rather than starting a second render alongside it.
-        // Must live here, not State::new: the builder-created instance skips it.
+        // Must live here, not Document::new: the builder-created instance skips it.
         self.obj().connect_notify_local(Some("zoom"), |state, _| {
             let imp = state.imp();
             imp.render_waiters.borrow_mut().clear();

@@ -40,7 +40,7 @@ type Job = Box<dyn FnOnce() + Send + 'static>;
 
 struct RenderRequest {
     uri: String,
-    // requesting window (its State id); the wanted-range filter is per-window
+    // requesting window (its Document id); the wanted-range filter is per-window
     client: u64,
     page: i32,
     job: Job,

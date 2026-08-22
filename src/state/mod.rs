@@ -7,7 +7,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
 
-pub(crate) use document::State;
+pub(crate) use document::Document;
 
 // Per-preview size the adaptive preview scaler steers toward. The preview cache's byte budget is
 // this times the configured number of resident previews (config::preview_cache_pages), so the cache
