@@ -14,8 +14,8 @@ use crate::jump_stack;
 #[properties(wrapper_type = super::Viewport)]
 pub struct Viewport {
     // The document this pane reads. Set once, at construction.
-    #[property(get = Self::document, set, construct_only, type = super::Document)]
-    document: RefCell<Option<super::Document>>,
+    #[property(get = Self::document, set, construct_only, type = crate::document::Document)]
+    document: RefCell<Option<crate::document::Document>>,
 
     #[property(get, set)]
     zoom: Cell<f64>,
@@ -61,7 +61,7 @@ pub struct Viewport {
 }
 
 impl Viewport {
-    fn document(&self) -> super::Document {
+    fn document(&self) -> crate::document::Document {
         self.document
             .borrow()
             .clone()

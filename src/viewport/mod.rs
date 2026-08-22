@@ -1,6 +1,8 @@
 // One pane's viewport: zoom, position, jump history, and selection over a shared document.
-use super::viewport_imp as imp;
-use super::{Document, Position, MAX_ZOOM, MIN_ZOOM};
+mod imp;
+
+use crate::document::Document;
+use crate::state::{Position, MAX_ZOOM, MIN_ZOOM};
 use gtk::glib;
 use gtk::prelude::ObjectExt;
 use gtk::subclass::prelude::*;

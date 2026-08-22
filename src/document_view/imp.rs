@@ -18,8 +18,9 @@ use gtk::{
 use gtk::{prelude::*, GestureClick};
 
 use super::{ReaderKeyContext, ZoomChoice, ZoomChoiceAction};
+use crate::document::Document;
 use crate::page;
-use crate::state::{Document, Viewport};
+use crate::viewport::Viewport;
 
 // Time constant of the exponential glide toward the target page position. Larger = slower and
 // smoother; the perceived slide runs a few times this long. The glide is a low-pass follow, which

@@ -1,16 +1,9 @@
-// Document data and the viewport state that reads it.
-mod document;
-mod document_imp;
-mod viewport;
-mod viewport_imp;
+// Shared helpers for document and viewport state.
 
 use gtk::glib;
 use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
-
-pub(crate) use document::Document;
-pub(crate) use viewport::Viewport;
 
 // Per-preview size the adaptive preview scaler steers toward. The preview cache's byte budget is
 // this times the configured number of resident previews (config::preview_cache_pages), so the cache
@@ -19,8 +12,8 @@ pub(crate) const PREVIEW_TARGET_BYTES: usize = 20 * 1024 * 1024 / 65;
 
 // Zoom bounds. The same for every document: huge pages are the ones that need deep zoom most.
 // Render buffers are bounded by scale instead (see page::render_scale).
-const MAX_ZOOM: f64 = 10.0;
-const MIN_ZOOM: f64 = 0.05;
+pub(crate) const MAX_ZOOM: f64 = 10.0;
+pub(crate) const MIN_ZOOM: f64 = 0.05;
 
 // The zoom a typed percent asks for. None below MIN_ZOOM: too small is a typo, so keep the current
 // zoom instead of clamping up to it.

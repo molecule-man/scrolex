@@ -63,13 +63,13 @@ glib::wrapper! {
 }
 
 impl Page {
-    pub fn new(viewport: &crate::state::Viewport) -> Self {
+    pub fn new(viewport: &crate::viewport::Viewport) -> Self {
         glib::Object::builder()
             .property("viewport", viewport)
             .build()
     }
 
-    pub(crate) fn document(&self) -> crate::state::Document {
+    pub(crate) fn document(&self) -> crate::document::Document {
         self.viewport().document()
     }
 

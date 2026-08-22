@@ -95,7 +95,7 @@ impl ObjectImpl for Document {
         // (full-render) one. Sized for the default resident-preview count; the window resizes it
         // from config.
         *self.preview_cache.borrow_mut() = crate::render_cache::RenderCache::new(
-            super::preview_cache_budget(crate::config::DEFAULT_PREVIEW_CACHE_PAGES),
+            crate::state::preview_cache_budget(crate::config::DEFAULT_PREVIEW_CACHE_PAGES),
         );
         self.preview_scale.set(crate::page::PREVIEW_INITIAL_SCALE);
         self.render_threads

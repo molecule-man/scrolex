@@ -5,7 +5,8 @@ use gtk::glib::subclass::types::ObjectSubclassIsExt;
 use gtk::prelude::*;
 use gtk::{gio, glib};
 
-use crate::state::{Document, Viewport};
+use crate::document::Document;
+use crate::viewport::Viewport;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ReaderKeyContext {

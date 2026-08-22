@@ -243,8 +243,8 @@ fn preview_window(capacity: usize) -> i32 {
 #[derive(Default, glib::Properties)]
 #[properties(wrapper_type = super::Page)]
 pub struct Page {
-    #[property(get = Self::viewport, set, construct_only, type = crate::state::Viewport)]
-    viewport: RefCell<Option<crate::state::Viewport>>,
+    #[property(get = Self::viewport, set, construct_only, type = crate::viewport::Viewport)]
+    viewport: RefCell<Option<crate::viewport::Viewport>>,
 
     #[property(get, set)]
     pub(crate) binding: RefCell<Option<glib::Binding>>,
@@ -433,20 +433,20 @@ impl Page {
     fn setup_viewport_listeners(&self) {
         let obj = self.obj().clone();
         obj.property_expression("viewport")
-            .chain_property::<crate::state::Viewport>("crop")
+            .chain_property::<crate::viewport::Viewport>("crop")
             .watch(gtk::Widget::NONE, move || obj.imp().resize());
 
         let obj = self.obj().clone();
         obj.property_expression("viewport")
-            .chain_property::<crate::state::Viewport>("zoom")
+            .chain_property::<crate::viewport::Viewport>("zoom")
             .watch(gtk::Widget::NONE, move || obj.imp().resize());
     }
 
-    fn document(&self) -> crate::state::Document {
+    fn document(&self) -> crate::document::Document {
         self.viewport().document()
     }
 
-    fn viewport(&self) -> crate::state::Viewport {
+    fn viewport(&self) -> crate::viewport::Viewport {
         self.viewport
             .borrow()
             .clone()
@@ -1901,7 +1901,7 @@ fn solid_page_data(stride: i32, height: i32, color: [u8; 3]) -> Box<[u8]> {
 // stale zoom or dropped queue request releases its own slot and redraws only a widget still bound to
 // this page, allowing it to request the current viewport and scale.
 fn accept_render<T, E>(
-    viewport: &crate::state::Viewport,
+    viewport: &crate::viewport::Viewport,
     page_num: i32,
     epoch: u64,
     doc_epoch: u64,
@@ -1939,7 +1939,7 @@ fn accept_render<T, E>(
 
 // Log cache state and repaint whichever widget currently waits for this page, which may differ from
 // the widget that submitted the render after list-item recycling.
-fn finish_render(viewport: &crate::state::Viewport, page_num: i32) {
+fn finish_render(viewport: &crate::viewport::Viewport, page_num: i32) {
     let document = viewport.document();
     log::debug!(
         "memory: rss={:.0}MB preview_scale={:.3} render_cache={:?} preview_cache={:?}",
@@ -2352,10 +2352,10 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         std::fs::write(&path, MIXED_SIZE_PDF).unwrap();
         let uri = crate::test_support::file_uri(&path);
 
-        let document = crate::state::Document::new();
+        let document = crate::document::Document::new();
         document.set_uri(uri);
         document.set_n_pages(2);
-        let page = crate::page::Page::new(&crate::state::Viewport::new(&document));
+        let page = crate::page::Page::new(&crate::viewport::Viewport::new(&document));
 
         // page 1 is 2000x3000pt. At zoom 10 a whole-page buffer would be ~2.4GB, so it renders
         // capped instead of not at all.

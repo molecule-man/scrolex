@@ -1,6 +1,7 @@
 // Document loading and the render bookkeeping the panes share.
-use super::document_imp as imp;
-use super::preview_cache_budget;
+mod imp;
+
+use crate::state::preview_cache_budget;
 use futures::channel::oneshot;
 use gtk::gio::prelude::*;
 use gtk::glib;
