@@ -45,7 +45,7 @@ impl Window {
         }
 
         for document in self.documents() {
-            document.state().invalidate_rendering();
+            document.document().invalidate_rendering();
             document.redraw_pages();
         }
     }

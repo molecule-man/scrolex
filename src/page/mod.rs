@@ -63,8 +63,14 @@ glib::wrapper! {
 }
 
 impl Page {
-    pub fn new(state: &crate::state::Document) -> Self {
-        glib::Object::builder().property("state", state).build()
+    pub fn new(viewport: &crate::state::Viewport) -> Self {
+        glib::Object::builder()
+            .property("viewport", viewport)
+            .build()
+    }
+
+    pub(crate) fn document(&self) -> crate::state::Document {
+        self.viewport().document()
     }
 
     pub(crate) fn bind(&self, pn: &PageNumber) {
@@ -84,15 +90,15 @@ impl Page {
     }
 
     pub(crate) fn crop(&self) -> bool {
-        self.state().crop()
+        self.viewport().crop()
     }
 
     pub(crate) fn zoom(&self) -> f64 {
-        self.state().zoom()
+        self.viewport().zoom()
     }
 
     pub(crate) fn uri(&self) -> String {
-        self.state().uri()
+        self.document().uri()
     }
 
     pub(crate) fn uses_tiles(&self) -> bool {

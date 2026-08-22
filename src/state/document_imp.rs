@@ -1,4 +1,4 @@
-// Per-window document state and render lifecycle bookkeeping.
+// Document data shared by the panes that show it, and render lifecycle bookkeeping.
 #![expect(unused_lifetimes)]
 
 use gtk::glib;
@@ -10,35 +10,16 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
-use crate::jump_stack;
-
 // Source of per-window render-client ids, assigned to each Document on construction.
 static NEXT_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Default, glib::Properties)]
 #[properties(wrapper_type = super::Document)]
 pub struct Document {
-    #[property(get, set)]
-    zoom: Cell<f64>,
-
-    #[property(get, set)]
-    crop: Cell<bool>,
-
-    // Fit the paper to the viewport height, and keep it fitted as the viewport changes. The
-    // intent lives here; the view owns the viewport and works out the zoom it means.
-    #[property(get, set)]
-    fit_height: Cell<bool>,
-
-    // Zoom that the reader selected.
-    pub(crate) manual_zoom: Cell<f64>,
-
     // Tallest paper height in points.
     pub(crate) tallest_page_height: Cell<f64>,
 
     pub(crate) page_sizes: RefCell<Vec<Option<crate::mupdf_render::PageSize>>>,
-
-    #[property(get, set)]
-    animate_scroll: Cell<bool>,
 
     #[property(get, set)]
     n_pages: Cell<i32>,
@@ -47,26 +28,14 @@ pub struct Document {
     uri: RefCell<String>,
 
     #[property(get, set)]
-    page: Cell<u32>,
-
-    #[property(get, set)]
-    prev_page: RefCell<u32>,
-
-    #[property(get, set)]
-    next_page: RefCell<u32>,
-
-    #[property(get, set)]
     multithread_rendering: Cell<bool>,
 
     // Slow status of the last three main-thread renders.
     pub(crate) slow_main_thread_renders: Cell<[bool; 3]>,
 
-    pub(super) jump_stack: Rc<RefCell<jump_stack::JumpStack>>,
-    pub(super) forward_jump_stack: Rc<RefCell<jump_stack::JumpStack>>,
     pub(crate) bbox_cache: Rc<RefCell<HashMap<i32, crate::page::Rectangle>>>,
     pub(crate) links: Rc<RefCell<crate::links::Links>>,
     pub(crate) search: Rc<RefCell<crate::search::Search>>,
-    pub(crate) selection: Rc<RefCell<Option<crate::selection::PageSelection>>>,
 
     // Whole-page and viewport-region textures, kept so scrolling back reuses rendered pixels
     // instead of re-rendering (and flashing white).
@@ -93,13 +62,6 @@ pub struct Document {
     // render scale for previews, adapted per document toward the time and memory budgets. Defaults
     // to 0.0 (Cell); set to the initial scale in constructed and on load.
     pub(crate) preview_scale: Cell<f64>,
-    // direction of travel, used to prefetch the pages being read toward: true = forward (higher page
-    // numbers), the default; flipped when the user scrolls back.
-    pub(crate) scroll_forward: Cell<bool>,
-    // bumped on zoom; a render captures it at schedule and drops out on completion if it changed, so
-    // an old-scale render can't cache/rebook. Per-Document so one window's zoom never invalidates
-    // another's in-flight renders.
-    pub(crate) render_epoch: Cell<u64>,
     // this window's id in the render pool's wanted-range filter, so windows don't filter each other
     pub(crate) render_client_id: Cell<u64>,
     // Bumped when the document or its rendering mode changes; a render captures it at schedule and
@@ -107,10 +69,9 @@ pub struct Document {
     // in-flight renders.
     pub(crate) doc_epoch: Cell<u64>,
 
-    // global render-thread count (user setting) and how many pages fully fit across the viewport;
-    // together they set prefetch depth. Set in constructed / by the window.
+    // global render-thread count (user setting). With the pane's visible page count it sets
+    // prefetch depth. Set in constructed / by the window.
     pub(crate) render_threads: Cell<usize>,
-    pub(crate) visible_page_count: Cell<i32>,
 
     // bumped on each load; the async open's completion drops out if it changed, so a load started
     // while an earlier one is still opening supersedes it.
@@ -129,36 +90,16 @@ impl ObjectImpl for Document {
         self.parent_constructed();
         self.render_client_id
             .set(NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed));
-        // animated scrolling is on by default; the builder-created instance doesn't run Document::new,
-        // so set it here
-        self.obj().set_animate_scroll(true);
 
         // Previews are tiny; give their cache its own small budget rather than the default
         // (full-render) one. Sized for the default resident-preview count; the window resizes it
-        // from config. Must live here, not in Document::new: the builder-created instance the window
-        // uses doesn't run Document::new.
+        // from config.
         *self.preview_cache.borrow_mut() = crate::render_cache::RenderCache::new(
             super::preview_cache_budget(crate::config::DEFAULT_PREVIEW_CACHE_PAGES),
         );
         self.preview_scale.set(crate::page::PREVIEW_INITIAL_SCALE);
-        self.scroll_forward.set(true);
         self.render_threads
             .set(crate::config::DEFAULT_RENDER_THREADS);
-
-        // Zoom changes every page's render scale. Keep completed textures as bounded transition
-        // images, but drop queued renders whose scale is now wrong. In-flight markers stay: their
-        // renders are still running and holding buffers, so the page waits for that completion
-        // rather than starting a second render alongside it.
-        // Must live here, not Document::new: the builder-created instance skips it.
-        self.obj().connect_notify_local(Some("zoom"), |state, _| {
-            let imp = state.imp();
-            imp.render_waiters.borrow_mut().clear();
-            imp.render_cache.borrow_mut().clear_pins();
-            crate::page::clear_full_renders(imp.render_client_id.get());
-            // in-flight renders started at the old scale are now stale; bump so their completion
-            // drops out instead of caching an obsolete-scale texture
-            imp.render_epoch.set(imp.render_epoch.get().wrapping_add(1));
-        });
     }
 
     fn signals() -> &'static [Signal] {
@@ -171,10 +112,6 @@ impl ObjectImpl for Document {
                     .build(),
                 Signal::builder("before-load").build(),
                 Signal::builder("loaded").build(),
-                // a page that gained or lost the selection highlight and needs repainting
-                Signal::builder("selection-changed")
-                    .param_types([i32::static_type()])
-                    .build(),
             ]
         })
     }

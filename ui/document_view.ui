@@ -1,16 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <interface>
-	<object class="Document" id="state">
-		<signal name="load-started" handler="on_load_started" swapped="true"/>
-		<signal name="load-failed" handler="on_load_failed" swapped="true"/>
-		<signal name="before-load" handler="clear_model" swapped="true"/>
-		<signal name="loaded" handler="handle_document_load" swapped="true"/>
-		<binding name="page">
-			<lookup name="page_number" type="PageNumber">
-				<lookup name="selected-item">selection</lookup>
-			</lookup>
-		</binding>
-	</object>
 	<template class="DocumentView" parent="GtkWidget">
 	<child>
 		<object class="GtkBox">
@@ -174,11 +163,6 @@
 					<property name="valign">center</property>
 					<property name="orientation">vertical</property>
 					<property name="spacing">18</property>
-					<binding name="visible">
-						<closure type="gboolean" function="document_is_empty">
-							<lookup name="n_pages">state</lookup>
-						</closure>
-					</binding>
 					<child>
 						<object class="GtkImage">
 							<property name="icon-name">x-office-document-symbolic</property>

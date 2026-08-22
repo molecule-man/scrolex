@@ -1,6 +1,8 @@
 // Document data and the viewport state that reads it.
 mod document;
 mod document_imp;
+mod viewport;
+mod viewport_imp;
 
 use gtk::glib;
 use std::fs;
@@ -8,6 +10,7 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 
 pub(crate) use document::Document;
+pub(crate) use viewport::Viewport;
 
 // Per-preview size the adaptive preview scaler steers toward. The preview cache's byte budget is
 // this times the configured number of resident previews (config::preview_cache_pages), so the cache

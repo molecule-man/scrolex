@@ -243,8 +243,8 @@ fn preview_window(capacity: usize) -> i32 {
 #[derive(Default, glib::Properties)]
 #[properties(wrapper_type = super::Page)]
 pub struct Page {
-    #[property(get, set)]
-    state: RefCell<crate::state::Document>,
+    #[property(get = Self::viewport, set, construct_only, type = crate::state::Viewport)]
+    viewport: RefCell<Option<crate::state::Viewport>>,
 
     #[property(get, set)]
     pub(crate) binding: RefCell<Option<glib::Binding>>,
@@ -348,7 +348,7 @@ impl WidgetImpl for Page {
             return;
         }
 
-        if self.obj().state().multithread_rendering() {
+        if self.obj().document().multithread_rendering() {
             self.multithread_snapshot(snapshot, &page);
         } else {
             self.render_snapshot(snapshot, &page);
@@ -366,7 +366,7 @@ impl Page {
 
     pub(super) fn unpin_render(&self) {
         let obj = self.obj();
-        obj.state()
+        obj.document()
             .render_cache()
             .borrow_mut()
             .unpin_page(obj.index());
@@ -432,14 +432,25 @@ impl Page {
 
     fn setup_state_listeners(&self) {
         let obj = self.obj().clone();
-        obj.property_expression("state")
-            .chain_property::<crate::state::Document>("crop")
+        obj.property_expression("viewport")
+            .chain_property::<crate::state::Viewport>("crop")
             .watch(gtk::Widget::NONE, move || obj.imp().resize());
 
         let obj = self.obj().clone();
-        obj.property_expression("state")
-            .chain_property::<crate::state::Document>("zoom")
+        obj.property_expression("viewport")
+            .chain_property::<crate::state::Viewport>("zoom")
             .watch(gtk::Widget::NONE, move || obj.imp().resize());
+    }
+
+    fn document(&self) -> crate::state::Document {
+        self.viewport().document()
+    }
+
+    fn viewport(&self) -> crate::state::Viewport {
+        self.viewport
+            .borrow()
+            .clone()
+            .expect("a page has a viewport")
     }
 
     pub(super) fn resize(&self) {
@@ -483,7 +494,7 @@ impl Page {
     // the page can't be read.
     fn page_info(&self) -> Option<PageInfo> {
         let index = self.obj().index();
-        let size = self.state.borrow().page_size(index).or_else(|| {
+        let size = self.document().page_size(index).or_else(|| {
             crate::mupdf_render::page_size(&self.obj().uri(), index)
                 .map(|(width, height)| crate::mupdf_render::PageSize { width, height })
         })?;
@@ -512,7 +523,7 @@ impl Page {
             #[strong]
             cursor,
             move |_gc, _n_press, x, y| {
-                page.state().clear_selection();
+                page.viewport().clear_selection();
                 mouse_coords.replace(Some((x, y)));
                 if !imp.cursor_guard.get() {
                     page.set_cursor_from_name(Some("text"));
@@ -541,13 +552,13 @@ impl Page {
                     crate::selection::selection(&obj.uri(), obj.index(), (x1, y1), (x2, y2));
                 match selection {
                     Some(sel) if !sel.rects.is_empty() => {
-                        obj.state().set_selection(Some(PageSelection {
+                        obj.viewport().set_selection(Some(PageSelection {
                             page: obj.index(),
                             rects: sel.rects.into_iter().map(Rectangle::from).collect(),
                             text: sel.text,
                         }));
                     }
-                    _ => obj.state().clear_selection(),
+                    _ => obj.viewport().clear_selection(),
                 }
             }
         ));
@@ -555,7 +566,7 @@ impl Page {
         let obj = self.obj().clone();
         gc.connect_end(move |_, _| {
             // Primary selection only (middle-click paste); the clipboard needs an explicit copy.
-            if let Some(text) = obj.state().selected_text() {
+            if let Some(text) = obj.viewport().selected_text() {
                 obj.primary_clipboard().set_text(&text);
             }
             if Cell::get(&cursor) {
@@ -583,8 +594,7 @@ impl Page {
             move |_, x, y| {
                 let Point { x, y } = undo_zoom_and_crop(&obj, x, y);
                 if imp
-                    .state
-                    .borrow()
+                    .document()
                     .imp()
                     .links
                     .borrow_mut()
@@ -618,12 +628,13 @@ impl Page {
             move |gc, _n_press, x, y| {
                 let Point { x, y } = undo_zoom_and_crop(&obj, x, y);
 
-                if let Some(link_target) = imp.state.borrow().imp().links.borrow_mut().get_link(
-                    &obj.uri(),
-                    obj.index(),
-                    x,
-                    y,
-                ) {
+                if let Some(link_target) =
+                    imp.document()
+                        .imp()
+                        .links
+                        .borrow_mut()
+                        .get_link(&obj.uri(), obj.index(), x, y)
+                {
                     match link_target {
                         LinkTarget::Page(page_num) => {
                             gc.set_state(gtk::EventSequenceState::Claimed); // stop the event from propagating
@@ -648,8 +659,7 @@ impl Page {
         }
 
         let bbox = get_bbox(&self.obj().uri(), page, true);
-        self.state
-            .borrow()
+        self.document()
             .bbox_cache()
             .borrow_mut()
             .insert(page.index, bbox);
@@ -678,8 +688,7 @@ impl Page {
         }
 
         let bbox = get_bbox(&self.obj().uri(), page, true);
-        self.state
-            .borrow()
+        self.document()
             .bbox_cache()
             .borrow_mut()
             .insert(page.index, bbox);
@@ -690,8 +699,7 @@ impl Page {
         if !crop {
             return Some(Rectangle::new(0.0, 0.0, page.width, page.height));
         }
-        self.state
-            .borrow()
+        self.document()
             .bbox_cache()
             .borrow()
             .get(&page.index)
@@ -729,12 +737,12 @@ impl Page {
         if render_scale < scale {
             // Viewport regions are rendered off the UI thread; entering this path also keeps later
             // page renders asynchronous so snapshots do not alternate rendering modes.
-            obj.state().set_multithread_rendering(true);
+            obj.document().set_multithread_rendering(true);
             self.multithread_snapshot(snapshot, page);
             return;
         }
         self.tiled.set(false);
-        obj.state()
+        obj.document()
             .render_cache()
             .borrow_mut()
             .unpin_page(page.index);
@@ -769,11 +777,11 @@ impl Page {
             page.index
         );
 
-        if obj.state().record_main_thread_render(elapsed) {
+        if obj.document().record_main_thread_render(elapsed) {
             log::warn!(
                 "Two of the last three main-thread renders exceeded 100 ms. Latest: {elapsed:?}. Switching to multithreading mode."
             );
-            obj.state().set_multithread_rendering(true);
+            obj.document().set_multithread_rendering(true);
         }
     }
 
@@ -857,7 +865,7 @@ impl Page {
     // land on the words.
     fn snapshot_selection_overlay(&self, snapshot: &gtk::Snapshot, page: &PageInfo) {
         let obj = self.obj();
-        let selection = obj.state().selection();
+        let selection = obj.viewport().selection();
         let selection = selection.borrow();
         let Some(selection) = selection
             .as_ref()
@@ -887,7 +895,7 @@ impl Page {
     fn snapshot_search_overlay(&self, snapshot: &gtk::Snapshot, page: &PageInfo) {
         let obj = self.obj();
         let index = obj.index();
-        let search = obj.state().search();
+        let search = obj.document().search();
         let search = search.borrow();
         let Some(matches) = search.results.get(&index) else {
             return;
@@ -1024,7 +1032,7 @@ impl Page {
             })
             .collect();
         {
-            let cache = obj.state().render_cache();
+            let cache = obj.document().render_cache();
             let mut cache = cache.borrow_mut();
             cache.pin_tiles(page_num, &visible_ids);
             for (region, id) in regions.into_iter().zip(visible_ids.iter().copied()) {
@@ -1035,8 +1043,8 @@ impl Page {
             }
         }
 
-        let full = obj.state().render_cache().borrow_mut().get(page_num);
-        let preview = obj.state().preview_cache().borrow_mut().get(page_num);
+        let full = obj.document().render_cache().borrow_mut().get(page_num);
+        let preview = obj.document().preview_cache().borrow_mut().get(page_num);
         let source = fallback_source(
             full.as_ref().map(|texture| texture.width()),
             preview.as_ref().map(|texture| texture.width()),
@@ -1075,7 +1083,7 @@ impl Page {
             return;
         }
         self.schedule_tile_render(page_num, scale, dsf, page_px, missing);
-        obj.state()
+        obj.document()
             .render_waiters()
             .borrow_mut()
             .insert(page_num, obj.downgrade());
@@ -1088,7 +1096,7 @@ impl Page {
             },
         );
 
-        let preview_target_width = ((page.width * obj.state().preview_scale()) as i32).max(1);
+        let preview_target_width = ((page.width * obj.document().preview_scale()) as i32).max(1);
         if needs_visible_preview(
             full.as_ref().map(|texture| texture.width()),
             preview.is_some(),
@@ -1113,11 +1121,14 @@ impl Page {
             return;
         }
         self.tiled.set(false);
-        obj.state().render_cache().borrow_mut().pin_page(page_num);
+        obj.document()
+            .render_cache()
+            .borrow_mut()
+            .pin_page(page_num);
         let expected = render_dimensions((width, height), render_scale, dsf);
         let page_bytes = page_buffer_bytes((width, height), render_scale, dsf);
 
-        let cache = obj.state().render_cache();
+        let cache = obj.document().render_cache();
         let cached = cache.borrow_mut().get(page_num);
         let stale_render = if let Some(texture) = cached {
             if (texture.width(), texture.height()) == expected {
@@ -1140,12 +1151,12 @@ impl Page {
 
         // remember that this widget is the one waiting for page_num, so the
         // render repaints it when it lands
-        obj.state()
+        obj.document()
             .render_waiters()
             .borrow_mut()
             .insert(page_num, obj.downgrade());
 
-        let preview = obj.state().preview_cache().borrow_mut().get(page_num);
+        let preview = obj.document().preview_cache().borrow_mut().get(page_num);
         let source = fallback_source(
             stale_render.as_ref().map(|texture| texture.width()),
             preview.as_ref().map(|texture| texture.width()),
@@ -1178,7 +1189,7 @@ impl Page {
         }
 
         // Request a stand-in for this page. Start look-ahead work after the full render lands.
-        let preview_target_width = ((page.width * obj.state().preview_scale()) as i32).max(1);
+        let preview_target_width = ((page.width * obj.document().preview_scale()) as i32).max(1);
         if needs_visible_preview(
             stale_render.as_ref().map(|texture| texture.width()),
             preview.is_some(),
@@ -1193,19 +1204,20 @@ impl Page {
     // `page_bytes` is the current page's render size, which bounds the depth.
     fn prefetch_next(&self, current: i32, page_bytes: usize) {
         let obj = self.obj();
-        let state = obj.state();
-        let n_pages = state.n_pages();
+        let viewport = obj.viewport();
+        let document = viewport.document();
+        let n_pages = document.n_pages();
         if n_pages == 0 {
             return;
         }
-        let dir = if state.scroll_forward() { 1 } else { -1 };
+        let dir = if viewport.scroll_forward() { 1 } else { -1 };
         let scale = obj.zoom();
         let dsf = device_scale(&*obj);
-        let cache = state.render_cache();
+        let cache = document.render_cache();
 
-        let visible = state.visible_page_count().max(1) as usize;
+        let visible = viewport.visible_page_count().max(1) as usize;
         let budget = cache.borrow().budget_bytes();
-        let ahead = prefetch_depth(state.render_threads(), visible, page_bytes, budget) as i32;
+        let ahead = prefetch_depth(document.render_threads(), visible, page_bytes, budget) as i32;
 
         // farthest first so the LIFO queue pops the nearest ahead-page first
         for d in (1..=ahead).rev() {
@@ -1225,7 +1237,7 @@ impl Page {
         // Cheap bail before reading page bounds: a page redrawn while its render runs comes back here
         // on every snapshot.
         if obj
-            .state()
+            .document()
             .render_inflight()
             .borrow()
             .contains_key(&page_num)
@@ -1246,7 +1258,7 @@ impl Page {
         };
         let pixel_scale = scale * dsf;
         if obj
-            .state()
+            .document()
             .render_cache()
             .borrow()
             .contains_at_scale(page_num, pixel_scale)
@@ -1254,33 +1266,40 @@ impl Page {
             return;
         }
 
-        let epoch = obj.state().render_epoch();
-        match obj.state().render_inflight().borrow_mut().entry(page_num) {
+        let epoch = obj.viewport().render_epoch();
+        match obj
+            .document()
+            .render_inflight()
+            .borrow_mut()
+            .entry(page_num)
+        {
             Entry::Occupied(_) => return,
             Entry::Vacant(slot) => {
                 slot.insert(epoch);
             }
         }
 
-        let client = obj.state().render_client_id();
+        let client = obj.document().render_client_id();
         log::trace!("Scheduling render of page {page_num}");
 
         let (resp_sender, resp_receiver) = oneshot::channel::<RenderedPixels>();
         let obj_clone = obj.clone();
-        let doc_epoch = obj.state().doc_epoch();
+        let doc_epoch = obj.document().doc_epoch();
         glib::spawn_future_local(async move {
             let result = resp_receiver.await;
-            let state = obj_clone.state();
-            let Some(rendered) = accept_render(&state, page_num, epoch, doc_epoch, result) else {
+            let viewport = obj_clone.viewport();
+            let Some(rendered) = accept_render(&viewport, page_num, epoch, doc_epoch, result)
+            else {
                 return;
             };
 
             let texture = rendered.into_texture();
-            state
-                .render_cache()
-                .borrow_mut()
-                .insert(page_num, texture.upcast(), pixel_scale);
-            finish_render(&state, page_num);
+            viewport.document().render_cache().borrow_mut().insert(
+                page_num,
+                texture.upcast(),
+                pixel_scale,
+            );
+            finish_render(&viewport, page_num);
         });
 
         let uri_job = uri.clone();
@@ -1319,8 +1338,13 @@ impl Page {
             return;
         }
         let obj = self.obj();
-        let epoch = obj.state().render_epoch();
-        match obj.state().render_inflight().borrow_mut().entry(page_num) {
+        let epoch = obj.viewport().render_epoch();
+        match obj
+            .document()
+            .render_inflight()
+            .borrow_mut()
+            .entry(page_num)
+        {
             Entry::Occupied(_) => return,
             Entry::Vacant(slot) => {
                 slot.insert(epoch);
@@ -1328,15 +1352,16 @@ impl Page {
         }
 
         let uri = obj.uri();
-        let client = obj.state().render_client_id();
-        let doc_epoch = obj.state().doc_epoch();
+        let client = obj.document().render_client_id();
+        let doc_epoch = obj.document().doc_epoch();
         let pixel_scale = scale * dsf;
         let (resp_sender, resp_receiver) = oneshot::channel::<Vec<RenderedRegion>>();
         let obj_clone = obj.clone();
         glib::spawn_future_local(async move {
             let result = resp_receiver.await;
-            let state = obj_clone.state();
-            let Some(rendered) = accept_render(&state, page_num, epoch, doc_epoch, result) else {
+            let viewport = obj_clone.viewport();
+            let Some(rendered) = accept_render(&viewport, page_num, epoch, doc_epoch, result)
+            else {
                 return;
             };
 
@@ -1351,11 +1376,12 @@ impl Page {
                     (id, region.pixels.into_texture().upcast())
                 })
                 .collect();
-            state
+            viewport
+                .document()
                 .render_cache()
                 .borrow_mut()
                 .insert_tile_batch(textures, pixel_scale);
-            finish_render(&state, page_num);
+            finish_render(&viewport, page_num);
         });
 
         let uri_job = uri.clone();
@@ -1384,14 +1410,14 @@ impl Page {
     // either way shows blurry pages instead of blank ones.
     fn prefetch_previews(&self, current: i32) {
         let obj = self.obj();
-        if !obj.state().preview_enabled() {
+        if !obj.document().preview_enabled() {
             return;
         }
-        let n_pages = obj.state().n_pages();
+        let n_pages = obj.document().n_pages();
         if n_pages == 0 {
             return;
         }
-        let window = preview_window(obj.state().preview_cache().borrow().page_capacity());
+        let window = preview_window(obj.document().preview_cache().borrow().page_capacity());
 
         // Walk outward from the visible page, interleaving both directions, and push so the nearest
         // pages end up on top of the LIFO queue (rendered first). Pages already cached - typically
@@ -1413,14 +1439,14 @@ impl Page {
     // before anything else) and Preview for the look-ahead window.
     fn schedule_preview_if_needed(&self, page_num: i32, priority: RenderPriority) {
         let obj = self.obj();
-        let state = obj.state();
-        if !state.preview_enabled() || state.preview_cache().borrow().contains(page_num) {
+        let document = obj.document();
+        if !document.preview_enabled() || document.preview_cache().borrow().contains(page_num) {
             return;
         }
-        if state.preview_inflight().borrow().len() >= MAX_INFLIGHT_PREVIEWS {
+        if document.preview_inflight().borrow().len() >= MAX_INFLIGHT_PREVIEWS {
             return;
         }
-        if state.preview_inflight().borrow_mut().insert(page_num) {
+        if document.preview_inflight().borrow_mut().insert(page_num) {
             self.schedule_preview(page_num, priority);
         }
     }
@@ -1428,8 +1454,8 @@ impl Page {
     fn schedule_preview(&self, page_num: i32, priority: RenderPriority) {
         let obj = self.obj();
         let uri = obj.uri();
-        let client = obj.state().render_client_id();
-        let scale = obj.state().preview_scale();
+        let client = obj.document().render_client_id();
+        let scale = obj.document().preview_scale();
         let page_pt = crate::mupdf_render::page_size(&uri, page_num);
 
         let (resp_sender, resp_receiver) = oneshot::channel::<RenderedPixels>();
@@ -1437,15 +1463,15 @@ impl Page {
         // Previews survive a zoom (they're rescaled at draw), so only a document load invalidates
         // them - check doc_epoch, not render_epoch. Per-window, so another window's load can't wedge
         // this preview's inflight marker.
-        let doc_epoch = obj.state().doc_epoch();
+        let doc_epoch = obj.document().doc_epoch();
         glib::spawn_future_local(async move {
             let result = resp_receiver.await;
-            let state = obj_clone.state();
+            let document = obj_clone.document();
 
-            if state.doc_epoch() != doc_epoch {
+            if document.doc_epoch() != doc_epoch {
                 return;
             }
-            state.preview_inflight().borrow_mut().remove(&page_num);
+            document.preview_inflight().borrow_mut().remove(&page_num);
 
             let Ok(rendered) = result else {
                 return;
@@ -1455,21 +1481,21 @@ impl Page {
             // once several previews in a row are slow at the floor they never will pay off - stop
             // making new ones. A one-off slow page just bumps the streak; a cheap preview clears it.
             // Keep the already-rendered previews cached either way - they're valid placeholders.
-            let cur_scale = state.preview_scale();
+            let cur_scale = document.preview_scale();
             if rendered.render_ms > PREVIEW_SLOW_MS && cur_scale <= PREVIEW_MIN_SCALE {
-                let streak = state.preview_slow_streak() + 1;
-                state.set_preview_slow_streak(streak);
+                let streak = document.preview_slow_streak() + 1;
+                document.set_preview_slow_streak(streak);
                 if streak >= PREVIEW_SLOW_STREAK_LIMIT {
                     log::debug!(
                         "preview page {page_num} took {}ms (>{PREVIEW_SLOW_MS}) at min scale, {streak}x in a row; disabling previews",
                         rendered.render_ms
                     );
-                    state.set_preview_enabled(false);
-                    state.preview_inflight().borrow_mut().clear();
+                    document.set_preview_enabled(false);
+                    document.preview_inflight().borrow_mut().clear();
                     return;
                 }
             } else {
-                state.set_preview_slow_streak(0);
+                document.set_preview_slow_streak(0);
             }
 
             // steer the scale for future previews toward the time and memory budgets, based on what
@@ -1482,18 +1508,18 @@ impl Page {
                     rendered.render_ms,
                     bytes / 1024
                 );
-                state.set_preview_scale(new_scale);
+                document.set_preview_scale(new_scale);
             }
 
             let texture = rendered.into_texture();
-            state
+            document
                 .preview_cache()
                 .borrow_mut()
                 .insert(page_num, texture.upcast(), scale);
 
             // repaint the waiting widget, but leave the waiter registered so the
             // full render still repaints it when it lands
-            if let Some(widget) = state
+            if let Some(widget) = document
                 .render_waiters()
                 .borrow()
                 .get(&page_num)
@@ -1875,17 +1901,18 @@ fn solid_page_data(stride: i32, height: i32, color: [u8; 3]) -> Box<[u8]> {
 // stale zoom or dropped queue request releases its own slot and redraws only a widget still bound to
 // this page, allowing it to request the current viewport and scale.
 fn accept_render<T, E>(
-    state: &crate::state::Document,
+    viewport: &crate::state::Viewport,
     page_num: i32,
     epoch: u64,
     doc_epoch: u64,
     result: Result<T, E>,
 ) -> Option<T> {
-    if state.doc_epoch() != doc_epoch {
+    let document = viewport.document();
+    if document.doc_epoch() != doc_epoch {
         return None;
     }
     {
-        let inflight = state.render_inflight();
+        let inflight = document.render_inflight();
         let mut inflight = inflight.borrow_mut();
         if inflight.get(&page_num) == Some(&epoch) {
             inflight.remove(&page_num);
@@ -1893,9 +1920,9 @@ fn accept_render<T, E>(
     }
 
     match result {
-        Ok(rendered) if state.render_epoch() == epoch => Some(rendered),
+        Ok(rendered) if viewport.render_epoch() == epoch => Some(rendered),
         _ => {
-            if let Some(widget) = state
+            if let Some(widget) = document
                 .render_waiters()
                 .borrow()
                 .get(&page_num)
@@ -1912,15 +1939,16 @@ fn accept_render<T, E>(
 
 // Log cache state and repaint whichever widget currently waits for this page, which may differ from
 // the widget that submitted the render after list-item recycling.
-fn finish_render(state: &crate::state::Document, page_num: i32) {
+fn finish_render(viewport: &crate::state::Viewport, page_num: i32) {
+    let document = viewport.document();
     log::debug!(
         "memory: rss={:.0}MB preview_scale={:.3} render_cache={:?} preview_cache={:?}",
         current_rss_mb(),
-        state.preview_scale(),
-        state.render_cache().borrow(),
-        state.preview_cache().borrow(),
+        document.preview_scale(),
+        document.render_cache().borrow(),
+        document.preview_cache().borrow(),
     );
-    if let Some(widget) = state
+    if let Some(widget) = document
         .render_waiters()
         .borrow_mut()
         .remove(&page_num)
@@ -2324,30 +2352,30 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         std::fs::write(&path, MIXED_SIZE_PDF).unwrap();
         let uri = crate::test_support::file_uri(&path);
 
-        let state = crate::state::Document::new();
-        state.set_uri(uri);
-        state.set_n_pages(2);
-        let page = crate::page::Page::new(&state);
+        let document = crate::state::Document::new();
+        document.set_uri(uri);
+        document.set_n_pages(2);
+        let page = crate::page::Page::new(&crate::state::Viewport::new(&document));
 
         // page 1 is 2000x3000pt. At zoom 10 a whole-page buffer would be ~2.4GB, so it renders
         // capped instead of not at all.
         page.imp()
             .schedule_render(1, 10.0, 1.0, RenderPriority::Prefetch);
-        assert!(state.render_inflight().borrow().contains_key(&1));
+        assert!(document.render_inflight().borrow().contains_key(&1));
 
         // already cached at the capped scale: don't render it again on every draw
-        state.render_inflight().borrow_mut().clear();
+        document.render_inflight().borrow_mut().clear();
         let capped = render_scale((2000.0, 3000.0), 10.0, 1.0);
         let (w, h) = render_dimensions((2000.0, 3000.0), capped, 1.0);
         let bytes = glib::Bytes::from_owned(vec![255u8; (w * h * 4) as usize]);
         let texture = MemoryTexture::new(w, h, MemoryFormat::B8g8r8x8, &bytes, (w * 4) as usize);
-        state
+        document
             .render_cache()
             .borrow_mut()
             .insert(1, texture.upcast(), capped);
         page.imp()
             .schedule_render(1, 10.0, 1.0, RenderPriority::Prefetch);
-        assert!(state.render_inflight().borrow().is_empty());
+        assert!(document.render_inflight().borrow().is_empty());
     }
 
     #[gtk::test]
