@@ -1,7 +1,6 @@
 // Document loading and the render bookkeeping the panes share.
 mod imp;
 
-use crate::state::preview_cache_budget;
 use futures::channel::oneshot;
 use gtk::gio::prelude::*;
 use gtk::glib;
@@ -17,6 +16,14 @@ use std::time::Duration;
 use crate::page;
 
 const MAX_MAIN_THREAD_RENDER_TIME: Duration = Duration::from_millis(100);
+
+// Per-preview size the adaptive preview scaler steers toward. The cache budget uses this size.
+pub(crate) const PREVIEW_TARGET_BYTES: usize = 20 * 1024 * 1024 / 65;
+
+// Preview cache byte budget for a given number of resident previews.
+pub(crate) fn preview_cache_budget(pages: usize) -> usize {
+    pages * PREVIEW_TARGET_BYTES
+}
 
 fn document_size_bytes(f: &gtk::gio::File) -> i64 {
     f.query_info(

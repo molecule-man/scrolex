@@ -864,13 +864,13 @@ impl DocumentView {
         choices.sort_by(|a, b| a.zoom.total_cmp(&b.zoom));
         choices
             .into_iter()
-            .filter(|choice| crate::state::zoom_is_supported(choice.zoom))
+            .filter(|choice| crate::viewport::zoom_is_supported(choice.zoom))
             .map(|choice| {
                 let mut label = String::new();
                 if choice.current {
                     label.push_str("✓  ");
                 }
-                label.push_str(&crate::state::zoom_percent_text(choice.zoom));
+                label.push_str(&crate::viewport::zoom_percent_text(choice.zoom));
                 label.push('%');
                 if !choice.descriptions.is_empty() {
                     label.push_str("  ");
@@ -1438,12 +1438,12 @@ impl DocumentView {
     // A zoom the reader typed. Asking for the fit zoom turns fit mode back on rather than
     // freezing that number, so the fit survives the next viewport change.
     pub(super) fn apply_zoom_percent(&self, percent: f64) {
-        let Some(zoom) = crate::state::zoom_from_percent(percent) else {
+        let Some(zoom) = crate::viewport::zoom_from_percent(percent) else {
             return;
         };
 
         if self.fit_height_zoom().is_some_and(|fit_zoom| {
-            crate::state::zoom_percent_text(fit_zoom) == crate::state::zoom_percent_text(zoom)
+            crate::viewport::zoom_percent_text(fit_zoom) == crate::viewport::zoom_percent_text(zoom)
         }) {
             self.viewport().set_fit_height(true);
             return;
@@ -2846,10 +2846,10 @@ fn add_zoom_choice(
     current: bool,
     shortcut: bool,
 ) {
-    let percent = crate::state::zoom_percent_text(zoom);
+    let percent = crate::viewport::zoom_percent_text(zoom);
     if let Some(choice) = choices
         .iter_mut()
-        .find(|choice| crate::state::zoom_percent_text(choice.zoom) == percent)
+        .find(|choice| crate::viewport::zoom_percent_text(choice.zoom) == percent)
     {
         if let Some(description) = description {
             if !choice.descriptions.contains(&description) {
@@ -3253,8 +3253,8 @@ mod tests {
 #[cfg(test)]
 mod widget_tests {
     use super::{anchored_scroll, KINETIC_MIN_VELOCITY};
-    use crate::state::zoom_percent_text;
     use crate::test_support::{loaded_window, type_zoom, wait_until, window};
+    use crate::viewport::zoom_percent_text;
     use gtk::prelude::*;
     use gtk::subclass::prelude::ObjectSubclassIsExt;
 
@@ -4004,19 +4004,19 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
     #[test]
     fn zoom_percent_text_keeps_at_most_two_decimals() {
         assert_eq!(
-            crate::state::zoom_percent_text(3.331_061_493_552_564),
+            crate::viewport::zoom_percent_text(3.331_061_493_552_564),
             "333.11"
         );
-        assert_eq!(crate::state::zoom_percent_text(1.0), "100");
-        assert_eq!(crate::state::zoom_percent_text(10.0), "1000");
-        assert_eq!(crate::state::zoom_percent_text(0.05), "5");
+        assert_eq!(crate::viewport::zoom_percent_text(1.0), "100");
+        assert_eq!(crate::viewport::zoom_percent_text(10.0), "1000");
+        assert_eq!(crate::viewport::zoom_percent_text(0.05), "5");
         // 0.07 * 100 is 7.000000000000001 in binary
-        assert_eq!(crate::state::zoom_percent_text(0.07), "7");
-        assert_eq!(crate::state::zoom_percent_text(1.5), "150");
-        assert_eq!(crate::state::zoom_percent_text(0.125), "12.5");
+        assert_eq!(crate::viewport::zoom_percent_text(0.07), "7");
+        assert_eq!(crate::viewport::zoom_percent_text(1.5), "150");
+        assert_eq!(crate::viewport::zoom_percent_text(0.125), "12.5");
         // the entry is six characters wide, and 1000 is the largest zoom
         for zoom in [0.05, 0.07, 0.333, 1.0, 3.331_061_493_552_564, 9.9999, 10.0] {
-            let text = crate::state::zoom_percent_text(zoom);
+            let text = crate::viewport::zoom_percent_text(zoom);
             assert!(text.len() <= 6, "{zoom} shows as {text}");
         }
     }

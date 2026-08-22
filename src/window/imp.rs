@@ -942,7 +942,7 @@ impl Window {
     #[allow(clippy::unused_self)]
     #[template_callback]
     fn zoom_entry_text(&self, zoom_value: f64) -> String {
-        crate::state::zoom_percent_text(zoom_value)
+        crate::viewport::zoom_percent_text(zoom_value)
     }
 
     // Dims the page entry's jump icon while pressing it would scroll nowhere. Runs while the
@@ -967,8 +967,8 @@ impl Window {
 
         // compared at the precision the entry shows, so applying what is already displayed counts
         // as no change
-        crate::state::zoom_from_percent(percent).is_some_and(|target| {
-            crate::state::zoom_percent_text(target) != crate::state::zoom_percent_text(zoom)
+        crate::viewport::zoom_from_percent(percent).is_some_and(|target| {
+            crate::viewport::zoom_percent_text(target) != crate::viewport::zoom_percent_text(zoom)
         })
     }
 }
@@ -1411,14 +1411,14 @@ mod widget_tests {
         };
         let whole = (
             total_mb * 1024 * 1024,
-            crate::state::preview_cache_budget(total_previews),
+            crate::document::preview_cache_budget(total_previews),
         );
         assert_eq!(budgets(&first), whole, "one document holds the whole cache");
 
         let second = window.header().add_document().expect("a tab");
         let half = (
             whole.0 / 2,
-            crate::state::preview_cache_budget(total_previews / 2),
+            crate::document::preview_cache_budget(total_previews / 2),
         );
         assert_eq!(budgets(&first), half, "two documents halve it");
         assert_eq!(budgets(&second), half);

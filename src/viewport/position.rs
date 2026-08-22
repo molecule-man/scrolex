@@ -1,41 +1,9 @@
-// Shared helpers for document and viewport state.
+// Reading position persistence.
 
 use gtk::glib;
 use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
-
-// Per-preview size the adaptive preview scaler steers toward. The preview cache's byte budget is
-// this times the configured number of resident previews (config::preview_cache_pages), so the cache
-// holds about that many previews regardless of the adaptive scale.
-pub(crate) const PREVIEW_TARGET_BYTES: usize = 20 * 1024 * 1024 / 65;
-
-// Zoom bounds. The same for every document: huge pages are the ones that need deep zoom most.
-// Render buffers are bounded by scale instead (see page::render_scale).
-pub(crate) const MAX_ZOOM: f64 = 10.0;
-pub(crate) const MIN_ZOOM: f64 = 0.05;
-
-// The zoom a typed percent asks for. None below MIN_ZOOM: too small is a typo, so keep the current
-// zoom instead of clamping up to it.
-pub(crate) fn zoom_from_percent(percent: f64) -> Option<f64> {
-    let zoom = percent / 100.0;
-
-    (zoom >= MIN_ZOOM).then(|| zoom.min(MAX_ZOOM))
-}
-
-pub(crate) fn zoom_is_supported(zoom: f64) -> bool {
-    (MIN_ZOOM..=MAX_ZOOM).contains(&zoom)
-}
-
-// Zoom as a percent for the entry, at most two decimals so that it fully fits into entry input
-pub(crate) fn zoom_percent_text(zoom: f64) -> String {
-    format!("{}", (zoom * 10_000.0).round() / 100.0)
-}
-
-// Preview cache byte budget for a given number of resident previews.
-pub(crate) fn preview_cache_budget(pages: usize) -> usize {
-    pages * PREVIEW_TARGET_BYTES
-}
 
 // Where the reader left a document. Saved per uri, restored on open.
 #[derive(Debug, Clone, Copy, PartialEq)]

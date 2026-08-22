@@ -1640,7 +1640,7 @@ fn texture_from_raw(data: Vec<u8>, width: i32, height: i32, stride: i32) -> Memo
 fn adapt_preview_scale(cur_scale: f64, render_ms: u128, bytes: usize) -> f64 {
     // Per-preview size ceiling: the cache budget is this times the resident-preview count, so
     // steering each preview toward this size keeps that many resident.
-    let target_bytes = crate::state::PREVIEW_TARGET_BYTES as f64;
+    let target_bytes = crate::document::PREVIEW_TARGET_BYTES as f64;
 
     let render_ms = render_ms.max(1) as f64;
     let bytes = bytes.max(1) as f64;

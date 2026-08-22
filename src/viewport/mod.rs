@@ -1,8 +1,8 @@
 // One pane's viewport: zoom, position, jump history, and selection over a shared document.
 mod imp;
+mod position;
 
 use crate::document::Document;
-use crate::state::{Position, MAX_ZOOM, MIN_ZOOM};
 use gtk::glib;
 use gtk::prelude::ObjectExt;
 use gtk::subclass::prelude::*;
@@ -10,6 +10,33 @@ use gtk::subclass::prelude::*;
 use std::cell::RefCell;
 use std::io;
 use std::rc::Rc;
+
+use position::Position;
+
+#[cfg(test)]
+pub(crate) use position::use_scratch_state_dir;
+
+// Zoom bounds. The same for every document: huge pages are the ones that need deep zoom most.
+// Render buffers are bounded by scale instead (see page::render_scale).
+const MAX_ZOOM: f64 = 10.0;
+const MIN_ZOOM: f64 = 0.05;
+
+// The zoom a typed percent asks for. None below MIN_ZOOM: too small is a typo, so keep the current
+// zoom instead of clamping up to it.
+pub(crate) fn zoom_from_percent(percent: f64) -> Option<f64> {
+    let zoom = percent / 100.0;
+
+    (zoom >= MIN_ZOOM).then(|| zoom.min(MAX_ZOOM))
+}
+
+pub(crate) fn zoom_is_supported(zoom: f64) -> bool {
+    (MIN_ZOOM..=MAX_ZOOM).contains(&zoom)
+}
+
+// Zoom as a percent for the entry, at most two decimals so that it fully fits into entry input
+pub(crate) fn zoom_percent_text(zoom: f64) -> String {
+    format!("{}", (zoom * 10_000.0).round() / 100.0)
+}
 
 glib::wrapper! {
     pub struct Viewport(ObjectSubclass<imp::Viewport>);
@@ -179,7 +206,7 @@ impl Viewport {
 mod tests {
     use super::*;
     use crate::page;
-    use crate::state::use_scratch_state_dir;
+    use crate::viewport::use_scratch_state_dir;
     use gtk::prelude::Cast;
 
     fn viewport() -> Viewport {
