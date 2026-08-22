@@ -1,5 +1,6 @@
 // Public state API for document loading, persistence, and rendering coordination.
 use super::document_imp as imp;
+use super::{preview_cache_budget, Position, MAX_ZOOM, MIN_ZOOM};
 use futures::channel::oneshot;
 use gtk::gio::prelude::*;
 use gtk::glib;
@@ -9,46 +10,13 @@ use gtk::subclass::prelude::*;
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::fs;
-use std::io::{self, Write};
-use std::path::PathBuf;
+use std::io;
 use std::rc::Rc;
 use std::time::Duration;
 
 use crate::page;
 
-// Per-preview size the adaptive preview scaler steers toward. The preview cache's byte budget is
-// this times the configured number of resident previews (config::preview_cache_pages), so the cache
-// holds about that many previews regardless of the adaptive scale.
-pub(crate) const PREVIEW_TARGET_BYTES: usize = 20 * 1024 * 1024 / 65;
 const MAX_MAIN_THREAD_RENDER_TIME: Duration = Duration::from_millis(100);
-
-// Zoom bounds. The same for every document: huge pages are the ones that need deep zoom most.
-// Render buffers are bounded by scale instead (see page::render_scale).
-const MAX_ZOOM: f64 = 10.0;
-const MIN_ZOOM: f64 = 0.05;
-
-// The zoom a typed percent asks for. None below MIN_ZOOM: too small is a typo, so keep the current
-// zoom instead of clamping up to it.
-pub(crate) fn zoom_from_percent(percent: f64) -> Option<f64> {
-    let zoom = percent / 100.0;
-
-    (zoom >= MIN_ZOOM).then(|| zoom.min(MAX_ZOOM))
-}
-
-pub(crate) fn zoom_is_supported(zoom: f64) -> bool {
-    (MIN_ZOOM..=MAX_ZOOM).contains(&zoom)
-}
-
-// Zoom as a percent for the entry, at most two decimals so that it fully fits into entry input
-pub(crate) fn zoom_percent_text(zoom: f64) -> String {
-    format!("{}", (zoom * 10_000.0).round() / 100.0)
-}
-
-// Preview cache byte budget for a given number of resident previews.
-pub(crate) fn preview_cache_budget(pages: usize) -> usize {
-    pages * PREVIEW_TARGET_BYTES
-}
 
 fn document_size_bytes(f: &gtk::gio::File) -> i64 {
     f.query_info(
@@ -257,8 +225,6 @@ impl State {
 
         self.emit_by_name::<()>("before-load", &[]);
 
-        let state_path = get_state_file_path(uri);
-
         self.imp().jump_stack.borrow_mut().reset();
         self.imp().forward_jump_stack.borrow_mut().reset();
         self.set_prev_page(0);
@@ -269,33 +235,13 @@ impl State {
         self.imp()
             .tallest_page_height
             .set(tallest_page_height.unwrap_or(0.0));
-        self.zoom_to(1.0);
-        self.set_crop(false);
-        self.set_page(0);
         self.imp().slow_main_thread_renders.set([false; 3]);
         self.set_multithread_rendering(false);
 
-        if state_path.exists() {
-            for line in fs::read_to_string(&state_path).unwrap().lines() {
-                match line.split_once('=') {
-                    Some(("zoom", value)) => {
-                        let zoom = value.parse().unwrap_or(1.0);
-                        if zoom > 0.0 {
-                            self.zoom_to(zoom);
-                        }
-                    }
-                    Some(("page", value)) => {
-                        let page = value.parse().unwrap_or(0);
-                        self.set_page(page);
-                    }
-                    Some(("crop", value)) => {
-                        let crop = value.parse().unwrap_or(false);
-                        self.set_crop(crop);
-                    }
-                    _ => {}
-                }
-            }
-        }
+        let position = Position::read(uri);
+        self.zoom_to(position.zoom);
+        self.set_page(position.page);
+        self.set_crop(position.crop);
 
         log::info!(
             "Loaded document: {n_pages} pages, {size_bytes} bytes, tallest page {tallest_page_height:?} pt, \
@@ -309,24 +255,12 @@ impl State {
     }
 
     pub fn save(&self) -> io::Result<()> {
-        let state_path = get_state_file_path(&self.uri());
-        let state_dir = state_path.parent().unwrap();
-
-        if !state_dir.exists() {
-            fs::create_dir_all(state_dir)?;
+        Position {
+            zoom: self.imp().manual_zoom.get(),
+            page: self.page(),
+            crop: self.crop(),
         }
-
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&state_path)?;
-
-        writeln!(file, "zoom={}", self.imp().manual_zoom.get())?;
-        writeln!(file, "page={}", self.page())?;
-        writeln!(file, "crop={}", self.crop())?;
-
-        file.flush()
+        .write(&self.uri())
     }
 
     pub(crate) fn bbox_cache(&self) -> Rc<RefCell<HashMap<i32, page::Rectangle>>> {
@@ -481,82 +415,12 @@ impl Default for State {
     }
 }
 
-// Tests open documents, and an open writes the reading position. Redirect the directory per test:
-// a zoom left by one test must not come back in another, nor in the reader's own files.
-#[cfg(test)]
-struct ScratchState {
-    dir: tempfile::TempDir,
-}
-
-#[cfg(test)]
-thread_local! {
-    static TEST_STATE: RefCell<Option<ScratchState>> = const { RefCell::new(None) };
-}
-
-// Point this thread's per-document state at an empty directory.
-#[cfg(test)]
-pub(crate) fn use_scratch_state_dir() {
-    let dir = tempfile::Builder::new()
-        .prefix("scrolex-test-state-")
-        .tempdir()
-        .expect("scratch state dir");
-    TEST_STATE.with(|slot| *slot.borrow_mut() = Some(ScratchState { dir }));
-}
-
-// A uri maps to nested directories under the state dir. Windows forbids : ? " < > | * and \\ in a
-// name, and every uri starts with a scheme colon, so those are replaced there. Paths on other
-// platforms keep their existing layout.
-#[cfg(not(windows))]
-fn uri_components(uri: &str) -> PathBuf {
-    PathBuf::from(uri)
-}
-
-#[cfg(windows)]
-fn uri_components(uri: &str) -> PathBuf {
-    uri.split('/')
-        .filter(|part| !part.is_empty())
-        .map(|part| part.replace([':', '?', '"', '<', '>', '|', '*', '\\'], "_"))
-        .collect()
-}
-
-fn get_state_file_path(uri: &str) -> PathBuf {
-    #[cfg(test)]
-    if let Some(mut state_path) = TEST_STATE.with(|state| {
-        state
-            .borrow()
-            .as_ref()
-            .map(|state| state.dir.path().to_path_buf())
-    }) {
-        state_path.push(uri_components(uri));
-        state_path.set_extension("ini");
-        return state_path;
-    }
-
-    let mut state_path = glib::user_state_dir();
-    state_path.push("pdf-viewer");
-    state_path.push(uri_components(uri));
-    state_path.set_extension("ini");
-
-    state_path
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::use_scratch_state_dir;
     use gtk::prelude::Cast;
     use std::time::Duration;
-
-    // Windows rejects a colon in a filename, and every uri carries a scheme colon.
-    #[test]
-    fn a_state_path_for_a_file_uri_can_be_written() {
-        use_scratch_state_dir();
-        let path = get_state_file_path("file:///D:/a/scrolex/tests/fixtures/no_outline.pdf");
-
-        fs::create_dir_all(path.parent().expect("a parent")).expect("create the state directory");
-        fs::write(&path, "zoom=1\n").expect("write the state file");
-
-        assert!(path.exists());
-    }
 
     #[gtk::test]
     fn one_slow_main_thread_render_does_not_require_workers() {
@@ -616,20 +480,6 @@ mod tests {
         assert_eq!(state.jump_list_forward(3), None);
     }
 
-    #[test]
-    fn replacing_scratch_state_removes_the_previous_directory() {
-        use_scratch_state_dir();
-        let state = State::new();
-        state.set_uri("scratch.pdf");
-        state.save().unwrap();
-        let path = get_state_file_path(&state.uri());
-        let dir = path.parent().unwrap().to_path_buf();
-
-        use_scratch_state_dir();
-
-        assert!(!dir.exists());
-    }
-
     #[gtk::test]
     fn zoom_bounds_hold_whatever_the_document() {
         let state = State::new();
@@ -650,9 +500,7 @@ mod tests {
 
         state.save().unwrap();
 
-        let path = get_state_file_path(&state.uri());
-        let saved = fs::read_to_string(path).unwrap();
-        assert!(saved.lines().any(|line| line == "zoom=2"));
+        assert_eq!(Position::read(&state.uri()).zoom, 2.0);
     }
 
     #[gtk::test]
