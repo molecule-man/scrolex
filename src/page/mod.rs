@@ -5,7 +5,7 @@ mod imp;
 pub(crate) use imp::device_scale;
 mod page_number_imp;
 
-pub(crate) use imp::clear_all_renders;
+pub(crate) use imp::clear_document_renders;
 pub(crate) use imp::clear_full_renders;
 pub(crate) use imp::set_render_threads;
 pub(crate) use imp::set_wanted_pages;

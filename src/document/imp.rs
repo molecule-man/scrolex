@@ -7,15 +7,13 @@ use gtk::{gio::prelude::*, glib::subclass::Signal};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
-
-// Source of per-window render-client ids, assigned to each Document on construction.
-static NEXT_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Default, glib::Properties)]
 #[properties(wrapper_type = super::Document)]
 pub struct Document {
+    pub(crate) id: Cell<u64>,
+
     // Tallest paper height in points.
     pub(crate) tallest_page_height: Cell<f64>,
 
@@ -40,13 +38,7 @@ pub struct Document {
     // Whole-page and viewport-region textures, kept so scrolling back reuses rendered pixels
     // instead of re-rendering (and flashing white).
     pub(crate) render_cache: Rc<RefCell<crate::render_cache::RenderCache>>,
-    // pages with a render in flight, mapped to the render_epoch it was scheduled at. One render per
-    // page at a time: a zoom leaves the entry in place, and the stale render's completion releases it
-    // (see Page::schedule_render), so zooming can't stack up buffers for the same page.
-    pub(crate) render_inflight: Rc<RefCell<HashMap<i32, u64>>>,
-    // widget currently waiting to display each page, so a finished render repaints the right widget
-    // even if list recycling moved the requester
-    pub(crate) render_waiters: Rc<RefCell<HashMap<i32, glib::WeakRef<crate::page::Page>>>>,
+    pub(crate) render_jobs: Rc<RefCell<HashMap<super::RenderJobKey, super::RenderJob>>>,
 
     // low-resolution page previews rendered ahead and shown instantly (upscaled) while the full
     // render is pending, so aggressive scrolling shows blurry pages, not blank. Small budget
@@ -62,11 +54,7 @@ pub struct Document {
     // render scale for previews, adapted per document toward the time and memory budgets. Defaults
     // to 0.0 (Cell); set to the initial scale in constructed and on load.
     pub(crate) preview_scale: Cell<f64>,
-    // this window's id in the render pool's wanted-range filter, so windows don't filter each other
-    pub(crate) render_client_id: Cell<u64>,
-    // Bumped when the document or its rendering mode changes; a render captures it at schedule and
-    // drops out on completion if it changed. Per-Document so one window never invalidates another's
-    // in-flight renders.
+    // A document or render-mode change invalidates work from an earlier epoch.
     pub(crate) doc_epoch: Cell<u64>,
 
     // global render-thread count (user setting). With the pane's visible page count it sets
@@ -88,8 +76,7 @@ impl ObjectSubclass for Document {
 impl ObjectImpl for Document {
     fn constructed(&self) {
         self.parent_constructed();
-        self.render_client_id
-            .set(NEXT_CLIENT_ID.fetch_add(1, Ordering::Relaxed));
+        self.id.set(super::DocumentRenderId::next().0);
 
         // Previews are tiny; give their cache its own small budget rather than the default
         // (full-render) one. Sized for the default resident-preview count; the window resizes it

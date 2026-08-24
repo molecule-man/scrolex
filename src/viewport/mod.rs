@@ -10,6 +10,7 @@ use gtk::subclass::prelude::*;
 use std::cell::RefCell;
 use std::io;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use position::Position;
 
@@ -20,6 +21,26 @@ pub(crate) use position::use_scratch_state_dir;
 // Render buffers are bounded by scale instead (see page::render_scale).
 const MAX_ZOOM: f64 = 10.0;
 const MIN_ZOOM: f64 = 0.05;
+
+static NEXT_VIEWPORT_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct ViewportId(u64);
+
+impl ViewportId {
+    fn next() -> Self {
+        Self(NEXT_VIEWPORT_ID.fetch_add(1, Ordering::Relaxed))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_raw(id: u64) -> Self {
+        Self(id)
+    }
+
+    pub(crate) fn raw(self) -> u64 {
+        self.0
+    }
+}
 
 // The zoom a typed percent asks for. None below MIN_ZOOM: too small is a typo, so keep the current
 // zoom instead of clamping up to it.
@@ -51,6 +72,10 @@ impl Viewport {
             .property("animate_scroll", true)
             .property("page", 0_u32)
             .build()
+    }
+
+    pub(crate) fn id(&self) -> ViewportId {
+        ViewportId(self.imp().id.get())
     }
 
     // Apply and save a manual zoom.
@@ -121,6 +146,7 @@ impl Viewport {
         self.set_prev_page(0);
         self.set_next_page(0);
         self.imp().selection.replace(None);
+        self.imp().current_search_result.set(None);
     }
 
     // Where the reader left this document, or the defaults.
@@ -181,8 +207,12 @@ impl Viewport {
             .filter(|text| !text.is_empty())
     }
 
-    pub(crate) fn render_epoch(&self) -> u64 {
-        self.imp().render_epoch.get()
+    pub(crate) fn current_search_result(&self) -> Option<(i32, usize)> {
+        self.imp().current_search_result.get()
+    }
+
+    pub(crate) fn set_current_search_result(&self, result: Option<(i32, usize)>) {
+        self.imp().current_search_result.set(result);
     }
 
     pub(crate) fn scroll_forward(&self) -> bool {
@@ -230,6 +260,59 @@ mod tests {
         assert_eq!(viewport.jump_list_forward(1), Some(2));
         assert_eq!(viewport.prev_page(), 1);
         assert_eq!(viewport.next_page(), 3);
+    }
+
+    #[test]
+    fn viewports_select_search_results_independently() {
+        let document = Document::new();
+        let left = Viewport::new(&document);
+        let right = Viewport::new(&document);
+
+        left.set_current_search_result(Some((2, 1)));
+
+        assert_eq!(left.current_search_result(), Some((2, 1)));
+        assert_eq!(right.current_search_result(), None);
+    }
+
+    #[test]
+    fn a_shared_render_keeps_the_other_viewport_interest() {
+        let document = Document::new();
+        let left = Viewport::new(&document);
+        let right = Viewport::new(&document);
+        let key = crate::document::RenderJobKey::Page(
+            crate::render_cache::PageRenderKey::from_factors(2, 1.0, 1.0),
+        );
+
+        let demand = document
+            .request_render(key.clone(), &left, None)
+            .expect("the first request starts the job");
+        assert!(document.request_render(key.clone(), &right, None).is_none());
+
+        document.remove_render_interests(left.id());
+        assert!(!demand.is_empty());
+        assert!(document.has_render_job(&key));
+
+        document.remove_render_interests(right.id());
+        assert!(demand.is_empty());
+        assert!(!document.has_render_job(&key));
+    }
+
+    #[gtk::test]
+    fn prefetch_keeps_a_visible_render_waiter() {
+        let document = Document::new();
+        let viewport = Viewport::new(&document);
+        let page = page::Page::new(&viewport);
+        page.set_index(2);
+        let key = crate::document::RenderJobKey::Page(
+            crate::render_cache::PageRenderKey::from_factors(2, 1.0, 1.0),
+        );
+
+        document.request_render(key.clone(), &viewport, Some(&page));
+        document.request_render(key, &viewport, None);
+
+        let waiters = document.render_waiters(2);
+        assert_eq!(waiters.len(), 1);
+        assert_eq!(waiters[0].upgrade(), Some(page));
     }
 
     #[gtk::test]
@@ -313,16 +396,22 @@ mod tests {
     }
 
     #[gtk::test]
-    fn a_zoom_leaves_the_other_viewport_alone() {
+    fn a_zoom_keeps_the_other_viewports_render_interest() {
         let document = Document::new();
         let left = Viewport::new(&document);
         let right = Viewport::new(&document);
-        let (before_left, before_right) = (left.render_epoch(), right.render_epoch());
+        let key = crate::document::RenderJobKey::Page(
+            crate::render_cache::PageRenderKey::from_factors(2, 1.0, 1.0),
+        );
+        let demand = document
+            .request_render(key.clone(), &left, None)
+            .expect("the first request starts the job");
+        document.request_render(key.clone(), &right, None);
 
         left.zoom_to(2.0);
 
-        assert_eq!(left.render_epoch(), before_left + 1);
-        assert_eq!(right.render_epoch(), before_right);
+        assert!(!demand.is_empty());
+        assert!(document.has_render_job(&key));
     }
 
     #[gtk::test]
@@ -332,11 +421,12 @@ mod tests {
         let texture =
             gtk::gdk::MemoryTexture::new(2, 2, gtk::gdk::MemoryFormat::B8g8r8x8, &bytes, 8);
         let cache = viewport.document().render_cache();
-        cache.borrow_mut().insert(3, texture.upcast(), 1.0);
+        let render = crate::render_cache::PageRenderKey::from_factors(3, 1.0, 1.0);
+        cache.borrow_mut().insert(render, texture.upcast());
 
         viewport.zoom_to(1.1);
 
-        assert!(cache.borrow().contains_at_scale(3, 1.0));
+        assert!(cache.borrow().contains(render));
     }
 
     fn selection_on(page: i32, text: &str) -> crate::selection::PageSelection {

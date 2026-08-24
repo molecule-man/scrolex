@@ -6,27 +6,54 @@ use std::collections::{HashMap, HashSet};
 use gtk::gdk;
 use gtk::prelude::TextureExt;
 
+use crate::viewport::ViewportId;
+
 // Budget for the CPU-side texture buffers (GSK holds its own GPU copy). Covers the active scrolling
 // working set: visible page plus prefetched neighbours.
 const DEFAULT_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct TileId {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct RenderScale(u64);
+
+impl RenderScale {
+    pub fn from_factors(scale: f64, device_scale: f64) -> Self {
+        let pixel_scale = scale * device_scale;
+        debug_assert!(pixel_scale.is_finite() && pixel_scale > 0.0);
+        Self(pixel_scale.to_bits())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct PageRenderKey {
     pub page: i32,
+    pub scale: RenderScale,
+}
+
+impl PageRenderKey {
+    pub fn from_factors(page: i32, scale: f64, device_scale: f64) -> Self {
+        Self {
+            page,
+            scale: RenderScale::from_factors(scale, device_scale),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct TileId {
+    pub render: PageRenderKey,
     pub x: i32,
     pub y: i32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum CacheKey {
-    Page(i32),
+    Page(PageRenderKey),
     Tile(TileId),
 }
 
 struct Entry {
     texture: gdk::Texture,
     bytes: usize,
-    pixel_scale: f64,
 }
 
 pub struct RenderCache {
@@ -37,7 +64,7 @@ pub struct RenderCache {
     order: Vec<CacheKey>,
     // Keys currently presented by each mapped page widget. They may exceed the nominal budget: a
     // viewport cannot be made smaller by evicting its own pixels.
-    pinned_by_page: HashMap<i32, HashSet<CacheKey>>,
+    pinned_by_page: HashMap<(ViewportId, i32), HashSet<CacheKey>>,
 }
 
 impl Default for RenderCache {
@@ -76,36 +103,39 @@ impl RenderCache {
         self.budget_bytes
     }
 
-    pub fn get(&mut self, page: i32) -> Option<gdk::Texture> {
-        let key = CacheKey::Page(page);
+    pub fn get(&mut self, render: PageRenderKey) -> Option<gdk::Texture> {
+        let key = CacheKey::Page(render);
         let texture = self.entries.get(&key)?.texture.clone();
         self.touch(key);
         Some(texture)
     }
 
-    pub fn get_tile(&mut self, tile: TileId, pixel_scale: f64) -> Option<gdk::Texture> {
-        let key = CacheKey::Tile(tile);
-        let entry = self.entries.get(&key)?;
-        if entry.pixel_scale != pixel_scale {
-            return None;
-        }
-        let texture = entry.texture.clone();
+    pub fn get_latest(&mut self, page: i32) -> Option<gdk::Texture> {
+        let key = self.order.iter().rev().find_map(|key| match key {
+            CacheKey::Page(render) if render.page == page => Some(*key),
+            _ => None,
+        })?;
+        let texture = self.entries.get(&key)?.texture.clone();
         self.touch(key);
         Some(texture)
     }
 
-    // Whether a page is cached, without affecting recency (used by prefetch to
-    // decide what still needs rendering).
-    pub fn contains(&self, page: i32) -> bool {
-        self.entries.contains_key(&CacheKey::Page(page))
+    pub fn get_tile(&mut self, tile: TileId) -> Option<gdk::Texture> {
+        let key = CacheKey::Tile(tile);
+        let texture = self.entries.get(&key)?.texture.clone();
+        self.touch(key);
+        Some(texture)
     }
 
-    // Whether a page is cached at the requested render scale, without affecting recency. Exact
-    // comparison is stable because insertion and lookup use the same zoom * scale_factor product.
-    pub fn contains_at_scale(&self, page: i32, pixel_scale: f64) -> bool {
+    // Check one page and scale without a recency change.
+    pub fn contains(&self, render: PageRenderKey) -> bool {
+        self.entries.contains_key(&CacheKey::Page(render))
+    }
+
+    pub fn contains_page(&self, page: i32) -> bool {
         self.entries
-            .get(&CacheKey::Page(page))
-            .is_some_and(|entry| entry.pixel_scale == pixel_scale)
+            .keys()
+            .any(|key| matches!(key, CacheKey::Page(render) if render.page == page))
     }
 
     // Rough number of pages that fit the budget, from the average cached page size. 0 until
@@ -118,37 +148,44 @@ impl RenderCache {
         self.budget_bytes.checked_div(avg).unwrap_or(0)
     }
 
-    pub fn insert(&mut self, page: i32, texture: gdk::Texture, pixel_scale: f64) {
-        self.insert_key(CacheKey::Page(page), texture, pixel_scale);
+    pub fn insert(&mut self, render: PageRenderKey, texture: gdk::Texture) {
+        self.insert_key(CacheKey::Page(render), texture);
     }
 
     #[cfg(test)]
-    fn insert_tile(&mut self, tile: TileId, texture: gdk::Texture, pixel_scale: f64) {
-        self.insert_key(CacheKey::Tile(tile), texture, pixel_scale);
+    fn insert_tile(&mut self, tile: TileId, texture: gdk::Texture) {
+        self.insert_key(CacheKey::Tile(tile), texture);
     }
 
-    pub fn insert_tile_batch(&mut self, tiles: Vec<(TileId, gdk::Texture)>, pixel_scale: f64) {
+    pub fn insert_tile_batch(&mut self, tiles: Vec<(TileId, gdk::Texture)>) {
         for (tile, texture) in tiles {
-            self.insert_key_unbounded(CacheKey::Tile(tile), texture, pixel_scale);
+            self.insert_key_unbounded(CacheKey::Tile(tile), texture);
         }
         self.evict();
     }
 
-    pub fn pin_page(&mut self, page: i32) {
+    pub(crate) fn pin_page(&mut self, viewport: ViewportId, render: PageRenderKey) {
+        let owner = (viewport, render.page);
         if self
             .pinned_by_page
-            .get(&page)
-            .is_some_and(|keys| keys.len() == 1 && keys.contains(&CacheKey::Page(page)))
+            .get(&owner)
+            .is_some_and(|keys| keys.len() == 1 && keys.contains(&CacheKey::Page(render)))
         {
             return;
         }
         self.pinned_by_page
-            .insert(page, HashSet::from([CacheKey::Page(page)]));
+            .insert(owner, HashSet::from([CacheKey::Page(render)]));
         self.evict();
     }
 
-    pub fn pin_tiles(&mut self, page: i32, tiles: &[TileId]) {
-        if self.pinned_by_page.get(&page).is_some_and(|keys| {
+    pub(crate) fn pin_tiles(
+        &mut self,
+        viewport: ViewportId,
+        render: PageRenderKey,
+        tiles: &[TileId],
+    ) {
+        let owner = (viewport, render.page);
+        if self.pinned_by_page.get(&owner).is_some_and(|keys| {
             keys.len() == tiles.len()
                 && tiles
                     .iter()
@@ -157,47 +194,44 @@ impl RenderCache {
             return;
         }
         self.pinned_by_page
-            .insert(page, tiles.iter().copied().map(CacheKey::Tile).collect());
+            .insert(owner, tiles.iter().copied().map(CacheKey::Tile).collect());
         self.evict();
     }
 
-    pub fn unpin_page(&mut self, page: i32) {
-        if self.pinned_by_page.remove(&page).is_some() {
+    pub(crate) fn unpin_page(&mut self, viewport: ViewportId, page: i32) {
+        if self.pinned_by_page.remove(&(viewport, page)).is_some() {
             self.evict();
         }
     }
 
-    pub fn clear_pins(&mut self) {
-        if self.pinned_by_page.is_empty() {
+    pub(crate) fn clear_pins(&mut self, viewport: ViewportId) {
+        let before = self.pinned_by_page.len();
+        self.pinned_by_page
+            .retain(|(owner, _), _| *owner != viewport);
+        if self.pinned_by_page.len() == before {
             return;
         }
-        self.pinned_by_page.clear();
         self.evict();
     }
 
-    pub fn has_tiled_pages(&self) -> bool {
+    pub(crate) fn has_tiled_pages(&self, viewport: ViewportId) -> bool {
         self.pinned_by_page
-            .values()
+            .iter()
+            .filter(|((owner, _), _)| *owner == viewport)
+            .map(|(_, keys)| keys)
             .any(|keys| keys.is_empty() || keys.iter().any(|key| matches!(key, CacheKey::Tile(_))))
     }
 
-    fn insert_key(&mut self, key: CacheKey, texture: gdk::Texture, pixel_scale: f64) {
-        self.insert_key_unbounded(key, texture, pixel_scale);
+    fn insert_key(&mut self, key: CacheKey, texture: gdk::Texture) {
+        self.insert_key_unbounded(key, texture);
         self.evict();
     }
 
-    fn insert_key_unbounded(&mut self, key: CacheKey, texture: gdk::Texture, pixel_scale: f64) {
+    fn insert_key_unbounded(&mut self, key: CacheKey, texture: gdk::Texture) {
         // 4 bytes/pixel (BGRx) - close enough to the resident buffer for the budget.
         let bytes = (texture.width() as usize) * (texture.height() as usize) * 4;
         self.remove_key(key);
-        self.entries.insert(
-            key,
-            Entry {
-                texture,
-                bytes,
-                pixel_scale,
-            },
-        );
+        self.entries.insert(key, Entry { texture, bytes });
         self.order.push(key);
         self.total_bytes += bytes;
     }
@@ -267,158 +301,165 @@ mod tests {
         .upcast()
     }
 
+    fn render(page: i32, scale: f64) -> PageRenderKey {
+        PageRenderKey::from_factors(page, scale, 1.0)
+    }
+
+    fn tile(page: i32, scale: f64, x: i32) -> TileId {
+        TileId {
+            render: render(page, scale),
+            x,
+            y: 0,
+        }
+    }
+
     #[test]
     fn tracks_tiled_pages_even_before_a_region_is_visible() {
         let mut cache = RenderCache::new(100);
-        cache.pin_tiles(2, &[]);
+        let left = ViewportId::from_raw(1);
+        let right = ViewportId::from_raw(2);
+        cache.pin_tiles(left, render(2, 2.0), &[]);
 
-        assert!(cache.has_tiled_pages());
-        cache.pin_page(2);
-        assert!(!cache.has_tiled_pages());
+        assert!(cache.has_tiled_pages(left));
+        assert!(!cache.has_tiled_pages(right));
+        cache.pin_page(left, render(2, 1.0));
+        assert!(!cache.has_tiled_pages(left));
     }
 
     #[gtk::test]
     fn evicts_least_recently_used_over_budget() {
         let mut cache = RenderCache::new(100);
-        cache.insert(1, texture(40), 1.0);
-        cache.insert(2, texture(40), 1.0);
+        cache.insert(render(1, 1.0), texture(40));
+        cache.insert(render(2, 1.0), texture(40));
         // 80 bytes used; inserting another 40 exceeds 100 and evicts page 1
-        cache.insert(3, texture(40), 1.0);
+        cache.insert(render(3, 1.0), texture(40));
 
-        assert!(cache.get(1).is_none());
-        assert!(cache.get(2).is_some());
-        assert!(cache.get(3).is_some());
+        assert!(cache.get(render(1, 1.0)).is_none());
+        assert!(cache.get(render(2, 1.0)).is_some());
+        assert!(cache.get(render(3, 1.0)).is_some());
     }
 
     #[gtk::test]
-    fn distinguishes_render_scales_for_the_same_page() {
+    fn keeps_render_scales_for_the_same_page() {
         let mut cache = RenderCache::new(100);
-        cache.insert(1, texture(40), 1.25);
+        let first = PageRenderKey::from_factors(1, 1.25, 1.0);
+        let second = PageRenderKey::from_factors(1, 1.5, 1.0);
+        cache.insert(first, texture(40));
+        cache.insert(second, texture(40));
 
-        assert!(cache.contains_at_scale(1, 1.25));
-        assert!(!cache.contains_at_scale(1, 1.5));
-        assert!(!cache.contains_at_scale(2, 1.25));
+        assert!(cache.contains(first));
+        assert!(cache.contains(second));
+        assert!(cache.get(first).is_some());
+        assert!(cache.get(second).is_some());
+    }
+
+    #[gtk::test]
+    fn one_viewport_cannot_remove_another_viewports_pin() {
+        let mut cache = RenderCache::new(60);
+        let key = PageRenderKey::from_factors(1, 1.0, 1.0);
+        cache.pin_page(ViewportId::from_raw(1), key);
+        cache.pin_page(ViewportId::from_raw(2), key);
+        cache.insert(key, texture(40));
+
+        cache.clear_pins(ViewportId::from_raw(1));
+        let other = PageRenderKey::from_factors(2, 1.0, 1.0);
+        cache.insert(other, texture(40));
+
+        assert!(cache.get(key).is_some());
+        assert!(cache.get(other).is_some());
     }
 
     #[gtk::test]
     fn touch_on_get_protects_from_eviction() {
         let mut cache = RenderCache::new(100);
-        cache.insert(1, texture(40), 1.0);
-        cache.insert(2, texture(40), 1.0);
+        cache.insert(render(1, 1.0), texture(40));
+        cache.insert(render(2, 1.0), texture(40));
         // touch page 1 so page 2 becomes least-recently-used
-        assert!(cache.get(1).is_some());
-        cache.insert(3, texture(40), 1.0);
+        assert!(cache.get(render(1, 1.0)).is_some());
+        cache.insert(render(3, 1.0), texture(40));
 
-        assert!(cache.get(1).is_some());
-        assert!(cache.get(2).is_none());
+        assert!(cache.get(render(1, 1.0)).is_some());
+        assert!(cache.get(render(2, 1.0)).is_none());
     }
 
     #[gtk::test]
     fn always_keeps_most_recent_even_if_over_budget() {
         let mut cache = RenderCache::new(10);
-        cache.insert(1, texture(40), 1.0);
-        assert!(cache.get(1).is_some());
+        cache.insert(render(1, 1.0), texture(40));
+        assert!(cache.get(render(1, 1.0)).is_some());
     }
 
     #[gtk::test]
     fn tiles_are_independent_and_scale_specific() {
         let mut cache = RenderCache::new(200);
-        let left = TileId {
-            page: 3,
-            x: 0,
-            y: 0,
-        };
-        let right = TileId {
-            page: 3,
-            x: 1024,
-            y: 0,
-        };
-        cache.insert_tile(left, texture(40), 4.0);
-        cache.insert_tile(right, texture(40), 4.0);
+        let left = tile(3, 4.0, 0);
+        let right = tile(3, 4.0, 1024);
+        let other_scale = tile(3, 5.0, 0);
+        cache.insert_tile(left, texture(40));
+        cache.insert_tile(right, texture(40));
+        cache.insert_tile(other_scale, texture(40));
 
-        assert!(cache.get_tile(left, 4.0).is_some());
-        assert!(cache.get_tile(right, 4.0).is_some());
-        assert!(cache.get_tile(left, 5.0).is_none());
-        assert!(cache.get(3).is_none());
+        assert!(cache.get_tile(left).is_some());
+        assert!(cache.get_tile(right).is_some());
+        assert!(cache.get_tile(other_scale).is_some());
+        assert!(cache.get(render(3, 4.0)).is_none());
     }
 
     #[gtk::test]
     fn serial_tile_batch_keeps_the_complete_viewport_over_budget() {
         let mut cache = RenderCache::new(60);
-        let stale = TileId {
-            page: 1,
-            x: 0,
-            y: 0,
-        };
-        cache.insert_tile(stale, texture(40), 1.0);
-        let left = TileId {
-            page: 2,
-            x: 0,
-            y: 0,
-        };
-        let right = TileId {
-            page: 2,
-            x: 10,
-            y: 0,
-        };
-        cache.pin_tiles(2, &[left, right]);
-        cache.insert_tile_batch(vec![(left, texture(40)), (right, texture(40))], 2.0);
+        let stale = tile(1, 1.0, 0);
+        cache.insert_tile(stale, texture(40));
+        let left = tile(2, 2.0, 0);
+        let right = tile(2, 2.0, 10);
+        cache.pin_tiles(ViewportId::from_raw(1), render(2, 2.0), &[left, right]);
+        cache.insert_tile_batch(vec![(left, texture(40)), (right, texture(40))]);
 
-        assert!(cache.get_tile(stale, 1.0).is_none());
-        assert!(cache.get_tile(left, 2.0).is_some());
-        assert!(cache.get_tile(right, 2.0).is_some());
+        assert!(cache.get_tile(stale).is_none());
+        assert!(cache.get_tile(left).is_some());
+        assert!(cache.get_tile(right).is_some());
     }
 
     #[gtk::test]
     fn insertion_preserves_pinned_entries_and_one_completed_prefetch() {
         let mut cache = RenderCache::new(60);
-        let left = TileId {
-            page: 2,
-            x: 0,
-            y: 0,
-        };
-        let right = TileId {
-            page: 2,
-            x: 10,
-            y: 0,
-        };
-        cache.pin_tiles(2, &[left, right]);
-        cache.insert_tile_batch(vec![(left, texture(40)), (right, texture(40))], 2.0);
+        let viewport = ViewportId::from_raw(1);
+        let left = tile(2, 2.0, 0);
+        let right = tile(2, 2.0, 10);
+        cache.pin_tiles(viewport, render(2, 2.0), &[left, right]);
+        cache.insert_tile_batch(vec![(left, texture(40)), (right, texture(40))]);
 
-        cache.insert(9, texture(40), 1.0);
+        cache.insert(render(9, 1.0), texture(40));
 
-        assert!(cache.get_tile(left, 2.0).is_some());
-        assert!(cache.get_tile(right, 2.0).is_some());
-        assert!(cache.get(9).is_some());
+        assert!(cache.get_tile(left).is_some());
+        assert!(cache.get_tile(right).is_some());
+        assert!(cache.get(render(9, 1.0)).is_some());
 
-        assert!(cache.get_tile(left, 2.0).is_some());
-        cache.pin_tiles(2, &[left, right]);
+        assert!(cache.get_tile(left).is_some());
+        cache.pin_tiles(viewport, render(2, 2.0), &[left, right]);
         assert!(
-            cache.get(9).is_some(),
+            cache.get(render(9, 1.0)).is_some(),
             "an unchanged pin set should not run eviction"
         );
 
-        cache.insert(10, texture(40), 1.0);
-        assert!(cache.get_tile(left, 2.0).is_some());
-        assert!(cache.get_tile(right, 2.0).is_some());
-        assert!(cache.get(9).is_none());
-        assert!(cache.get(10).is_some());
+        cache.insert(render(10, 1.0), texture(40));
+        assert!(cache.get_tile(left).is_some());
+        assert!(cache.get_tile(right).is_some());
+        assert!(cache.get(render(9, 1.0)).is_none());
+        assert!(cache.get(render(10, 1.0)).is_some());
     }
 
     #[gtk::test]
     fn mapped_whole_page_and_tiles_can_jointly_exceed_the_budget() {
         let mut cache = RenderCache::new(60);
-        let tile = TileId {
-            page: 2,
-            x: 0,
-            y: 0,
-        };
-        cache.pin_tiles(2, &[tile]);
-        cache.insert_tile_batch(vec![(tile, texture(40))], 2.0);
-        cache.pin_page(9);
-        cache.insert(9, texture(40), 1.0);
+        let viewport = ViewportId::from_raw(1);
+        let tile = tile(2, 2.0, 0);
+        cache.pin_tiles(viewport, render(2, 2.0), &[tile]);
+        cache.insert_tile_batch(vec![(tile, texture(40))]);
+        cache.pin_page(viewport, render(9, 1.0));
+        cache.insert(render(9, 1.0), texture(40));
 
-        assert!(cache.get_tile(tile, 2.0).is_some());
-        assert!(cache.get(9).is_some());
+        assert!(cache.get_tile(tile).is_some());
+        assert!(cache.get(render(9, 1.0)).is_some());
     }
 }

@@ -144,9 +144,8 @@ impl DocumentView {
 
     // Release this document's share of the render pool. Call before dropping the view.
     pub fn release_renders(&self) {
-        let client = self.document().render_client_id();
-        crate::page::clear_all_renders(client);
-        crate::page::set_wanted_pages(client, None);
+        crate::page::clear_document_renders(self.document().id());
+        self.document().clear_render_jobs();
     }
 
     pub fn show_error_dialog(&self, message: &str) {
