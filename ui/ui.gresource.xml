@@ -2,6 +2,7 @@
 <gresources>
 	<gresource prefix="/com/andr2i/scrolex">
 		<file preprocess="xml-stripblanks">app.ui</file>
+		<file preprocess="xml-stripblanks">document_pane.ui</file>
 		<file preprocess="xml-stripblanks">document_view.ui</file>
 		<file preprocess="xml-stripblanks">about.ui</file>
 		<file>icons/scalable/actions/image-crop-symbolic.svg</file>

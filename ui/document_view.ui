@@ -5,6 +5,11 @@
 		<object class="GtkBox">
 			<property name="orientation">vertical</property>
 			<child>
+				<object class="GtkEventControllerKey">
+					<signal name="key-pressed" handler="handle_key_press" swapped="true" />
+				</object>
+			</child>
+			<child>
 				<object class="GtkSearchBar" id="search_bar">
 					<property name="show-close-button">true</property>
 					<child>
@@ -60,102 +65,10 @@
 			<child>
 			<object class="GtkOverlay">
 			<property name="child">
-		<object class="GtkScrolledWindow" id="vscrolledwindow">
-			<property name="hscrollbar-policy">never</property>
-			<property name="vscrollbar-policy">automatic</property>
-			<!-- GTK must not scroll on its own; we drive both axes -->
-			<property name="kinetic-scrolling">false</property>
+		<object class="GtkBox" id="pane_host">
 			<property name="hexpand">true</property>
 			<property name="vexpand">true</property>
-			<child>
-		<object class="GtkScrolledWindow" id="scrolledwindow">
-			<property name="hscrollbar-policy">automatic</property>
-			<property name="vscrollbar-policy">never</property>
-			<property name="kinetic-scrolling">false</property>
-			<property name="propagate-natural-height">true</property>
-			<property name="hexpand">true</property>
-			<child>
-				<object class="GtkListView" id="listview">
-					<property name="hexpand">true</property>
-					<property name="orientation">horizontal</property>
-					<property name="model">
-						<object class="GtkSingleSelection" id="selection">
-							<property name="model">
-								<object class="GListStore" id="model"/>
-							</property>
-						</object>
-					</property>
-					<property name="factory">
-						<object class="GtkSignalListItemFactory">
-							<signal name="setup" handler="on_factory_setup" swapped="true"/>
-							<signal name="bind" handler="on_factory_bind"/>
-						</object>
-					</property>
-					<!--<property name="factory">-->
-					<!--	<object class="GtkBuilderListItemFactory">-->
-					<!--		<property name="bytes"><![CDATA[-->
-					<!--		<?xml version="1.0" encoding="UTF-8"?>-->
-					<!--		<interface>-->
-					<!--			<template class="GtkListItem">-->
-					<!--				<property name="child">-->
-					<!--					<object class="Page">-->
-					<!--						<binding name="state">-->
-					<!--							<lookup name="state" type="PageNumber">-->
-					<!--								<lookup name="item">GtkListItem</lookup>-->
-					<!--							</lookup>-->
-					<!--						</binding>-->
-					<!--						<binding name="index">-->
-					<!--							<lookup name="page_number" type="PageNumber">-->
-					<!--								<lookup name="item">GtkListItem</lookup>-->
-					<!--							</lookup>-->
-					<!--						</binding>-->
-					<!--					</object>-->
-					<!--				</property>-->
-					<!--			</template>-->
-					<!--		</interface>-->
-					<!--			]]></property>-->
-					<!--	</object>-->
-					<!--</property>-->
-				</object>
-			</child>
-			<child>
-				<object class="GtkGestureClick">
-					<property name="button">2</property>
-					<signal name="pressed" handler="handle_drag_start" swapped="true" />
-					<signal name="update" handler="handle_drag_move" swapped="true" />
-					<signal name="end" handler="handle_drag_end" swapped="true" />
-				</object>
-			</child>
-			<child>
-				<object class="GtkEventControllerKey">
-					<signal name="key-pressed" handler="handle_key_press" swapped="true" />
-				</object>
-			</child>
-			<child>
-				<object class="GtkGestureZoom">
-					<signal name="begin" handler="handle_zoom_begin" swapped="true" />
-					<signal name="scale-changed" handler="handle_zoom_scale_changed" swapped="true" />
-					<signal name="end" handler="handle_zoom_end" swapped="true" />
-					<signal name="cancel" handler="handle_zoom_end" swapped="true" />
-				</object>
-			</child>
 		</object>
-		</child>
-		<child>
-			<!--
-				Both scrollers would keep scrolling on their own after a touchpad flick.
-				Capture runs outside-in, so only here do we get the event before both.
-			-->
-			<object class="GtkEventControllerScroll" id="pan_scroll">
-				<!-- kinetic: gives us the swipe's lift-off speed via the decelerate signal -->
-				<property name="flags">both-axes|kinetic</property>
-				<property name="propagation-phase">capture</property>
-				<signal name="scroll" handler="handle_scroll" swapped="true" />
-				<signal name="scroll-begin" handler="handle_scroll_begin" swapped="true" />
-				<signal name="decelerate" handler="handle_decelerate" swapped="true" />
-			</object>
-		</child>
-	</object>
 			</property>
 			<child type="overlay">
 				<object class="GtkBox" id="empty_view">

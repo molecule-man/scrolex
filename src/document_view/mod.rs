@@ -6,27 +6,10 @@ use gtk::prelude::*;
 use gtk::{gio, glib};
 
 use crate::document::Document;
+use crate::document_pane::DocumentPane;
 use crate::viewport::Viewport;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ReaderKeyContext {
-    Document,
-    NumericEntry,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct ZoomChoice {
-    pub label: String,
-    action: ZoomChoiceAction,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-enum ZoomChoiceAction {
-    Scale(f64),
-    FitHeight(f64),
-    FitPages { first: i32, count: usize, zoom: f64 },
-    FitVisible,
-}
+pub(crate) use crate::document_pane::{ReaderKeyContext, ZoomChoice};
 
 glib::wrapper! {
     pub struct DocumentView(ObjectSubclass<imp::DocumentView>)
@@ -52,10 +35,13 @@ impl DocumentView {
     }
 
     pub fn viewport(&self) -> &Viewport {
-        self.imp().viewport()
+        self.pane().viewport()
     }
 
-    // Open a file in this tab. Saves the position of the document it replaces.
+    pub fn selection(&self) -> gtk::SingleSelection {
+        self.pane().selection()
+    }
+
     pub fn load(&self, file: &gio::File) {
         self.imp().load(file);
     }
@@ -68,53 +54,50 @@ impl DocumentView {
         self.imp().loading_spinner.is_spinning()
     }
 
-    // Actions the header bar and the menu drive.
-
     pub fn zoom_in(&self) {
-        self.imp().zoom_in();
+        self.pane().zoom_in();
     }
 
     pub fn zoom_out(&self) {
-        self.imp().zoom_out();
+        self.pane().zoom_out();
     }
 
     pub fn fit_width(&self) {
-        self.imp().fit_width();
+        self.pane().fit_width();
     }
 
     pub fn reset_zoom(&self) {
-        self.imp().reset_zoom();
+        self.pane().reset_zoom();
     }
 
     pub(crate) fn zoom_choices(&self) -> Vec<ZoomChoice> {
-        self.imp().zoom_choices()
+        self.pane().zoom_choices()
     }
 
     pub(crate) fn apply_zoom_choice(&self, choice: &ZoomChoice) {
-        self.imp().apply_zoom_choice(choice);
+        self.pane().apply_zoom_choice(choice);
     }
 
     pub fn jump_back(&self) {
-        self.imp().jump_back();
+        self.pane().jump_back();
     }
 
     pub fn jump_forward(&self) {
-        self.imp().jump_forward();
+        self.pane().jump_forward();
     }
 
     pub fn goto_page(&self, page_num: u32) {
-        self.imp().goto_page(page_num);
+        self.pane().goto_page(page_num);
     }
 
     pub fn apply_zoom_percent(&self, percent: f64) {
-        self.imp().apply_zoom_percent(percent);
+        self.pane().apply_zoom_percent(percent);
     }
 
     pub fn open_search(&self) {
         self.imp().open_search();
     }
 
-    // Ctrl+F, F3, Shift+F3, and Escape, routed from the window.
     pub fn handle_search_key(
         &self,
         keyval: gtk::gdk::Key,
@@ -132,17 +115,14 @@ impl DocumentView {
         self.imp().handle_reader_key(keyval, modifier, context)
     }
 
-    // The page a jump to `page_num` would land on, 1-based. None while no document is open.
     pub fn target_page(&self, page_num: u32) -> Option<u32> {
-        self.imp().target_page(page_num)
+        self.pane().target_page(page_num)
     }
 
-    // Repaint every laid-out page, e.g. after the render colours changed.
     pub fn redraw_pages(&self) {
-        self.imp().redraw_pages();
+        self.pane().redraw_pages();
     }
 
-    // Release this document's share of the render pool. Call before dropping the view.
     pub fn release_renders(&self) {
         crate::page::clear_document_renders(self.document().id());
         self.document().clear_render_jobs();
@@ -153,5 +133,9 @@ impl DocumentView {
             .message(message)
             .build()
             .show(self.root().and_downcast::<gtk::Window>().as_ref());
+    }
+
+    pub(crate) fn pane(&self) -> &DocumentPane {
+        self.imp().pane()
     }
 }
