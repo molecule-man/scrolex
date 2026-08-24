@@ -155,26 +155,6 @@ impl RenderQueue {
         self.prefetch.retain(|request| !request.demand.is_empty());
     }
 
-    #[cfg(test)]
-    fn clear_all_client(&mut self, client: u64) {
-        for request in self
-            .visible_preview
-            .iter()
-            .chain(&self.visible)
-            .chain(&self.preview)
-            .chain(&self.prefetch)
-        {
-            request.demand.remove(client);
-        }
-        self.visible_preview
-            .retain(|request| !request.demand.is_empty());
-        self.visible.retain(|request| !request.demand.is_empty());
-        self.preview.retain(|request| !request.demand.is_empty());
-        self.prefetch.retain(|request| !request.demand.is_empty());
-        self.wanted.remove(&client);
-        self.wanted_documents.remove(&client);
-    }
-
     fn clear_all_document(&mut self, document: u64) {
         self.visible_preview
             .retain(|request| request.document != document);
@@ -533,17 +513,6 @@ mod tests {
         q.clear_full(1);
         // full renders gone; the preview survives (zoom rescales it)
         assert_eq!(drain_pages(&mut q), vec![3]);
-    }
-
-    #[test]
-    fn clear_all_drops_everything_for_the_client() {
-        let mut q = RenderQueue::new(4, 4, 4, 4);
-        q.push(RenderPriority::Visible, req_cp(1, 1));
-        q.push(RenderPriority::Preview, req_cp(1, 2));
-        q.push(RenderPriority::VisiblePreview, req_cp(1, 3));
-        q.push(RenderPriority::Visible, req_cp(2, 4)); // another viewport: untouched
-        q.clear_all_client(1);
-        assert_eq!(drain_pages(&mut q), vec![4]);
     }
 
     #[test]

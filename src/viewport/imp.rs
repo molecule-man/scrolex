@@ -54,11 +54,6 @@ pub struct Viewport {
     // numbers), the default; flipped when the user scrolls back.
     pub(crate) scroll_forward: Cell<bool>,
 
-    // bumped on zoom; a render captures it at schedule and drops out on completion if it changed, so
-    // an old-scale render can't cache/rebook. Per pane, so one pane's zoom never invalidates
-    // another's in-flight renders.
-    pub(crate) render_epoch: Cell<u64>,
-
     // how many pages fully fit across this pane; with the render-thread count it sets prefetch depth.
     pub(crate) visible_page_count: Cell<i32>,
 }
@@ -85,10 +80,7 @@ impl ObjectImpl for Viewport {
         self.id.set(super::ViewportId::next().0);
         self.scroll_forward.set(true);
 
-        // Zoom changes every page's render scale. Keep completed textures as bounded transition
-        // images, but drop queued renders whose scale is now wrong. In-flight markers stay: their
-        // renders are still running and holding buffers, so the page waits for that completion
-        // rather than starting a second render alongside it.
+        // A zoom removes this viewport from obsolete jobs and cache pins.
         self.obj()
             .connect_notify_local(Some("zoom"), |viewport, _| {
                 let document = viewport.document();
@@ -99,10 +91,6 @@ impl ObjectImpl for Viewport {
                     .borrow_mut()
                     .clear_pins(viewport.id());
                 crate::page::clear_full_renders(viewport.id());
-                // in-flight renders started at the old scale are now stale; bump so their completion
-                // drops out instead of caching an obsolete-scale texture
-                let epoch = viewport.imp().render_epoch.get();
-                viewport.imp().render_epoch.set(epoch.wrapping_add(1));
             });
     }
 

@@ -50,8 +50,6 @@ impl RenderJobKey {
 
 #[derive(Debug)]
 pub(crate) struct RenderInterest {
-    pub(crate) viewport: glib::WeakRef<crate::viewport::Viewport>,
-    pub(crate) epoch: u64,
     pub(crate) widget: Option<glib::WeakRef<page::Page>>,
 }
 
@@ -245,15 +243,23 @@ impl Document {
     ) -> Option<crate::bg_job::RenderDemand> {
         let viewport_id = viewport.id();
         let interest = RenderInterest {
-            viewport: viewport.downgrade(),
-            epoch: viewport.render_epoch(),
             widget: widget.map(ObjectExt::downgrade),
         };
         let mut jobs = self.imp().render_jobs.borrow_mut();
         match jobs.entry(key) {
             std::collections::hash_map::Entry::Occupied(mut entry) => {
-                entry.get().demand.add(viewport_id.raw());
-                entry.get_mut().interests.insert(viewport_id, interest);
+                let job = entry.get_mut();
+                job.demand.add(viewport_id.raw());
+                match job.interests.entry(viewport_id) {
+                    std::collections::hash_map::Entry::Occupied(mut stored) => {
+                        if interest.widget.is_some() {
+                            stored.insert(interest);
+                        }
+                    }
+                    std::collections::hash_map::Entry::Vacant(stored) => {
+                        stored.insert(interest);
+                    }
+                }
                 None
             }
             std::collections::hash_map::Entry::Vacant(entry) => {

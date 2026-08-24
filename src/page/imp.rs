@@ -1470,9 +1470,7 @@ impl Page {
 
         let (resp_sender, resp_receiver) = oneshot::channel::<RenderedPixels>();
         let obj_clone = obj.clone();
-        // Previews survive a zoom (they're rescaled at draw), so only a document load invalidates
-        // them - check doc_epoch, not render_epoch. Per document, so another load cannot wedge
-        // this preview's inflight marker.
+        // Previews survive viewport zoom. A document load invalidates them through doc_epoch.
         let doc_epoch = obj.document().doc_epoch();
         glib::spawn_future_local(async move {
             let result = resp_receiver.await;
@@ -1909,7 +1907,7 @@ fn solid_page_data(stride: i32, height: i32, color: [u8; 3]) -> Box<[u8]> {
     data.into_boxed_slice()
 }
 
-// Accept a result only for the same document epoch and an interested viewport epoch.
+// Accept a result only for the same document epoch and active job.
 fn accept_render<T, E>(
     document: &crate::document::Document,
     key: &crate::document::RenderJobKey,
@@ -1921,23 +1919,11 @@ fn accept_render<T, E>(
         return None;
     }
     let job = document.take_render_job(key, demand)?;
-    let mut valid = 0;
-    let mut waiters = Vec::new();
-    for interest in job.interests.into_values() {
-        let Some(viewport) = interest.viewport.upgrade() else {
-            continue;
-        };
-        if viewport.render_epoch() != interest.epoch {
-            continue;
-        }
-        valid += 1;
-        if let Some(widget) = interest.widget {
-            waiters.push(widget);
-        }
-    }
-    if valid == 0 {
-        return None;
-    }
+    let waiters = job
+        .interests
+        .into_values()
+        .filter_map(|interest| interest.widget)
+        .collect();
     match result {
         Ok(rendered) => Some((rendered, waiters)),
         Err(_) => {

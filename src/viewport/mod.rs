@@ -207,10 +207,6 @@ impl Viewport {
             .filter(|text| !text.is_empty())
     }
 
-    pub(crate) fn render_epoch(&self) -> u64 {
-        self.imp().render_epoch.get()
-    }
-
     pub(crate) fn current_search_result(&self) -> Option<(i32, usize)> {
         self.imp().current_search_result.get()
     }
@@ -302,6 +298,24 @@ mod tests {
     }
 
     #[gtk::test]
+    fn prefetch_keeps_a_visible_render_waiter() {
+        let document = Document::new();
+        let viewport = Viewport::new(&document);
+        let page = page::Page::new(&viewport);
+        page.set_index(2);
+        let key = crate::document::RenderJobKey::Page(
+            crate::render_cache::PageRenderKey::from_factors(2, 1.0, 1.0),
+        );
+
+        document.request_render(key.clone(), &viewport, Some(&page));
+        document.request_render(key, &viewport, None);
+
+        let waiters = document.render_waiters(2);
+        assert_eq!(waiters.len(), 1);
+        assert_eq!(waiters[0].upgrade(), Some(page));
+    }
+
+    #[gtk::test]
     fn a_page_jump_clears_forward_history() {
         let viewport = viewport();
         viewport.jump_list_add(1);
@@ -382,16 +396,22 @@ mod tests {
     }
 
     #[gtk::test]
-    fn a_zoom_leaves_the_other_viewport_alone() {
+    fn a_zoom_keeps_the_other_viewports_render_interest() {
         let document = Document::new();
         let left = Viewport::new(&document);
         let right = Viewport::new(&document);
-        let (before_left, before_right) = (left.render_epoch(), right.render_epoch());
+        let key = crate::document::RenderJobKey::Page(
+            crate::render_cache::PageRenderKey::from_factors(2, 1.0, 1.0),
+        );
+        let demand = document
+            .request_render(key.clone(), &left, None)
+            .expect("the first request starts the job");
+        document.request_render(key.clone(), &right, None);
 
         left.zoom_to(2.0);
 
-        assert_eq!(left.render_epoch(), before_left + 1);
-        assert_eq!(right.render_epoch(), before_right);
+        assert!(!demand.is_empty());
+        assert!(document.has_render_job(&key));
     }
 
     #[gtk::test]
