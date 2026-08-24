@@ -2,7 +2,7 @@ pub mod about;
 pub mod bg_job;
 pub mod config;
 pub mod document;
-#[path = "document_pane/mod.rs"]
+pub(crate) mod document_pane;
 pub mod document_view;
 pub mod emulate;
 pub mod jump_stack;

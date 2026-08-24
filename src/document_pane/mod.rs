@@ -29,22 +29,16 @@ enum ZoomChoiceAction {
 }
 
 glib::wrapper! {
-    pub struct DocumentView(ObjectSubclass<imp::DocumentView>)
+    pub struct DocumentPane(ObjectSubclass<imp::DocumentPane>)
         @extends gtk::Widget,
         @implements gio::ActionGroup, gio::ActionMap, gtk::Accessible, gtk::Buildable,
                     gtk::ConstraintTarget;
 }
 
-impl Default for DocumentView {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[gtk::template_callbacks]
-impl DocumentView {
-    pub fn new() -> Self {
-        Object::builder().build()
+impl DocumentPane {
+    pub fn new(document: &Document) -> Self {
+        Object::builder().property("document", document).build()
     }
 
     pub fn document(&self) -> &Document {
@@ -55,17 +49,37 @@ impl DocumentView {
         self.imp().viewport()
     }
 
-    // Open a file in this tab. Saves the position of the document it replaces.
-    pub fn load(&self, file: &gio::File) {
-        self.imp().load(file);
+    pub(crate) fn selection(&self) -> gtk::SingleSelection {
+        self.imp().selection.clone()
     }
 
-    pub fn save_position(&self) -> std::io::Result<()> {
-        self.viewport().save_position()
+    pub(crate) fn prepare_load(&self) {
+        self.imp().cancel_scroll_motion();
     }
 
-    pub fn is_loading(&self) -> bool {
-        self.imp().loading_spinner.is_spinning()
+    pub(crate) fn clear_document(&self) {
+        self.imp().clear_model();
+        self.viewport().reset();
+    }
+
+    pub(crate) fn finish_document_load(&self) {
+        self.imp().handle_document_load();
+    }
+
+    pub(crate) fn focus_reader(&self) {
+        self.imp().scrolledwindow.grab_focus();
+    }
+
+    pub(crate) fn page_area(&self) -> gtk::ScrolledWindow {
+        self.imp().scrolledwindow.clone()
+    }
+
+    pub(crate) fn redraw_page(&self, index: i32) {
+        self.imp().redraw_page(index);
+    }
+
+    pub(crate) fn reveal_current(&self) {
+        self.imp().reveal_current();
     }
 
     // Actions the header bar and the menu drive.
@@ -110,19 +124,6 @@ impl DocumentView {
         self.imp().apply_zoom_percent(percent);
     }
 
-    pub fn open_search(&self) {
-        self.imp().open_search();
-    }
-
-    // Ctrl+F, F3, Shift+F3, and Escape, routed from the window.
-    pub fn handle_search_key(
-        &self,
-        keyval: gtk::gdk::Key,
-        modifier: gtk::gdk::ModifierType,
-    ) -> glib::Propagation {
-        self.imp().handle_search_key(keyval, modifier)
-    }
-
     pub(crate) fn handle_reader_key(
         &self,
         keyval: gtk::gdk::Key,
@@ -140,18 +141,5 @@ impl DocumentView {
     // Repaint every laid-out page, e.g. after the render colours changed.
     pub fn redraw_pages(&self) {
         self.imp().redraw_pages();
-    }
-
-    // Release this document's share of the render pool. Call before dropping the view.
-    pub fn release_renders(&self) {
-        crate::page::clear_document_renders(self.document().id());
-        self.document().clear_render_jobs();
-    }
-
-    pub fn show_error_dialog(&self, message: &str) {
-        gtk::AlertDialog::builder()
-            .message(message)
-            .build()
-            .show(self.root().and_downcast::<gtk::Window>().as_ref());
     }
 }

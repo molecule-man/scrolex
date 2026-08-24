@@ -1778,7 +1778,7 @@ mod widget_tests {
     #[gtk::test]
     fn page_jump_icon_ignores_a_half_filled_model() {
         let window = loaded_window();
-        let imp = window.imp();
+        let imp = window.pane().imp();
         let entry = window.header().entry_page_num.get();
 
         imp.model.remove_all();

@@ -113,8 +113,8 @@ pub fn loaded_window() -> TestWindow {
     window.set_default_size(900, 700);
     window.present();
     window.load(&fixture("outline.pdf"));
-    wait_until(|| window.imp().mapped_page(0).is_some());
-    wait_until(|| window.imp().selection.n_items() == 3);
+    wait_until(|| window.pane().imp().mapped_page(0).is_some());
+    wait_until(|| window.pane().imp().selection.n_items() == 3);
 
     window
 }

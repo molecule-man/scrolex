@@ -1,20 +1,15 @@
-// One open document: navigation, and viewport/render coordination.
+// One pane's navigation and viewport/render coordination.
 use std::cell::{Cell, OnceCell, RefCell};
 use std::sync::OnceLock;
 
-use futures::StreamExt;
 use glib::clone;
 use glib::subclass::InitializingObject;
 use gtk::gdk::{EventSequence, Key, ModifierType, BUTTON_PRIMARY};
 use gtk::glib::closure_local;
 use gtk::glib::subclass::prelude::*;
 use gtk::glib::subclass::types::ObjectSubclassIsExt;
-use gtk::glib::subclass::Signal;
 use gtk::subclass::prelude::*;
-use gtk::{
-    glib, CompositeTemplate, Label, ListView, ScrolledWindow, SearchBar, SearchEntry,
-    SingleSelection,
-};
+use gtk::{glib, CompositeTemplate, ListView, ScrolledWindow, SingleSelection};
 use gtk::{prelude::*, GestureClick};
 
 use super::{ReaderKeyContext, ZoomChoice, ZoomChoiceAction};
@@ -56,9 +51,6 @@ const KINETIC_MIN_VELOCITY: f64 = 100.0;
 
 // Multiplicative zoom step per notch.
 const ZOOM_STEP: f64 = 1.1;
-
-// Quiet period after the last keystroke before a search sweep launches, coalescing a burst of typing.
-const SEARCH_DEBOUNCE_MS: u64 = 100;
 
 // In-flight state of the animated one-page slide.
 //
@@ -118,10 +110,10 @@ struct WidthFit {
     first_top: f64,
 }
 
-// One open document: its data, page list, and the pane that shows it.
+// One pane's page list and input state.
 #[derive(CompositeTemplate, Default)]
-#[template(resource = "/com/andr2i/scrolex/document_view.ui")]
-pub struct DocumentView {
+#[template(resource = "/com/andr2i/scrolex/document_pane.ui")]
+pub struct DocumentPane {
     document: OnceCell<Document>,
     viewport: OnceCell<Viewport>,
     #[template_child]
@@ -139,29 +131,6 @@ pub struct DocumentView {
     pub pan_scroll: TemplateChild<gtk::EventControllerScroll>,
     #[template_child]
     pub listview: TemplateChild<ListView>,
-    #[template_child]
-    pub search_bar: TemplateChild<SearchBar>,
-    #[template_child]
-    pub search_entry: TemplateChild<SearchEntry>,
-    #[template_child]
-    pub search_status: TemplateChild<Label>,
-    #[template_child]
-    pub toc_revealer: TemplateChild<gtk::Revealer>,
-    #[template_child]
-    pub toc_list: TemplateChild<gtk::ListBox>,
-    #[template_child]
-    pub empty_view: TemplateChild<gtk::Box>,
-    #[template_child]
-    pub loading_overlay: TemplateChild<gtk::Box>,
-    #[template_child]
-    pub loading_spinner: TemplateChild<gtk::Spinner>,
-
-    // target page per outline row (index-aligned), None for non-navigable entries
-    toc_pages: RefCell<Vec<Option<i32>>>,
-
-    // set while a re-search is queued, to coalesce keystrokes into one sweep
-    search_debounce: RefCell<Option<glib::SourceId>>,
-
     drag_coords: RefCell<Option<(f64, f64)>>,
     drag_cursor: RefCell<Option<gtk::gdk::Cursor>>,
 
@@ -227,7 +196,7 @@ pub struct DocumentView {
     // Vertical list-row padding in logical pixels.
     fit_chrome_height: Cell<Option<f64>>,
 
-    // Page and position from when this view left the screen.
+    // Page and position from when this pane left the screen.
     hidden_at: Cell<Option<(u32, f64)>>,
 }
 
@@ -242,10 +211,10 @@ struct ZoomAnchor {
 
 // The central trait for subclassing a GObject
 #[glib::object_subclass]
-impl ObjectSubclass for DocumentView {
+impl ObjectSubclass for DocumentPane {
     // `NAME` needs to match `class` attribute of template
-    const NAME: &'static str = "DocumentView";
-    type Type = super::DocumentView;
+    const NAME: &'static str = "DocumentPane";
+    type Type = super::DocumentPane;
     type ParentType = gtk::Widget;
 
     fn class_init(klass: &mut Self::Class) {
@@ -259,93 +228,19 @@ impl ObjectSubclass for DocumentView {
     }
 }
 
-impl DocumentView {
+impl DocumentPane {
     pub(crate) fn document(&self) -> &Document {
-        self.document.get().expect("a tab has a document")
+        self.document.get().expect("a pane has a document")
     }
 
     pub(crate) fn viewport(&self) -> &Viewport {
-        self.viewport.get().expect("a tab has a viewport")
-    }
-
-    // Load into this tab, keeping the position the reader leaves behind.
-    pub(crate) fn load(&self, file: &gtk::gio::File) {
-        if self.document().n_pages() > 0 {
-            if let Err(err) = self.viewport().save_position() {
-                log::warn!("could not save the reading position before load: {err}");
-            }
-        }
-        self.document().load(file);
-    }
-
-    // Follow the document through a load, and show the empty view while it has no pages.
-    fn setup_document(&self) {
-        let document = self.document();
-
-        document.connect_closure(
-            "load-started",
-            false,
-            closure_local!(
-                #[weak(rename_to = imp)]
-                self,
-                move |_: &Document| imp.on_load_started()
-            ),
-        );
-        document.connect_closure(
-            "load-failed",
-            false,
-            closure_local!(
-                #[weak(rename_to = imp)]
-                self,
-                move |_: &Document, message: String| imp.on_load_failed(&message)
-            ),
-        );
-        document.connect_closure(
-            "before-load",
-            false,
-            closure_local!(
-                #[weak(rename_to = imp)]
-                self,
-                move |_: &Document| {
-                    imp.clear_model();
-                    imp.viewport().reset();
-                }
-            ),
-        );
-        document.connect_closure(
-            "loaded",
-            false,
-            closure_local!(
-                #[weak(rename_to = imp)]
-                self,
-                move |_: &Document| imp.handle_document_load()
-            ),
-        );
-
-        document
-            .bind_property("n-pages", &*self.empty_view, "visible")
-            .transform_to(|_, n_pages: i32| Some(n_pages == 0))
-            .sync_create()
-            .build();
-
-        // The pane follows the page the list has selected.
-        self.selection
-            .property_expression("selected-item")
-            .chain_property::<page::PageNumber>("page-number")
-            .bind(self.viewport(), "page", gtk::Widget::NONE);
+        self.viewport.get().expect("a pane has a viewport")
     }
 }
 
-impl ObjectImpl for DocumentView {
+impl ObjectImpl for DocumentPane {
     // A closed tab is disposed while the window lives on, so its pending work stops here.
     fn dispose(&self) {
-        if let Some(source) = self.search_debounce.take() {
-            source.remove();
-        }
-        // bumps the sweep epoch, which stops the background search
-        self.document().search().borrow_mut().clear();
-        self.obj().release_renders();
-
         if let Some(content) = self.content() {
             content.unparent();
         }
@@ -354,21 +249,21 @@ impl ObjectImpl for DocumentView {
     fn constructed(&self) {
         self.parent_constructed();
 
-        let document = Document::new();
+        let document = self.document().clone();
         self.viewport
             .set(Viewport::new(&document))
-            .expect("one viewport per tab");
-        self.document.set(document).expect("one document per tab");
-        self.setup_document();
+            .expect("one viewport per pane");
+
+        self.selection
+            .property_expression("selected-item")
+            .chain_property::<page::PageNumber>("page-number")
+            .bind(self.viewport(), "page", gtk::Widget::NONE);
 
         self.setup_scroll_selection_sync();
         self.setup_pointer_tracking();
         // The cache budgets are application totals; the window divides them across its documents.
         self.setup_fit_height();
         self.setup_text_selection();
-        self.setup_search();
-        self.setup_toc();
-
         // Give keyboard focus to the scroll area rather than the header entry
         self.scrolledwindow.set_focusable(true);
         self.listview.set_focusable(false);
@@ -383,16 +278,12 @@ impl ObjectImpl for DocumentView {
         PROPERTIES.get_or_init(|| {
             vec![
                 glib::ParamSpecObject::builder::<Document>("document")
-                    .read_only()
+                    .construct_only()
                     .build(),
                 glib::ParamSpecObject::builder::<Viewport>("viewport")
                     .read_only()
                     .build(),
                 glib::ParamSpecObject::builder::<SingleSelection>("selection")
-                    .read_only()
-                    .build(),
-                glib::ParamSpecBoolean::builder("toc-visible").build(),
-                glib::ParamSpecBoolean::builder("has-toc")
                     .read_only()
                     .build(),
             ]
@@ -405,34 +296,23 @@ impl ObjectImpl for DocumentView {
             "document" => self.document.get().to_value(),
             "viewport" => self.viewport.get().to_value(),
             "selection" => self.selection.try_get().to_value(),
-            "toc-visible" => self
-                .toc_revealer
-                .try_get()
-                .is_some_and(|r: gtk::Revealer| r.reveals_child())
-                .to_value(),
-            "has-toc" => (!self.toc_pages.borrow().is_empty()).to_value(),
             name => unimplemented!("unknown property {name}"),
         }
     }
 
     fn set_property(&self, _id: usize, value: &glib::Value, pspec: &glib::ParamSpec) {
         match pspec.name() {
-            "toc-visible" => self.toc_revealer.set_reveal_child(value.get().unwrap()),
+            "document" => self
+                .document
+                .set(value.get().expect("document property type"))
+                .expect("one document per pane"),
             name => unimplemented!("unknown property {name}"),
         }
-    }
-
-    fn signals() -> &'static [Signal] {
-        static SIGNALS: OnceLock<Vec<Signal>> = OnceLock::new();
-        SIGNALS.get_or_init(|| {
-            // The reader asked to open a document into this view. The window owns the file chooser.
-            vec![Signal::builder("open-requested").build()]
-        })
     }
 }
 
 #[gtk::template_callbacks]
-impl DocumentView {
+impl DocumentPane {
     #[template_callback]
     fn on_factory_setup(&self, list_item: &gtk::ListItem) {
         let page = &page::Page::new(self.viewport());
@@ -694,7 +574,7 @@ impl DocumentView {
 
     // Stop both axes. For inputs that own the position outright - a jump, a drag, a new document -
     // because a slide or a coast keeps writing the adjustments every frame and would drag us off.
-    fn cancel_scroll_motion(&self) {
+    pub(crate) fn cancel_scroll_motion(&self) {
         *self.scroll_anim.borrow_mut() = None;
         self.vscroll_anim.set(None);
     }
@@ -1337,16 +1217,6 @@ impl DocumentView {
         Some((f64::from(point.x()), f64::from(point.y())))
     }
 
-    #[template_callback]
-    pub(super) fn handle_key_press(
-        &self,
-        keyval: Key,
-        _keycode: u32,
-        modifier: ModifierType,
-    ) -> glib::Propagation {
-        self.handle_reader_key(keyval, modifier, ReaderKeyContext::Document)
-    }
-
     pub(super) fn handle_reader_key(
         &self,
         keyval: Key,
@@ -1361,16 +1231,6 @@ impl DocumentView {
             Key::Escape if self.viewport().has_selection() => {
                 run_reader_action(context, false, || self.viewport().clear_selection())
             }
-            Key::o => run_reader_action(context, true, || {
-                self.obj().emit_by_name::<()>("open-requested", &[])
-            }),
-            Key::t if !control => run_reader_action(context, true, || {
-                if !self.toc_pages.borrow().is_empty() {
-                    self.toc_revealer
-                        .set_reveal_child(!self.toc_revealer.reveals_child());
-                }
-            }),
-            Key::f => run_reader_action(context, true, || self.open_search()),
             Key::w => run_reader_action(context, true, || self.fit_width()),
             Key::l | Key::Page_Down => run_reader_action(context, true, || self.next_page()),
             Key::h | Key::Page_Up => run_reader_action(context, true, || self.prev_page()),
@@ -1387,12 +1247,6 @@ impl DocumentView {
             }
             Key::_0 | Key::KP_0 if control => {
                 run_reader_action(context, true, || self.reset_zoom())
-            }
-            Key::n if self.document().search().borrow().total() > 0 => {
-                run_reader_action(context, true, || self.next_match())
-            }
-            Key::N if self.document().search().borrow().total() > 0 => {
-                run_reader_action(context, true, || self.prev_match())
             }
             Key::Left => run_reader_action(context, false, || self.pan_horizontal(-1.0)),
             Key::Right => run_reader_action(context, false, || self.pan_horizontal(1.0)),
@@ -1805,135 +1659,18 @@ impl DocumentView {
         Some(selection)
     }
 
-    fn clear_model(&self) {
+    pub(crate) fn clear_model(&self) {
         self.model.remove_all();
     }
 
-    fn populate_toc(&self) {
-        self.toc_list.remove_all();
-        let items = crate::outline::entries(&self.document().uri());
-        let mut pages = Vec::with_capacity(items.len());
-        for item in &items {
-            let label = gtk::Label::new(Some(&item.title));
-            label.set_xalign(0.0);
-            label.set_wrap(true);
-            label.set_margin_start(8 + item.depth as i32 * 16);
-            label.set_margin_end(8);
-            label.set_margin_top(3);
-            label.set_margin_bottom(3);
-            if item.page.is_none() {
-                label.add_css_class("dim-label");
-            }
-            let row = gtk::ListBoxRow::new();
-            row.set_child(Some(&label));
-            row.set_activatable(item.page.is_some());
-            self.toc_list.append(&row);
-            pages.push(item.page);
-        }
-        self.toc_pages.replace(pages);
-        self.obj().notify("has-toc");
-        self.toc_revealer.set_reveal_child(false);
-    }
-
-    #[template_callback]
-    fn toc_row_activated(&self, row: &gtk::ListBoxRow) {
-        let idx = row.index();
-        let page = if idx >= 0 {
-            self.toc_pages.borrow().get(idx as usize).copied().flatten()
-        } else {
-            None
-        };
-        if let Some(page) = page {
-            self.goto_page(page as u32);
-        }
-        self.toc_revealer.set_reveal_child(false);
-    }
-
-    fn setup_toc(&self) {
-        // follow focus into the panel while open, back to the reader when it closes
-        self.toc_revealer.connect_reveal_child_notify(clone!(
-            #[weak(rename_to = imp)]
-            self,
-            move |rev| {
-                if rev.reveals_child() {
-                    imp.toc_list.grab_focus();
-                } else {
-                    imp.scrolledwindow.grab_focus();
-                }
-                imp.obj().notify("toc-visible");
-            }
-        ));
-
-        // Esc or t closes; the panel holds focus while open, so the reader's key handler never sees these.
-        let key = gtk::EventControllerKey::new();
-        key.connect_key_pressed(clone!(
-            #[weak(rename_to = imp)]
-            self,
-            #[upgrade_or]
-            glib::Propagation::Proceed,
-            move |_, keyval, _, modifier| {
-                let closes = keyval == Key::Escape
-                    || (keyval == Key::t && !modifier.contains(ModifierType::CONTROL_MASK));
-                if closes {
-                    imp.toc_revealer.set_reveal_child(false);
-                    glib::Propagation::Stop
-                } else {
-                    glib::Propagation::Proceed
-                }
-            }
-        ));
-        self.toc_revealer.add_controller(key);
-
-        // A click on the page area (never on the panel, which is a separate overlay child) dismisses.
-        let click = gtk::GestureClick::new();
-        click.set_propagation_phase(gtk::PropagationPhase::Capture);
-        click.connect_pressed(clone!(
-            #[weak(rename_to = imp)]
-            self,
-            move |gesture, _, _, _| {
-                if imp.toc_revealer.reveals_child() {
-                    imp.toc_revealer.set_reveal_child(false);
-                    gesture.set_state(gtk::EventSequenceState::Claimed);
-                }
-            }
-        ));
-        self.scrolledwindow.add_controller(click);
-    }
-
     // The empty view's Open button. The window owns the file chooser.
-    #[template_callback]
-    fn open_document(&self) {
-        self.obj().emit_by_name::<()>("open-requested", &[]);
-    }
-
-    fn on_load_started(&self) {
-        self.cancel_scroll_motion();
-        self.loading_spinner.start();
-        self.loading_overlay.set_visible(true);
-    }
-
-    fn hide_loading(&self) {
-        self.loading_overlay.set_visible(false);
-        self.loading_spinner.stop();
-    }
-
-    fn on_load_failed(&self, message: &str) {
-        self.hide_loading();
-        self.obj()
-            .show_error_dialog(&format!("Error loading file: {message}"));
-    }
-
-    fn handle_document_load(&self) {
-        self.hide_loading();
-
+    pub(crate) fn handle_document_load(&self) {
         self.viewport().restore_position();
 
         let n_pages = self.document().n_pages() as u32;
         if n_pages == 0 {
             return;
         }
-
-        self.populate_toc();
 
         let model = self.model.clone();
         let selection = self.selection.clone();
@@ -2155,7 +1892,7 @@ impl DocumentView {
         crate::page::set_wanted_pages(self.document().id(), self.viewport().id(), range);
     }
 
-    // The template's single child, which holds the whole document UI.
+    // The template's single child holds the pane UI.
     fn content(&self) -> Option<gtk::Widget> {
         self.obj().first_child()
     }
@@ -2308,238 +2045,15 @@ impl DocumentView {
         }
     }
 
-    fn setup_search(&self) {
-        // let the search bar drive its entry (built-in reveal/conceal plumbing)
-        self.search_bar.connect_entry(&*self.search_entry);
-
-        // Route every dismissal (Esc, close button, stop-search) through one cleanup.
-        self.search_bar.connect_search_mode_enabled_notify(clone!(
-            #[weak(rename_to = imp)]
-            self,
-            move |bar| {
-                if !bar.is_search_mode() {
-                    imp.clear_search();
-                }
-            }
-        ));
-    }
-
     // Search keys (Ctrl+F / F3 / Esc). The window drives these from its own capture-phase
     // controller, so they work wherever the focus sits, the header entries included.
-    pub(super) fn handle_search_key(
-        &self,
-        keyval: Key,
-        modifier: ModifierType,
-    ) -> glib::Propagation {
-        match keyval {
-            Key::f if modifier.contains(ModifierType::CONTROL_MASK) => {
-                self.open_search();
-                glib::Propagation::Stop
-            }
-            Key::F3 => {
-                if modifier.contains(ModifierType::SHIFT_MASK) {
-                    self.prev_match();
-                } else {
-                    self.next_match();
-                }
-                glib::Propagation::Stop
-            }
-            Key::Escape if self.search_bar.is_search_mode() => {
-                self.search_bar.set_search_mode(false);
-                glib::Propagation::Stop
-            }
-            _ => glib::Propagation::Proceed,
-        }
-    }
-
-    pub(super) fn open_search(&self) {
-        self.search_bar.set_search_mode(true);
-        self.search_entry.grab_focus();
-        self.search_entry.select_region(0, -1);
-        // restore highlights for a leftover query
-        let query = self.search_entry.text().to_string();
-        if !query.is_empty() {
-            self.run_search(query);
-        }
-    }
-
     // Cleanup on dismissal: clear highlights, refocus the document, but keep the query text so
     // reopening restores it.
-    fn clear_search(&self) {
-        if let Some(source) = self.search_debounce.take() {
-            source.remove();
-        }
-
-        let pages: Vec<i32> = {
-            let search = self.document().search();
-            let mut search = search.borrow_mut();
-            let pages = search.results.keys().copied().collect();
-            search.clear();
-            pages
-        };
-        for page in pages {
-            self.redraw_page(page);
-        }
-        self.viewport().set_current_search_result(None);
-        self.update_search_status();
-        self.scrolledwindow.grab_focus();
-    }
-
-    #[template_callback]
-    fn search_changed(&self, entry: &SearchEntry) {
-        self.schedule_search(entry.text().to_string());
-    }
-
-    #[template_callback]
-    fn search_activate(&self) {
-        // Enter advances; the first match was auto-revealed when the sweep began
-        self.next_match();
-    }
-
-    #[template_callback]
-    fn search_stop(&self) {
-        self.search_bar.set_search_mode(false);
-    }
-
-    #[template_callback]
-    fn search_next(&self) {
-        self.next_match();
-    }
-
-    #[template_callback]
-    fn search_prev(&self) {
-        self.prev_match();
-    }
-
-    fn schedule_search(&self, query: String) {
-        if let Some(source) = self.search_debounce.take() {
-            source.remove();
-        }
-        // clear immediately when emptied, so highlights vanish without a delay
-        if query.is_empty() {
-            self.run_search(query);
-            return;
-        }
-        let source = glib::timeout_add_local_once(
-            std::time::Duration::from_millis(SEARCH_DEBOUNCE_MS),
-            clone!(
-                #[weak(rename_to = imp)]
-                self,
-                move || {
-                    imp.search_debounce.replace(None);
-                    imp.run_search(query);
-                }
-            ),
-        );
-        self.search_debounce.replace(Some(source));
-    }
-
     // Launch a fresh sweep: cancel the previous (epoch bump), clear old highlights, then stream
     // results back and repaint pages as matches arrive.
-    fn run_search(&self, query: String) {
-        let old_pages: Vec<i32> = self
-            .document()
-            .search()
-            .borrow()
-            .results
-            .keys()
-            .copied()
-            .collect();
-
-        let (epoch, shared_epoch) = {
-            let search = self.document().search();
-            let mut search = search.borrow_mut();
-            search.query = query.clone();
-            search.begin_sweep()
-        };
-        self.viewport().set_current_search_result(None);
-
-        for page in old_pages {
-            self.redraw_page(page);
-        }
-        self.update_search_status();
-
-        let n_pages = self.document().n_pages();
-        if n_pages == 0 || query.is_empty() {
-            return;
-        }
-
-        let mut rx = crate::search::spawn_search(
-            self.document().uri(),
-            query,
-            n_pages,
-            self.selection.selected() as i32,
-            epoch,
-            shared_epoch,
-        );
-
-        glib::spawn_future_local(clone!(
-            #[weak(rename_to = imp)]
-            self,
-            async move {
-                while let Some(update) = rx.next().await {
-                    {
-                        let search = imp.document().search();
-                        let mut search = search.borrow_mut();
-                        if update.epoch != search.epoch() {
-                            continue; // superseded
-                        }
-                        let first = imp.viewport().current_search_result().is_none();
-                        search.results.insert(update.page, update.matches);
-                        if first {
-                            // outward order => first arrival is the nearest match
-                            imp.viewport()
-                                .set_current_search_result(Some((update.page, 0)));
-                        }
-                        drop(search);
-                        if first {
-                            imp.reveal_current();
-                        }
-                    }
-                    imp.redraw_page(update.page);
-                    imp.update_search_status();
-                }
-
-                // sweep done (or superseded); report no results if it found nothing
-                let search = imp.document().search();
-                let search = search.borrow();
-                if search.epoch() == epoch && !search.query.is_empty() && search.total() == 0 {
-                    imp.search_status.set_text("No results");
-                }
-            }
-        ));
-    }
-
-    fn next_match(&self) {
-        self.move_match(true);
-    }
-
-    fn prev_match(&self) {
-        self.move_match(false);
-    }
-
-    fn move_match(&self, forward: bool) {
-        let (previous, selected) = {
-            let search = self.document().search();
-            let search = search.borrow();
-            let previous = self.viewport().current_search_result();
-            let Some(selected) = search.step(previous, forward) else {
-                return;
-            };
-            (previous, selected)
-        };
-        self.viewport().set_current_search_result(Some(selected));
-        if let Some((page, _)) = previous {
-            self.redraw_page(page);
-        }
-        self.reveal_current();
-        self.redraw_page(selected.0);
-        self.update_search_status();
-    }
-
     // Bring the current match into view: select its page (keeping entry focus), then scroll
     // horizontally to the match once the page is laid out.
-    fn reveal_current(&self) {
+    pub(crate) fn reveal_current(&self) {
         let (page, rect) = {
             let search = self.document().search();
             let search = search.borrow();
@@ -2626,7 +2140,7 @@ impl DocumentView {
         }
     }
 
-    fn redraw_page(&self, index: i32) {
+    pub(crate) fn redraw_page(&self, index: i32) {
         let mut child = self.listview.first_child();
         while let Some(c) = child {
             if let Some(page) = descendant_page(&c) {
@@ -2648,20 +2162,6 @@ impl DocumentView {
         }
     }
 
-    fn update_search_status(&self) {
-        let search = self.document().search();
-        let search = search.borrow();
-        let text = if search.query.is_empty() {
-            String::new()
-        } else if let Some(ordinal) = search.ordinal(self.viewport().current_search_result()) {
-            format!("{ordinal} / {}", search.total())
-        } else {
-            // query set, no match yet: still searching
-            "Searching…".to_string()
-        };
-        self.search_status.set_text(&text);
-    }
-
     pub(super) fn jump_back(&self) {
         if let Some(page) = self.viewport().jump_list_back(self.viewport().page() + 1) {
             self.navigate_to_page(page);
@@ -2679,7 +2179,7 @@ impl DocumentView {
 }
 
 // Trait shared by all widgets
-impl WidgetImpl for DocumentView {
+impl WidgetImpl for DocumentPane {
     fn measure(&self, orientation: gtk::Orientation, for_size: i32) -> (i32, i32, i32, i32) {
         self.content()
             .map_or((0, 0, -1, -1), |c| c.measure(orientation, for_size))
@@ -2909,7 +2409,7 @@ mod tests {
         page_range_start, run_reader_action, widest_window, width_fit_range, KINETIC_TAU_US,
         SCROLL_ANIM_MAX_US, SCROLL_ANIM_TAU_US, WHEEL_NOTCH, WHEEL_TRIGGER,
     };
-    use crate::document_view::{ReaderKeyContext, ZoomChoiceAction};
+    use crate::document_pane::{ReaderKeyContext, ZoomChoiceAction};
 
     #[test]
     fn width_fit_scales_papers_but_not_gaps() {
@@ -3270,26 +2770,11 @@ mod widget_tests {
     use gtk::prelude::*;
     use gtk::subclass::prelude::ObjectSubclassIsExt;
 
-    #[gtk::test]
-    fn ctrl_t_leaves_the_contents_panel_to_the_tab_key() {
-        let window = loaded_window();
-        let imp = window.imp();
-        wait_until(|| !imp.toc_pages.borrow().is_empty());
-
-        imp.handle_key_press(gtk::gdk::Key::t, 0, gtk::gdk::ModifierType::CONTROL_MASK);
-        assert!(!imp.toc_revealer.reveals_child(), "Ctrl+T opens a tab");
-
-        imp.handle_key_press(gtk::gdk::Key::t, 0, gtk::gdk::ModifierType::empty());
-        assert!(imp.toc_revealer.reveals_child(), "plain t still toggles");
-
-        window.close();
-    }
-
     // The page it left on, so the restore has something to aim at.
     #[gtk::test]
     fn hiding_a_view_records_where_the_reader_was() {
         let window = loaded_window();
-        let imp = window.imp();
+        let imp = window.pane().imp();
         imp.selection.set_selected(2);
         wait_until(|| window.viewport().page() == 2);
         assert!(imp.hidden_at.get().is_none(), "nothing recorded on screen");
@@ -3307,34 +2792,22 @@ mod widget_tests {
         window.present();
         wait_until(|| window.is_mapped());
         assert_eq!(
-            window.imp().selection.selected(),
+            window.pane().imp().selection.selected(),
             gtk::INVALID_LIST_POSITION
         );
 
         window.set_visible(false);
         wait_until(|| !window.is_mapped());
 
-        assert!(window.imp().hidden_at.get().is_none());
+        assert!(window.pane().imp().hidden_at.get().is_none());
         window.close();
-    }
-
-    #[gtk::test]
-    fn empty_view_follows_the_page_count() {
-        let window = window();
-        let imp = window.imp();
-
-        assert!(imp.empty_view.property::<bool>("visible"));
-        imp.document().set_n_pages(1);
-        assert!(!imp.empty_view.property::<bool>("visible"));
-        imp.document().set_n_pages(0);
-        assert!(imp.empty_view.property::<bool>("visible"));
     }
 
     // GTK's own kinetic scrolling is off on both scrollers, so nothing else coasts for us.
     #[gtk::test]
     fn vertical_flick_coasts_when_the_page_is_taller_than_the_viewport() {
         let window = window();
-        let imp = window.imp();
+        let imp = window.pane().imp();
         let vadj = imp.vscrolledwindow.vadjustment();
         vadj.configure(0.0, 0.0, 2000.0, 10.0, 100.0, 500.0);
 
@@ -3347,7 +2820,7 @@ mod widget_tests {
     #[gtk::test]
     fn a_page_that_fits_the_viewport_has_nothing_to_coast() {
         let window = window();
-        let imp = window.imp();
+        let imp = window.pane().imp();
         let vadj = imp.vscrolledwindow.vadjustment();
         // page_size must not exceed `upper`; GtkAdjustment drops the whole call if it does
         vadj.configure(0.0, 0.0, 400.0, 10.0, 100.0, 400.0);
@@ -3361,7 +2834,7 @@ mod widget_tests {
     #[gtk::test]
     fn a_pinch_stops_both_coasts() {
         let window = window();
-        let imp = window.imp();
+        let imp = window.pane().imp();
         let vadj = imp.vscrolledwindow.vadjustment();
         vadj.configure(0.0, 0.0, 2000.0, 10.0, 100.0, 500.0);
         imp.handle_decelerate(-1500.0, -1500.0);
@@ -3379,7 +2852,7 @@ mod widget_tests {
     #[gtk::test]
     fn a_pinch_leaves_a_page_slide_running() {
         let window = window();
-        let imp = window.imp();
+        let imp = window.pane().imp();
         *imp.scroll_anim.borrow_mut() = Some(super::ScrollAnim {
             anchor_x: Some(0.0),
             last_target: 100.0,
@@ -3398,7 +2871,7 @@ mod widget_tests {
     }
 
     // A slide already running: we last wrote `value`, and aim at `target` a page ahead.
-    fn slide(imp: &super::DocumentView, value: f64, target: f64) {
+    fn slide(imp: &super::DocumentPane, value: f64, target: f64) {
         let hadj = imp.scrolledwindow.hadjustment();
         hadj.configure(value, 0.0, 100_000.0, 10.0, 100.0, 1_000.0);
         *imp.scroll_anim.borrow_mut() = Some(super::ScrollAnim {
@@ -3418,7 +2891,7 @@ mod widget_tests {
     #[gtk::test]
     fn a_coordinate_rewrite_carries_the_slide_target_with_it() {
         let window = window();
-        let imp = window.imp();
+        let imp = window.pane().imp();
         slide(imp, 50_000.0, 50_677.0);
         let anim = imp.scroll_anim.borrow().expect("slide armed");
 
@@ -3430,7 +2903,7 @@ mod widget_tests {
     #[gtk::test]
     fn a_coordinate_rewrite_does_not_reverse_prefetch() {
         let window = window();
-        let imp = window.imp();
+        let imp = window.pane().imp();
         let hadj = imp.scrolledwindow.hadjustment();
         hadj.configure(500.0, 0.0, 2000.0, 10.0, 100.0, 500.0);
         imp.viewport().set_scroll_forward(true);
@@ -3446,7 +2919,7 @@ mod widget_tests {
     #[gtk::test]
     fn a_retarget_advances_from_the_rebased_target() {
         let window = window();
-        let imp = window.imp();
+        let imp = window.pane().imp();
         imp.viewport().set_animate_scroll(true);
         slide(imp, 50_000.0, 50_677.0);
 
@@ -3465,7 +2938,7 @@ mod widget_tests {
     #[gtk::test]
     fn a_slow_vertical_lift_off_does_not_coast() {
         let window = window();
-        let imp = window.imp();
+        let imp = window.pane().imp();
         let vadj = imp.vscrolledwindow.vadjustment();
         vadj.configure(0.0, 0.0, 2000.0, 10.0, 100.0, 500.0);
 
@@ -3481,7 +2954,7 @@ mod widget_tests {
     #[gtk::test]
     fn scroll_controller_runs_before_gtk_coasts() {
         let window = window();
-        let imp = window.imp();
+        let imp = window.pane().imp();
         let ours = imp.pan_scroll.get();
 
         assert_eq!(ours.propagation_phase(), gtk::PropagationPhase::Capture);
@@ -3542,7 +3015,7 @@ mod widget_tests {
         ));
         window.load(&fixture);
 
-        let imp = window.imp();
+        let imp = window.pane().imp();
         wait_until(|| imp.mapped_page(0).is_some());
         let page = imp.mapped_page(0).unwrap();
         let (left, top) = imp.page_origin(&page).unwrap();
@@ -3623,7 +3096,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
 
     // Height the list asks for to show the page in view, the row's own padding included. Measured,
     // not allocated: Xvfb has no window manager, so the window re-lays out only when it resizes.
-    fn asked_height(imp: &super::DocumentView) -> f64 {
+    fn asked_height(imp: &super::DocumentPane) -> f64 {
         let row = imp
             .mapped_page(imp.viewport().page() as i32)
             .and_then(|page| page.parent())
@@ -3633,7 +3106,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
     }
 
     // Nothing to pan to: the page in view asks for no more than the viewport holds.
-    fn assert_nothing_to_pan(imp: &super::DocumentView) {
+    fn assert_nothing_to_pan(imp: &super::DocumentPane) {
         let (asked, viewport) = (
             asked_height(imp) + super::hscrollbar_reserve(&imp.scrolledwindow),
             imp.vscrolledwindow.vadjustment().page_size(),
@@ -3646,7 +3119,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
     }
 
     // The page in view is as tall as the viewport, to the pixel.
-    fn assert_fills_the_viewport(imp: &super::DocumentView) {
+    fn assert_fills_the_viewport(imp: &super::DocumentPane) {
         let (asked, viewport) = (
             asked_height(imp) + super::hscrollbar_reserve(&imp.scrolledwindow),
             imp.vscrolledwindow.vadjustment().page_size(),
@@ -3662,7 +3135,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
     fn width_fit_aligns_the_visible_range_without_slots() {
         let window = window();
         window.present();
-        let imp = window.imp();
+        let imp = window.pane().imp();
         window.load(&mixed_heights_document());
         wait_until(|| imp.selection.n_items() == 3);
 
@@ -3702,7 +3175,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
     fn width_fit_aligns_when_the_target_exceeds_the_zoom_limit() {
         let window = window();
         window.present();
-        let imp = window.imp();
+        let imp = window.pane().imp();
         window.load(&narrow_page_document());
         wait_until(|| imp.mapped_page(0).is_some());
 
@@ -3722,7 +3195,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
     #[gtk::test]
     fn a_fitted_page_fills_the_viewport_exactly() {
         let window = loaded_window();
-        let imp = window.imp();
+        let imp = window.pane().imp();
 
         imp.viewport().set_fit_height(true);
         wait_until(|| !imp.fit_pending.get());
@@ -3734,7 +3207,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
     #[gtk::test]
     fn a_fitted_page_without_horizontal_overflow_fills_the_viewport() {
         let window = loaded_window();
-        let imp = window.imp();
+        let imp = window.pane().imp();
         imp.viewport().set_fit_height(true);
 
         window.load(&one_page_document());
@@ -3815,7 +3288,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
     }
 
     // Every term the fit measures, so a re-fit that lands on another zoom names the term that moved.
-    fn fit_terms(imp: &super::DocumentView) -> String {
+    fn fit_terms(imp: &super::DocumentPane) -> String {
         format!(
             "page_size={} chrome={:?} reserve={} tallest={}",
             imp.vscrolledwindow.vadjustment().page_size(),
@@ -3830,7 +3303,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
     #[gtk::test]
     fn fit_keeps_cached_chrome_without_a_mapped_selected_page() {
         let window = loaded_window();
-        let imp = window.imp();
+        let imp = window.pane().imp();
         imp.viewport().set_fit_height(true);
         wait_until(|| !imp.fit_pending.get());
         let chrome = imp.fit_chrome_height.get().expect("a cached chrome");
@@ -3860,7 +3333,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
     #[gtk::test]
     fn turning_fit_off_restores_the_manual_zoom() {
         let window = loaded_window();
-        let imp = window.imp();
+        let imp = window.pane().imp();
         imp.viewport().zoom_to(2.0);
 
         imp.viewport().set_fit_height(true);
@@ -3876,7 +3349,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
     #[gtk::test]
     fn entering_the_displayed_fit_zoom_restores_fit_height() {
         let window = loaded_window();
-        let imp = window.imp();
+        let imp = window.pane().imp();
         imp.viewport().set_fit_height(true);
         wait_until(|| !imp.fit_pending.get());
         let fit_zoom = zoom_percent_text(imp.viewport().zoom());
@@ -3899,7 +3372,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
     #[gtk::test]
     fn cropping_does_not_move_the_fit() {
         let window = loaded_window();
-        let imp = window.imp();
+        let imp = window.pane().imp();
 
         imp.viewport().set_fit_height(true);
         wait_until(|| !imp.fit_pending.get());
@@ -3918,7 +3391,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
     #[gtk::test]
     fn a_shorter_viewport_queues_a_re_fit() {
         let window = loaded_window();
-        let imp = window.imp();
+        let imp = window.pane().imp();
 
         imp.viewport().set_fit_height(true);
         wait_until(|| !imp.fit_pending.get());
@@ -3941,7 +3414,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
     #[gtk::test]
     fn a_zoom_of_the_readers_own_ends_fit_height() {
         let window = loaded_window();
-        let imp = window.imp();
+        let imp = window.pane().imp();
 
         let zooms: [&dyn Fn(); 4] = [
             &|| imp.zoom_in(),
@@ -3964,7 +3437,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
     #[gtk::test]
     fn manual_zoom_from_fit_keeps_its_anchor() {
         let window = loaded_window();
-        let imp = window.imp();
+        let imp = window.pane().imp();
         imp.viewport().zoom_to(2.0);
         imp.viewport().set_fit_height(true);
         wait_until(|| !imp.fit_pending.get());
@@ -3983,7 +3456,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
     fn the_tallest_page_sets_the_fit_for_every_page() {
         let window = window();
         window.present();
-        let imp = window.imp();
+        let imp = window.pane().imp();
         imp.viewport().set_fit_height(true);
 
         window.load(&mixed_heights_document());
@@ -4036,7 +3509,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
     #[gtk::test]
     fn a_jump_to_the_current_page_is_not_recorded() {
         let window = loaded_window();
-        let imp = window.imp();
+        let imp = window.pane().imp();
 
         imp.goto_page(1);
         assert_eq!(
@@ -4066,7 +3539,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         window.set_default_size(500, 400);
         window.present();
         window.load(&gtk::gio::File::for_path(path));
-        let imp = window.imp();
+        let imp = window.pane().imp();
         wait_until(|| imp.mapped_page(0).is_some());
 
         imp.viewport().zoom_to(10.0);
@@ -4130,7 +3603,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
     #[gtk::test]
     fn pinch_keeps_its_document_point_and_follows_the_gesture_center() {
         let window = window();
-        let imp = window.imp();
+        let imp = window.pane().imp();
         imp.zoom_gesture_base.set(1.0);
         imp.zoom_anchor.set(Some(super::ZoomAnchor {
             page: 3,
@@ -4151,7 +3624,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
     #[gtk::test]
     fn zoom_at_a_bound_does_not_leave_a_stale_pointer_anchor() {
         let window = window();
-        let imp = window.imp();
+        let imp = window.pane().imp();
         imp.viewport().zoom_to(f64::MAX);
         imp.zoom_anchor.set(Some(super::ZoomAnchor {
             page: 0,
@@ -4169,23 +3642,27 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
     fn ctrl_plus_minus_and_equal_zoom() {
         use gtk::gdk::{Key, ModifierType};
         let window = window();
-        let imp = window.imp();
+        let imp = window.pane().imp();
         let ctrl = ModifierType::CONTROL_MASK;
 
         for key in [Key::plus, Key::equal, Key::KP_Add] {
             imp.viewport().zoom_to(1.0);
-            imp.handle_key_press(key, 0, ctrl);
+            imp.handle_reader_key(key, ctrl, crate::document_pane::ReaderKeyContext::Document);
             assert!(imp.viewport().zoom() > 1.0, "{key:?} should zoom in");
         }
         for key in [Key::minus, Key::KP_Subtract] {
             imp.viewport().zoom_to(1.0);
-            imp.handle_key_press(key, 0, ctrl);
+            imp.handle_reader_key(key, ctrl, crate::document_pane::ReaderKeyContext::Document);
             assert!(imp.viewport().zoom() < 1.0, "{key:?} should zoom out");
         }
 
         // plain minus stays free for other bindings
         imp.viewport().zoom_to(1.0);
-        imp.handle_key_press(Key::minus, 0, ModifierType::empty());
+        imp.handle_reader_key(
+            Key::minus,
+            ModifierType::empty(),
+            crate::document_pane::ReaderKeyContext::Document,
+        );
         assert_eq!(imp.viewport().zoom(), 1.0);
     }
 
@@ -4203,7 +3680,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         ));
         window.load(&fixture);
 
-        let imp = window.imp();
+        let imp = window.pane().imp();
         wait_until(|| imp.mapped_page(0).is_some());
         let page = imp.mapped_page(0).unwrap();
         let (left, top) = imp.page_origin(&page).unwrap();
@@ -4213,7 +3690,11 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
 
         let zooms: [&dyn Fn(); 4] = [
             &|| {
-                imp.handle_key_press(Key::plus, 0, ModifierType::CONTROL_MASK);
+                imp.handle_reader_key(
+                    Key::plus,
+                    ModifierType::CONTROL_MASK,
+                    crate::document_pane::ReaderKeyContext::Document,
+                );
             },
             &|| imp.zoom_in(),
             &|| imp.zoom_out(),
@@ -4239,22 +3720,26 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
     fn ctrl_zero_resets_zoom() {
         use gtk::gdk::{Key, ModifierType};
         let window = window();
-        let imp = window.imp();
+        let imp = window.pane().imp();
         let ctrl = ModifierType::CONTROL_MASK;
 
         for key in [Key::_0, Key::KP_0] {
             imp.viewport().zoom_to(2.5);
-            imp.handle_key_press(key, 0, ctrl);
+            imp.handle_reader_key(key, ctrl, crate::document_pane::ReaderKeyContext::Document);
             assert_eq!(imp.viewport().zoom(), 1.0, "{key:?} should reset to 100%");
 
             imp.viewport().zoom_to(0.4);
-            imp.handle_key_press(key, 0, ctrl);
+            imp.handle_reader_key(key, ctrl, crate::document_pane::ReaderKeyContext::Document);
             assert_eq!(imp.viewport().zoom(), 1.0, "{key:?} should reset to 100%");
         }
 
         // plain 0 stays free for other bindings
         imp.viewport().zoom_to(2.5);
-        imp.handle_key_press(Key::_0, 0, ModifierType::empty());
+        imp.handle_reader_key(
+            Key::_0,
+            ModifierType::empty(),
+            crate::document_pane::ReaderKeyContext::Document,
+        );
         assert_eq!(imp.viewport().zoom(), 2.5);
     }
 }
