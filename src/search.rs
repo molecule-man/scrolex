@@ -31,8 +31,6 @@ pub struct Search {
     pub query: String,
     // page -> matches, in page coords (top-left origin)
     pub results: BTreeMap<i32, Vec<Match>>,
-    // the highlighted match: (page, index within that page's matches)
-    pub current: Option<(i32, usize)>,
     // bumped per sweep; the background thread stops once it no longer matches
     epoch: Arc<AtomicU64>,
 }
@@ -41,7 +39,6 @@ impl Search {
     pub fn clear(&mut self) {
         self.query.clear();
         self.results.clear();
-        self.current = None;
         // abandon any in-flight sweep
         self.epoch.fetch_add(1, Ordering::Relaxed);
     }
@@ -53,7 +50,6 @@ impl Search {
     // Start a new sweep: bump the epoch (cancelling the previous) and return it plus the shared handle.
     pub fn begin_sweep(&mut self) -> (u64, Arc<AtomicU64>) {
         self.results.clear();
-        self.current = None;
         let epoch = self.epoch.fetch_add(1, Ordering::Relaxed) + 1;
         (epoch, self.epoch.clone())
     }
@@ -71,8 +67,8 @@ impl Search {
     }
 
     // 1-based position of the current match, for the counter.
-    pub fn current_ordinal(&self) -> Option<usize> {
-        let current = self.current?;
+    pub fn ordinal(&self, current: Option<(i32, usize)>) -> Option<usize> {
+        let current = current?;
         self.ordered()
             .iter()
             .position(|&m| m == current)
@@ -80,12 +76,12 @@ impl Search {
     }
 
     // The match after/before the current one, wrapping. Without a current match, the first/last.
-    pub fn step(&self, forward: bool) -> Option<(i32, usize)> {
+    pub fn step(&self, current: Option<(i32, usize)>, forward: bool) -> Option<(i32, usize)> {
         let order = self.ordered();
         if order.is_empty() {
             return None;
         }
-        let Some(current) = self.current else {
+        let Some(current) = current else {
             return Some(if forward {
                 order[0]
             } else {
@@ -274,33 +270,28 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
 
     #[test]
     fn step_forward_walks_reading_order_and_wraps() {
-        let mut s = search_with(&[(1, 2), (4, 1)]);
-        s.current = Some((1, 0));
-        assert_eq!(s.step(true), Some((1, 1)));
-        s.current = Some((1, 1));
-        assert_eq!(s.step(true), Some((4, 0)));
-        s.current = Some((4, 0));
-        assert_eq!(s.step(true), Some((1, 0))); // wrap to first
+        let s = search_with(&[(1, 2), (4, 1)]);
+        assert_eq!(s.step(Some((1, 0)), true), Some((1, 1)));
+        assert_eq!(s.step(Some((1, 1)), true), Some((4, 0)));
+        assert_eq!(s.step(Some((4, 0)), true), Some((1, 0))); // wrap to first
     }
 
     #[test]
     fn step_backward_wraps_to_last() {
-        let mut s = search_with(&[(1, 2), (4, 1)]);
-        s.current = Some((1, 0));
-        assert_eq!(s.step(false), Some((4, 0)));
+        let s = search_with(&[(1, 2), (4, 1)]);
+        assert_eq!(s.step(Some((1, 0)), false), Some((4, 0)));
     }
 
     #[test]
     fn step_without_current_returns_first_or_last() {
         let s = search_with(&[(1, 2), (4, 1)]);
-        assert_eq!(s.step(true), Some((1, 0)));
-        assert_eq!(s.step(false), Some((4, 0)));
+        assert_eq!(s.step(None, true), Some((1, 0)));
+        assert_eq!(s.step(None, false), Some((4, 0)));
     }
 
     #[test]
     fn current_ordinal_is_one_based_global_position() {
-        let mut s = search_with(&[(1, 2), (4, 1)]);
-        s.current = Some((4, 0));
-        assert_eq!(s.current_ordinal(), Some(3));
+        let s = search_with(&[(1, 2), (4, 1)]);
+        assert_eq!(s.ordinal(Some((4, 0))), Some(3));
     }
 }

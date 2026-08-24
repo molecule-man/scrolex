@@ -13,6 +13,8 @@ use crate::jump_stack;
 #[derive(Debug, Default, glib::Properties)]
 #[properties(wrapper_type = super::Viewport)]
 pub struct Viewport {
+    pub(crate) id: Cell<u64>,
+
     // The document this pane reads. Set once, at construction.
     #[property(get = Self::document, set, construct_only, type = crate::document::Document)]
     document: RefCell<Option<crate::document::Document>>,
@@ -46,6 +48,7 @@ pub struct Viewport {
     pub(super) jump_stack: Rc<RefCell<jump_stack::JumpStack>>,
     pub(super) forward_jump_stack: Rc<RefCell<jump_stack::JumpStack>>,
     pub(crate) selection: Rc<RefCell<Option<crate::selection::PageSelection>>>,
+    pub(crate) current_search_result: Cell<Option<(i32, usize)>>,
 
     // direction of travel, used to prefetch the pages being read toward: true = forward (higher page
     // numbers), the default; flipped when the user scrolls back.
@@ -79,6 +82,7 @@ impl ObjectSubclass for Viewport {
 impl ObjectImpl for Viewport {
     fn constructed(&self) {
         self.parent_constructed();
+        self.id.set(super::ViewportId::next().0);
         self.scroll_forward.set(true);
 
         // Zoom changes every page's render scale. Keep completed textures as bounded transition
@@ -88,9 +92,13 @@ impl ObjectImpl for Viewport {
         self.obj()
             .connect_notify_local(Some("zoom"), |viewport, _| {
                 let document = viewport.document();
-                document.imp().render_waiters.borrow_mut().clear();
-                document.imp().render_cache.borrow_mut().clear_pins();
-                crate::page::clear_full_renders(document.render_client_id());
+                document.remove_render_interests(viewport.id());
+                document
+                    .imp()
+                    .render_cache
+                    .borrow_mut()
+                    .clear_pins(viewport.id());
+                crate::page::clear_full_renders(viewport.id());
                 // in-flight renders started at the old scale are now stale; bump so their completion
                 // drops out instead of caching an obsolete-scale texture
                 let epoch = viewport.imp().render_epoch.get();

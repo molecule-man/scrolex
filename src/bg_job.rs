@@ -2,7 +2,7 @@
 // own MuPDF Document via the renderer's thread-local), so the pool holds no document itself. One
 // pool serves every kind of job - visible-page renders and low-res previews.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 
@@ -38,10 +38,58 @@ impl RenderPriority {
 
 type Job = Box<dyn FnOnce() + Send + 'static>;
 
+#[derive(Clone, Default, Debug)]
+pub(crate) struct RenderDemand {
+    clients: Arc<Mutex<HashSet<u64>>>,
+}
+
+impl RenderDemand {
+    pub(crate) fn from_client(client: u64) -> Self {
+        Self::from_clients([client])
+    }
+
+    pub(crate) fn from_clients(clients: impl IntoIterator<Item = u64>) -> Self {
+        Self {
+            clients: Arc::new(Mutex::new(clients.into_iter().collect())),
+        }
+    }
+
+    pub(crate) fn add(&self, client: u64) {
+        self.clients.lock().unwrap().insert(client);
+    }
+
+    pub(crate) fn remove(&self, client: u64) {
+        self.clients.lock().unwrap().remove(&client);
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.clients.lock().unwrap().is_empty()
+    }
+
+    pub(crate) fn clear(&self) {
+        self.clients.lock().unwrap().clear();
+    }
+
+    pub(crate) fn same_request(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.clients, &other.clients)
+    }
+
+    fn any(&self, predicate: impl Fn(u64) -> bool) -> bool {
+        self.clients.lock().unwrap().iter().copied().any(predicate)
+    }
+
+    #[cfg(test)]
+    fn clients(&self) -> Vec<u64> {
+        let mut clients: Vec<_> = self.clients.lock().unwrap().iter().copied().collect();
+        clients.sort_unstable();
+        clients
+    }
+}
+
 struct RenderRequest {
     uri: String,
-    // requesting window (its Document id); the wanted-range filter is per-window
-    client: u64,
+    document: u64,
+    demand: RenderDemand,
     page: i32,
     job: Job,
 }
@@ -59,9 +107,9 @@ struct RenderQueue {
     max_visible: usize,
     max_preview: usize,
     max_prefetch: usize,
-    // Per-window page range worth a full render (keyed by requesting window); full renders outside
-    // it drop on pop. Absent window = unrestricted. Previews aren't filtered.
+    // Each viewport has one page range. Full renders outside every interested range drop on pop.
     wanted: HashMap<u64, (i32, i32)>,
+    wanted_documents: HashMap<u64, u64>,
     // worker count bookkeeping for set_size: live threads and how many should exit next
     live_threads: usize,
     stop_requested: usize,
@@ -84,31 +132,64 @@ impl RenderQueue {
             max_preview,
             max_prefetch,
             wanted: HashMap::new(),
+            wanted_documents: HashMap::new(),
             live_threads: 0,
             stop_requested: 0,
         }
     }
 
-    fn in_wanted(&self, client: u64, page: i32) -> bool {
-        self.wanted
-            .get(&client)
-            .is_none_or(|&(lo, hi)| page >= lo && page <= hi)
+    fn in_wanted(&self, request: &RenderRequest) -> bool {
+        request.demand.any(|client| {
+            self.wanted
+                .get(&client)
+                .is_none_or(|&(lo, hi)| request.page >= lo && request.page <= hi)
+        })
     }
 
-    // Drop a window's queued full renders (visible, prefetch), keeping previews (which survive a
-    // zoom, rescaled).
+    // Remove one viewport from queued full renders. Keep work that another viewport needs.
     fn clear_full(&mut self, client: u64) {
-        self.visible.retain(|req| req.client != client);
-        self.prefetch.retain(|req| req.client != client);
+        for request in self.visible.iter().chain(&self.prefetch) {
+            request.demand.remove(client);
+        }
+        self.visible.retain(|request| !request.demand.is_empty());
+        self.prefetch.retain(|request| !request.demand.is_empty());
     }
 
-    // Drop all of a window's queued renders, previews included (document switch or window close, when
-    // nothing of the old view is worth rendering).
-    fn clear_all(&mut self, client: u64) {
-        self.visible_preview.retain(|req| req.client != client);
-        self.visible.retain(|req| req.client != client);
-        self.preview.retain(|req| req.client != client);
-        self.prefetch.retain(|req| req.client != client);
+    #[cfg(test)]
+    fn clear_all_client(&mut self, client: u64) {
+        for request in self
+            .visible_preview
+            .iter()
+            .chain(&self.visible)
+            .chain(&self.preview)
+            .chain(&self.prefetch)
+        {
+            request.demand.remove(client);
+        }
+        self.visible_preview
+            .retain(|request| !request.demand.is_empty());
+        self.visible.retain(|request| !request.demand.is_empty());
+        self.preview.retain(|request| !request.demand.is_empty());
+        self.prefetch.retain(|request| !request.demand.is_empty());
+        self.wanted.remove(&client);
+        self.wanted_documents.remove(&client);
+    }
+
+    fn clear_all_document(&mut self, document: u64) {
+        self.visible_preview
+            .retain(|request| request.document != document);
+        self.visible.retain(|request| request.document != document);
+        self.preview.retain(|request| request.document != document);
+        self.prefetch.retain(|request| request.document != document);
+        let clients: Vec<_> = self
+            .wanted_documents
+            .iter()
+            .filter_map(|(&client, &owner)| (owner == document).then_some(client))
+            .collect();
+        for client in clients {
+            self.wanted.remove(&client);
+            self.wanted_documents.remove(&client);
+        }
     }
 
     fn push(&mut self, priority: RenderPriority, req: RenderRequest) {
@@ -129,12 +210,12 @@ impl RenderQueue {
             return Some(req);
         }
         while let Some(req) = self.visible.pop() {
-            if self.in_wanted(req.client, req.page) {
+            if self.in_wanted(&req) {
                 return Some(req);
             }
         }
         while let Some(req) = self.prefetch.pop() {
-            if self.in_wanted(req.client, req.page) {
+            if self.in_wanted(&req) {
                 return Some(req);
             }
         }
@@ -194,7 +275,8 @@ impl RenderPool {
     pub(crate) fn submit(
         &self,
         uri: &str,
-        client: u64,
+        document: u64,
+        demand: RenderDemand,
         page: i32,
         priority: RenderPriority,
         job: Job,
@@ -205,7 +287,8 @@ impl RenderPool {
             priority,
             RenderRequest {
                 uri: uri.to_string(),
-                client,
+                document,
+                demand,
                 page,
                 job,
             },
@@ -213,25 +296,31 @@ impl RenderPool {
         cvar.notify_one();
     }
 
-    pub(crate) fn set_wanted(&self, client: u64, range: Option<(i32, i32)>) {
+    pub(crate) fn set_wanted(&self, document: u64, client: u64, range: Option<(i32, i32)>) {
         let (lock, _cvar) = &*self.inner;
         let mut queue = lock.lock().unwrap();
         match range {
-            Some(range) => queue.wanted.insert(client, range),
-            None => queue.wanted.remove(&client),
+            Some(range) => {
+                queue.wanted_documents.insert(client, document);
+                queue.wanted.insert(client, range)
+            }
+            None => {
+                queue.wanted_documents.remove(&client);
+                queue.wanted.remove(&client)
+            }
         };
     }
 
-    // Drop this window's queued full renders (zoom: previews survive, rescaled).
+    // Remove one viewport from queued full renders. Previews survive zoom.
     pub(crate) fn clear_full(&self, client: u64) {
         let (lock, _cvar) = &*self.inner;
         lock.lock().unwrap().clear_full(client);
     }
 
-    // Drop all of this window's queued renders (document switch / window close).
-    pub(crate) fn clear_all(&self, client: u64) {
+    // Drop queued renders and wanted ranges for one document.
+    pub(crate) fn clear_all_document(&self, document: u64) {
         let (lock, _cvar) = &*self.inner;
-        lock.lock().unwrap().clear_all(client);
+        lock.lock().unwrap().clear_all_document(document);
     }
 
     fn spawn_bg_thread(inner: Arc<(Mutex<RenderQueue>, Condvar)>) {
@@ -292,7 +381,8 @@ mod tests {
     fn req(tag: &str) -> RenderRequest {
         RenderRequest {
             uri: tag.to_string(),
-            client: 0,
+            document: 0,
+            demand: RenderDemand::from_client(0),
             page: 0,
             job: Box::new(|| {}),
         }
@@ -301,10 +391,55 @@ mod tests {
     fn req_cp(client: u64, page: i32) -> RenderRequest {
         RenderRequest {
             uri: String::new(),
-            client,
+            document: 0,
+            demand: RenderDemand::from_client(client),
             page,
             job: Box::new(|| {}),
         }
+    }
+
+    fn req_with_demand(document: u64, demand: RenderDemand, page: i32) -> RenderRequest {
+        RenderRequest {
+            uri: String::new(),
+            document,
+            demand,
+            page,
+            job: Box::new(|| {}),
+        }
+    }
+
+    #[test]
+    fn a_shared_request_survives_one_viewport_clear() {
+        let mut q = RenderQueue::new(4, 4, 4, 4);
+        let demand = RenderDemand::from_clients([1, 2]);
+        q.wanted.insert(1, (1, 2));
+        q.wanted.insert(2, (10, 20));
+        q.push(
+            RenderPriority::Visible,
+            req_with_demand(7, demand.clone(), 15),
+        );
+
+        q.clear_full(1);
+
+        assert_eq!(drain_pages(&mut q), vec![15]);
+        assert_eq!(demand.clients(), vec![2]);
+    }
+
+    #[test]
+    fn a_document_clear_removes_each_viewport_request() {
+        let mut q = RenderQueue::new(4, 4, 4, 4);
+        q.push(
+            RenderPriority::Visible,
+            req_with_demand(7, RenderDemand::from_clients([1]), 3),
+        );
+        q.push(
+            RenderPriority::Visible,
+            req_with_demand(8, RenderDemand::from_clients([2]), 4),
+        );
+
+        q.clear_all_document(7);
+
+        assert_eq!(drain_pages(&mut q), vec![4]);
     }
 
     fn drain(queue: &mut RenderQueue) -> Vec<String> {
@@ -381,11 +516,11 @@ mod tests {
     }
 
     #[test]
-    fn range_is_per_window() {
+    fn range_is_per_viewport() {
         let mut q = RenderQueue::new(4, 4, 4, 4);
         q.wanted.insert(1, (10, 20));
-        q.push(RenderPriority::Visible, req_cp(1, 100)); // window 1, out of range: dropped
-        q.push(RenderPriority::Visible, req_cp(2, 50)); // window 2, unrestricted: kept
+        q.push(RenderPriority::Visible, req_cp(1, 100)); // viewport 1: dropped
+        q.push(RenderPriority::Visible, req_cp(2, 50)); // viewport 2: kept
         assert_eq!(drain_pages(&mut q), vec![50]);
     }
 
@@ -406,8 +541,8 @@ mod tests {
         q.push(RenderPriority::Visible, req_cp(1, 1));
         q.push(RenderPriority::Preview, req_cp(1, 2));
         q.push(RenderPriority::VisiblePreview, req_cp(1, 3));
-        q.push(RenderPriority::Visible, req_cp(2, 4)); // another window: untouched
-        q.clear_all(1);
+        q.push(RenderPriority::Visible, req_cp(2, 4)); // another viewport: untouched
+        q.clear_all_client(1);
         assert_eq!(drain_pages(&mut q), vec![4]);
     }
 

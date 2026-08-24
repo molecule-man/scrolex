@@ -11,11 +11,55 @@ use gtk::subclass::prelude::*;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use crate::page;
 
 const MAX_MAIN_THREAD_RENDER_TIME: Duration = Duration::from_millis(100);
+
+static NEXT_DOCUMENT_RENDER_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct DocumentRenderId(u64);
+
+impl DocumentRenderId {
+    fn next() -> Self {
+        Self(NEXT_DOCUMENT_RENDER_ID.fetch_add(1, Ordering::Relaxed))
+    }
+
+    pub(crate) fn raw(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum RenderJobKey {
+    Page(crate::render_cache::PageRenderKey),
+    Tiles(Vec<crate::render_cache::TileId>),
+}
+
+impl RenderJobKey {
+    pub(crate) fn page(&self) -> i32 {
+        match self {
+            Self::Page(render) => render.page,
+            Self::Tiles(tiles) => tiles.first().expect("a tile job has tiles").render.page,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct RenderInterest {
+    pub(crate) viewport: glib::WeakRef<crate::viewport::Viewport>,
+    pub(crate) epoch: u64,
+    pub(crate) widget: Option<glib::WeakRef<page::Page>>,
+}
+
+#[derive(Debug)]
+pub(crate) struct RenderJob {
+    pub(crate) demand: crate::bg_job::RenderDemand,
+    pub(crate) interests: HashMap<crate::viewport::ViewportId, RenderInterest>,
+}
 
 // Per-preview size the adaptive preview scaler steers toward. The cache budget uses this size.
 pub(crate) const PREVIEW_TARGET_BYTES: usize = 20 * 1024 * 1024 / 65;
@@ -129,12 +173,9 @@ impl Document {
         // version-isolated if that file changes on disk.
         crate::mupdf_render::invalidate();
         candidate.commit();
-        // Drop this window's queued renders and wanted-range entry for the outgoing document so they
-        // neither run stale nor linger in the shared pool.
-        let client = self.render_client_id();
-        crate::page::clear_all_renders(client);
-        crate::page::set_wanted_pages(client, None);
-        // invalidate this window's in-flight renders (their content/scale is about to change)
+        // Drop queued renders and wanted ranges for the outgoing document.
+        crate::page::clear_document_renders(self.id());
+        // Invalidate this document's active render jobs.
         self.imp()
             .doc_epoch
             .set(self.imp().doc_epoch.get().wrapping_add(1));
@@ -142,8 +183,7 @@ impl Document {
         self.imp().links.borrow_mut().clear();
         self.imp().search.borrow_mut().clear();
         self.imp().render_cache.borrow_mut().clear();
-        self.imp().render_inflight.borrow_mut().clear();
-        self.imp().render_waiters.borrow_mut().clear();
+        self.clear_render_jobs();
         self.imp().preview_cache.borrow_mut().clear();
         self.imp().preview_inflight.borrow_mut().clear();
         self.imp().preview_enabled.set(true);
@@ -182,14 +222,6 @@ impl Document {
         self.imp().render_cache.clone()
     }
 
-    pub(crate) fn render_inflight(&self) -> Rc<RefCell<HashMap<i32, u64>>> {
-        self.imp().render_inflight.clone()
-    }
-
-    pub(crate) fn render_waiters(&self) -> Rc<RefCell<HashMap<i32, glib::WeakRef<page::Page>>>> {
-        self.imp().render_waiters.clone()
-    }
-
     pub(crate) fn preview_cache(&self) -> Rc<RefCell<crate::render_cache::RenderCache>> {
         self.imp().preview_cache.clone()
     }
@@ -201,8 +233,83 @@ impl Document {
             .set_budget(preview_cache_budget(pages));
     }
 
-    pub(crate) fn render_client_id(&self) -> u64 {
-        self.imp().render_client_id.get()
+    pub(crate) fn id(&self) -> DocumentRenderId {
+        DocumentRenderId(self.imp().id.get())
+    }
+
+    pub(crate) fn request_render(
+        &self,
+        key: RenderJobKey,
+        viewport: &crate::viewport::Viewport,
+        widget: Option<&page::Page>,
+    ) -> Option<crate::bg_job::RenderDemand> {
+        let viewport_id = viewport.id();
+        let interest = RenderInterest {
+            viewport: viewport.downgrade(),
+            epoch: viewport.render_epoch(),
+            widget: widget.map(ObjectExt::downgrade),
+        };
+        let mut jobs = self.imp().render_jobs.borrow_mut();
+        match jobs.entry(key) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                entry.get().demand.add(viewport_id.raw());
+                entry.get_mut().interests.insert(viewport_id, interest);
+                None
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let demand = crate::bg_job::RenderDemand::from_client(viewport_id.raw());
+                entry.insert(RenderJob {
+                    demand: demand.clone(),
+                    interests: HashMap::from([(viewport_id, interest)]),
+                });
+                Some(demand)
+            }
+        }
+    }
+
+    pub(crate) fn take_render_job(
+        &self,
+        key: &RenderJobKey,
+        demand: &crate::bg_job::RenderDemand,
+    ) -> Option<RenderJob> {
+        let mut jobs = self.imp().render_jobs.borrow_mut();
+        let owns_key = jobs
+            .get(key)
+            .is_some_and(|job| job.demand.same_request(demand));
+        owns_key.then(|| jobs.remove(key)).flatten()
+    }
+
+    pub(crate) fn remove_render_interests(&self, viewport: crate::viewport::ViewportId) {
+        let mut jobs = self.imp().render_jobs.borrow_mut();
+        for job in jobs.values_mut() {
+            job.interests.remove(&viewport);
+            job.demand.remove(viewport.raw());
+        }
+        jobs.retain(|_, job| !job.interests.is_empty());
+    }
+
+    pub(crate) fn render_waiters(&self, page: i32) -> Vec<glib::WeakRef<page::Page>> {
+        self.imp()
+            .render_jobs
+            .borrow()
+            .iter()
+            .filter(|(key, _)| key.page() == page)
+            .flat_map(|(_, job)| job.interests.values())
+            .filter_map(|interest| interest.widget.clone())
+            .collect()
+    }
+
+    pub(crate) fn clear_render_jobs(&self) {
+        let mut jobs = self.imp().render_jobs.borrow_mut();
+        for job in jobs.values() {
+            job.demand.clear();
+        }
+        jobs.clear();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_render_job(&self, key: &RenderJobKey) -> bool {
+        self.imp().render_jobs.borrow().contains_key(key)
     }
 
     pub(crate) fn doc_epoch(&self) -> u64 {
@@ -210,12 +317,12 @@ impl Document {
     }
 
     pub(crate) fn invalidate_rendering(&self) {
-        crate::page::clear_all_renders(self.render_client_id());
+        crate::page::clear_document_renders(self.id());
         self.imp()
             .doc_epoch
             .set(self.imp().doc_epoch.get().wrapping_add(1));
         self.imp().render_cache.borrow_mut().clear();
-        self.imp().render_inflight.borrow_mut().clear();
+        self.clear_render_jobs();
         self.imp().preview_cache.borrow_mut().clear();
         self.imp().preview_inflight.borrow_mut().clear();
     }

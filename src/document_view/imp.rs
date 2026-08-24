@@ -2101,7 +2101,12 @@ impl DocumentView {
     // Region-backed pages must snapshot after viewport movement so newly exposed regions can be
     // requested. Whole-page texture nodes remain reusable and stay off this redraw path.
     fn redraw_tiled_pages(&self) {
-        if !self.document().render_cache().borrow().has_tiled_pages() {
+        if !self
+            .document()
+            .render_cache()
+            .borrow()
+            .has_tiled_pages(self.viewport().id())
+        {
             return;
         }
         let mut child = self.listview.first_child();
@@ -2119,8 +2124,12 @@ impl DocumentView {
     // queue. Spans the mapped page widgets plus a prefetch margin. A briefly-excluded visible page
     // reschedules via the render-waiter redraw, so the range only needs to be roughly right.
     fn update_wanted_render_range(&self, redraw_tiles: bool) {
-        let redraw_tiles =
-            redraw_tiles && self.document().render_cache().borrow().has_tiled_pages();
+        let redraw_tiles = redraw_tiles
+            && self
+                .document()
+                .render_cache()
+                .borrow()
+                .has_tiled_pages(self.viewport().id());
         let mut lo = i32::MAX;
         let mut hi = i32::MIN;
         let mut child = self.listview.first_child();
@@ -2143,7 +2152,7 @@ impl DocumentView {
         } else {
             None
         };
-        crate::page::set_wanted_pages(self.document().render_client_id(), range);
+        crate::page::set_wanted_pages(self.document().id(), self.viewport().id(), range);
     }
 
     // The template's single child, which holds the whole document UI.
@@ -2371,6 +2380,7 @@ impl DocumentView {
         for page in pages {
             self.redraw_page(page);
         }
+        self.viewport().set_current_search_result(None);
         self.update_search_status();
         self.scrolledwindow.grab_focus();
     }
@@ -2442,6 +2452,7 @@ impl DocumentView {
             search.query = query.clone();
             search.begin_sweep()
         };
+        self.viewport().set_current_search_result(None);
 
         for page in old_pages {
             self.redraw_page(page);
@@ -2473,11 +2484,12 @@ impl DocumentView {
                         if update.epoch != search.epoch() {
                             continue; // superseded
                         }
-                        let first = search.current.is_none();
+                        let first = imp.viewport().current_search_result().is_none();
                         search.results.insert(update.page, update.matches);
                         if first {
                             // outward order => first arrival is the nearest match
-                            search.current = Some((update.page, 0));
+                            imp.viewport()
+                                .set_current_search_result(Some((update.page, 0)));
                         }
                         drop(search);
                         if first {
@@ -2507,21 +2519,21 @@ impl DocumentView {
     }
 
     fn move_match(&self, forward: bool) {
-        let (old, new) = {
+        let (previous, selected) = {
             let search = self.document().search();
-            let mut search = search.borrow_mut();
-            let Some(next) = search.step(forward) else {
+            let search = search.borrow();
+            let previous = self.viewport().current_search_result();
+            let Some(selected) = search.step(previous, forward) else {
                 return;
             };
-            let old = search.current;
-            search.current = Some(next);
-            (old, next)
+            (previous, selected)
         };
-        if let Some((page, _)) = old {
+        self.viewport().set_current_search_result(Some(selected));
+        if let Some((page, _)) = previous {
             self.redraw_page(page);
         }
         self.reveal_current();
-        self.redraw_page(new.0);
+        self.redraw_page(selected.0);
         self.update_search_status();
     }
 
@@ -2531,7 +2543,7 @@ impl DocumentView {
         let (page, rect) = {
             let search = self.document().search();
             let search = search.borrow();
-            let Some((p, i)) = search.current else {
+            let Some((p, i)) = self.viewport().current_search_result() else {
                 return;
             };
             let Some(r) = search.rect(p, i) else {
@@ -2641,7 +2653,7 @@ impl DocumentView {
         let search = search.borrow();
         let text = if search.query.is_empty() {
             String::new()
-        } else if let Some(ordinal) = search.current_ordinal() {
+        } else if let Some(ordinal) = search.ordinal(self.viewport().current_search_result()) {
             format!("{ordinal} / {}", search.total())
         } else {
             // query set, no match yet: still searching
@@ -4060,6 +4072,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         imp.viewport().zoom_to(10.0);
         wait_until(|| imp.mapped_page(0).is_some_and(|page| page.uses_tiles()));
         let dsf = crate::page::device_scale(&imp.mapped_page(0).unwrap());
+        let render = crate::render_cache::PageRenderKey::from_factors(0, 10.0, dsf);
         let mut found = None;
         wait_until(|| {
             let cache = imp.document().render_cache();
@@ -4067,11 +4080,11 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
             for y in 0..30 {
                 for x in 0..20 {
                     let id = crate::render_cache::TileId {
-                        page: 0,
+                        render,
                         x: x * 1024,
                         y: y * 1024,
                     };
-                    if let Some(texture) = cache.get_tile(id, 10.0 * dsf) {
+                    if let Some(texture) = cache.get_tile(id) {
                         found = Some(texture);
                         return true;
                     }
@@ -4100,7 +4113,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
                 * 1024;
         assert!(resized_right_tile > initial_right_tile);
         let newly_visible = crate::render_cache::TileId {
-            page: 0,
+            render,
             x: resized_right_tile,
             y: 0,
         };
@@ -4108,7 +4121,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
             imp.document()
                 .render_cache()
                 .borrow_mut()
-                .get_tile(newly_visible, 10.0 * dsf)
+                .get_tile(newly_visible)
                 .is_some()
         });
         window.close();

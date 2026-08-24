@@ -2,7 +2,6 @@
 #![expect(unused_lifetimes)]
 
 use std::cell::{Cell, RefCell};
-use std::collections::hash_map::Entry;
 use std::rc::Rc;
 use std::sync::OnceLock;
 
@@ -75,18 +74,21 @@ pub(crate) fn set_render_threads(n: usize) {
     RENDER_QUEUE.with(|queue| queue.set_size(n));
 }
 
-pub(crate) fn set_wanted_pages(client: u64, range: Option<(i32, i32)>) {
-    RENDER_QUEUE.with(|queue| queue.set_wanted(client, range));
+pub(crate) fn set_wanted_pages(
+    document: crate::document::DocumentRenderId,
+    viewport: crate::viewport::ViewportId,
+    range: Option<(i32, i32)>,
+) {
+    RENDER_QUEUE.with(|queue| queue.set_wanted(document.raw(), viewport.raw(), range));
 }
 
-// Drop a window's queued full renders (zoom invalidates their scale; previews survive).
-pub(crate) fn clear_full_renders(client: u64) {
-    RENDER_QUEUE.with(|queue| queue.clear_full(client));
+// Remove one viewport from queued full renders. Previews survive zoom.
+pub(crate) fn clear_full_renders(viewport: crate::viewport::ViewportId) {
+    RENDER_QUEUE.with(|queue| queue.clear_full(viewport.raw()));
 }
 
-// Drop all of a window's queued renders, previews included (document switch / window close).
-pub(crate) fn clear_all_renders(client: u64) {
-    RENDER_QUEUE.with(|queue| queue.clear_all(client));
+pub(crate) fn clear_document_renders(document: crate::document::DocumentRenderId) {
+    RENDER_QUEUE.with(|queue| queue.clear_all_document(document.raw()));
 }
 
 // How many pages to prefetch ahead: the threads not busy on visible pages, but never more full
@@ -369,7 +371,7 @@ impl Page {
         obj.document()
             .render_cache()
             .borrow_mut()
-            .unpin_page(obj.index());
+            .unpin_page(obj.viewport().id(), obj.index());
         self.tiled.set(false);
     }
 
@@ -745,7 +747,7 @@ impl Page {
         obj.document()
             .render_cache()
             .borrow_mut()
-            .unpin_page(page.index);
+            .unpin_page(obj.viewport().id(), page.index);
         let bbox = self.get_bbox(page, obj.crop());
 
         match render_page_texture(
@@ -913,7 +915,7 @@ impl Page {
         // Each match may span multiple lines (one rect each); the current match is orange, others
         // yellow.
         for (i, rects) in matches.iter().enumerate() {
-            let color = if search.current == Some((index, i)) {
+            let color = if obj.viewport().current_search_result() == Some((index, i)) {
                 RGBA::new(1.0, 0.55, 0.0, 0.45)
             } else {
                 RGBA::new(1.0, 0.9, 0.0, 0.4)
@@ -1018,7 +1020,7 @@ impl Page {
     ) {
         let obj = self.obj();
         let page_num = page.index;
-        let pixel_scale = scale * dsf;
+        let render = crate::render_cache::PageRenderKey::from_factors(page_num, scale, dsf);
         let page_px = render_dimensions((page.width, page.height), scale, dsf);
         let regions = self.visible_tile_regions(page, bbox, scale, dsf);
         let mut ready = Vec::new();
@@ -1026,7 +1028,7 @@ impl Page {
         let visible_ids: Vec<_> = regions
             .iter()
             .map(|region| crate::render_cache::TileId {
-                page: page_num,
+                render,
                 x: region.x0,
                 y: region.y0,
             })
@@ -1034,17 +1036,25 @@ impl Page {
         {
             let cache = obj.document().render_cache();
             let mut cache = cache.borrow_mut();
-            cache.pin_tiles(page_num, &visible_ids);
+            cache.pin_tiles(obj.viewport().id(), render, &visible_ids);
             for (region, id) in regions.into_iter().zip(visible_ids.iter().copied()) {
-                match cache.get_tile(id, pixel_scale) {
+                match cache.get_tile(id) {
                     Some(texture) => ready.push((region, texture)),
                     None => missing.push(region),
                 }
             }
         }
 
-        let full = obj.document().render_cache().borrow_mut().get(page_num);
-        let preview = obj.document().preview_cache().borrow_mut().get(page_num);
+        let full = obj
+            .document()
+            .render_cache()
+            .borrow_mut()
+            .get_latest(page_num);
+        let preview = obj
+            .document()
+            .preview_cache()
+            .borrow_mut()
+            .get_latest(page_num);
         let source = fallback_source(
             full.as_ref().map(|texture| texture.width()),
             preview.as_ref().map(|texture| texture.width()),
@@ -1083,10 +1093,6 @@ impl Page {
             return;
         }
         self.schedule_tile_render(page_num, scale, dsf, page_px, missing);
-        obj.document()
-            .render_waiters()
-            .borrow_mut()
-            .insert(page_num, obj.downgrade());
         self.note_paint(
             page_num,
             match source {
@@ -1121,15 +1127,19 @@ impl Page {
             return;
         }
         self.tiled.set(false);
+        let render = crate::render_cache::PageRenderKey::from_factors(page_num, render_scale, dsf);
         obj.document()
             .render_cache()
             .borrow_mut()
-            .pin_page(page_num);
+            .pin_page(obj.viewport().id(), render);
         let expected = render_dimensions((width, height), render_scale, dsf);
         let page_bytes = page_buffer_bytes((width, height), render_scale, dsf);
 
         let cache = obj.document().render_cache();
-        let cached = cache.borrow_mut().get(page_num);
+        let cached = {
+            let mut cache = cache.borrow_mut();
+            cache.get(render).or_else(|| cache.get_latest(page_num))
+        };
         let stale_render = if let Some(texture) = cached {
             if (texture.width(), texture.height()) == expected {
                 log::debug!("draw page {page_num}: cache hit");
@@ -1149,14 +1159,11 @@ impl Page {
         // the workers mid-scroll.
         self.schedule_render(page_num, render_scale, dsf, RenderPriority::Visible);
 
-        // remember that this widget is the one waiting for page_num, so the
-        // render repaints it when it lands
-        obj.document()
-            .render_waiters()
+        let preview = obj
+            .document()
+            .preview_cache()
             .borrow_mut()
-            .insert(page_num, obj.downgrade());
-
-        let preview = obj.document().preview_cache().borrow_mut().get(page_num);
+            .get_latest(page_num);
         let source = fallback_source(
             stale_render.as_ref().map(|texture| texture.width()),
             preview.as_ref().map(|texture| texture.width()),
@@ -1229,87 +1236,74 @@ impl Page {
         }
     }
 
-    // Queue a full render of `page_num`. Skipped if one is in flight, or if the cache holds the page
-    // at the capped scale already - callers pass the zoom, so only this point knows that scale. The
-    // marker records the epoch, so the completion can tell whether the slot is still its own.
+    // Queue one page and scale. Equal requests share the job and keep separate viewport interests.
     fn schedule_render(&self, page_num: i32, scale: f64, dsf: f64, priority: RenderPriority) {
         let obj = self.obj();
-        // Cheap bail before reading page bounds: a page redrawn while its render runs comes back here
-        // on every snapshot.
-        if obj
-            .document()
-            .render_inflight()
-            .borrow()
-            .contains_key(&page_num)
-        {
-            return;
-        }
-
         let uri = obj.uri();
         // Page size (points) from the main-thread doc, so the worker sizes its pixel buffer to
         // exactly what the render cache expects (see mupdf_render::render_page_pixels).
         let page_pt = crate::mupdf_render::page_size(&uri, page_num);
 
-        // Capped and skipped before the marker goes in. A page marked in flight with no render to
-        // release it would stay wedged.
+        // Apply the buffer cap before the cache and job lookups.
         let scale = match page_pt {
             Some(size) => render_scale(size, scale, dsf),
             None => scale,
         };
-        let pixel_scale = scale * dsf;
-        if obj
-            .document()
-            .render_cache()
-            .borrow()
-            .contains_at_scale(page_num, pixel_scale)
-        {
+        let render = crate::render_cache::PageRenderKey::from_factors(page_num, scale, dsf);
+        if obj.document().render_cache().borrow().contains(render) {
             return;
         }
 
-        let epoch = obj.viewport().render_epoch();
-        match obj
+        let key = crate::document::RenderJobKey::Page(render);
+        let waiter = matches!(priority, RenderPriority::Visible).then_some(&*obj);
+        let Some(demand) = obj
             .document()
-            .render_inflight()
-            .borrow_mut()
-            .entry(page_num)
-        {
-            Entry::Occupied(_) => return,
-            Entry::Vacant(slot) => {
-                slot.insert(epoch);
-            }
-        }
+            .request_render(key.clone(), &obj.viewport(), waiter)
+        else {
+            return;
+        };
 
-        let client = obj.document().render_client_id();
         log::trace!("Scheduling render of page {page_num}");
 
         let (resp_sender, resp_receiver) = oneshot::channel::<RenderedPixels>();
-        let obj_clone = obj.clone();
-        let doc_epoch = obj.document().doc_epoch();
+        let document = obj.document();
+        let doc_epoch = document.doc_epoch();
+        let completion_demand = demand.clone();
+        let completion_document = document.clone();
+        let completion_key = key.clone();
         glib::spawn_future_local(async move {
             let result = resp_receiver.await;
-            let viewport = obj_clone.viewport();
-            let Some(rendered) = accept_render(&viewport, page_num, epoch, doc_epoch, result)
-            else {
+            let Some((rendered, waiters)) = accept_render(
+                &completion_document,
+                &completion_key,
+                &completion_demand,
+                doc_epoch,
+                result,
+            ) else {
                 return;
             };
 
             let texture = rendered.into_texture();
-            viewport.document().render_cache().borrow_mut().insert(
-                page_num,
-                texture.upcast(),
-                pixel_scale,
-            );
-            finish_render(&viewport, page_num);
+            completion_document
+                .render_cache()
+                .borrow_mut()
+                .insert(render, texture.upcast());
+            finish_render(&completion_document, page_num, waiters);
         });
 
         let uri_job = uri.clone();
+        let worker_demand = demand.clone();
         RENDER_QUEUE.with(move |queue| {
             queue.submit(
                 &uri,
-                client,
+                document.id().raw(),
+                demand,
                 page_num,
                 priority,
                 Box::new(move || {
+                    if worker_demand.is_empty() {
+                        return;
+                    }
                     request_render(
                         &uri_job,
                         scale,
@@ -1338,30 +1332,40 @@ impl Page {
             return;
         }
         let obj = self.obj();
-        let epoch = obj.viewport().render_epoch();
-        match obj
-            .document()
-            .render_inflight()
-            .borrow_mut()
-            .entry(page_num)
-        {
-            Entry::Occupied(_) => return,
-            Entry::Vacant(slot) => {
-                slot.insert(epoch);
-            }
-        }
-
         let uri = obj.uri();
-        let client = obj.document().render_client_id();
-        let doc_epoch = obj.document().doc_epoch();
-        let pixel_scale = scale * dsf;
+        let render = crate::render_cache::PageRenderKey::from_factors(page_num, scale, dsf);
+        let mut tiles: Vec<_> = regions
+            .iter()
+            .map(|region| crate::render_cache::TileId {
+                render,
+                x: region.x0,
+                y: region.y0,
+            })
+            .collect();
+        tiles.sort_unstable();
+        let key = crate::document::RenderJobKey::Tiles(tiles);
+        let Some(demand) = obj
+            .document()
+            .request_render(key.clone(), &obj.viewport(), Some(&obj))
+        else {
+            return;
+        };
+
+        let document = obj.document();
+        let doc_epoch = document.doc_epoch();
         let (resp_sender, resp_receiver) = oneshot::channel::<Vec<RenderedRegion>>();
-        let obj_clone = obj.clone();
+        let completion_demand = demand.clone();
+        let completion_document = document.clone();
+        let completion_key = key.clone();
         glib::spawn_future_local(async move {
             let result = resp_receiver.await;
-            let viewport = obj_clone.viewport();
-            let Some(rendered) = accept_render(&viewport, page_num, epoch, doc_epoch, result)
-            else {
+            let Some((rendered, waiters)) = accept_render(
+                &completion_document,
+                &completion_key,
+                &completion_demand,
+                doc_epoch,
+                result,
+            ) else {
                 return;
             };
 
@@ -1369,29 +1373,33 @@ impl Page {
                 .into_iter()
                 .map(|region| {
                     let id = crate::render_cache::TileId {
-                        page: page_num,
+                        render,
                         x: region.x,
                         y: region.y,
                     };
                     (id, region.pixels.into_texture().upcast())
                 })
                 .collect();
-            viewport
-                .document()
+            completion_document
                 .render_cache()
                 .borrow_mut()
-                .insert_tile_batch(textures, pixel_scale);
-            finish_render(&viewport, page_num);
+                .insert_tile_batch(textures);
+            finish_render(&completion_document, page_num, waiters);
         });
 
         let uri_job = uri.clone();
+        let worker_demand = demand.clone();
         RENDER_QUEUE.with(move |queue| {
             queue.submit(
                 &uri,
-                client,
+                document.id().raw(),
+                demand,
                 page_num,
                 RenderPriority::Visible,
                 Box::new(move || {
+                    if worker_demand.is_empty() {
+                        return;
+                    }
                     request_region_render(
                         &uri_job,
                         scale,
@@ -1440,7 +1448,8 @@ impl Page {
     fn schedule_preview_if_needed(&self, page_num: i32, priority: RenderPriority) {
         let obj = self.obj();
         let document = obj.document();
-        if !document.preview_enabled() || document.preview_cache().borrow().contains(page_num) {
+        if !document.preview_enabled() || document.preview_cache().borrow().contains_page(page_num)
+        {
             return;
         }
         if document.preview_inflight().borrow().len() >= MAX_INFLIGHT_PREVIEWS {
@@ -1454,14 +1463,15 @@ impl Page {
     fn schedule_preview(&self, page_num: i32, priority: RenderPriority) {
         let obj = self.obj();
         let uri = obj.uri();
-        let client = obj.document().render_client_id();
+        let document = obj.document();
+        let demand = crate::bg_job::RenderDemand::from_client(obj.viewport().id().raw());
         let scale = obj.document().preview_scale();
         let page_pt = crate::mupdf_render::page_size(&uri, page_num);
 
         let (resp_sender, resp_receiver) = oneshot::channel::<RenderedPixels>();
         let obj_clone = obj.clone();
         // Previews survive a zoom (they're rescaled at draw), so only a document load invalidates
-        // them - check doc_epoch, not render_epoch. Per-window, so another window's load can't wedge
+        // them - check doc_epoch, not render_epoch. Per document, so another load cannot wedge
         // this preview's inflight marker.
         let doc_epoch = obj.document().doc_epoch();
         glib::spawn_future_local(async move {
@@ -1512,18 +1522,16 @@ impl Page {
             }
 
             let texture = rendered.into_texture();
-            document
-                .preview_cache()
-                .borrow_mut()
-                .insert(page_num, texture.upcast(), scale);
+            document.preview_cache().borrow_mut().insert(
+                crate::render_cache::PageRenderKey::from_factors(page_num, scale, 1.0),
+                texture.upcast(),
+            );
 
-            // repaint the waiting widget, but leave the waiter registered so the
-            // full render still repaints it when it lands
-            if let Some(widget) = document
-                .render_waiters()
-                .borrow()
-                .get(&page_num)
-                .and_then(glib::WeakRef::upgrade)
+            // Repaint full-render waiters. Keep them for the full-render result.
+            for widget in document
+                .render_waiters(page_num)
+                .into_iter()
+                .filter_map(|widget| widget.upgrade())
             {
                 if widget.index() == page_num {
                     widget.queue_draw();
@@ -1532,13 +1540,18 @@ impl Page {
         });
 
         let uri_job = uri.clone();
+        let worker_demand = demand.clone();
         RENDER_QUEUE.with(move |queue| {
             queue.submit(
                 &uri,
-                client,
+                document.id().raw(),
+                demand,
                 page_num,
                 priority,
                 Box::new(move || {
+                    if worker_demand.is_empty() {
+                        return;
+                    }
                     request_render(
                         &uri_job,
                         scale,
@@ -1896,51 +1909,50 @@ fn solid_page_data(stride: i32, height: i32, color: [u8; 3]) -> Box<[u8]> {
     data.into_boxed_slice()
 }
 
-// Apply the shared completion lifecycle before a renderer-specific cache insertion. A document or
-// rendering-mode switch already cleared these slots, so it must not mutate the current entries. A
-// stale zoom or dropped queue request releases its own slot and redraws only a widget still bound to
-// this page, allowing it to request the current viewport and scale.
+// Accept a result only for the same document epoch and an interested viewport epoch.
 fn accept_render<T, E>(
-    viewport: &crate::viewport::Viewport,
-    page_num: i32,
-    epoch: u64,
+    document: &crate::document::Document,
+    key: &crate::document::RenderJobKey,
+    demand: &crate::bg_job::RenderDemand,
     doc_epoch: u64,
     result: Result<T, E>,
-) -> Option<T> {
-    let document = viewport.document();
+) -> Option<(T, Vec<glib::WeakRef<crate::page::Page>>)> {
     if document.doc_epoch() != doc_epoch {
         return None;
     }
-    {
-        let inflight = document.render_inflight();
-        let mut inflight = inflight.borrow_mut();
-        if inflight.get(&page_num) == Some(&epoch) {
-            inflight.remove(&page_num);
+    let job = document.take_render_job(key, demand)?;
+    let mut valid = 0;
+    let mut waiters = Vec::new();
+    for interest in job.interests.into_values() {
+        let Some(viewport) = interest.viewport.upgrade() else {
+            continue;
+        };
+        if viewport.render_epoch() != interest.epoch {
+            continue;
+        }
+        valid += 1;
+        if let Some(widget) = interest.widget {
+            waiters.push(widget);
         }
     }
-
+    if valid == 0 {
+        return None;
+    }
     match result {
-        Ok(rendered) if viewport.render_epoch() == epoch => Some(rendered),
-        _ => {
-            if let Some(widget) = document
-                .render_waiters()
-                .borrow()
-                .get(&page_num)
-                .and_then(glib::WeakRef::upgrade)
-            {
-                if widget.index() == page_num {
-                    widget.queue_draw();
-                }
-            }
+        Ok(rendered) => Some((rendered, waiters)),
+        Err(_) => {
+            redraw_waiters(key.page(), waiters);
             None
         }
     }
 }
 
-// Log cache state and repaint whichever widget currently waits for this page, which may differ from
-// the widget that submitted the render after list-item recycling.
-fn finish_render(viewport: &crate::viewport::Viewport, page_num: i32) {
-    let document = viewport.document();
+// Log cache state and repaint each valid waiter.
+fn finish_render(
+    document: &crate::document::Document,
+    page_num: i32,
+    waiters: Vec<glib::WeakRef<crate::page::Page>>,
+) {
     log::debug!(
         "memory: rss={:.0}MB preview_scale={:.3} render_cache={:?} preview_cache={:?}",
         current_rss_mb(),
@@ -1948,12 +1960,11 @@ fn finish_render(viewport: &crate::viewport::Viewport, page_num: i32) {
         document.render_cache().borrow(),
         document.preview_cache().borrow(),
     );
-    if let Some(widget) = document
-        .render_waiters()
-        .borrow_mut()
-        .remove(&page_num)
-        .and_then(|weak| weak.upgrade())
-    {
+    redraw_waiters(page_num, waiters);
+}
+
+fn redraw_waiters(page_num: i32, waiters: Vec<glib::WeakRef<crate::page::Page>>) {
+    for widget in waiters.into_iter().filter_map(|widget| widget.upgrade()) {
         if widget.index() == page_num {
             widget.queue_draw();
         }
@@ -2361,21 +2372,24 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         // capped instead of not at all.
         page.imp()
             .schedule_render(1, 10.0, 1.0, RenderPriority::Prefetch);
-        assert!(document.render_inflight().borrow().contains_key(&1));
+        let capped = render_scale((2000.0, 3000.0), 10.0, 1.0);
+        let key = crate::document::RenderJobKey::Page(
+            crate::render_cache::PageRenderKey::from_factors(1, capped, 1.0),
+        );
+        assert!(document.has_render_job(&key));
 
         // already cached at the capped scale: don't render it again on every draw
-        document.render_inflight().borrow_mut().clear();
-        let capped = render_scale((2000.0, 3000.0), 10.0, 1.0);
+        document.clear_render_jobs();
         let (w, h) = render_dimensions((2000.0, 3000.0), capped, 1.0);
         let bytes = glib::Bytes::from_owned(vec![255u8; (w * h * 4) as usize]);
         let texture = MemoryTexture::new(w, h, MemoryFormat::B8g8r8x8, &bytes, (w * 4) as usize);
-        document
-            .render_cache()
-            .borrow_mut()
-            .insert(1, texture.upcast(), capped);
+        document.render_cache().borrow_mut().insert(
+            crate::render_cache::PageRenderKey::from_factors(1, capped, 1.0),
+            texture.upcast(),
+        );
         page.imp()
             .schedule_render(1, 10.0, 1.0, RenderPriority::Prefetch);
-        assert!(document.render_inflight().borrow().is_empty());
+        assert!(!document.has_render_job(&key));
     }
 
     #[gtk::test]
