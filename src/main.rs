@@ -223,7 +223,7 @@ fn build_ui(app: &Application, args: &[OsString], file: Option<&gtk::gio::File>)
         window.add_css_class("debug");
     }
 
-    let state = window.active_document().state().clone();
+    let document = window.active_document();
 
     app.connect_shutdown(clone!(
         #[strong]
@@ -240,24 +240,27 @@ fn build_ui(app: &Application, args: &[OsString], file: Option<&gtk::gio::File>)
             }
 
             for document in window.documents() {
-                if let Err(err) = document.state().save() {
-                    eprintln!("Error saving state for {}: {err}", document.state().uri());
+                if let Err(err) = document.save_position() {
+                    eprintln!(
+                        "Error saving the reading position for {}: {err}",
+                        document.document().uri()
+                    );
                 }
             }
 
             // The background render threads (bg_job) are detached and may be mid MuPDF render at
             // this point; a MuPDF render can't be interrupted. Terminating normally would let the
             // C library destructors free MuPDF/cairo/pixman globals out from under a
-            // still-running render thread, which segfaults. State is saved above, so exit
+            // still-running render thread, which segfaults. The position is saved above, so exit
             // immediately without running those destructors and let the OS reclaim everything.
             unsafe { libc_exit(0) };
         }
     ));
 
     if scrolex::emulate::config().is_some() {
-        state.load(&gtk::gio::File::for_uri(scrolex::emulate::URI));
+        document.load(&gtk::gio::File::for_uri(scrolex::emulate::URI));
     } else if let Some(file) = file {
-        state.load(file);
+        document.load(file);
     }
 
     if let Some(geometry) = config::load_config().geometry {

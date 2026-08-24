@@ -52,9 +52,8 @@ impl TestWindow {
 pub fn init() {
     install_log_writer();
     crate::config::use_scratch_config();
-    crate::state::use_scratch_state_dir();
+    crate::viewport::use_scratch_state_dir();
     gtk::gio::resources_register_include!("scrolex-ui.gresource").expect("ui resources");
-    crate::state::State::static_type();
     crate::page::PageNumber::static_type();
     crate::page::Page::static_type();
     crate::document_view::DocumentView::static_type();
@@ -113,7 +112,7 @@ pub fn loaded_window() -> TestWindow {
     let window = window();
     window.set_default_size(900, 700);
     window.present();
-    window.state().load(&fixture("outline.pdf"));
+    window.load(&fixture("outline.pdf"));
     wait_until(|| window.imp().mapped_page(0).is_some());
     wait_until(|| window.imp().selection.n_items() == 3);
 

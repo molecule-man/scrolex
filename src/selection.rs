@@ -18,7 +18,7 @@ pub struct Selection {
 }
 
 // The document's text selection: page, per-line highlight rects (page-local top-left points) and
-// text. Held by State, not by the page widget, since list recycling reassigns widgets to pages.
+// text. Held by the document, not by the page widget, since list recycling reassigns widgets to pages.
 #[derive(Debug)]
 pub struct PageSelection {
     pub page: i32,

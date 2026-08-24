@@ -262,7 +262,7 @@ impl Window {
             }
         }
 
-        let selected = doc.is_some_and(|doc| doc.state().has_selection());
+        let selected = doc.is_some_and(|doc| doc.viewport().has_selection());
         if modifiers.is_empty() && keyval == Key::Escape && !selected && self.obj().is_fullscreen()
         {
             self.obj().set_fullscreened(false);
@@ -296,13 +296,15 @@ impl Window {
 
         let document = DocumentView::new();
 
-        let state = document.state();
-        state.set_render_threads(self.render_threads.get());
-        state.set_animate_scroll(self.animate_scroll.get());
-        state.connect_animate_scroll_notify(clone!(
+        document
+            .document()
+            .set_render_threads(self.render_threads.get());
+        let viewport = document.viewport();
+        viewport.set_animate_scroll(self.animate_scroll.get());
+        viewport.connect_animate_scroll_notify(clone!(
             #[weak(rename_to = imp)]
             self,
-            move |state| imp.apply_animate_scroll(state.animate_scroll())
+            move |viewport| imp.apply_animate_scroll(viewport.animate_scroll())
         ));
         document.connect_closure(
             "open-requested",
@@ -336,10 +338,10 @@ impl Window {
             return;
         };
 
-        let state = document.state();
-        if !state.uri().is_empty() {
-            if let Err(err) = state.save() {
-                eprintln!("Error saving state for {}: {err}", state.uri());
+        let uri = document.document().uri();
+        if !uri.is_empty() {
+            if let Err(err) = document.save_position() {
+                eprintln!("Error saving the reading position for {uri}: {err}");
             }
         }
         self.notebook.remove_page(Some(page));
@@ -384,13 +386,13 @@ impl Window {
         label.append(&name);
         label.append(&close);
 
-        let state = document.state();
-        state
+        let document = document.document();
+        document
             .bind_property("uri", &name, "label")
             .transform_to(|_, uri: String| Some(display_name(&uri)))
             .sync_create()
             .build();
-        state
+        document
             .bind_property("uri", &label, "tooltip-text")
             .transform_to(|_, uri: String| Some(document_path(&uri)))
             .sync_create()
@@ -453,7 +455,7 @@ impl Window {
         self.animate_scroll_sync.set(true);
         self.animate_scroll.set(animate_scroll);
         for document in self.documents() {
-            document.state().set_animate_scroll(animate_scroll);
+            document.viewport().set_animate_scroll(animate_scroll);
         }
         self.animate_scroll_sync.set(false);
     }
@@ -523,20 +525,20 @@ impl Window {
         for binding in self.header_bindings.take() {
             binding.unbind();
         }
-        let state = document.state();
+        let viewport = document.viewport();
 
         let bindings = vec![
-            state
+            viewport
                 .bind_property("crop", &*self.btn_crop, "active")
                 .bidirectional()
                 .sync_create()
                 .build(),
-            state
+            viewport
                 .bind_property("animate-scroll", &*self.btn_animate_scroll, "active")
                 .bidirectional()
                 .sync_create()
                 .build(),
-            state
+            viewport
                 .bind_property("fit-height", &*self.btn_fit_height, "active")
                 .bidirectional()
                 .sync_create()
@@ -550,7 +552,8 @@ impl Window {
                 .bind_property("has-toc", &*self.btn_toc, "sensitive")
                 .sync_create()
                 .build(),
-            state
+            document
+                .document()
                 .bind_property("uri", &*self.obj(), "title")
                 .transform_to(|_, uri: String| Some(window_title(&uri)))
                 .sync_create()
@@ -569,7 +572,7 @@ impl Window {
 
     fn open_document_into(&self, document: &DocumentView) {
         let document = document.clone();
-        self.choose_document(move |file| document.state().load(&file));
+        self.choose_document(move |file| document.load(&file));
     }
 
     #[template_callback]
@@ -595,13 +598,15 @@ impl Window {
     // Fill an idle empty tab instead of adding another tab. Returns false if tab limit is reached.
     pub(crate) fn open_in_new_tab(&self, file: &gtk::gio::File) -> bool {
         let document = match self.active_document() {
-            Some(active) if active.state().n_pages() == 0 && !active.is_loading() => Some(active),
+            Some(active) if active.document().n_pages() == 0 && !active.is_loading() => {
+                Some(active)
+            }
             _ => self.add_document(),
         };
         let Some(document) = document else {
             return false;
         };
-        document.state().load(file);
+        document.load(file);
         true
     }
 
@@ -677,7 +682,7 @@ impl Window {
         let Some(document) = self.active_document() else {
             return false;
         };
-        document.state().load(file);
+        document.load(file);
         true
     }
 
@@ -718,7 +723,7 @@ impl Window {
             imp.spin_threads.set_value(n as f64);
         }
         for document in self.application_documents() {
-            document.state().set_render_threads(n);
+            document.document().set_render_threads(n);
         }
         for window in windows {
             window.imp().setting_controls_sync.set(false);
@@ -784,8 +789,8 @@ impl Window {
         let preview_pages = (self.preview_cache_pages.get() / count).max(1);
 
         for document in documents {
-            document.state().set_render_cache_bytes(render_bytes);
-            document.state().set_preview_cache_pages(preview_pages);
+            document.document().set_render_cache_bytes(render_bytes);
+            document.document().set_preview_cache_pages(preview_pages);
         }
     }
 
@@ -801,8 +806,8 @@ impl Window {
             imp.animate_scroll.set(enabled);
         }
         for document in self.application_documents() {
-            if document.state().animate_scroll() != enabled {
-                document.state().set_animate_scroll(enabled);
+            if document.viewport().animate_scroll() != enabled {
+                document.viewport().set_animate_scroll(enabled);
             }
         }
         for window in windows {
@@ -937,7 +942,7 @@ impl Window {
     #[allow(clippy::unused_self)]
     #[template_callback]
     fn zoom_entry_text(&self, zoom_value: f64) -> String {
-        crate::state::zoom_percent_text(zoom_value)
+        crate::viewport::zoom_percent_text(zoom_value)
     }
 
     // Dims the page entry's jump icon while pressing it would scroll nowhere. Runs while the
@@ -962,8 +967,8 @@ impl Window {
 
         // compared at the precision the entry shows, so applying what is already displayed counts
         // as no change
-        crate::state::zoom_from_percent(percent).is_some_and(|target| {
-            crate::state::zoom_percent_text(target) != crate::state::zoom_percent_text(zoom)
+        crate::viewport::zoom_from_percent(percent).is_some_and(|target| {
+            crate::viewport::zoom_percent_text(target) != crate::viewport::zoom_percent_text(zoom)
         })
     }
 }
@@ -1045,7 +1050,7 @@ mod widget_tests {
         for page in 0..count {
             model.append(&PageNumber::new(page as i32));
         }
-        document.state().set_n_pages(count as i32);
+        document.document().set_n_pages(count as i32);
         selection.set_selected(selected);
     }
 
@@ -1090,8 +1095,8 @@ mod widget_tests {
     fn zoom_menu_resets_zoom_and_ends_fit_height() {
         let window = loaded_window();
         let document = window.header().active_document().expect("a document");
-        document.state().set_zoom(2.0);
-        document.state().set_fit_height(true);
+        document.viewport().set_zoom(2.0);
+        document.viewport().set_fit_height(true);
 
         let choice = document
             .zoom_choices()
@@ -1100,8 +1105,8 @@ mod widget_tests {
             .expect("100% choice");
         document.apply_zoom_choice(&choice);
 
-        assert_eq!(document.state().zoom(), 1.0);
-        assert!(!document.state().fit_height());
+        assert_eq!(document.viewport().zoom(), 1.0);
+        assert!(!document.viewport().fit_height());
         window.close();
     }
 
@@ -1119,7 +1124,7 @@ mod widget_tests {
             .expect("W choice");
         document.apply_zoom_choice(&choice);
 
-        assert_ne!(document.state().zoom(), 0.5);
+        assert_ne!(document.viewport().zoom(), 0.5);
         window.close();
     }
 
@@ -1156,7 +1161,7 @@ mod widget_tests {
         let window = loaded_window();
         let document = window.header().active_document().expect("a document");
         document.apply_zoom_percent(50.0);
-        wait_until(|| document.state().zoom() == 0.5);
+        wait_until(|| document.viewport().zoom() == 0.5);
 
         window.header().entry_zoom.grab_focus();
         let focus =
@@ -1168,7 +1173,7 @@ mod widget_tests {
             .handle_window_key(gtk::gdk::Key::w, gtk::gdk::ModifierType::empty());
 
         assert_eq!(taken, glib::Propagation::Stop);
-        assert_ne!(document.state().zoom(), 0.5);
+        assert_ne!(document.viewport().zoom(), 0.5);
 
         let taken = window
             .header()
@@ -1183,10 +1188,10 @@ mod widget_tests {
         let first = window.header().active_document().expect("first document");
         let second = window.header().add_document().expect("a tab");
         set_document_page(&second, 10, 9);
-        second.state().set_zoom(2.0);
-        second.state().set_crop(true);
-        second.state().set_fit_height(true);
-        second.state().set_prev_page(4);
+        second.viewport().set_zoom(2.0);
+        second.viewport().set_crop(true);
+        second.viewport().set_fit_height(true);
+        second.viewport().set_prev_page(4);
 
         wait_until(|| window.header().entry_page_num.text() == "10");
 
@@ -1220,7 +1225,7 @@ mod widget_tests {
 
         assert_eq!(notebook.n_pages(), 2, "a loaded document keeps its own tab");
         let second = window.header().active_document().expect("the new document");
-        wait_until(|| second.state().n_pages() > 0);
+        wait_until(|| second.document().n_pages() > 0);
         assert_eq!(tab_title(&notebook, 0), "outline.pdf");
         assert_eq!(tab_title(&notebook, 1), "no_outline.pdf");
 
@@ -1294,7 +1299,7 @@ mod widget_tests {
         window.header().open_in_new_tab(&fixture("outline.pdf"));
 
         assert_eq!(notebook.n_pages(), 1, "the empty view takes the document");
-        wait_until(|| empty.state().n_pages() > 0);
+        wait_until(|| empty.document().n_pages() > 0);
         assert_eq!(tab_title(&notebook, 0), "outline.pdf");
 
         window.close();
@@ -1304,7 +1309,7 @@ mod widget_tests {
     fn a_pending_load_keeps_its_tab() {
         let window = test_window();
         let first = window.header().active_document().expect("the empty view");
-        first.state().load(&fixture("outline.pdf"));
+        first.load(&fixture("outline.pdf"));
         assert!(first.is_loading());
 
         window.header().open_in_new_tab(&fixture("no_outline.pdf"));
@@ -1373,16 +1378,19 @@ mod widget_tests {
     fn closing_a_tab_saves_its_state() {
         let window = loaded_window();
         let second = window.header().add_document().expect("a tab");
-        second.state().load(&fixture("no_outline.pdf"));
-        wait_until(|| second.state().n_pages() > 0);
-        second.state().set_crop(true);
+        second.load(&fixture("no_outline.pdf"));
+        wait_until(|| second.document().n_pages() > 0);
+        second.viewport().set_crop(true);
 
         window.header().close_document(&second);
 
         let reopened = window.header().add_document().expect("a tab");
-        reopened.state().load(&fixture("no_outline.pdf"));
-        wait_until(|| reopened.state().n_pages() > 0);
-        assert!(reopened.state().crop(), "the closed tab saved its state");
+        reopened.load(&fixture("no_outline.pdf"));
+        wait_until(|| reopened.document().n_pages() > 0);
+        assert!(
+            reopened.viewport().crop(),
+            "the closed tab saved its position"
+        );
 
         window.close();
     }
@@ -1397,20 +1405,20 @@ mod widget_tests {
 
         let budgets = |document: &DocumentView| {
             (
-                document.state().render_cache().borrow().budget_bytes(),
-                document.state().preview_cache().borrow().budget_bytes(),
+                document.document().render_cache().borrow().budget_bytes(),
+                document.document().preview_cache().borrow().budget_bytes(),
             )
         };
         let whole = (
             total_mb * 1024 * 1024,
-            crate::state::preview_cache_budget(total_previews),
+            crate::document::preview_cache_budget(total_previews),
         );
         assert_eq!(budgets(&first), whole, "one document holds the whole cache");
 
         let second = window.header().add_document().expect("a tab");
         let half = (
             whole.0 / 2,
-            crate::state::preview_cache_budget(total_previews / 2),
+            crate::document::preview_cache_budget(total_previews / 2),
         );
         assert_eq!(budgets(&first), half, "two documents halve it");
         assert_eq!(budgets(&second), half);
@@ -1457,7 +1465,7 @@ mod widget_tests {
         let window = test_window();
         window.present();
         wait_until(|| window.header().obj().is_visible());
-        assert_eq!(window.state().n_pages(), 0, "the empty view");
+        assert_eq!(window.document().n_pages(), 0, "the empty view");
 
         window
             .header()
@@ -1654,15 +1662,15 @@ mod widget_tests {
         window.header().btn_animate_scroll.set_active(false);
 
         for document in [&first, &second] {
-            assert_eq!(document.state().render_threads(), 1);
-            assert!(!document.state().animate_scroll());
+            assert_eq!(document.document().render_threads(), 1);
+            assert!(!document.viewport().animate_scroll());
         }
 
-        let first_epoch = first.state().doc_epoch();
-        let second_epoch = second.state().doc_epoch();
+        let first_epoch = first.document().doc_epoch();
+        let second_epoch = second.document().doc_epoch();
         window.header().obj().apply_dark_mode(false);
-        assert!(first.state().doc_epoch() > first_epoch);
-        assert!(second.state().doc_epoch() > second_epoch);
+        assert!(first.document().doc_epoch() > first_epoch);
+        assert!(second.document().doc_epoch() > second_epoch);
         window.close();
     }
 
@@ -1692,7 +1700,7 @@ mod widget_tests {
         assert_eq!(
             first
                 .active_document()
-                .state()
+                .document()
                 .render_cache()
                 .borrow()
                 .budget_bytes(),
@@ -1707,7 +1715,7 @@ mod widget_tests {
         assert_eq!(
             first
                 .active_document()
-                .state()
+                .document()
                 .render_cache()
                 .borrow()
                 .budget_bytes(),
@@ -1776,7 +1784,7 @@ mod widget_tests {
         imp.model.remove_all();
         imp.model.append(&crate::page::PageNumber::new(1));
         imp.selection.set_selected(0);
-        wait_until(|| window.state().page() == 1);
+        wait_until(|| window.viewport().page() == 1);
 
         assert_eq!(entry.text(), "2", "the entry follows the selected page");
         assert!(

@@ -1,6 +1,7 @@
 pub mod about;
 pub mod bg_job;
 pub mod config;
+pub mod document;
 pub mod document_view;
 pub mod emulate;
 pub mod jump_stack;
@@ -11,7 +12,7 @@ pub mod page;
 pub mod render_cache;
 pub mod search;
 pub mod selection;
-pub mod state;
 #[cfg(test)]
 pub mod test_support;
+pub mod viewport;
 pub mod window;

@@ -1,5 +1,5 @@
 // One open document: navigation, and viewport/render coordination.
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::sync::OnceLock;
 
 use futures::StreamExt;
@@ -18,8 +18,9 @@ use gtk::{
 use gtk::{prelude::*, GestureClick};
 
 use super::{ReaderKeyContext, ZoomChoice, ZoomChoiceAction};
+use crate::document::Document;
 use crate::page;
-use crate::state::State;
+use crate::viewport::Viewport;
 
 // Time constant of the exponential glide toward the target page position. Larger = slower and
 // smoother; the perceived slide runs a few times this long. The glide is a low-pass follow, which
@@ -117,12 +118,12 @@ struct WidthFit {
     first_top: f64,
 }
 
-// One open document: its state, page list, and everything that reads or moves the viewport.
+// One open document: its data, page list, and the pane that shows it.
 #[derive(CompositeTemplate, Default)]
 #[template(resource = "/com/andr2i/scrolex/document_view.ui")]
 pub struct DocumentView {
-    #[template_child]
-    pub state: TemplateChild<State>,
+    document: OnceCell<Document>,
+    viewport: OnceCell<Viewport>,
     #[template_child]
     pub model: TemplateChild<gtk::gio::ListStore>,
     #[template_child]
@@ -258,6 +259,83 @@ impl ObjectSubclass for DocumentView {
     }
 }
 
+impl DocumentView {
+    pub(crate) fn document(&self) -> &Document {
+        self.document.get().expect("a tab has a document")
+    }
+
+    pub(crate) fn viewport(&self) -> &Viewport {
+        self.viewport.get().expect("a tab has a viewport")
+    }
+
+    // Load into this tab, keeping the position the reader leaves behind.
+    pub(crate) fn load(&self, file: &gtk::gio::File) {
+        if self.document().n_pages() > 0 {
+            if let Err(err) = self.viewport().save_position() {
+                log::warn!("could not save the reading position before load: {err}");
+            }
+        }
+        self.document().load(file);
+    }
+
+    // Follow the document through a load, and show the empty view while it has no pages.
+    fn setup_document(&self) {
+        let document = self.document();
+
+        document.connect_closure(
+            "load-started",
+            false,
+            closure_local!(
+                #[weak(rename_to = imp)]
+                self,
+                move |_: &Document| imp.on_load_started()
+            ),
+        );
+        document.connect_closure(
+            "load-failed",
+            false,
+            closure_local!(
+                #[weak(rename_to = imp)]
+                self,
+                move |_: &Document, message: String| imp.on_load_failed(&message)
+            ),
+        );
+        document.connect_closure(
+            "before-load",
+            false,
+            closure_local!(
+                #[weak(rename_to = imp)]
+                self,
+                move |_: &Document| {
+                    imp.clear_model();
+                    imp.viewport().reset();
+                }
+            ),
+        );
+        document.connect_closure(
+            "loaded",
+            false,
+            closure_local!(
+                #[weak(rename_to = imp)]
+                self,
+                move |_: &Document| imp.handle_document_load()
+            ),
+        );
+
+        document
+            .bind_property("n-pages", &*self.empty_view, "visible")
+            .transform_to(|_, n_pages: i32| Some(n_pages == 0))
+            .sync_create()
+            .build();
+
+        // The pane follows the page the list has selected.
+        self.selection
+            .property_expression("selected-item")
+            .chain_property::<page::PageNumber>("page-number")
+            .bind(self.viewport(), "page", gtk::Widget::NONE);
+    }
+}
+
 impl ObjectImpl for DocumentView {
     // A closed tab is disposed while the window lives on, so its pending work stops here.
     fn dispose(&self) {
@@ -265,7 +343,7 @@ impl ObjectImpl for DocumentView {
             source.remove();
         }
         // bumps the sweep epoch, which stops the background search
-        self.state.search().borrow_mut().clear();
+        self.document().search().borrow_mut().clear();
         self.obj().release_renders();
 
         if let Some(content) = self.content() {
@@ -275,6 +353,13 @@ impl ObjectImpl for DocumentView {
 
     fn constructed(&self) {
         self.parent_constructed();
+
+        let document = Document::new();
+        self.viewport
+            .set(Viewport::new(&document))
+            .expect("one viewport per tab");
+        self.document.set(document).expect("one document per tab");
+        self.setup_document();
 
         self.setup_scroll_selection_sync();
         self.setup_pointer_tracking();
@@ -297,7 +382,10 @@ impl ObjectImpl for DocumentView {
         static PROPERTIES: OnceLock<Vec<glib::ParamSpec>> = OnceLock::new();
         PROPERTIES.get_or_init(|| {
             vec![
-                glib::ParamSpecObject::builder::<State>("state")
+                glib::ParamSpecObject::builder::<Document>("document")
+                    .read_only()
+                    .build(),
+                glib::ParamSpecObject::builder::<Viewport>("viewport")
                     .read_only()
                     .build(),
                 glib::ParamSpecObject::builder::<SingleSelection>("selection")
@@ -314,7 +402,8 @@ impl ObjectImpl for DocumentView {
     // Bindings evaluate while the template is still building, so read through try_get.
     fn property(&self, _id: usize, pspec: &glib::ParamSpec) -> glib::Value {
         match pspec.name() {
-            "state" => self.state.try_get().to_value(),
+            "document" => self.document.get().to_value(),
+            "viewport" => self.viewport.get().to_value(),
             "selection" => self.selection.try_get().to_value(),
             "toc-visible" => self
                 .toc_revealer
@@ -346,7 +435,7 @@ impl ObjectImpl for DocumentView {
 impl DocumentView {
     #[template_callback]
     fn on_factory_setup(&self, list_item: &gtk::ListItem) {
-        let page = &page::Page::new(&self.state);
+        let page = &page::Page::new(self.viewport());
 
         let obj = self.obj().clone();
         page.connect_closure(
@@ -409,7 +498,7 @@ impl DocumentView {
                     gtk::gdk::ScrollUnit::Wheel => dy,
                     _ => dy / TOUCHPAD_NOTCH,
                 };
-                self.zoom_anchored(self.state.zoom() * ZOOM_STEP.powf(-notches));
+                self.zoom_anchored(self.viewport().zoom() * ZOOM_STEP.powf(-notches));
             }
             return glib::Propagation::Stop;
         }
@@ -676,13 +765,13 @@ impl DocumentView {
     // Manual zoom turns fit off.
     fn zoom_to(&self, zoom: f64) {
         self.apply_zoom(zoom);
-        self.state.set_fit_height(false);
+        self.viewport().set_fit_height(false);
     }
 
     // A zoom relayouts the pages, so a coast has to stop first.
     fn apply_zoom(&self, zoom: f64) {
         self.cancel_coast();
-        self.state.zoom_to(zoom);
+        self.viewport().zoom_to(zoom);
     }
 
     // Zoom, keeping the point under the pointer in place.
@@ -697,11 +786,11 @@ impl DocumentView {
     }
 
     pub(super) fn zoom_out(&self) {
-        self.zoom_centered(self.state.zoom() / ZOOM_STEP);
+        self.zoom_centered(self.viewport().zoom() / ZOOM_STEP);
     }
 
     pub(super) fn zoom_in(&self) {
-        self.zoom_centered(self.state.zoom() * ZOOM_STEP);
+        self.zoom_centered(self.viewport().zoom() * ZOOM_STEP);
     }
 
     pub(super) fn reset_zoom(&self) {
@@ -761,7 +850,7 @@ impl DocumentView {
             );
         }
 
-        let current = self.state.zoom();
+        let current = self.viewport().zoom();
         add_zoom_choice(
             &mut choices,
             current,
@@ -775,13 +864,13 @@ impl DocumentView {
         choices.sort_by(|a, b| a.zoom.total_cmp(&b.zoom));
         choices
             .into_iter()
-            .filter(|choice| crate::state::zoom_is_supported(choice.zoom))
+            .filter(|choice| crate::viewport::zoom_is_supported(choice.zoom))
             .map(|choice| {
                 let mut label = String::new();
                 if choice.current {
                     label.push_str("✓  ");
                 }
-                label.push_str(&crate::state::zoom_percent_text(choice.zoom));
+                label.push_str(&crate::viewport::zoom_percent_text(choice.zoom));
                 label.push('%');
                 if !choice.descriptions.is_empty() {
                     label.push_str("  ");
@@ -803,7 +892,7 @@ impl DocumentView {
             ZoomChoiceAction::Scale(zoom) => self.zoom_centered(zoom),
             ZoomChoiceAction::FitHeight(zoom) => {
                 let anchor = self
-                    .mapped_page(self.state.page() as i32)
+                    .mapped_page(self.viewport().page() as i32)
                     .and_then(|page| self.page_origin(&page))
                     .unwrap_or_else(|| self.viewport_center());
                 self.zoom_at(zoom, anchor);
@@ -817,7 +906,7 @@ impl DocumentView {
 
     // Defer the fit until the current layout ends.
     fn queue_fit_height(&self) {
-        if !self.state.fit_height() || self.fit_pending.replace(true) {
+        if !self.viewport().fit_height() || self.fit_pending.replace(true) {
             return;
         }
 
@@ -833,7 +922,7 @@ impl DocumentView {
 
     // Fit the tallest paper to the viewport.
     fn fit_height(&self) {
-        if !self.state.fit_height() {
+        if !self.viewport().fit_height() {
             return;
         }
         let Some(zoom) = self.fit_height_zoom() else {
@@ -844,17 +933,17 @@ impl DocumentView {
         log::debug!(
             target: "scrolex::fit",
             "fit: page={} tallest_pt={:.1} viewport={:.1} content={:.1} zoom {:.4} -> {zoom:.4}",
-            self.state.page(),
-            self.state.tallest_page_height(),
+            self.viewport().page(),
+            self.document().tallest_page_height(),
             vadj.page_size(),
             vadj.upper(),
-            self.state.zoom(),
+            self.viewport().zoom(),
         );
 
         // Hold the page's own top-left, not the viewport centre. The reader reads one page, and a
         // sideways slide reads as a jump off it.
         let anchor = self
-            .mapped_page(self.state.page() as i32)
+            .mapped_page(self.viewport().page() as i32)
             .and_then(|page| self.page_origin(&page))
             .unwrap_or_else(|| self.viewport_center());
         self.apply_fit_zoom_at(zoom, anchor);
@@ -866,7 +955,7 @@ impl DocumentView {
         let viewport = self.vscrolledwindow.vadjustment().page_size()
             - self.fit_chrome_height.get()?
             - hscrollbar_reserve(&self.scrolledwindow);
-        let tallest = self.state.tallest_page_height();
+        let tallest = self.document().tallest_page_height();
 
         (viewport > 0.0 && tallest > 0.0).then(|| viewport / tallest)
     }
@@ -875,7 +964,7 @@ impl DocumentView {
         if self.zoom_anchor_pending.get() {
             return;
         }
-        let zoom = self.state.zoom();
+        let zoom = self.viewport().zoom();
         let Some(fit) = self.visible_width_fit() else {
             return;
         };
@@ -887,7 +976,7 @@ impl DocumentView {
             screen: (0.0, fit.first_top),
         }));
         self.zoom_at(fit.zoom, (0.0, fit.first_top));
-        if self.state.zoom() == zoom {
+        if self.viewport().zoom() == zoom {
             let Some(first) = self.mapped_page(fit.first) else {
                 return;
             };
@@ -902,7 +991,7 @@ impl DocumentView {
 
     fn visible_width_fit(&self) -> Option<WidthFit> {
         let viewport = self.scrolledwindow.hadjustment().page_size();
-        let current_zoom = self.state.zoom();
+        let current_zoom = self.viewport().zoom();
         if viewport <= 0.0 || current_zoom <= 0.0 {
             return None;
         }
@@ -925,14 +1014,14 @@ impl DocumentView {
     }
 
     fn page_count_fit(&self, count: usize) -> Option<(i32, f64)> {
-        let n_pages = usize::try_from(self.state.n_pages()).ok()?;
-        let selected = self.state.page() as usize;
+        let n_pages = usize::try_from(self.document().n_pages()).ok()?;
+        let selected = self.viewport().page() as usize;
         let first = page_range_start(n_pages, selected, count)?;
         let paper_points = (first..first + count).try_fold(0.0, |sum, index| {
             let index = i32::try_from(index).ok()?;
-            let size = self.state.page_size(index)?;
-            let width = if self.state.crop() {
-                self.state
+            let size = self.document().page_size(index)?;
+            let width = if self.viewport().crop() {
+                self.document()
                     .bbox_cache()
                     .borrow()
                     .get(&index)
@@ -990,7 +1079,7 @@ impl DocumentView {
         let Some((first_left, first_top)) = self.page_origin(&page) else {
             return;
         };
-        let before = self.state.zoom();
+        let before = self.viewport().zoom();
         self.cancel_scroll_motion();
         self.zoom_anchor.set(Some(ZoomAnchor {
             page: first,
@@ -998,7 +1087,7 @@ impl DocumentView {
             screen: (0.0, first_top),
         }));
         self.zoom_at(zoom, (0.0, first_top));
-        if self.state.zoom() == before {
+        if self.viewport().zoom() == before {
             let hadj = self.scrolledwindow.hadjustment();
             let target = self.clamp_scroll(hadj.value() + first_left);
             self.set_hscroll(target, "fit-pages");
@@ -1018,7 +1107,7 @@ impl DocumentView {
             .collect();
         if shown.is_empty() {
             return self
-                .mapped_page(self.state.page() as i32)
+                .mapped_page(self.viewport().page() as i32)
                 .into_iter()
                 .collect();
         }
@@ -1071,27 +1160,32 @@ impl DocumentView {
     // Manual zoom about `screen` turns fit off.
     fn zoom_at(&self, zoom: f64, screen: (f64, f64)) {
         self.apply_zoom_at(zoom, screen);
-        self.state.set_fit_height(false);
+        self.viewport().set_fit_height(false);
     }
 
     // Zoom about `screen` and hold the document point there still. The zoom mode does not change.
     fn apply_zoom_at(&self, zoom: f64, screen: (f64, f64)) {
-        self.apply_zoom_at_with(zoom, screen, |state, zoom| state.zoom_to(zoom));
+        self.apply_zoom_at_with(zoom, screen, |viewport, zoom| viewport.zoom_to(zoom));
     }
 
     fn apply_fit_zoom_at(&self, zoom: f64, screen: (f64, f64)) {
-        self.apply_zoom_at_with(zoom, screen, |state, zoom| state.fit_zoom_to(zoom));
+        self.apply_zoom_at_with(zoom, screen, |viewport, zoom| viewport.fit_zoom_to(zoom));
     }
 
-    fn apply_zoom_at_with(&self, zoom: f64, screen: (f64, f64), apply: impl FnOnce(&State, f64)) {
+    fn apply_zoom_at_with(
+        &self,
+        zoom: f64,
+        screen: (f64, f64),
+        apply: impl FnOnce(&Viewport, f64),
+    ) {
         if self.zoom_anchor.get().is_none() {
             self.zoom_anchor.set(self.capture_zoom_anchor(screen));
         }
 
-        let before = self.state.zoom();
+        let before = self.viewport().zoom();
         self.cancel_coast();
-        apply(&self.state, zoom);
-        if self.state.zoom() == before {
+        apply(self.viewport(), zoom);
+        if self.viewport().zoom() == before {
             if !self.zoom_gesturing.get() {
                 self.zoom_anchor.set(None);
             }
@@ -1103,7 +1197,7 @@ impl DocumentView {
     }
 
     fn capture_zoom_anchor(&self, screen: (f64, f64)) -> Option<ZoomAnchor> {
-        let zoom = self.state.zoom();
+        let zoom = self.viewport().zoom();
         if zoom <= 0.0 {
             return None;
         }
@@ -1131,7 +1225,7 @@ impl DocumentView {
             self.zoom_anchor_pending.set(true);
             return;
         };
-        let zoom = self.state.zoom();
+        let zoom = self.viewport().zoom();
         let hadj = self.scrolledwindow.hadjustment();
         let vadj = self.vscrolledwindow.vadjustment();
         // Each adjustment clamps itself, so a point the new geometry cannot reach (already at an
@@ -1202,7 +1296,7 @@ impl DocumentView {
         // the pinch takes over before it has changed the zoom at all
         self.cancel_coast();
         self.zoom_gesturing.set(true);
-        self.zoom_gesture_base.set(self.state.zoom());
+        self.zoom_gesture_base.set(self.viewport().zoom());
         self.zoom_anchor
             .set(screen.and_then(|p| self.capture_zoom_anchor(p)));
     }
@@ -1261,11 +1355,11 @@ impl DocumentView {
     ) -> glib::Propagation {
         let control = modifier.contains(ModifierType::CONTROL_MASK);
         match keyval {
-            Key::c if control && self.state.has_selection() => {
+            Key::c if control && self.viewport().has_selection() => {
                 run_reader_action(context, false, || self.copy_selection())
             }
-            Key::Escape if self.state.has_selection() => {
-                run_reader_action(context, false, || self.state.clear_selection())
+            Key::Escape if self.viewport().has_selection() => {
+                run_reader_action(context, false, || self.viewport().clear_selection())
             }
             Key::o => run_reader_action(context, true, || {
                 self.obj().emit_by_name::<()>("open-requested", &[])
@@ -1294,10 +1388,10 @@ impl DocumentView {
             Key::_0 | Key::KP_0 if control => {
                 run_reader_action(context, true, || self.reset_zoom())
             }
-            Key::n if self.state.search().borrow().total() > 0 => {
+            Key::n if self.document().search().borrow().total() > 0 => {
                 run_reader_action(context, true, || self.next_match())
             }
-            Key::N if self.state.search().borrow().total() > 0 => {
+            Key::N if self.document().search().borrow().total() > 0 => {
                 run_reader_action(context, true, || self.prev_match())
             }
             Key::Left => run_reader_action(context, false, || self.pan_horizontal(-1.0)),
@@ -1336,7 +1430,7 @@ impl DocumentView {
 
     // The only writer of the clipboard; a drag publishes to the primary selection instead.
     fn copy_selection(&self) {
-        if let Some(text) = self.state.selected_text() {
+        if let Some(text) = self.viewport().selected_text() {
             self.obj().clipboard().set_text(&text);
         }
     }
@@ -1344,14 +1438,14 @@ impl DocumentView {
     // A zoom the reader typed. Asking for the fit zoom turns fit mode back on rather than
     // freezing that number, so the fit survives the next viewport change.
     pub(super) fn apply_zoom_percent(&self, percent: f64) {
-        let Some(zoom) = crate::state::zoom_from_percent(percent) else {
+        let Some(zoom) = crate::viewport::zoom_from_percent(percent) else {
             return;
         };
 
         if self.fit_height_zoom().is_some_and(|fit_zoom| {
-            crate::state::zoom_percent_text(fit_zoom) == crate::state::zoom_percent_text(zoom)
+            crate::viewport::zoom_percent_text(fit_zoom) == crate::viewport::zoom_percent_text(zoom)
         }) {
-            self.state.set_fit_height(true);
+            self.viewport().set_fit_height(true);
             return;
         }
 
@@ -1359,14 +1453,14 @@ impl DocumentView {
     }
 
     pub(super) fn goto_page(&self, page_num: u32) {
-        let from = self.state.page() + 1;
+        let from = self.viewport().page() + 1;
         // no scroll, so no jump-list entry either: the back button would offer a jump that never
         // happened
         if self.target_page(page_num) == Some(from) {
             return;
         }
 
-        self.state.jump_list_add(from);
+        self.viewport().jump_list_add(from);
         self.navigate_to_page(page_num);
     }
 
@@ -1391,7 +1485,7 @@ impl DocumentView {
     // The page a jump to `page_num` lands on, 1-based. From the document, not the model: the model
     // fills in two stages, and a count that grows under us leaves the jump icon lit for a no-op.
     pub(super) fn target_page(&self, page_num: u32) -> Option<u32> {
-        let n_pages = u32::try_from(self.state.try_get()?.n_pages()).ok()?;
+        let n_pages = u32::try_from(self.document().n_pages()).ok()?;
 
         (n_pages > 0).then(|| page_num.clamp(1, n_pages))
     }
@@ -1401,7 +1495,7 @@ impl DocumentView {
             return;
         };
 
-        self.state.set_scroll_forward(false);
+        self.viewport().set_scroll_forward(false);
 
         // where the page we're leaving sits now; the newly selected page slides
         // to this same spot
@@ -1427,7 +1521,7 @@ impl DocumentView {
             return;
         };
 
-        self.state.set_scroll_forward(true);
+        self.viewport().set_scroll_forward(true);
 
         // where the page we're leaving sits now; the newly selected page slides to this same spot
         let anchor = self.selected_page_left_x();
@@ -1464,7 +1558,7 @@ impl DocumentView {
         let hadj = self.scrolledwindow.hadjustment();
 
         // animation toggled off: jump straight to the page
-        if !self.state.animate_scroll() {
+        if !self.viewport().animate_scroll() {
             self.set_hscroll(self.clamp_scroll(hadj.value() + delta), "page-step");
             return;
         }
@@ -1639,7 +1733,7 @@ impl DocumentView {
 
     fn set_scroll_direction_from_delta(&self, delta: f64) {
         if delta.abs() > f64::EPSILON {
-            self.state.set_scroll_forward(delta > 0.0);
+            self.viewport().set_scroll_forward(delta > 0.0);
         }
     }
 
@@ -1711,14 +1805,13 @@ impl DocumentView {
         Some(selection)
     }
 
-    #[template_callback]
     fn clear_model(&self) {
         self.model.remove_all();
     }
 
     fn populate_toc(&self) {
         self.toc_list.remove_all();
-        let items = crate::outline::entries(&self.state.uri());
+        let items = crate::outline::entries(&self.document().uri());
         let mut pages = Vec::with_capacity(items.len());
         for item in &items {
             let label = gtk::Label::new(Some(&item.title));
@@ -1813,7 +1906,6 @@ impl DocumentView {
         self.obj().emit_by_name::<()>("open-requested", &[]);
     }
 
-    #[template_callback]
     fn on_load_started(&self) {
         self.cancel_scroll_motion();
         self.loading_spinner.start();
@@ -1825,18 +1917,18 @@ impl DocumentView {
         self.loading_spinner.stop();
     }
 
-    #[template_callback]
     fn on_load_failed(&self, message: &str) {
         self.hide_loading();
         self.obj()
             .show_error_dialog(&format!("Error loading file: {message}"));
     }
 
-    #[template_callback]
-    fn handle_document_load(&self, state: &State) {
+    fn handle_document_load(&self) {
         self.hide_loading();
 
-        let n_pages = state.n_pages() as u32;
+        self.viewport().restore_position();
+
+        let n_pages = self.document().n_pages() as u32;
         if n_pages == 0 {
             return;
         }
@@ -1846,7 +1938,7 @@ impl DocumentView {
         let model = self.model.clone();
         let selection = self.selection.clone();
 
-        let scroll_to = state.page().min(n_pages - 1);
+        let scroll_to = self.viewport().page().min(n_pages - 1);
         let init_load_from = scroll_to.saturating_sub(1);
         let init_load_till = (scroll_to + 10).min(n_pages - 1);
 
@@ -1951,7 +2043,7 @@ impl DocumentView {
                     if let Some(now) = page_x {
                         imp.seen_page_x.set(Some((selected, now)));
                     }
-                    let reversed = if imp.state.scroll_forward() {
+                    let reversed = if imp.viewport().scroll_forward() {
                         shift > 8.0
                     } else {
                         shift < -8.0
@@ -2009,7 +2101,7 @@ impl DocumentView {
     // Region-backed pages must snapshot after viewport movement so newly exposed regions can be
     // requested. Whole-page texture nodes remain reusable and stay off this redraw path.
     fn redraw_tiled_pages(&self) {
-        if !self.state.render_cache().borrow().has_tiled_pages() {
+        if !self.document().render_cache().borrow().has_tiled_pages() {
             return;
         }
         let mut child = self.listview.first_child();
@@ -2027,7 +2119,8 @@ impl DocumentView {
     // queue. Spans the mapped page widgets plus a prefetch margin. A briefly-excluded visible page
     // reschedules via the render-waiter redraw, so the range only needs to be roughly right.
     fn update_wanted_render_range(&self, redraw_tiles: bool) {
-        let redraw_tiles = redraw_tiles && self.state.render_cache().borrow().has_tiled_pages();
+        let redraw_tiles =
+            redraw_tiles && self.document().render_cache().borrow().has_tiled_pages();
         let mut lo = i32::MAX;
         let mut hi = i32::MIN;
         let mut child = self.listview.first_child();
@@ -2045,12 +2138,12 @@ impl DocumentView {
             child = c.next_sibling();
         }
         let range = if lo <= hi {
-            let margin = self.state.render_threads() as i32 + 4;
+            let margin = self.document().render_threads() as i32 + 4;
             Some((lo - margin, hi + margin))
         } else {
             None
         };
-        crate::page::set_wanted_pages(self.state.render_client_id(), range);
+        crate::page::set_wanted_pages(self.document().render_client_id(), range);
     }
 
     // The template's single child, which holds the whole document UI.
@@ -2060,19 +2153,19 @@ impl DocumentView {
 
     // Turning fit on fits now; turning it off restores the zoom the reader last chose.
     fn fit_height_changed(&self) {
-        if self.state.fit_height() {
+        if self.viewport().fit_height() {
             self.queue_fit_height();
-        } else if self.state.zoom() != self.state.manual_zoom() {
+        } else if self.viewport().zoom() != self.viewport().manual_zoom() {
             let anchor = self
-                .mapped_page(self.state.page() as i32)
+                .mapped_page(self.viewport().page() as i32)
                 .and_then(|page| self.page_origin(&page))
                 .unwrap_or_else(|| self.viewport_center());
-            self.apply_zoom_at(self.state.manual_zoom(), anchor);
+            self.apply_zoom_at(self.viewport().manual_zoom(), anchor);
         }
     }
 
     fn setup_fit_height(&self) {
-        self.state.connect_fit_height_notify(clone!(
+        self.viewport().connect_fit_height_notify(clone!(
             #[weak(rename_to = imp)]
             self,
             move |_| imp.fit_height_changed()
@@ -2089,13 +2182,13 @@ impl DocumentView {
 
     fn setup_text_selection(&self) {
         // This view can reach its recycled page widgets.
-        self.state.connect_closure(
+        self.viewport().connect_closure(
             "selection-changed",
             false,
             closure_local!(
                 #[weak(rename_to = imp)]
                 self,
-                move |_: &State, page: i32| imp.redraw_page(page)
+                move |_: &Viewport, page: i32| imp.redraw_page(page)
             ),
         );
 
@@ -2106,7 +2199,7 @@ impl DocumentView {
         click.connect_pressed(clone!(
             #[weak(rename_to = imp)]
             self,
-            move |_, _, _, _| imp.state.clear_selection()
+            move |_, _, _, _| imp.viewport().clear_selection()
         ));
         self.scrolledwindow.add_controller(click);
     }
@@ -2135,7 +2228,7 @@ impl DocumentView {
             }
             child = c.next_sibling();
         }
-        self.state.set_visible_page_count(count);
+        self.viewport().set_visible_page_count(count);
     }
 
     // Coalesce a burst of scroll events into a single sync run on idle, after the list view has
@@ -2196,7 +2289,7 @@ impl DocumentView {
 
         if let Some(index) = center {
             if index >= 0 && (index as u32) < n_items {
-                self.state.set_scroll_forward(index > selected);
+                self.viewport().set_scroll_forward(index > selected);
                 log::debug!(
                     target: "scrolex::pan",
                     "viewport sync: selection {selected} -> {index}",
@@ -2269,7 +2362,7 @@ impl DocumentView {
         }
 
         let pages: Vec<i32> = {
-            let search = self.state.search();
+            let search = self.document().search();
             let mut search = search.borrow_mut();
             let pages = search.results.keys().copied().collect();
             search.clear();
@@ -2335,7 +2428,7 @@ impl DocumentView {
     // results back and repaint pages as matches arrive.
     fn run_search(&self, query: String) {
         let old_pages: Vec<i32> = self
-            .state
+            .document()
             .search()
             .borrow()
             .results
@@ -2344,7 +2437,7 @@ impl DocumentView {
             .collect();
 
         let (epoch, shared_epoch) = {
-            let search = self.state.search();
+            let search = self.document().search();
             let mut search = search.borrow_mut();
             search.query = query.clone();
             search.begin_sweep()
@@ -2355,13 +2448,13 @@ impl DocumentView {
         }
         self.update_search_status();
 
-        let n_pages = self.state.n_pages();
+        let n_pages = self.document().n_pages();
         if n_pages == 0 || query.is_empty() {
             return;
         }
 
         let mut rx = crate::search::spawn_search(
-            self.state.uri(),
+            self.document().uri(),
             query,
             n_pages,
             self.selection.selected() as i32,
@@ -2375,7 +2468,7 @@ impl DocumentView {
             async move {
                 while let Some(update) = rx.next().await {
                     {
-                        let search = imp.state.search();
+                        let search = imp.document().search();
                         let mut search = search.borrow_mut();
                         if update.epoch != search.epoch() {
                             continue; // superseded
@@ -2396,7 +2489,7 @@ impl DocumentView {
                 }
 
                 // sweep done (or superseded); report no results if it found nothing
-                let search = imp.state.search();
+                let search = imp.document().search();
                 let search = search.borrow();
                 if search.epoch() == epoch && !search.query.is_empty() && search.total() == 0 {
                     imp.search_status.set_text("No results");
@@ -2415,7 +2508,7 @@ impl DocumentView {
 
     fn move_match(&self, forward: bool) {
         let (old, new) = {
-            let search = self.state.search();
+            let search = self.document().search();
             let mut search = search.borrow_mut();
             let Some(next) = search.step(forward) else {
                 return;
@@ -2436,7 +2529,7 @@ impl DocumentView {
     // horizontally to the match once the page is laid out.
     fn reveal_current(&self) {
         let (page, rect) = {
-            let search = self.state.search();
+            let search = self.document().search();
             let search = search.borrow();
             let Some((p, i)) = search.current else {
                 return;
@@ -2504,9 +2597,9 @@ impl DocumentView {
         if vw <= 0.0 {
             return;
         }
-        let zoom = self.state.zoom();
+        let zoom = self.viewport().zoom();
         let bbox_x1 = self
-            .state
+            .document()
             .bbox_cache()
             .borrow()
             .get(&page_index)
@@ -2544,7 +2637,7 @@ impl DocumentView {
     }
 
     fn update_search_status(&self) {
-        let search = self.state.search();
+        let search = self.document().search();
         let search = search.borrow();
         let text = if search.query.is_empty() {
             String::new()
@@ -2558,21 +2651,18 @@ impl DocumentView {
     }
 
     pub(super) fn jump_back(&self) {
-        if let Some(page) = self.state.jump_list_back(self.state.page() + 1) {
+        if let Some(page) = self.viewport().jump_list_back(self.viewport().page() + 1) {
             self.navigate_to_page(page);
         }
     }
 
     pub(super) fn jump_forward(&self) {
-        if let Some(page) = self.state.jump_list_forward(self.state.page() + 1) {
+        if let Some(page) = self
+            .viewport()
+            .jump_list_forward(self.viewport().page() + 1)
+        {
             self.navigate_to_page(page);
         }
-    }
-
-    #[allow(clippy::unused_self)]
-    #[template_callback]
-    fn document_is_empty(&self, n_pages: i32) -> bool {
-        n_pages == 0
     }
 }
 
@@ -2756,10 +2846,10 @@ fn add_zoom_choice(
     current: bool,
     shortcut: bool,
 ) {
-    let percent = crate::state::zoom_percent_text(zoom);
+    let percent = crate::viewport::zoom_percent_text(zoom);
     if let Some(choice) = choices
         .iter_mut()
-        .find(|choice| crate::state::zoom_percent_text(choice.zoom) == percent)
+        .find(|choice| crate::viewport::zoom_percent_text(choice.zoom) == percent)
     {
         if let Some(description) = description {
             if !choice.descriptions.contains(&description) {
@@ -3163,8 +3253,8 @@ mod tests {
 #[cfg(test)]
 mod widget_tests {
     use super::{anchored_scroll, KINETIC_MIN_VELOCITY};
-    use crate::state::zoom_percent_text;
     use crate::test_support::{loaded_window, type_zoom, wait_until, window};
+    use crate::viewport::zoom_percent_text;
     use gtk::prelude::*;
     use gtk::subclass::prelude::ObjectSubclassIsExt;
 
@@ -3189,7 +3279,7 @@ mod widget_tests {
         let window = loaded_window();
         let imp = window.imp();
         imp.selection.set_selected(2);
-        wait_until(|| window.state().page() == 2);
+        wait_until(|| window.viewport().page() == 2);
         assert!(imp.hidden_at.get().is_none(), "nothing recorded on screen");
 
         window.set_visible(false);
@@ -3217,14 +3307,14 @@ mod widget_tests {
     }
 
     #[gtk::test]
-    fn empty_view_follows_document_state() {
+    fn empty_view_follows_the_page_count() {
         let window = window();
         let imp = window.imp();
 
         assert!(imp.empty_view.property::<bool>("visible"));
-        imp.state.set_n_pages(1);
+        imp.document().set_n_pages(1);
         assert!(!imp.empty_view.property::<bool>("visible"));
-        imp.state.set_n_pages(0);
+        imp.document().set_n_pages(0);
         assert!(imp.empty_view.property::<bool>("visible"));
     }
 
@@ -3331,13 +3421,13 @@ mod widget_tests {
         let imp = window.imp();
         let hadj = imp.scrolledwindow.hadjustment();
         hadj.configure(500.0, 0.0, 2000.0, 10.0, 100.0, 500.0);
-        imp.state.set_scroll_forward(true);
+        imp.viewport().set_scroll_forward(true);
 
         hadj.set_value(400.0);
 
-        assert!(imp.state.scroll_forward());
+        assert!(imp.viewport().scroll_forward());
         imp.set_scroll_direction_from_delta(-1.0);
-        assert!(!imp.state.scroll_forward());
+        assert!(!imp.viewport().scroll_forward());
     }
 
     // Wheeling mid-slide retargets the running slide, and starts from where it was already heading.
@@ -3345,7 +3435,7 @@ mod widget_tests {
     fn a_retarget_advances_from_the_rebased_target() {
         let window = window();
         let imp = window.imp();
-        imp.state.set_animate_scroll(true);
+        imp.viewport().set_animate_scroll(true);
         slide(imp, 50_000.0, 50_677.0);
 
         imp.scrolledwindow.hadjustment().set_value(45_369.0); // the list view rewrites coordinates
@@ -3438,7 +3528,7 @@ mod widget_tests {
             env!("CARGO_MANIFEST_DIR"),
             "/tests/fixtures/outline.pdf"
         ));
-        window.state().load(&fixture);
+        window.load(&fixture);
 
         let imp = window.imp();
         wait_until(|| imp.mapped_page(0).is_some());
@@ -3453,8 +3543,8 @@ mod widget_tests {
         let page = imp.mapped_page(anchor.page).unwrap();
         let (left, top) = imp.page_origin(&page).unwrap();
         let landed = (
-            left + anchor.offset.0 * imp.state.zoom(),
-            top + anchor.offset.1 * imp.state.zoom(),
+            left + anchor.offset.0 * imp.viewport().zoom(),
+            top + anchor.offset.1 * imp.viewport().zoom(),
         );
         assert!(
             (landed.0 - screen.0).abs() <= 1.0,
@@ -3523,7 +3613,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
     // not allocated: Xvfb has no window manager, so the window re-lays out only when it resizes.
     fn asked_height(imp: &super::DocumentView) -> f64 {
         let row = imp
-            .mapped_page(imp.state.page() as i32)
+            .mapped_page(imp.viewport().page() as i32)
             .and_then(|page| page.parent())
             .expect("a page in view");
 
@@ -3561,10 +3651,10 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         let window = window();
         window.present();
         let imp = window.imp();
-        window.state().load(&mixed_heights_document());
+        window.load(&mixed_heights_document());
         wait_until(|| imp.selection.n_items() == 3);
 
-        imp.state.zoom_to(0.1);
+        imp.viewport().zoom_to(0.1);
         wait_until(|| (0..3).all(|index| imp.mapped_page(index).is_some()));
         let viewport = imp.scrolledwindow.hadjustment().page_size();
         let pages = imp.pages_for_width_fit(viewport);
@@ -3573,10 +3663,10 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         let last = pages.last().unwrap().index();
 
         imp.fit_width();
-        let fitted_zoom = imp.state.zoom();
+        let fitted_zoom = imp.viewport().zoom();
         imp.fit_width();
         assert_eq!(
-            imp.state.zoom(),
+            imp.viewport().zoom(),
             fitted_zoom,
             "a repeated action must wait for the first layout"
         );
@@ -3592,7 +3682,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
             "last edge is {last_right}"
         );
         assert!(first_page.width() < imp.mapped_page(1).unwrap().width());
-        assert_eq!(imp.state.manual_zoom(), imp.state.zoom());
+        assert_eq!(imp.viewport().manual_zoom(), imp.viewport().zoom());
         window.close();
     }
 
@@ -3601,16 +3691,16 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         let window = window();
         window.present();
         let imp = window.imp();
-        window.state().load(&narrow_page_document());
+        window.load(&narrow_page_document());
         wait_until(|| imp.mapped_page(0).is_some());
 
-        imp.state.zoom_to(10.0);
+        imp.viewport().zoom_to(10.0);
         wait_until(|| imp.mapped_page(0).is_some_and(|page| page.width() >= 200));
         imp.hscroll_intent.set((f64::NAN, "test"));
 
         imp.fit_width();
 
-        assert_eq!(imp.state.zoom(), 10.0);
+        assert_eq!(imp.viewport().zoom(), 10.0);
         assert_eq!(imp.hscroll_intent.get().1, "fit-width");
         window.close();
     }
@@ -3622,7 +3712,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         let window = loaded_window();
         let imp = window.imp();
 
-        imp.state.set_fit_height(true);
+        imp.viewport().set_fit_height(true);
         wait_until(|| !imp.fit_pending.get());
 
         assert_fills_the_viewport(imp);
@@ -3633,9 +3723,9 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
     fn a_fitted_page_without_horizontal_overflow_fills_the_viewport() {
         let window = loaded_window();
         let imp = window.imp();
-        imp.state.set_fit_height(true);
+        imp.viewport().set_fit_height(true);
 
-        window.state().load(&one_page_document());
+        window.load(&one_page_document());
         wait_until(|| imp.selection.n_items() == 1);
         wait_until(|| !imp.fit_pending.get() && imp.mapped_page(0).is_some());
 
@@ -3719,7 +3809,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
             imp.vscrolledwindow.vadjustment().page_size(),
             imp.fit_chrome_height.get(),
             super::hscrollbar_reserve(&imp.scrolledwindow),
-            imp.state.tallest_page_height(),
+            imp.document().tallest_page_height(),
         )
     }
 
@@ -3729,12 +3819,12 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
     fn fit_keeps_cached_chrome_without_a_mapped_selected_page() {
         let window = loaded_window();
         let imp = window.imp();
-        imp.state.set_fit_height(true);
+        imp.viewport().set_fit_height(true);
         wait_until(|| !imp.fit_pending.get());
         let chrome = imp.fit_chrome_height.get().expect("a cached chrome");
         assert!(chrome > 0.0, "the row pads the page");
 
-        imp.state.set_page(imp.state.n_pages() as u32 + 1);
+        imp.viewport().set_page(imp.document().n_pages() as u32 + 1);
         imp.queue_fit_height();
         wait_until(|| !imp.fit_pending.get());
 
@@ -3747,8 +3837,8 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
             - chrome
             - super::hscrollbar_reserve(&imp.scrolledwindow);
         assert_eq!(
-            imp.state.zoom(),
-            viewport / imp.state.tallest_page_height(),
+            imp.viewport().zoom(),
+            viewport / imp.document().tallest_page_height(),
             "the fit dropped the cached chrome: {}",
             fit_terms(imp)
         );
@@ -3759,15 +3849,15 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
     fn turning_fit_off_restores_the_manual_zoom() {
         let window = loaded_window();
         let imp = window.imp();
-        imp.state.zoom_to(2.0);
+        imp.viewport().zoom_to(2.0);
 
-        imp.state.set_fit_height(true);
+        imp.viewport().set_fit_height(true);
         wait_until(|| !imp.fit_pending.get());
-        assert_ne!(imp.state.zoom(), 2.0);
+        assert_ne!(imp.viewport().zoom(), 2.0);
 
-        imp.state.set_fit_height(false);
+        imp.viewport().set_fit_height(false);
 
-        assert_eq!(imp.state.zoom(), 2.0);
+        assert_eq!(imp.viewport().zoom(), 2.0);
         window.close();
     }
 
@@ -3775,20 +3865,20 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
     fn entering_the_displayed_fit_zoom_restores_fit_height() {
         let window = loaded_window();
         let imp = window.imp();
-        imp.state.set_fit_height(true);
+        imp.viewport().set_fit_height(true);
         wait_until(|| !imp.fit_pending.get());
-        let fit_zoom = zoom_percent_text(imp.state.zoom());
+        let fit_zoom = zoom_percent_text(imp.viewport().zoom());
 
         imp.zoom_in();
-        assert!(!imp.state.fit_height());
-        let manual_zoom = imp.state.manual_zoom();
+        assert!(!imp.viewport().fit_height());
+        let manual_zoom = imp.viewport().manual_zoom();
         type_zoom(&window, &fit_zoom);
 
-        assert!(imp.state.fit_height());
+        assert!(imp.viewport().fit_height());
         wait_until(|| !imp.fit_pending.get());
-        assert_eq!(imp.state.manual_zoom(), manual_zoom);
-        imp.state.set_fit_height(false);
-        assert_eq!(imp.state.zoom(), manual_zoom);
+        assert_eq!(imp.viewport().manual_zoom(), manual_zoom);
+        imp.viewport().set_fit_height(false);
+        assert_eq!(imp.viewport().zoom(), manual_zoom);
         window.close();
     }
 
@@ -3799,14 +3889,14 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         let window = loaded_window();
         let imp = window.imp();
 
-        imp.state.set_fit_height(true);
+        imp.viewport().set_fit_height(true);
         wait_until(|| !imp.fit_pending.get());
-        let zoom = imp.state.zoom();
+        let zoom = imp.viewport().zoom();
 
-        imp.state.set_crop(true);
+        imp.viewport().set_crop(true);
 
-        assert_eq!(imp.state.zoom(), zoom);
-        assert!(imp.state.fit_height(), "the mode stays on");
+        assert_eq!(imp.viewport().zoom(), zoom);
+        assert!(imp.viewport().fit_height(), "the mode stays on");
         assert_nothing_to_pan(imp);
         window.close();
     }
@@ -3818,7 +3908,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         let window = loaded_window();
         let imp = window.imp();
 
-        imp.state.set_fit_height(true);
+        imp.viewport().set_fit_height(true);
         wait_until(|| !imp.fit_pending.get());
 
         let vadj = imp.vscrolledwindow.vadjustment();
@@ -3848,13 +3938,13 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
             &|| type_zoom(&window, "42"),
         ];
         for zoom in zooms {
-            imp.state.set_fit_height(true);
+            imp.viewport().set_fit_height(true);
             wait_until(|| !imp.fit_pending.get());
 
             zoom();
 
-            assert!(!imp.state.fit_height());
-            assert_eq!(imp.state.manual_zoom(), imp.state.zoom());
+            assert!(!imp.viewport().fit_height());
+            assert_eq!(imp.viewport().manual_zoom(), imp.viewport().zoom());
         }
         window.close();
     }
@@ -3863,8 +3953,8 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
     fn manual_zoom_from_fit_keeps_its_anchor() {
         let window = loaded_window();
         let imp = window.imp();
-        imp.state.zoom_to(2.0);
-        imp.state.set_fit_height(true);
+        imp.viewport().zoom_to(2.0);
+        imp.viewport().set_fit_height(true);
         wait_until(|| !imp.fit_pending.get());
         imp.zoom_anchor.set(None);
 
@@ -3882,28 +3972,28 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         let window = window();
         window.present();
         let imp = window.imp();
-        imp.state.set_fit_height(true);
+        imp.viewport().set_fit_height(true);
 
-        window.state().load(&mixed_heights_document());
+        window.load(&mixed_heights_document());
         wait_until(|| imp.selection.n_items() == 3);
         wait_until(|| !imp.fit_pending.get() && imp.mapped_page(0).is_some());
 
         assert_eq!(
-            imp.state.tallest_page_height(),
+            imp.document().tallest_page_height(),
             3000.0,
             "the tallest of 200, 3000, 400"
         );
-        let first = imp.state.zoom();
+        let first = imp.viewport().zoom();
 
         // page 2 is the tallest in the document: it fills the viewport, and the page turn to it
         // leaves the zoom where it was
         imp.navigate_to_page(2);
-        wait_until(|| imp.state.page() == 1 && imp.mapped_page(1).is_some());
+        wait_until(|| imp.viewport().page() == 1 && imp.mapped_page(1).is_some());
 
         assert!(
-            (imp.state.zoom() - first).abs() < f64::EPSILON,
+            (imp.viewport().zoom() - first).abs() < f64::EPSILON,
             "the page turn moved the zoom from {first} to {}",
-            imp.state.zoom(),
+            imp.viewport().zoom(),
         );
         assert_fills_the_viewport(imp);
         window.close();
@@ -3914,19 +4004,19 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
     #[test]
     fn zoom_percent_text_keeps_at_most_two_decimals() {
         assert_eq!(
-            crate::state::zoom_percent_text(3.331_061_493_552_564),
+            crate::viewport::zoom_percent_text(3.331_061_493_552_564),
             "333.11"
         );
-        assert_eq!(crate::state::zoom_percent_text(1.0), "100");
-        assert_eq!(crate::state::zoom_percent_text(10.0), "1000");
-        assert_eq!(crate::state::zoom_percent_text(0.05), "5");
+        assert_eq!(crate::viewport::zoom_percent_text(1.0), "100");
+        assert_eq!(crate::viewport::zoom_percent_text(10.0), "1000");
+        assert_eq!(crate::viewport::zoom_percent_text(0.05), "5");
         // 0.07 * 100 is 7.000000000000001 in binary
-        assert_eq!(crate::state::zoom_percent_text(0.07), "7");
-        assert_eq!(crate::state::zoom_percent_text(1.5), "150");
-        assert_eq!(crate::state::zoom_percent_text(0.125), "12.5");
+        assert_eq!(crate::viewport::zoom_percent_text(0.07), "7");
+        assert_eq!(crate::viewport::zoom_percent_text(1.5), "150");
+        assert_eq!(crate::viewport::zoom_percent_text(0.125), "12.5");
         // the entry is six characters wide, and 1000 is the largest zoom
         for zoom in [0.05, 0.07, 0.333, 1.0, 3.331_061_493_552_564, 9.9999, 10.0] {
-            let text = crate::state::zoom_percent_text(zoom);
+            let text = crate::viewport::zoom_percent_text(zoom);
             assert!(text.len() <= 6, "{zoom} shows as {text}");
         }
     }
@@ -3937,10 +4027,14 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         let imp = window.imp();
 
         imp.goto_page(1);
-        assert_eq!(window.state().prev_page(), 0, "no jump to come back from");
+        assert_eq!(
+            window.viewport().prev_page(),
+            0,
+            "no jump to come back from"
+        );
 
         imp.goto_page(2);
-        assert_eq!(window.state().prev_page(), 1, "came from page 1");
+        assert_eq!(window.viewport().prev_page(), 1, "came from page 1");
 
         window.close();
     }
@@ -3959,16 +4053,16 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         let window = window();
         window.set_default_size(500, 400);
         window.present();
-        window.state().load(&gtk::gio::File::for_path(path));
+        window.load(&gtk::gio::File::for_path(path));
         let imp = window.imp();
         wait_until(|| imp.mapped_page(0).is_some());
 
-        imp.state.zoom_to(10.0);
+        imp.viewport().zoom_to(10.0);
         wait_until(|| imp.mapped_page(0).is_some_and(|page| page.uses_tiles()));
         let dsf = crate::page::device_scale(&imp.mapped_page(0).unwrap());
         let mut found = None;
         wait_until(|| {
-            let cache = imp.state.render_cache();
+            let cache = imp.document().render_cache();
             let mut cache = cache.borrow_mut();
             for y in 0..30 {
                 for x in 0..20 {
@@ -4011,7 +4105,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
             y: 0,
         };
         wait_until(|| {
-            imp.state
+            imp.document()
                 .render_cache()
                 .borrow_mut()
                 .get_tile(newly_visible, 10.0 * dsf)
@@ -4037,7 +4131,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         assert_eq!(anchor.page, 3);
         assert_eq!(anchor.offset, (120.0, 80.0));
         assert_eq!(anchor.screen, (340.0, 270.0));
-        assert_eq!(imp.state.zoom(), 1.5);
+        assert_eq!(imp.viewport().zoom(), 1.5);
         assert!(imp.zoom_anchor_pending.get());
     }
 
@@ -4045,7 +4139,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
     fn zoom_at_a_bound_does_not_leave_a_stale_pointer_anchor() {
         let window = window();
         let imp = window.imp();
-        imp.state.zoom_to(f64::MAX);
+        imp.viewport().zoom_to(f64::MAX);
         imp.zoom_anchor.set(Some(super::ZoomAnchor {
             page: 0,
             offset: (10.0, 20.0),
@@ -4066,20 +4160,20 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         let ctrl = ModifierType::CONTROL_MASK;
 
         for key in [Key::plus, Key::equal, Key::KP_Add] {
-            imp.state.zoom_to(1.0);
+            imp.viewport().zoom_to(1.0);
             imp.handle_key_press(key, 0, ctrl);
-            assert!(imp.state.zoom() > 1.0, "{key:?} should zoom in");
+            assert!(imp.viewport().zoom() > 1.0, "{key:?} should zoom in");
         }
         for key in [Key::minus, Key::KP_Subtract] {
-            imp.state.zoom_to(1.0);
+            imp.viewport().zoom_to(1.0);
             imp.handle_key_press(key, 0, ctrl);
-            assert!(imp.state.zoom() < 1.0, "{key:?} should zoom out");
+            assert!(imp.viewport().zoom() < 1.0, "{key:?} should zoom out");
         }
 
         // plain minus stays free for other bindings
-        imp.state.zoom_to(1.0);
+        imp.viewport().zoom_to(1.0);
         imp.handle_key_press(Key::minus, 0, ModifierType::empty());
-        assert_eq!(imp.state.zoom(), 1.0);
+        assert_eq!(imp.viewport().zoom(), 1.0);
     }
 
     // Keys and toolbar buttons zoom about the centre even when the mouse rests over a page, unlike
@@ -4094,7 +4188,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
             env!("CARGO_MANIFEST_DIR"),
             "/tests/fixtures/outline.pdf"
         ));
-        window.state().load(&fixture);
+        window.load(&fixture);
 
         let imp = window.imp();
         wait_until(|| imp.mapped_page(0).is_some());
@@ -4113,7 +4207,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
             &|| imp.reset_zoom(),
         ];
         for zoom in zooms {
-            imp.state.zoom_to(1.5);
+            imp.viewport().zoom_to(1.5);
             imp.zoom_anchor.set(None);
             imp.pointer.set(Some(off_center));
 
@@ -4136,18 +4230,18 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         let ctrl = ModifierType::CONTROL_MASK;
 
         for key in [Key::_0, Key::KP_0] {
-            imp.state.zoom_to(2.5);
+            imp.viewport().zoom_to(2.5);
             imp.handle_key_press(key, 0, ctrl);
-            assert_eq!(imp.state.zoom(), 1.0, "{key:?} should reset to 100%");
+            assert_eq!(imp.viewport().zoom(), 1.0, "{key:?} should reset to 100%");
 
-            imp.state.zoom_to(0.4);
+            imp.viewport().zoom_to(0.4);
             imp.handle_key_press(key, 0, ctrl);
-            assert_eq!(imp.state.zoom(), 1.0, "{key:?} should reset to 100%");
+            assert_eq!(imp.viewport().zoom(), 1.0, "{key:?} should reset to 100%");
         }
 
         // plain 0 stays free for other bindings
-        imp.state.zoom_to(2.5);
+        imp.viewport().zoom_to(2.5);
         imp.handle_key_press(Key::_0, 0, ModifierType::empty());
-        assert_eq!(imp.state.zoom(), 2.5);
+        assert_eq!(imp.viewport().zoom(), 2.5);
     }
 }

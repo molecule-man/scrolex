@@ -5,7 +5,8 @@ use gtk::glib::subclass::types::ObjectSubclassIsExt;
 use gtk::prelude::*;
 use gtk::{gio, glib};
 
-use crate::state::State;
+use crate::document::Document;
+use crate::viewport::Viewport;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ReaderKeyContext {
@@ -46,8 +47,21 @@ impl DocumentView {
         Object::builder().build()
     }
 
-    pub fn state(&self) -> &State {
-        self.imp().state.as_ref()
+    pub fn document(&self) -> &Document {
+        self.imp().document()
+    }
+
+    pub fn viewport(&self) -> &Viewport {
+        self.imp().viewport()
+    }
+
+    // Open a file in this tab. Saves the position of the document it replaces.
+    pub fn load(&self, file: &gio::File) {
+        self.imp().load(file);
+    }
+
+    pub fn save_position(&self) -> std::io::Result<()> {
+        self.viewport().save_position()
     }
 
     pub fn is_loading(&self) -> bool {
@@ -130,7 +144,7 @@ impl DocumentView {
 
     // Release this document's share of the render pool. Call before dropping the view.
     pub fn release_renders(&self) {
-        let client = self.state().render_client_id();
+        let client = self.document().render_client_id();
         crate::page::clear_all_renders(client);
         crate::page::set_wanted_pages(client, None);
     }
