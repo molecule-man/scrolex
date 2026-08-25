@@ -374,21 +374,28 @@ impl Window {
             return;
         };
         let pending = Rc::new(Cell::new(Some(location)));
-        document.document().connect_closure(
+        let connection = Rc::new(RefCell::new(None));
+        let id = document.document().connect_closure(
             "loaded",
             false,
             glib::closure_local!(
                 #[strong]
                 pending,
+                #[strong]
+                connection,
                 #[weak]
                 document,
-                move |_: crate::document::Document| {
+                move |state: crate::document::Document| {
                     if let Some(location) = pending.take() {
                         document.pane().navigate_to_location(location);
+                    }
+                    if let Some(id) = connection.take() {
+                        state.disconnect(id);
                     }
                 }
             ),
         );
+        connection.replace(Some(id));
         document.load(&gtk::gio::File::for_uri(&source.document().uri()));
     }
 
