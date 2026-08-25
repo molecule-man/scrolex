@@ -45,23 +45,25 @@
 }
 
 .document-split > separator {
-	padding: 0 3px 0 2px;
+	margin: 0;
+	min-width: 8px;
+	padding: 0;
 	border: none;
-	background-color: shade(@window_bg_color, 0.75);
+	background-color: shade(@theme_bg_color, 0.75);
 	background-image: linear-gradient(
 		to bottom,
 		transparent 0,
 		transparent 1px,
-		white 1px,
-		white 3px,
+		alpha(currentColor, 0.6) 1px,
+		alpha(currentColor, 0.6) 3px,
 		transparent 3px,
 		transparent 6px,
-		white 6px,
-		white 8px,
+		alpha(currentColor, 0.6) 6px,
+		alpha(currentColor, 0.6) 8px,
 		transparent 8px,
 		transparent 11px,
-		white 11px,
-		white 13px,
+		alpha(currentColor, 0.6) 11px,
+		alpha(currentColor, 0.6) 13px,
 		transparent 13px
 	);
 	background-size: 6px 14px;
@@ -76,16 +78,16 @@
 .loading-overlay {
 	padding: 24px 32px;
 	border-radius: 12px;
-	background-color: alpha(@window_bg_color, 0.9);
+	background-color: alpha(@theme_bg_color, 0.9);
 	box-shadow: 0 2px 12px alpha(black, 0.3);
 }
 
 .toc-panel {
-	background-color: @window_bg_color;
+	background-color: @theme_bg_color;
 	border-right: 1px solid @borders;
 }
 
-/* override #main row's grey fill so labels sit on the dark panel */
+/* override #main row's grey fill so labels sit on the panel background */
 #main .toc-panel row {
 	background-color: transparent;
 }
