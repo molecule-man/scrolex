@@ -15,6 +15,9 @@ pub const DEFAULT_RENDER_CACHE_MB: usize = 64;
 pub const MIN_RENDER_CACHE_MB: usize = 32;
 pub const MAX_RENDER_CACHE_MB: usize = 512;
 
+pub const DARK_MODE_NOTICE_REVISION: u32 = 1;
+const DARK_MODE_NOTICE_ID: u64 = 0x28a9_9587_3f4d_6d3a;
+
 #[derive(Debug, Clone, Copy)]
 pub struct Config {
     pub render_threads: usize,
@@ -23,7 +26,7 @@ pub struct Config {
     pub animate_scroll: bool,
     pub dark_mode: bool,
     pub always_open_in_tabs: bool,
-    pub dismissed_notice: Option<u64>,
+    pub notice_revision: u32,
     pub geometry: Option<Geometry>,
 }
 
@@ -44,7 +47,7 @@ impl Default for Config {
             animate_scroll: true,
             dark_mode: false,
             always_open_in_tabs: false,
-            dismissed_notice: None,
+            notice_revision: 0,
             geometry: None,
         }
     }
@@ -133,6 +136,7 @@ pub fn load_config() -> Config {
     let mut animate_scroll = true;
     let mut dark_mode = false;
     let mut always_open_in_tabs = false;
+    let mut notice_revision = None;
     let mut dismissed_notice = None;
     let mut width = None;
     let mut height = None;
@@ -161,6 +165,7 @@ pub fn load_config() -> Config {
             Some(("dismissed_notice", v)) => {
                 dismissed_notice = u64::from_str_radix(v.trim(), 16).ok();
             }
+            Some(("notice_revision", v)) => notice_revision = v.trim().parse::<u32>().ok(),
             Some(("width", v)) => width = v.trim().parse::<i32>().ok().filter(|&w| w > 0),
             Some(("height", v)) => height = v.trim().parse::<i32>().ok().filter(|&h| h > 0),
             Some(("maximized", v)) => maximized = v.trim().parse().unwrap_or(false),
@@ -176,6 +181,10 @@ pub fn load_config() -> Config {
         }),
         _ => None,
     };
+    let notice_revision = notice_revision.unwrap_or(match dismissed_notice {
+        Some(DARK_MODE_NOTICE_ID) => DARK_MODE_NOTICE_REVISION,
+        _ => 0,
+    });
 
     Config {
         render_threads: render_threads.clamp(1, max_render_threads()),
@@ -184,7 +193,7 @@ pub fn load_config() -> Config {
         animate_scroll,
         dark_mode,
         always_open_in_tabs,
-        dismissed_notice,
+        notice_revision,
         geometry,
     }
 }
@@ -204,9 +213,7 @@ pub fn save_config(config: &Config) -> io::Result<()> {
     out.push_str(&format!("animate_scroll={}\n", config.animate_scroll));
     out.push_str(&format!("dark_mode={}\n", config.dark_mode));
     out.push_str(&format!("open_in_tabs={}\n", config.always_open_in_tabs));
-    if let Some(notice) = config.dismissed_notice {
-        out.push_str(&format!("dismissed_notice={notice:016x}\n"));
-    }
+    out.push_str(&format!("notice_revision={}\n", config.notice_revision));
     if let Some(g) = config.geometry {
         out.push_str(&format!("width={}\n", g.width));
         out.push_str(&format!("height={}\n", g.height));
@@ -251,7 +258,7 @@ mod tests {
             animate_scroll: false,
             dark_mode: true,
             always_open_in_tabs: true,
-            dismissed_notice: Some(0x1234_5678_90ab_cdef),
+            notice_revision: 2,
             geometry: Some(Geometry {
                 width: 1000,
                 height: 700,
@@ -266,7 +273,7 @@ mod tests {
         assert!(!loaded.animate_scroll);
         assert!(loaded.dark_mode);
         assert!(loaded.always_open_in_tabs);
-        assert_eq!(loaded.dismissed_notice, Some(0x1234_5678_90ab_cdef));
+        assert_eq!(loaded.notice_revision, 2);
         let g = loaded.geometry.expect("geometry persisted");
         assert_eq!((g.width, g.height, g.maximized), (1000, 700, true));
 
@@ -278,7 +285,7 @@ mod tests {
             animate_scroll: true,
             dark_mode: false,
             always_open_in_tabs: false,
-            dismissed_notice: None,
+            notice_revision: 0,
             geometry: None,
         })
         .unwrap();
@@ -287,7 +294,49 @@ mod tests {
         assert!(loaded.animate_scroll);
         assert!(!loaded.dark_mode);
         assert!(!loaded.always_open_in_tabs);
-        assert!(loaded.dismissed_notice.is_none());
+        assert_eq!(loaded.notice_revision, 0);
         assert!(loaded.geometry.is_none());
+    }
+
+    #[test]
+    fn dark_mode_notice_hash_migrates_to_revision_one() {
+        use_scratch_config();
+        let path = config_file_path().unwrap();
+        fs::write(
+            &path,
+            "dark_mode=true\nopen_in_tabs=true\nwidth=1111\nheight=777\nmaximized=true\ndismissed_notice=28a995873f4d6d3a\n",
+        )
+        .unwrap();
+
+        let config = load_config();
+
+        assert_eq!(config.notice_revision, DARK_MODE_NOTICE_REVISION);
+        assert!(config.dark_mode);
+        assert!(config.always_open_in_tabs);
+        assert_eq!(config.geometry.unwrap().width, 1111);
+        assert_eq!(config.geometry.unwrap().height, 777);
+        assert!(config.geometry.unwrap().maximized);
+        save_config(&config).unwrap();
+        let saved = fs::read_to_string(path).unwrap();
+        assert!(saved.contains("notice_revision=1\n"));
+        assert!(!saved.contains("dismissed_notice"));
+        assert!(saved.contains("dark_mode=true\n"));
+        assert!(saved.contains("open_in_tabs=true\n"));
+        assert!(saved.contains("width=1111\n"));
+        assert!(saved.contains("height=777\n"));
+        assert!(saved.contains("maximized=true\n"));
+    }
+
+    #[test]
+    fn notice_revision_takes_priority_over_the_notice_hash() {
+        use_scratch_config();
+        let path = config_file_path().unwrap();
+        fs::write(
+            path,
+            "dismissed_notice=28a995873f4d6d3a\nnotice_revision=2\n",
+        )
+        .unwrap();
+
+        assert_eq!(load_config().notice_revision, 2);
     }
 }
