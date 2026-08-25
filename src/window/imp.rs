@@ -37,6 +37,8 @@ pub struct Window {
     #[template_child]
     pub btn_menu_add_tab: TemplateChild<Button>,
     #[template_child]
+    pub btn_menu_split_view: TemplateChild<Button>,
+    #[template_child]
     pub btn_crop: TemplateChild<ToggleButton>,
     #[template_child]
     pub btn_fit_height: TemplateChild<ToggleButton>,
@@ -626,6 +628,11 @@ impl Window {
                 .sync_create()
                 .build(),
             document
+                .bind_property("split-open", &*self.btn_menu_split_view, "sensitive")
+                .transform_to(|_, split_open: bool| Some(!split_open))
+                .sync_create()
+                .build(),
+            document
                 .document()
                 .bind_property("uri", &*self.obj(), "title")
                 .transform_to(|_, uri: String| Some(window_title(&uri)))
@@ -666,6 +673,14 @@ impl Window {
     fn menu_add_tab(&self, btn: &Button) {
         dismiss_menu(btn);
         self.add_tab();
+    }
+
+    #[template_callback]
+    fn menu_split_view(&self, btn: &Button) {
+        dismiss_menu(btn);
+        if let Some(document) = self.active_document() {
+            document.split_here();
+        }
     }
 
     // Fill an idle empty tab instead of adding another tab. Returns false if tab limit is reached.
@@ -1723,6 +1738,26 @@ mod widget_tests {
             );
         }
 
+        window.close();
+    }
+
+    #[gtk::test]
+    fn split_menu_button_tracks_the_active_document() {
+        let window = loaded_window();
+        let header = window.header();
+        let first = header.active_document().expect("a document");
+        assert!(header.btn_menu_split_view.is_sensitive());
+
+        first.split_here();
+        wait_until(|| first.property::<bool>("split-open"));
+        assert!(!header.btn_menu_split_view.is_sensitive());
+
+        let second = header.add_document().expect("a tab");
+        assert!(header.btn_menu_split_view.is_sensitive());
+        header.notebook.set_current_page(Some(0));
+        assert!(!header.btn_menu_split_view.is_sensitive());
+
+        header.close_document(&second);
         window.close();
     }
 

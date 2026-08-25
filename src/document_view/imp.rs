@@ -23,6 +23,33 @@ struct SplitTargetSize {
     pane: f64,
 }
 
+struct SourcePosition {
+    page: i32,
+    vertical: f64,
+}
+
+#[derive(Clone, Copy)]
+enum SplitTarget {
+    Page(i32),
+    Location(DocumentLocation),
+}
+
+impl SplitTarget {
+    fn page(self) -> i32 {
+        match self {
+            Self::Page(page) => page,
+            Self::Location(location) => location.page,
+        }
+    }
+
+    fn navigate(self, pane: &DocumentPane) {
+        match self {
+            Self::Page(page) => pane.goto_page(page.saturating_add(1) as u32),
+            Self::Location(location) => pane.navigate_to_location(location),
+        }
+    }
+}
+
 #[derive(CompositeTemplate, Default)]
 #[template(resource = "/com/andr2i/scrolex/document_view.ui")]
 pub struct DocumentView {
@@ -339,6 +366,18 @@ impl DocumentView {
         }
     }
 
+    pub(crate) fn split_here(&self) {
+        if self.secondary.borrow().is_some()
+            || self.split_geometry_pending.get()
+            || self.document().n_pages() == 0
+        {
+            return;
+        }
+        let source = self.active_pane();
+        let page = source.viewport().page() as i32;
+        self.open_split(&source, page, SplitTarget::Page(page), true);
+    }
+
     fn ensure_secondary(&self) -> DocumentPane {
         if let Some(pane) = self.secondary.borrow().clone() {
             return pane;
@@ -364,6 +403,7 @@ impl DocumentView {
         self.pane_host.append(&paned);
         paned.set_end_child(Some(&pane));
         self.secondary.replace(Some(pane.clone()));
+        self.obj().notify("split-open");
         primary.set_close_visible(true);
         pane.set_close_visible(true);
         pane
@@ -381,28 +421,39 @@ impl DocumentView {
             self.activate_pane(source);
             return;
         }
+        self.open_split(source, source_page, SplitTarget::Location(location), false);
+    }
+
+    fn open_split(
+        &self,
+        source: &DocumentPane,
+        source_page: i32,
+        target: SplitTarget,
+        focus_target: bool,
+    ) {
         let generation = self.split_generation.get().wrapping_add(1);
         self.split_generation.set(generation);
         self.split_geometry_pending.set(true);
-        self.resolve_beside_crop(source, source_page, location, generation);
+        self.resolve_beside_crop(source, source_page, target, focus_target, generation);
     }
 
     fn resolve_beside_crop(
         &self,
         source: &DocumentPane,
         source_page: i32,
-        location: DocumentLocation,
+        target: SplitTarget,
+        focus_target: bool,
         generation: u64,
     ) {
         if !source.viewport().crop() {
-            self.apply_beside(source, source_page, location, generation);
+            self.apply_beside(source, source_page, target, focus_target, generation);
             return;
         }
 
         let cache = self.document().bbox_cache();
         let uri = self.document().uri();
         let mut missing = Vec::new();
-        for page in [source_page, location.page] {
+        for page in [source_page, target.page()] {
             if missing.iter().any(|(index, _, _)| *index == page)
                 || cache.borrow().contains_key(&page)
             {
@@ -413,7 +464,7 @@ impl DocumentView {
             }
         }
         if missing.is_empty() {
-            self.apply_beside(source, source_page, location, generation);
+            self.apply_beside(source, source_page, target, focus_target, generation);
             return;
         }
 
@@ -446,7 +497,7 @@ impl DocumentView {
                     return;
                 }
                 imp.document().bbox_cache().borrow_mut().extend(boxes);
-                imp.apply_beside(&source, source_page, location, generation);
+                imp.apply_beside(&source, source_page, target, focus_target, generation);
             }
         ));
     }
@@ -455,7 +506,8 @@ impl DocumentView {
         &self,
         source: &DocumentPane,
         source_page: i32,
-        location: DocumentLocation,
+        split_target: SplitTarget,
+        focus_target: bool,
         generation: u64,
     ) {
         if self.split_generation.get() != generation {
@@ -482,17 +534,18 @@ impl DocumentView {
                     if paned.width() <= 0 {
                         return glib::ControlFlow::Continue;
                     }
-                    imp.apply_beside(&source, source_page, location, generation);
+                    imp.apply_beside(&source, source_page, split_target, focus_target, generation);
                     glib::ControlFlow::Break
                 }
             ));
             return;
         }
         let source_width = source.paper_width(source_page).unwrap_or(1.0);
-        let target_width = target.paper_width(location.page).unwrap_or(1.0);
+        let target_page = split_target.page();
+        let target_width = target.paper_width(target_page).unwrap_or(1.0);
         let source_chrome = source.horizontal_chrome(source_page).unwrap_or_default();
         let target_chrome = target
-            .horizontal_chrome(location.page)
+            .horizontal_chrome(target_page)
             .unwrap_or(source_chrome);
         let divider = (total
             - f64::from(self.primary_pane().width())
@@ -513,7 +566,7 @@ impl DocumentView {
         let source_vertical = source.vertical_position();
         source.apply_split_zoom(zoom);
         target.apply_split_zoom(zoom);
-        target.navigate_to_location(location);
+        split_target.navigate(&target);
 
         let target_viewport = target_width * zoom + target_chrome.row;
         let target_display = target_viewport + target_chrome.pane;
@@ -523,27 +576,34 @@ impl DocumentView {
             total - divider - target_display
         };
         self.split_container().set_position(position.round() as i32);
+        if focus_target {
+            self.activate_pane(&target);
+        } else {
+            self.activate_pane(source);
+        }
         self.correct_split_once(
             source,
             target,
-            source_page,
-            source_vertical,
+            SourcePosition {
+                page: source_page,
+                vertical: source_vertical,
+            },
             SplitTargetSize {
                 viewport: target_viewport,
                 pane: target_display,
             },
+            focus_target,
             generation,
         );
-        self.activate_pane(source);
     }
 
     fn correct_split_once(
         &self,
         source: &DocumentPane,
         target: DocumentPane,
-        source_page: i32,
-        source_vertical: f64,
+        source_position: SourcePosition,
         target_size: SplitTargetSize,
+        focus_target: bool,
         generation: u64,
     ) {
         let paned = self.split_container();
@@ -560,9 +620,12 @@ impl DocumentView {
                     return glib::ControlFlow::Break;
                 }
                 if Instant::now() >= deadline {
-                    source.restore_vertical_position(source_vertical);
-                    source.reveal_page_horizontally(source_page);
+                    source.restore_vertical_position(source_position.vertical);
+                    source.reveal_page_horizontally(source_position.page);
                     target.set_sensitive(true);
+                    if focus_target {
+                        target.focus_reader();
+                    }
                     imp.hide_loading();
                     imp.split_geometry_pending.set(false);
                     return glib::ControlFlow::Break;
@@ -584,9 +647,12 @@ impl DocumentView {
                         (f64::from(paned.position()) + error * direction).round() as i32
                     );
                 }
-                source.restore_vertical_position(source_vertical);
-                source.reveal_page_horizontally(source_page);
+                source.restore_vertical_position(source_position.vertical);
+                source.reveal_page_horizontally(source_position.page);
                 target.set_sensitive(true);
+                if focus_target {
+                    target.focus_reader();
+                }
                 imp.hide_loading();
                 imp.split_geometry_pending.set(false);
                 glib::ControlFlow::Break
@@ -615,6 +681,7 @@ impl DocumentView {
             remaining = self.primary_pane();
             self.secondary.take();
         }
+        self.obj().notify("split-open");
         paned.set_start_child(gtk::Widget::NONE);
         paned.set_end_child(gtk::Widget::NONE);
         self.pane_host.remove(&paned);
@@ -868,6 +935,7 @@ impl DocumentView {
                 }
             }),
             Key::f => run_reader_action(context, true, || self.open_search()),
+            Key::s => run_reader_action(context, true, || self.split_here()),
             Key::n if self.document().search().borrow().total() > 0 => {
                 run_reader_action(context, true, || self.next_match())
             }
@@ -1011,6 +1079,9 @@ impl ObjectImpl for DocumentView {
                 glib::ParamSpecBoolean::builder("has-toc")
                     .read_only()
                     .build(),
+                glib::ParamSpecBoolean::builder("split-open")
+                    .read_only()
+                    .build(),
             ]
         })
     }
@@ -1036,6 +1107,7 @@ impl ObjectImpl for DocumentView {
                 .is_some_and(|revealer: gtk::Revealer| revealer.reveals_child())
                 .to_value(),
             "has-toc" => (!self.toc_pages.borrow().is_empty()).to_value(),
+            "split-open" => self.secondary.borrow().is_some().to_value(),
             name => unimplemented!("unknown property {name}"),
         }
     }
@@ -1076,6 +1148,7 @@ impl WidgetImpl for DocumentView {
 #[cfg(test)]
 mod tests {
     use super::split_zoom;
+    use crate::document_view::ReaderKeyContext;
     use crate::links::{DocumentLocation, LinkAction, LinkRequest};
     use crate::test_support::{loaded_window, wait_until, window};
     use gtk::prelude::*;
@@ -1168,6 +1241,61 @@ mod tests {
         assert_eq!(imp.active_pane(), imp.primary_pane());
         assert!(source.has_css_class("active-pane"));
         assert!(!source.has_css_class("inactive-pane"));
+        window.close();
+    }
+
+    #[gtk::test]
+    fn split_here_opens_the_current_page_and_activates_the_target() {
+        let window = loaded_window();
+        let imp = window.imp();
+        let source = imp.primary_pane();
+        source.goto_page(2);
+        wait_until(|| source.viewport().page() == 1);
+
+        imp.split_here();
+
+        wait_until(|| {
+            imp.secondary.borrow().as_ref().is_some_and(|pane| {
+                pane.viewport().page() == 1 && !imp.split_geometry_pending.get()
+            })
+        });
+        let target = imp.secondary.borrow().as_ref().unwrap().clone();
+        assert_eq!(imp.active_pane(), target);
+        assert!(target.has_css_class("active-pane"));
+        assert!(source.has_css_class("inactive-pane"));
+        assert!(window.property::<bool>("split-open"));
+
+        imp.split_here();
+        assert_eq!(imp.secondary.borrow().as_ref(), Some(&target));
+        imp.close_pane(&target);
+        assert!(!window.property::<bool>("split-open"));
+        window.close();
+    }
+
+    #[gtk::test]
+    fn split_shortcut_is_consumed_when_a_split_exists() {
+        let window = loaded_window();
+
+        assert_eq!(
+            window.handle_reader_key(
+                gtk::gdk::Key::s,
+                gtk::gdk::ModifierType::empty(),
+                ReaderKeyContext::Document,
+            ),
+            glib::Propagation::Stop
+        );
+        wait_until(|| !window.imp().split_geometry_pending.get());
+        let target = window.imp().secondary.borrow().as_ref().unwrap().clone();
+
+        assert_eq!(
+            window.handle_reader_key(
+                gtk::gdk::Key::s,
+                gtk::gdk::ModifierType::empty(),
+                ReaderKeyContext::Document,
+            ),
+            glib::Propagation::Stop
+        );
+        assert_eq!(window.imp().secondary.borrow().as_ref(), Some(&target));
         window.close();
     }
 

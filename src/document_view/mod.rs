@@ -98,6 +98,10 @@ impl DocumentView {
         self.imp().open_search();
     }
 
+    pub fn split_here(&self) {
+        self.imp().split_here();
+    }
+
     pub fn handle_search_key(
         &self,
         keyval: gtk::gdk::Key,
