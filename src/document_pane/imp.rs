@@ -135,7 +135,8 @@ pub struct DocumentPane {
     pub pan_scroll: TemplateChild<gtk::EventControllerScroll>,
     #[template_child]
     pub listview: TemplateChild<ListView>,
-    pub close_button: OnceCell<gtk::Button>,
+    #[template_child]
+    pub close_button: TemplateChild<gtk::Button>,
     drag_coords: RefCell<Option<(f64, f64)>>,
     drag_cursor: RefCell<Option<gtk::gdk::Cursor>>,
 
@@ -274,19 +275,6 @@ impl ObjectImpl for DocumentPane {
         // The cache budgets are application totals; the window divides them across its documents.
         self.setup_fit_height();
         self.setup_text_selection();
-        let close_button = gtk::Button::builder()
-            .icon_name("window-close-symbolic")
-            .tooltip_text("Close pane")
-            .halign(gtk::Align::End)
-            .valign(gtk::Align::Start)
-            .margin_end(8)
-            .margin_top(8)
-            .build();
-        close_button.add_css_class("circular");
-        close_button.set_visible(false);
-        self.close_button
-            .set(close_button)
-            .expect("one close button per pane");
         // Give keyboard focus to the scroll area rather than the header entry
         self.scrolledwindow.set_focusable(true);
         self.listview.set_focusable(false);
@@ -2088,7 +2076,7 @@ impl DocumentPane {
     }
 
     // The template's single child holds the pane UI.
-    pub(super) fn content(&self) -> Option<gtk::Widget> {
+    fn content(&self) -> Option<gtk::Widget> {
         self.obj().first_child()
     }
 

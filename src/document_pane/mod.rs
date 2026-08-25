@@ -88,19 +88,11 @@ impl DocumentPane {
     }
 
     pub(crate) fn close_button(&self) -> gtk::Button {
-        self.imp().close_button.get().unwrap().clone()
+        self.imp().close_button.clone()
     }
 
     pub(crate) fn set_close_visible(&self, visible: bool) {
-        let button = self.close_button();
-        if visible && button.parent().is_none() {
-            self.imp()
-                .content()
-                .and_downcast::<gtk::Overlay>()
-                .expect("a pane has an overlay")
-                .add_overlay(&button);
-        }
-        button.set_visible(visible);
+        self.imp().close_button.set_visible(visible);
     }
 
     pub(crate) fn release_renders(&self) {
