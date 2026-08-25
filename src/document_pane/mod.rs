@@ -116,13 +116,14 @@ impl DocumentPane {
     pub(crate) fn paper_width(&self, page: i32) -> Option<f64> {
         let size = self.document().page_size(page)?;
         if self.viewport().crop() {
-            Some(
-                self.document()
-                    .bbox_cache()
-                    .borrow()
-                    .get(&page)
-                    .map_or(size.width, |bbox| bbox.size().0),
-            )
+            let cache = self.document().bbox_cache();
+            if let Some(bbox) = cache.borrow().get(&page) {
+                return Some(bbox.size().0);
+            }
+            let bbox = crate::page::crop_box(&self.document().uri(), page, size.width, size.height);
+            let width = bbox.size().0;
+            cache.borrow_mut().insert(page, bbox);
+            Some(width)
         } else {
             Some(size.width)
         }

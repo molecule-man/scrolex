@@ -2153,6 +2153,18 @@ struct PageInfo {
     height: f64,
 }
 
+pub(crate) fn crop_box(uri: &str, index: i32, width: f64, height: f64) -> Rectangle {
+    get_bbox(
+        uri,
+        &PageInfo {
+            index,
+            width,
+            height,
+        },
+        true,
+    )
+}
+
 fn get_bbox(uri: &str, page: &PageInfo, crop: bool) -> Rectangle {
     if !crop {
         return Rectangle::new(0.0, 0.0, page.width, page.height);

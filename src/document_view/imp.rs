@@ -1158,6 +1158,41 @@ mod tests {
     }
 
     #[gtk::test]
+    fn beside_target_width_uses_resolved_crop_box() {
+        let window = loaded_window();
+        let imp = window.imp();
+        let primary = imp.primary_pane();
+        primary.viewport().set_crop(true);
+        window.document().bbox_cache().borrow_mut().clear();
+
+        imp.open_beside(
+            &primary,
+            0,
+            DocumentLocation {
+                page: 2,
+                x: 0.0,
+                y: 0.0,
+            },
+        );
+        let secondary = imp.secondary.borrow().as_ref().unwrap().clone();
+        wait_until(|| secondary.viewport().page() == 2 && !imp.split_geometry_pending.get());
+
+        let paper_width = window
+            .document()
+            .bbox_cache()
+            .borrow()
+            .get(&2)
+            .unwrap()
+            .size()
+            .0;
+        let chrome = secondary.horizontal_chrome(2).unwrap();
+        let expected = paper_width * secondary.viewport().zoom() + chrome.row;
+        assert!((secondary.viewport_width() - expected).abs() <= 1.0);
+        imp.close_pane(&secondary);
+        window.close();
+    }
+
+    #[gtk::test]
     fn later_beside_actions_keep_the_user_split_geometry() {
         let window = loaded_window();
         let imp = window.imp();
