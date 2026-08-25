@@ -117,8 +117,8 @@ impl DocumentPane {
         let size = self.document().page_size(page)?;
         if self.viewport().crop() {
             let cache = self.document().bbox_cache();
-            let width = cache.borrow().get(&page).map(|bbox| bbox.size().0);
-            width
+            let bbox = *cache.borrow().get(&page)?;
+            Some(bbox.size().0)
         } else {
             Some(size.width)
         }

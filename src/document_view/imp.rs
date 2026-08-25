@@ -387,7 +387,7 @@ impl DocumentView {
         self.register_toc_close(&pane);
         pane.finish_document_load();
         pane.viewport().set_crop(crop);
-        pane.set_sensitive(!self.loading_spinner.is_spinning());
+        pane.set_sensitive(!self.split_geometry_pending.get());
         let existing = self.paned.borrow().clone();
         let paned = if let Some(paned) = existing {
             paned
@@ -665,6 +665,7 @@ impl DocumentView {
         self.paned.take();
         self.pane_host.append(&remaining);
         remaining.set_close_visible(false);
+        remaining.set_sensitive(true);
         self.activate_pane(&self.primary_pane());
         if active_closed {
             self.primary_pane().focus_reader();
@@ -1226,11 +1227,15 @@ mod tests {
                 y: Some(0.0),
             },
         );
+        let secondary = imp.secondary.borrow().as_ref().unwrap().clone();
+        secondary.set_sensitive(false);
+        imp.split_geometry_pending.set(true);
         let file = gtk::gio::File::for_uri(&window.document().uri());
 
         imp.load(&file);
 
         assert!(imp.secondary.borrow().is_none());
+        assert!(imp.primary_pane().is_sensitive());
         window.close();
     }
 
@@ -1294,11 +1299,14 @@ mod tests {
             },
         );
         let secondary = imp.secondary.borrow().as_ref().unwrap().clone();
+        secondary.set_sensitive(false);
+        imp.split_geometry_pending.set(true);
 
         imp.close_pane(&primary);
 
         assert_eq!(window.pane(), secondary);
         assert_ne!(window.pane(), primary);
+        assert!(window.pane().is_sensitive());
         window.close();
     }
 
@@ -1399,6 +1407,39 @@ mod tests {
         wait_until(|| secondary.viewport().page() == 2 && !imp.split_geometry_pending.get());
         assert!(!secondary.viewport().crop());
         imp.close_pane(&secondary);
+        window.close();
+    }
+
+    #[gtk::test]
+    fn closing_the_source_pane_before_the_split_settles_keeps_the_view_usable() {
+        let window = loaded_window();
+        let imp = window.imp();
+        let primary = imp.primary_pane();
+        primary.viewport().set_crop(true);
+        window.document().bbox_cache().borrow_mut().clear();
+
+        imp.open_beside(
+            &primary,
+            0,
+            DocumentLocation {
+                page: 2,
+                x: Some(0.0),
+                y: Some(0.0),
+            },
+        );
+        wait_until(|| imp.secondary.borrow().is_some());
+        let secondary = imp.secondary.borrow().as_ref().unwrap().clone();
+        assert!(
+            imp.split_geometry_pending.get(),
+            "the split must still be pending for this test to mean anything"
+        );
+        assert!(!secondary.is_sensitive());
+
+        imp.close_pane(&primary);
+
+        assert_eq!(window.pane(), secondary);
+        assert!(window.pane().is_sensitive());
+        assert!(!window.is_loading());
         window.close();
     }
 
