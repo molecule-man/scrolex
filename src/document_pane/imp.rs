@@ -930,7 +930,7 @@ impl DocumentPane {
             let index = i32::try_from(index).ok()?;
             let width = self
                 .document()
-                .cached_bbox(index, self.viewport().crop())?
+                .page_bounds(index, self.viewport().crop())?
                 .size()
                 .0;
             Some(sum + width)
@@ -1431,7 +1431,7 @@ impl DocumentPane {
         };
         let Some(crop) = self
             .document()
-            .cached_bbox(location.page, self.viewport().crop())
+            .page_bounds(location.page, self.viewport().crop())
         else {
             return glib::ControlFlow::Continue;
         };

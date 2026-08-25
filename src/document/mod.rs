@@ -212,7 +212,7 @@ impl Document {
         self.imp().bbox_cache.clone()
     }
 
-    pub(crate) fn cached_bbox(&self, index: i32, crop: bool) -> Option<page::Rectangle> {
+    pub(crate) fn page_bounds(&self, index: i32, crop: bool) -> Option<page::Rectangle> {
         let size = self.page_size(index)?;
         let full_page = page::Rectangle::new(0.0, 0.0, size.width, size.height);
         Some(if crop {

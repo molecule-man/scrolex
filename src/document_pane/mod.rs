@@ -111,7 +111,7 @@ impl DocumentPane {
 
     pub(crate) fn paper_width(&self, page: i32) -> Option<f64> {
         self.document()
-            .cached_bbox(page, self.viewport().crop())
+            .page_bounds(page, self.viewport().crop())
             .map(|bbox| bbox.size().0)
     }
 
