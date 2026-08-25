@@ -114,6 +114,13 @@ struct WidthFit {
     first_top: f64,
 }
 
+#[derive(Clone, Copy)]
+struct PendingLocation {
+    location: DocumentLocation,
+    deadline: Instant,
+    stable_frames: u8,
+}
+
 // One pane's page list and input state.
 #[derive(CompositeTemplate, Default)]
 #[template(resource = "/com/andr2i/scrolex/document_pane.ui")]
@@ -205,10 +212,8 @@ pub struct DocumentPane {
     // Page and position from when this pane left the screen.
     hidden_at: Cell<Option<(u32, f64)>>,
 
-    pending_location: Cell<Option<DocumentLocation>>,
+    pending_location: Cell<Option<PendingLocation>>,
     location_tick_active: Cell<bool>,
-    location_stable_frames: Cell<u8>,
-    location_deadline: Cell<Option<Instant>>,
 }
 
 // A document point held still across a zoom: which page, where in it (page points from its
@@ -1350,10 +1355,11 @@ impl DocumentPane {
         };
 
         self.cancel_scroll_motion();
-        self.pending_location.set(Some(location));
-        self.location_stable_frames.set(0);
-        self.location_deadline
-            .set(Some(Instant::now() + LOCATION_TIMEOUT));
+        self.pending_location.set(Some(PendingLocation {
+            location,
+            deadline: Instant::now() + LOCATION_TIMEOUT,
+            stable_frames: 0,
+        }));
         if selection.n_items() == last + 1 {
             self.scroll_to_location_page(page);
         }
@@ -1394,21 +1400,16 @@ impl DocumentPane {
     }
 
     fn apply_pending_location(&self) -> glib::ControlFlow {
-        let Some(location) = self.pending_location.get() else {
+        let Some(mut pending) = self.pending_location.get() else {
             self.location_tick_active.set(false);
-            self.location_deadline.set(None);
             return glib::ControlFlow::Break;
         };
-        if self
-            .location_deadline
-            .get()
-            .is_some_and(|deadline| Instant::now() >= deadline)
-        {
+        if Instant::now() >= pending.deadline {
             self.pending_location.set(None);
             self.location_tick_active.set(false);
-            self.location_deadline.set(None);
             return glib::ControlFlow::Break;
         }
+        let location = pending.location;
         let page_count = u32::try_from(self.document().n_pages()).unwrap_or(0);
         if self.selection.n_items() != page_count {
             return glib::ControlFlow::Continue;
@@ -1455,15 +1456,16 @@ impl DocumentPane {
         vadj.set_value(vertical);
 
         if (hadj.value() - horizontal).abs() <= 0.5 && (vadj.value() - vertical).abs() <= 0.5 {
-            let stable = self.location_stable_frames.get() + 1;
-            self.location_stable_frames.set(stable);
-            if stable >= LOCATION_STABLE_FRAMES {
+            pending.stable_frames += 1;
+            if pending.stable_frames >= LOCATION_STABLE_FRAMES {
                 self.pending_location.set(None);
-                self.location_deadline.set(None);
+                self.location_tick_active.set(false);
+                return glib::ControlFlow::Break;
             }
         } else {
-            self.location_stable_frames.set(0);
+            pending.stable_frames = 0;
         }
+        self.pending_location.set(Some(pending));
         glib::ControlFlow::Continue
     }
 
@@ -1478,8 +1480,6 @@ impl DocumentPane {
 
         self.cancel_scroll_motion();
         self.pending_location.set(None);
-        self.location_stable_frames.set(0);
-        self.location_deadline.set(None);
         self.expect_hscroll("goto-page");
         self.listview.scroll_to(
             page_num.saturating_sub(1),
@@ -1751,9 +1751,7 @@ impl DocumentPane {
     }
 
     fn clamp_scroll(&self, value: f64) -> f64 {
-        let hadj = self.scrolledwindow.hadjustment();
-        let lower = hadj.lower();
-        value.clamp(lower, (hadj.upper() - hadj.page_size()).max(lower))
+        clamp_adjustment(&self.scrolledwindow.hadjustment(), value)
     }
 
     // Move an older target into the hadjustment's current coordinates. Measuring page widths changes
@@ -1813,8 +1811,6 @@ impl DocumentPane {
 
     pub(crate) fn clear_model(&self) {
         self.pending_location.set(None);
-        self.location_stable_frames.set(0);
-        self.location_deadline.set(None);
         self.model.remove_all();
     }
 
@@ -2954,7 +2950,7 @@ mod tests {
 
 #[cfg(test)]
 mod widget_tests {
-    use super::{anchored_scroll, KINETIC_MIN_VELOCITY};
+    use super::{anchored_scroll, PendingLocation, KINETIC_MIN_VELOCITY};
     use crate::links::DocumentLocation;
     use crate::test_support::{loaded_window, type_zoom, wait_until, window};
     use crate::viewport::zoom_percent_text;
@@ -2992,13 +2988,16 @@ mod widget_tests {
         let window = loaded_window();
         let pane = window.pane();
         let imp = pane.imp();
-        imp.pending_location.set(Some(DocumentLocation {
-            page: i32::MAX,
-            x: Some(0.0),
-            y: Some(0.0),
+        imp.pending_location.set(Some(PendingLocation {
+            location: DocumentLocation {
+                page: i32::MAX,
+                x: Some(0.0),
+                y: Some(0.0),
+            },
+            deadline: std::time::Instant::now(),
+            stable_frames: 0,
         }));
         imp.location_tick_active.set(true);
-        imp.location_deadline.set(Some(std::time::Instant::now()));
 
         let result = imp.apply_pending_location();
 
