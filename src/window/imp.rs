@@ -1,6 +1,7 @@
 // Window chrome: the header bar, the settings menu, and the file chooser. The document itself
 // lives in DocumentView.
 use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 use std::sync::OnceLock;
 
 use glib::clone;
@@ -11,6 +12,7 @@ use gtk::subclass::prelude::*;
 use gtk::{glib, Button, CompositeTemplate, ToggleButton};
 
 use crate::document_view::{DocumentView, ReaderKeyContext};
+use crate::links::DocumentLocation;
 
 // Tabs stop being a useful way to hold documents well before this. The cap also limits each
 // document's render state and widget tree.
@@ -315,6 +317,36 @@ impl Window {
                 move |document: &DocumentView| imp.open_document_into(document)
             ),
         );
+        document.connect_closure(
+            "new-tab-location-requested",
+            false,
+            glib::closure_local!(
+                #[weak(rename_to = imp)]
+                self,
+                move |document: &DocumentView, page: i32, x: f64, y: f64| {
+                    imp.open_link_in_tab(document, DocumentLocation { page, x, y });
+                }
+            ),
+        );
+        document.connect_notify_local(
+            Some("viewport"),
+            clone!(
+                #[weak(rename_to = imp)]
+                self,
+                move |document, _| {
+                    let viewport = document.viewport();
+                    viewport.set_animate_scroll(imp.animate_scroll.get());
+                    viewport.connect_animate_scroll_notify(clone!(
+                        #[weak]
+                        imp,
+                        move |viewport| imp.apply_animate_scroll(viewport.animate_scroll())
+                    ));
+                    if imp.active_document().as_ref() == Some(document) {
+                        imp.bind_header_to_document(document);
+                    }
+                }
+            ),
+        );
 
         let page = self
             .notebook
@@ -326,6 +358,29 @@ impl Window {
         self.share_cache_budgets();
 
         Some(document)
+    }
+
+    fn open_link_in_tab(&self, source: &DocumentView, location: DocumentLocation) {
+        let Some(document) = self.add_document() else {
+            return;
+        };
+        let pending = Rc::new(Cell::new(Some(location)));
+        document.document().connect_closure(
+            "loaded",
+            false,
+            glib::closure_local!(
+                #[strong]
+                pending,
+                #[weak]
+                document,
+                move |_: crate::document::Document| {
+                    if let Some(location) = pending.take() {
+                        document.pane().navigate_to_location(location);
+                    }
+                }
+            ),
+        );
+        document.load(&gtk::gio::File::for_uri(&source.document().uri()));
     }
 
     // The window keeps one document at all times, so the last tab does not close. The notebook
@@ -455,7 +510,9 @@ impl Window {
         self.animate_scroll_sync.set(true);
         self.animate_scroll.set(animate_scroll);
         for document in self.documents() {
-            document.viewport().set_animate_scroll(animate_scroll);
+            for viewport in document.viewports() {
+                viewport.set_animate_scroll(animate_scroll);
+            }
         }
         self.animate_scroll_sync.set(false);
     }
@@ -806,8 +863,10 @@ impl Window {
             imp.animate_scroll.set(enabled);
         }
         for document in self.application_documents() {
-            if document.viewport().animate_scroll() != enabled {
-                document.viewport().set_animate_scroll(enabled);
+            for viewport in document.viewports() {
+                if viewport.animate_scroll() != enabled {
+                    viewport.set_animate_scroll(enabled);
+                }
             }
         }
         for window in windows {

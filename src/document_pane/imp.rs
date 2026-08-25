@@ -7,13 +7,14 @@ use glib::subclass::InitializingObject;
 use gtk::gdk::{EventSequence, Key, ModifierType, BUTTON_PRIMARY};
 use gtk::glib::closure_local;
 use gtk::glib::subclass::prelude::*;
-use gtk::glib::subclass::types::ObjectSubclassIsExt;
+use gtk::glib::subclass::Signal;
 use gtk::subclass::prelude::*;
 use gtk::{glib, CompositeTemplate, ListView, ScrolledWindow, SingleSelection};
 use gtk::{prelude::*, GestureClick};
 
 use super::{ReaderKeyContext, ZoomChoice, ZoomChoiceAction};
 use crate::document::Document;
+use crate::links::DocumentLocation;
 use crate::page;
 use crate::viewport::Viewport;
 
@@ -41,6 +42,7 @@ const WHEEL_NOTCH: f64 = 1.0;
 const WHEEL_TRIGGER: f64 = 0.2;
 // Touchpad pixels per notch, used to scale a pinch's pixel travel onto the wheel's zoom rate.
 const TOUCHPAD_NOTCH: f64 = 40.0;
+const LOCATION_STABLE_FRAMES: u8 = 4;
 
 // Time constant of the kinetic scroll that continues a touchpad swipe after the fingers lift. Travel
 // lift-off speed times this, so a brisk swipe covers a couple of pages. It also sets how fast the
@@ -131,6 +133,7 @@ pub struct DocumentPane {
     pub pan_scroll: TemplateChild<gtk::EventControllerScroll>,
     #[template_child]
     pub listview: TemplateChild<ListView>,
+    pub close_button: OnceCell<gtk::Button>,
     drag_coords: RefCell<Option<(f64, f64)>>,
     drag_cursor: RefCell<Option<gtk::gdk::Cursor>>,
 
@@ -198,6 +201,10 @@ pub struct DocumentPane {
 
     // Page and position from when this pane left the screen.
     hidden_at: Cell<Option<(u32, f64)>>,
+
+    pending_location: Cell<Option<DocumentLocation>>,
+    location_tick_active: Cell<bool>,
+    location_stable_frames: Cell<u8>,
 }
 
 // A document point held still across a zoom: which page, where in it (page points from its
@@ -264,6 +271,19 @@ impl ObjectImpl for DocumentPane {
         // The cache budgets are application totals; the window divides them across its documents.
         self.setup_fit_height();
         self.setup_text_selection();
+        let close_button = gtk::Button::builder()
+            .icon_name("window-close-symbolic")
+            .tooltip_text("Close pane")
+            .halign(gtk::Align::End)
+            .valign(gtk::Align::Start)
+            .margin_end(8)
+            .margin_top(8)
+            .build();
+        close_button.add_css_class("circular");
+        close_button.set_visible(false);
+        self.close_button
+            .set(close_button)
+            .expect("one close button per pane");
         // Give keyboard focus to the scroll area rather than the header entry
         self.scrolledwindow.set_focusable(true);
         self.listview.set_focusable(false);
@@ -271,6 +291,21 @@ impl ObjectImpl for DocumentPane {
         self.obj().connect_map(move |_| {
             scrolledwindow.grab_focus();
         });
+    }
+
+    fn signals() -> &'static [Signal] {
+        static SIGNALS: OnceLock<Vec<Signal>> = OnceLock::new();
+        SIGNALS.get_or_init(|| {
+            vec![Signal::builder("link-activated")
+                .param_types([
+                    i32::static_type(),
+                    i32::static_type(),
+                    f64::static_type(),
+                    f64::static_type(),
+                    i32::static_type(),
+                ])
+                .build()]
+        })
     }
 
     fn properties() -> &'static [glib::ParamSpec] {
@@ -319,10 +354,15 @@ impl DocumentPane {
 
         let obj = self.obj().clone();
         page.connect_closure(
-            "named-link-clicked",
+            "internal-link-clicked",
             false,
-            closure_local!(move |_: &crate::page::Page, page_num: i32| {
-                obj.imp().goto_page(page_num as u32);
+            closure_local!(move |_: &crate::page::Page,
+                                 source: i32,
+                                 page_num: i32,
+                                 x: f64,
+                                 y: f64,
+                                 action: i32| {
+                obj.emit_by_name::<()>("link-activated", &[&source, &page_num, &x, &y, &action]);
             }),
         );
 
@@ -1318,6 +1358,114 @@ impl DocumentPane {
         self.navigate_to_page(page_num);
     }
 
+    pub(super) fn navigate_to_location(&self, location: DocumentLocation) {
+        let Some(selection) = self.ensure_ready_selection() else {
+            return;
+        };
+        let last = selection.n_items().saturating_sub(1);
+        let page = u32::try_from(location.page).unwrap_or(0).min(last);
+        let location = DocumentLocation {
+            page: page as i32,
+            ..location
+        };
+
+        self.cancel_scroll_motion();
+        self.pending_location.set(Some(location));
+        self.location_stable_frames.set(0);
+        self.expect_hscroll("link-location");
+        self.listview.scroll_to(
+            page,
+            gtk::ListScrollFlags::SELECT | gtk::ListScrollFlags::FOCUS,
+            None,
+        );
+        self.start_location_tick();
+    }
+
+    pub(super) fn follow_link(&self, source_page: i32, location: DocumentLocation) {
+        if self.ensure_ready_selection().is_none() {
+            return;
+        }
+        if source_page != location.page {
+            self.viewport()
+                .jump_list_add(u32::try_from(source_page).unwrap_or(0) + 1);
+        }
+        self.navigate_to_location(location);
+    }
+
+    fn start_location_tick(&self) {
+        if self.location_tick_active.replace(true) {
+            return;
+        }
+        self.obj().add_tick_callback(clone!(
+            #[weak(rename_to = imp)]
+            self,
+            #[upgrade_or]
+            glib::ControlFlow::Break,
+            move |_, _| imp.apply_pending_location()
+        ));
+    }
+
+    fn apply_pending_location(&self) -> glib::ControlFlow {
+        let Some(location) = self.pending_location.get() else {
+            self.location_tick_active.set(false);
+            return glib::ControlFlow::Break;
+        };
+        let hadj = self.scrolledwindow.hadjustment();
+        let vadj = self.vscrolledwindow.vadjustment();
+        if hadj.page_size() <= 0.0 || vadj.page_size() <= 0.0 {
+            return glib::ControlFlow::Continue;
+        }
+        let Some(page) = self.mapped_page(location.page) else {
+            return glib::ControlFlow::Continue;
+        };
+        let Some((left, top)) = self.page_origin(&page) else {
+            return glib::ControlFlow::Continue;
+        };
+        let size = self.document().page_size(location.page);
+        let Some(size) = size else {
+            return glib::ControlFlow::Continue;
+        };
+        let crop = if self.viewport().crop() {
+            self.document()
+                .bbox_cache()
+                .borrow()
+                .get(&location.page)
+                .copied()
+                .unwrap_or(page::Rectangle::new(0.0, 0.0, size.width, size.height))
+        } else {
+            page::Rectangle::new(0.0, 0.0, size.width, size.height)
+        };
+        let x = location.x.clamp(crop.x1, crop.x2);
+        let y = location.y.clamp(crop.y1, crop.y2);
+        let zoom = self.viewport().zoom();
+        let horizontal = if f64::from(page.width()) <= hadj.page_size() + 1.0 {
+            reveal_interval(
+                hadj.value(),
+                left,
+                left + f64::from(page.width()),
+                hadj.page_size(),
+            )
+        } else {
+            hadj.value() + left + (x - crop.x1) * zoom
+        };
+        let vertical = vadj.value() + top + (y - crop.y1) * zoom;
+        let horizontal = clamp_adjustment(&hadj, horizontal);
+        let vertical = clamp_adjustment(&vadj, vertical);
+        self.set_hscroll(horizontal, "link-location");
+        vadj.set_value(vertical);
+
+        if (hadj.value() - horizontal).abs() <= 0.5 && (vadj.value() - vertical).abs() <= 0.5 {
+            let stable = self.location_stable_frames.get() + 1;
+            self.location_stable_frames.set(stable);
+            if stable >= LOCATION_STABLE_FRAMES {
+                self.pending_location.set(None);
+            }
+        } else {
+            self.location_stable_frames.set(0);
+        }
+        glib::ControlFlow::Continue
+    }
+
     // same as goto_page, but doesn't add to jump list
     fn navigate_to_page(&self, page_num: u32) {
         let Some(selection) = self.ensure_ready_selection() else {
@@ -1328,6 +1476,8 @@ impl DocumentPane {
         let page_num = page_num.min(selection.n_items());
 
         self.cancel_scroll_motion();
+        self.pending_location.set(None);
+        self.location_stable_frames.set(0);
         self.expect_hscroll("goto-page");
         self.listview.scroll_to(
             page_num.saturating_sub(1),
@@ -1660,6 +1810,8 @@ impl DocumentPane {
     }
 
     pub(crate) fn clear_model(&self) {
+        self.pending_location.set(None);
+        self.location_stable_frames.set(0);
         self.model.remove_all();
     }
 
@@ -1893,7 +2045,7 @@ impl DocumentPane {
     }
 
     // The template's single child holds the pane UI.
-    fn content(&self) -> Option<gtk::Widget> {
+    pub(super) fn content(&self) -> Option<gtk::Widget> {
         self.obj().first_child()
     }
 
@@ -2162,6 +2314,23 @@ impl DocumentPane {
         }
     }
 
+    pub(super) fn reveal_page_horizontally(&self, index: i32) {
+        let Some(page) = self.mapped_page(index) else {
+            return;
+        };
+        let Some((left, _)) = self.page_origin(&page) else {
+            return;
+        };
+        let hadj = self.scrolledwindow.hadjustment();
+        let target = reveal_interval(
+            hadj.value(),
+            left,
+            left + f64::from(page.width()),
+            hadj.page_size(),
+        );
+        self.set_hscroll(clamp_adjustment(&hadj, target), "split-reveal");
+    }
+
     pub(super) fn jump_back(&self) {
         if let Some(page) = self.viewport().jump_list_back(self.viewport().page() + 1) {
             self.navigate_to_page(page);
@@ -2307,8 +2476,26 @@ fn hscrollbar_reserve(scroller: &gtk::ScrolledWindow) -> f64 {
     })
 }
 
-fn fit_width_zoom(viewport: f64, paper_points: f64, gaps: f64) -> Option<f64> {
+pub(super) fn fit_width_zoom(viewport: f64, paper_points: f64, gaps: f64) -> Option<f64> {
     (viewport > gaps && paper_points > 0.0).then(|| (viewport - gaps) / paper_points)
+}
+
+fn clamp_adjustment(adjustment: &gtk::Adjustment, value: f64) -> f64 {
+    let lower = adjustment.lower();
+    value.clamp(
+        lower,
+        (adjustment.upper() - adjustment.page_size()).max(lower),
+    )
+}
+
+fn reveal_interval(value: f64, start: f64, end: f64, viewport: f64) -> f64 {
+    if start < 0.0 {
+        value + start
+    } else if end > viewport {
+        value + end - viewport
+    } else {
+        value
+    }
 }
 
 fn width_fit_range(fractions: &[f64]) -> std::ops::Range<usize> {
@@ -2765,10 +2952,36 @@ mod tests {
 #[cfg(test)]
 mod widget_tests {
     use super::{anchored_scroll, KINETIC_MIN_VELOCITY};
+    use crate::links::DocumentLocation;
     use crate::test_support::{loaded_window, type_zoom, wait_until, window};
     use crate::viewport::zoom_percent_text;
     use gtk::prelude::*;
     use gtk::subclass::prelude::ObjectSubclassIsExt;
+
+    #[gtk::test]
+    fn link_location_lands_at_the_viewport_origin_after_allocation() {
+        let window = loaded_window();
+        let imp = window.pane().imp();
+        imp.viewport().zoom_to(3.0);
+        wait_until(|| {
+            imp.mapped_page(0).is_some_and(|page| {
+                f64::from(page.width()) > imp.scrolledwindow.hadjustment().page_size()
+            })
+        });
+
+        imp.navigate_to_location(DocumentLocation {
+            page: 0,
+            x: 100.0,
+            y: 100.0,
+        });
+        wait_until(|| imp.pending_location.get().is_none());
+
+        let page = imp.mapped_page(0).unwrap();
+        let (left, top) = imp.page_origin(&page).unwrap();
+        assert!((left + 300.0).abs() <= 1.0, "target x is {}", left + 300.0);
+        assert!((top + 300.0).abs() <= 1.0, "target y is {}", top + 300.0);
+        window.close();
+    }
 
     // The page it left on, so the restore has something to aim at.
     #[gtk::test]
