@@ -361,12 +361,12 @@ impl DocumentView {
         pane.set_hexpand(true);
         pane.set_vexpand(true);
         pane.add_css_class("inactive-pane");
-        pane.viewport().set_crop(crop);
         pane.viewport()
             .set_animate_scroll(self.primary_pane().viewport().animate_scroll());
         self.setup_pane(&pane);
         self.register_toc_close(&pane);
         pane.finish_document_load();
+        pane.viewport().set_crop(crop);
         let existing = self.paned.borrow().clone();
         let paned = if let Some(paned) = existing {
             paned
@@ -399,9 +399,7 @@ impl DocumentView {
             } else {
                 self.primary_pane()
             };
-            if source.viewport().crop() {
-                target.viewport().set_crop(true);
-            }
+            target.viewport().set_crop(source.viewport().crop());
             target.navigate_to_location(location);
             self.activate_pane(source);
             return;
@@ -429,9 +427,7 @@ impl DocumentView {
         } else {
             self.primary_pane()
         };
-        if source_crop {
-            target.viewport().set_crop(true);
-        }
+        target.viewport().set_crop(source_crop);
         let paned = self.split_container();
         let total = f64::from(paned.width());
         if total <= 0.0 {
@@ -1153,6 +1149,45 @@ mod tests {
         wait_until(|| primary.viewport().page() == 2);
         assert!(primary.viewport().crop());
 
+        imp.close_pane(&secondary);
+        window.close();
+    }
+
+    #[gtk::test]
+    fn beside_target_uses_disabled_source_crop_mode() {
+        let window = loaded_window();
+        let imp = window.imp();
+        let primary = imp.primary_pane();
+        primary.viewport().set_crop(true);
+        primary.viewport().save_position().unwrap();
+
+        imp.open_beside(
+            &primary,
+            0,
+            DocumentLocation {
+                page: 1,
+                x: 0.0,
+                y: 0.0,
+            },
+        );
+        let secondary = imp.secondary.borrow().as_ref().unwrap().clone();
+        wait_until(|| secondary.viewport().page() == 1 && !imp.split_geometry_pending.get());
+        assert!(secondary.viewport().crop());
+        imp.close_pane(&secondary);
+
+        primary.viewport().set_crop(false);
+        imp.open_beside(
+            &primary,
+            0,
+            DocumentLocation {
+                page: 2,
+                x: 0.0,
+                y: 0.0,
+            },
+        );
+        let secondary = imp.secondary.borrow().as_ref().unwrap().clone();
+        wait_until(|| secondary.viewport().page() == 2 && !imp.split_geometry_pending.get());
+        assert!(!secondary.viewport().crop());
         imp.close_pane(&secondary);
         window.close();
     }
