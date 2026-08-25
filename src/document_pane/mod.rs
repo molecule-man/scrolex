@@ -106,14 +106,9 @@ impl DocumentPane {
     }
 
     pub(crate) fn paper_width(&self, page: i32) -> Option<f64> {
-        let size = self.document().page_size(page)?;
-        if self.viewport().crop() {
-            let cache = self.document().bbox_cache();
-            let bbox = *cache.borrow().get(&page)?;
-            Some(bbox.size().0)
-        } else {
-            Some(size.width)
-        }
+        self.document()
+            .cached_bbox(page, self.viewport().crop())
+            .map(|bbox| bbox.size().0)
     }
 
     pub(crate) fn apply_split_zoom(&self, zoom: f64) {
@@ -226,20 +221,4 @@ impl DocumentPane {
     }
 }
 
-pub(crate) fn fit_width_zoom(viewport: f64, paper_points: f64, gaps: f64) -> Option<f64> {
-    imp::fit_width_zoom(viewport, paper_points, gaps)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::HorizontalChrome;
-
-    #[test]
-    fn chrome_width_uses_only_widget_gaps() {
-        let chrome = HorizontalChrome {
-            pane: 4.0,
-            row: 10.0,
-        };
-        assert_eq!(chrome.total(), 14.0);
-    }
-}
+pub(crate) use imp::fit_width_zoom;

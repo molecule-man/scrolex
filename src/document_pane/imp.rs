@@ -937,17 +937,11 @@ impl DocumentPane {
         let first = page_range_start(n_pages, selected, count)?;
         let paper_points = (first..first + count).try_fold(0.0, |sum, index| {
             let index = i32::try_from(index).ok()?;
-            let size = self.document().page_size(index)?;
-            let width = if self.viewport().crop() {
-                self.document()
-                    .bbox_cache()
-                    .borrow()
-                    .get(&index)
-                    .map(|bbox| bbox.size().0)
-                    .unwrap_or(size.width)
-            } else {
-                size.width
-            };
+            let width = self
+                .document()
+                .cached_bbox(index, self.viewport().crop())?
+                .size()
+                .0;
             Some(sum + width)
         })?;
         let viewport = self.scrolledwindow.hadjustment().page_size();
@@ -1448,19 +1442,11 @@ impl DocumentPane {
         let Some((left, top)) = self.page_origin(&page) else {
             return glib::ControlFlow::Continue;
         };
-        let size = self.document().page_size(location.page);
-        let Some(size) = size else {
+        let Some(crop) = self
+            .document()
+            .cached_bbox(location.page, self.viewport().crop())
+        else {
             return glib::ControlFlow::Continue;
-        };
-        let crop = if self.viewport().crop() {
-            self.document()
-                .bbox_cache()
-                .borrow()
-                .get(&location.page)
-                .copied()
-                .unwrap_or(page::Rectangle::new(0.0, 0.0, size.width, size.height))
-        } else {
-            page::Rectangle::new(0.0, 0.0, size.width, size.height)
         };
         let x = location.x.map(|x| x.clamp(crop.x1, crop.x2));
         let y = location.y.map(|y| y.clamp(crop.y1, crop.y2));
@@ -2507,7 +2493,7 @@ fn hscrollbar_reserve(scroller: &gtk::ScrolledWindow) -> f64 {
     })
 }
 
-pub(super) fn fit_width_zoom(viewport: f64, paper_points: f64, gaps: f64) -> Option<f64> {
+pub(crate) fn fit_width_zoom(viewport: f64, paper_points: f64, gaps: f64) -> Option<f64> {
     (viewport > gaps && paper_points > 0.0).then(|| (viewport - gaps) / paper_points)
 }
 

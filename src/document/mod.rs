@@ -212,6 +212,21 @@ impl Document {
         self.imp().bbox_cache.clone()
     }
 
+    pub(crate) fn cached_bbox(&self, index: i32, crop: bool) -> Option<page::Rectangle> {
+        let size = self.page_size(index)?;
+        let full_page = page::Rectangle::new(0.0, 0.0, size.width, size.height);
+        Some(if crop {
+            self.imp()
+                .bbox_cache
+                .borrow()
+                .get(&index)
+                .copied()
+                .unwrap_or(full_page)
+        } else {
+            full_page
+        })
+    }
+
     pub(crate) fn search(&self) -> Rc<RefCell<crate::search::Search>> {
         self.imp().search.clone()
     }

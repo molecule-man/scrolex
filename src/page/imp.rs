@@ -871,14 +871,7 @@ impl Page {
     }
 
     fn lookup_bbox(&self, page: &PageInfo, crop: bool) -> Option<Rectangle> {
-        if !crop {
-            return Some(Rectangle::new(0.0, 0.0, page.width, page.height));
-        }
-        self.document()
-            .bbox_cache()
-            .borrow()
-            .get(&page.index)
-            .copied()
+        self.document().cached_bbox(page.index, crop)
     }
 
     // Log when a page draws something different than last time. Getting worse while the zoom stays
