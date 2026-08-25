@@ -324,8 +324,10 @@ impl DocumentView {
         for candidate in self.panes() {
             if candidate == *pane {
                 candidate.add_css_class("active-pane");
+                candidate.remove_css_class("inactive-pane");
             } else {
                 candidate.remove_css_class("active-pane");
+                candidate.add_css_class("inactive-pane");
             }
         }
         self.active_pane.replace(Some(pane.clone()));
@@ -358,6 +360,7 @@ impl DocumentView {
         let pane = DocumentPane::new(self.document());
         pane.set_hexpand(true);
         pane.set_vexpand(true);
+        pane.add_css_class("inactive-pane");
         pane.viewport().set_crop(crop);
         pane.viewport()
             .set_animate_scroll(self.primary_pane().viewport().animate_scroll());
@@ -371,6 +374,8 @@ impl DocumentView {
             let paned = gtk::Paned::new(gtk::Orientation::Horizontal);
             paned.set_hexpand(true);
             paned.set_vexpand(true);
+            paned.set_wide_handle(true);
+            paned.add_css_class("document-split");
             self.paned.replace(Some(paned.clone()));
             paned
         };
@@ -1084,7 +1089,12 @@ mod tests {
                 .is_some_and(|pane| pane.viewport().page() == 1 && pane.viewport_width() > 0.0)
         });
         let secondary = imp.secondary.borrow().as_ref().unwrap().clone();
+        let paned = imp.split_container();
+        assert!(paned.has_css_class("document-split"));
+        assert_eq!(paned.width() - source.width() - secondary.width(), 10);
         assert_eq!(imp.active_pane(), source);
+        assert!(source.has_css_class("active-pane"));
+        assert!(secondary.has_css_class("inactive-pane"));
         assert_eq!(source.viewport().zoom(), secondary.viewport().zoom());
         assert!((source.vertical_position() - source_vertical).abs() <= 1.0);
 
@@ -1099,10 +1109,14 @@ mod tests {
         );
         wait_until(|| imp.primary_pane().viewport().page() == 2);
         assert_eq!(imp.active_pane(), secondary);
+        assert!(source.has_css_class("inactive-pane"));
+        assert!(secondary.has_css_class("active-pane"));
 
         imp.close_pane(&secondary);
         assert!(imp.secondary.borrow().is_none());
         assert_eq!(imp.active_pane(), imp.primary_pane());
+        assert!(source.has_css_class("active-pane"));
+        assert!(!source.has_css_class("inactive-pane"));
         window.close();
     }
 
