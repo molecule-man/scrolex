@@ -1,19 +1,21 @@
 // One pane's navigation and viewport/render coordination.
 use std::cell::{Cell, OnceCell, RefCell};
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use glib::clone;
 use glib::subclass::InitializingObject;
 use gtk::gdk::{EventSequence, Key, ModifierType, BUTTON_PRIMARY};
 use gtk::glib::closure_local;
 use gtk::glib::subclass::prelude::*;
-use gtk::glib::subclass::types::ObjectSubclassIsExt;
+use gtk::glib::subclass::Signal;
 use gtk::subclass::prelude::*;
 use gtk::{glib, CompositeTemplate, ListView, ScrolledWindow, SingleSelection};
 use gtk::{prelude::*, GestureClick};
 
 use super::{ReaderKeyContext, ZoomChoice, ZoomChoiceAction};
 use crate::document::Document;
+use crate::links::{DocumentLocation, LinkRequest};
 use crate::page;
 use crate::viewport::Viewport;
 
@@ -41,6 +43,8 @@ const WHEEL_NOTCH: f64 = 1.0;
 const WHEEL_TRIGGER: f64 = 0.2;
 // Touchpad pixels per notch, used to scale a pinch's pixel travel onto the wheel's zoom rate.
 const TOUCHPAD_NOTCH: f64 = 40.0;
+const LOCATION_STABLE_FRAMES: u8 = 4;
+const LOCATION_TIMEOUT: Duration = Duration::from_secs(2);
 
 // Time constant of the kinetic scroll that continues a touchpad swipe after the fingers lift. Travel
 // lift-off speed times this, so a brisk swipe covers a couple of pages. It also sets how fast the
@@ -110,6 +114,13 @@ struct WidthFit {
     first_top: f64,
 }
 
+#[derive(Clone, Copy)]
+struct PendingLocation {
+    location: DocumentLocation,
+    deadline: Instant,
+    stable_frames: u8,
+}
+
 // One pane's page list and input state.
 #[derive(CompositeTemplate, Default)]
 #[template(resource = "/com/andr2i/scrolex/document_pane.ui")]
@@ -131,6 +142,8 @@ pub struct DocumentPane {
     pub pan_scroll: TemplateChild<gtk::EventControllerScroll>,
     #[template_child]
     pub listview: TemplateChild<ListView>,
+    #[template_child]
+    pub close_button: TemplateChild<gtk::Button>,
     drag_coords: RefCell<Option<(f64, f64)>>,
     drag_cursor: RefCell<Option<gtk::gdk::Cursor>>,
 
@@ -198,6 +211,9 @@ pub struct DocumentPane {
 
     // Page and position from when this pane left the screen.
     hidden_at: Cell<Option<(u32, f64)>>,
+
+    pending_location: Cell<Option<PendingLocation>>,
+    location_tick_active: Cell<bool>,
 }
 
 // A document point held still across a zoom: which page, where in it (page points from its
@@ -273,6 +289,15 @@ impl ObjectImpl for DocumentPane {
         });
     }
 
+    fn signals() -> &'static [Signal] {
+        static SIGNALS: OnceLock<Vec<Signal>> = OnceLock::new();
+        SIGNALS.get_or_init(|| {
+            vec![Signal::builder("link-activated")
+                .param_types([LinkRequest::static_type()])
+                .build()]
+        })
+    }
+
     fn properties() -> &'static [glib::ParamSpec] {
         static PROPERTIES: OnceLock<Vec<glib::ParamSpec>> = OnceLock::new();
         PROPERTIES.get_or_init(|| {
@@ -317,13 +342,17 @@ impl DocumentPane {
     fn on_factory_setup(&self, list_item: &gtk::ListItem) {
         let page = &page::Page::new(self.viewport());
 
-        let obj = self.obj().clone();
+        let obj = self.obj();
         page.connect_closure(
-            "named-link-clicked",
+            "internal-link-clicked",
             false,
-            closure_local!(move |_: &crate::page::Page, page_num: i32| {
-                obj.imp().goto_page(page_num as u32);
-            }),
+            closure_local!(
+                #[weak]
+                obj,
+                move |_: &crate::page::Page, request: LinkRequest| {
+                    obj.emit_by_name::<()>("link-activated", &[&request]);
+                }
+            ),
         );
 
         page.connect_map(clone!(
@@ -899,17 +928,11 @@ impl DocumentPane {
         let first = page_range_start(n_pages, selected, count)?;
         let paper_points = (first..first + count).try_fold(0.0, |sum, index| {
             let index = i32::try_from(index).ok()?;
-            let size = self.document().page_size(index)?;
-            let width = if self.viewport().crop() {
-                self.document()
-                    .bbox_cache()
-                    .borrow()
-                    .get(&index)
-                    .map(|bbox| bbox.size().0)
-                    .unwrap_or(size.width)
-            } else {
-                size.width
-            };
+            let width = self
+                .document()
+                .page_bounds(index, self.viewport().crop())?
+                .size()
+                .0;
             Some(sum + width)
         })?;
         let viewport = self.scrolledwindow.hadjustment().page_size();
@@ -1318,6 +1341,134 @@ impl DocumentPane {
         self.navigate_to_page(page_num);
     }
 
+    pub(super) fn navigate_to_location(&self, location: DocumentLocation) {
+        let Some(selection) = self.ensure_ready_selection() else {
+            return;
+        };
+        let last = u32::try_from(self.document().n_pages())
+            .unwrap_or(0)
+            .saturating_sub(1);
+        let page = u32::try_from(location.page).unwrap_or(0).min(last);
+        let location = DocumentLocation {
+            page: page as i32,
+            ..location
+        };
+
+        self.cancel_scroll_motion();
+        self.pending_location.set(Some(PendingLocation {
+            location,
+            deadline: Instant::now() + LOCATION_TIMEOUT,
+            stable_frames: 0,
+        }));
+        if selection.n_items() == last + 1 {
+            self.scroll_to_location_page(page);
+        }
+        self.start_location_tick();
+    }
+
+    fn scroll_to_location_page(&self, page: u32) {
+        self.expect_hscroll("link-location");
+        self.listview.scroll_to(
+            page,
+            gtk::ListScrollFlags::SELECT | gtk::ListScrollFlags::FOCUS,
+            None,
+        );
+    }
+
+    pub(super) fn follow_link(&self, source_page: i32, location: DocumentLocation) {
+        if self.ensure_ready_selection().is_none() {
+            return;
+        }
+        if source_page != location.page {
+            self.viewport()
+                .jump_list_add(u32::try_from(source_page).unwrap_or(0) + 1);
+        }
+        self.navigate_to_location(location);
+    }
+
+    fn start_location_tick(&self) {
+        if self.location_tick_active.replace(true) {
+            return;
+        }
+        self.obj().add_tick_callback(clone!(
+            #[weak(rename_to = imp)]
+            self,
+            #[upgrade_or]
+            glib::ControlFlow::Break,
+            move |_, _| imp.apply_pending_location()
+        ));
+    }
+
+    fn apply_pending_location(&self) -> glib::ControlFlow {
+        let Some(mut pending) = self.pending_location.get() else {
+            self.location_tick_active.set(false);
+            return glib::ControlFlow::Break;
+        };
+        if Instant::now() >= pending.deadline {
+            self.pending_location.set(None);
+            self.location_tick_active.set(false);
+            return glib::ControlFlow::Break;
+        }
+        let location = pending.location;
+        let page_count = u32::try_from(self.document().n_pages()).unwrap_or(0);
+        if self.selection.n_items() != page_count {
+            return glib::ControlFlow::Continue;
+        }
+        if self.viewport().page() as i32 != location.page {
+            self.scroll_to_location_page(location.page as u32);
+            return glib::ControlFlow::Continue;
+        }
+        let hadj = self.scrolledwindow.hadjustment();
+        let vadj = self.vscrolledwindow.vadjustment();
+        if hadj.page_size() <= 0.0 || vadj.page_size() <= 0.0 {
+            return glib::ControlFlow::Continue;
+        }
+        let Some(page) = self.mapped_page(location.page) else {
+            return glib::ControlFlow::Continue;
+        };
+        let Some((left, top)) = self.page_origin(&page) else {
+            return glib::ControlFlow::Continue;
+        };
+        let Some(crop) = self
+            .document()
+            .page_bounds(location.page, self.viewport().crop())
+        else {
+            return glib::ControlFlow::Continue;
+        };
+        let x = location.x.map(|x| x.clamp(crop.x1, crop.x2));
+        let y = location.y.map(|y| y.clamp(crop.y1, crop.y2));
+        let zoom = self.viewport().zoom();
+        let horizontal = match x {
+            Some(x) if f64::from(page.width()) > hadj.page_size() + 1.0 => {
+                hadj.value() + left + (x - crop.x1) * zoom
+            }
+            _ => reveal_interval(
+                hadj.value(),
+                left,
+                left + f64::from(page.width()),
+                hadj.page_size(),
+            ),
+        };
+        let vertical = y.map_or(vadj.value(), |y| vadj.value() + top + (y - crop.y1) * zoom);
+        let horizontal = clamp_adjustment(&hadj, horizontal);
+        let vertical = clamp_adjustment(&vadj, vertical);
+        self.set_hscroll(horizontal, "link-location");
+        vadj.set_value(vertical);
+
+        if (hadj.value() - horizontal).abs() <= 0.5 && (vadj.value() - vertical).abs() <= 0.5 {
+            pending.stable_frames += 1;
+            if pending.stable_frames >= LOCATION_STABLE_FRAMES {
+                self.pending_location.set(None);
+                self.location_tick_active.set(false);
+                return glib::ControlFlow::Break;
+            }
+        } else {
+            pending.stable_frames = 0;
+        }
+        self.pending_location.set(Some(pending));
+        glib::ControlFlow::Continue
+    }
+
     // same as goto_page, but doesn't add to jump list
     fn navigate_to_page(&self, page_num: u32) {
         let Some(selection) = self.ensure_ready_selection() else {
@@ -1328,6 +1479,7 @@ impl DocumentPane {
         let page_num = page_num.min(selection.n_items());
 
         self.cancel_scroll_motion();
+        self.pending_location.set(None);
         self.expect_hscroll("goto-page");
         self.listview.scroll_to(
             page_num.saturating_sub(1),
@@ -1599,9 +1751,7 @@ impl DocumentPane {
     }
 
     fn clamp_scroll(&self, value: f64) -> f64 {
-        let hadj = self.scrolledwindow.hadjustment();
-        let lower = hadj.lower();
-        value.clamp(lower, (hadj.upper() - hadj.page_size()).max(lower))
+        clamp_adjustment(&self.scrolledwindow.hadjustment(), value)
     }
 
     // Move an older target into the hadjustment's current coordinates. Measuring page widths changes
@@ -1660,6 +1810,7 @@ impl DocumentPane {
     }
 
     pub(crate) fn clear_model(&self) {
+        self.pending_location.set(None);
         self.model.remove_all();
     }
 
@@ -2162,6 +2313,23 @@ impl DocumentPane {
         }
     }
 
+    pub(super) fn reveal_page_horizontally(&self, index: i32) {
+        let Some(page) = self.mapped_page(index) else {
+            return;
+        };
+        let Some((left, _)) = self.page_origin(&page) else {
+            return;
+        };
+        let hadj = self.scrolledwindow.hadjustment();
+        let target = reveal_interval(
+            hadj.value(),
+            left,
+            left + f64::from(page.width()),
+            hadj.page_size(),
+        );
+        self.set_hscroll(clamp_adjustment(&hadj, target), "split-reveal");
+    }
+
     pub(super) fn jump_back(&self) {
         if let Some(page) = self.viewport().jump_list_back(self.viewport().page() + 1) {
             self.navigate_to_page(page);
@@ -2307,8 +2475,26 @@ fn hscrollbar_reserve(scroller: &gtk::ScrolledWindow) -> f64 {
     })
 }
 
-fn fit_width_zoom(viewport: f64, paper_points: f64, gaps: f64) -> Option<f64> {
+pub(crate) fn fit_width_zoom(viewport: f64, paper_points: f64, gaps: f64) -> Option<f64> {
     (viewport > gaps && paper_points > 0.0).then(|| (viewport - gaps) / paper_points)
+}
+
+fn clamp_adjustment(adjustment: &gtk::Adjustment, value: f64) -> f64 {
+    let lower = adjustment.lower();
+    value.clamp(
+        lower,
+        (adjustment.upper() - adjustment.page_size()).max(lower),
+    )
+}
+
+fn reveal_interval(value: f64, start: f64, end: f64, viewport: f64) -> f64 {
+    if start < 0.0 {
+        value + start
+    } else if end > viewport {
+        value + end - viewport
+    } else {
+        value
+    }
 }
 
 fn width_fit_range(fractions: &[f64]) -> std::ops::Range<usize> {
@@ -2764,17 +2950,69 @@ mod tests {
 
 #[cfg(test)]
 mod widget_tests {
-    use super::{anchored_scroll, KINETIC_MIN_VELOCITY};
+    use super::{anchored_scroll, PendingLocation, KINETIC_MIN_VELOCITY};
+    use crate::links::DocumentLocation;
     use crate::test_support::{loaded_window, type_zoom, wait_until, window};
     use crate::viewport::zoom_percent_text;
     use gtk::prelude::*;
     use gtk::subclass::prelude::ObjectSubclassIsExt;
 
+    #[gtk::test]
+    fn link_location_lands_at_the_viewport_origin_after_allocation() {
+        let window = loaded_window();
+        let pane = window.pane();
+        let imp = pane.imp();
+        imp.viewport().zoom_to(3.0);
+        wait_until(|| {
+            imp.mapped_page(0).is_some_and(|page| {
+                f64::from(page.width()) > imp.scrolledwindow.hadjustment().page_size()
+            })
+        });
+
+        imp.navigate_to_location(DocumentLocation {
+            page: 0,
+            x: Some(100.0),
+            y: Some(100.0),
+        });
+        wait_until(|| imp.pending_location.get().is_none());
+
+        let page = imp.mapped_page(0).unwrap();
+        let (left, top) = imp.page_origin(&page).unwrap();
+        assert!((left + 300.0).abs() <= 1.0, "target x is {}", left + 300.0);
+        assert!((top + 300.0).abs() <= 1.0, "target y is {}", top + 300.0);
+        window.close();
+    }
+
+    #[gtk::test]
+    fn expired_link_location_stops_its_tick() {
+        let window = loaded_window();
+        let pane = window.pane();
+        let imp = pane.imp();
+        imp.pending_location.set(Some(PendingLocation {
+            location: DocumentLocation {
+                page: i32::MAX,
+                x: Some(0.0),
+                y: Some(0.0),
+            },
+            deadline: std::time::Instant::now(),
+            stable_frames: 0,
+        }));
+        imp.location_tick_active.set(true);
+
+        let result = imp.apply_pending_location();
+
+        assert_eq!(result, glib::ControlFlow::Break);
+        assert!(imp.pending_location.get().is_none());
+        assert!(!imp.location_tick_active.get());
+        window.close();
+    }
+
     // The page it left on, so the restore has something to aim at.
     #[gtk::test]
     fn hiding_a_view_records_where_the_reader_was() {
         let window = loaded_window();
-        let imp = window.pane().imp();
+        let pane = window.pane();
+        let imp = pane.imp();
         imp.selection.set_selected(2);
         wait_until(|| window.viewport().page() == 2);
         assert!(imp.hidden_at.get().is_none(), "nothing recorded on screen");
@@ -2807,7 +3045,8 @@ mod widget_tests {
     #[gtk::test]
     fn vertical_flick_coasts_when_the_page_is_taller_than_the_viewport() {
         let window = window();
-        let imp = window.pane().imp();
+        let pane = window.pane();
+        let imp = pane.imp();
         let vadj = imp.vscrolledwindow.vadjustment();
         vadj.configure(0.0, 0.0, 2000.0, 10.0, 100.0, 500.0);
 
@@ -2820,7 +3059,8 @@ mod widget_tests {
     #[gtk::test]
     fn a_page_that_fits_the_viewport_has_nothing_to_coast() {
         let window = window();
-        let imp = window.pane().imp();
+        let pane = window.pane();
+        let imp = pane.imp();
         let vadj = imp.vscrolledwindow.vadjustment();
         // page_size must not exceed `upper`; GtkAdjustment drops the whole call if it does
         vadj.configure(0.0, 0.0, 400.0, 10.0, 100.0, 400.0);
@@ -2834,7 +3074,8 @@ mod widget_tests {
     #[gtk::test]
     fn a_pinch_stops_both_coasts() {
         let window = window();
-        let imp = window.pane().imp();
+        let pane = window.pane();
+        let imp = pane.imp();
         let vadj = imp.vscrolledwindow.vadjustment();
         vadj.configure(0.0, 0.0, 2000.0, 10.0, 100.0, 500.0);
         imp.handle_decelerate(-1500.0, -1500.0);
@@ -2852,7 +3093,8 @@ mod widget_tests {
     #[gtk::test]
     fn a_pinch_leaves_a_page_slide_running() {
         let window = window();
-        let imp = window.pane().imp();
+        let pane = window.pane();
+        let imp = pane.imp();
         *imp.scroll_anim.borrow_mut() = Some(super::ScrollAnim {
             anchor_x: Some(0.0),
             last_target: 100.0,
@@ -2891,7 +3133,8 @@ mod widget_tests {
     #[gtk::test]
     fn a_coordinate_rewrite_carries_the_slide_target_with_it() {
         let window = window();
-        let imp = window.pane().imp();
+        let pane = window.pane();
+        let imp = pane.imp();
         slide(imp, 50_000.0, 50_677.0);
         let anim = imp.scroll_anim.borrow().expect("slide armed");
 
@@ -2903,7 +3146,8 @@ mod widget_tests {
     #[gtk::test]
     fn a_coordinate_rewrite_does_not_reverse_prefetch() {
         let window = window();
-        let imp = window.pane().imp();
+        let pane = window.pane();
+        let imp = pane.imp();
         let hadj = imp.scrolledwindow.hadjustment();
         hadj.configure(500.0, 0.0, 2000.0, 10.0, 100.0, 500.0);
         imp.viewport().set_scroll_forward(true);
@@ -2919,7 +3163,8 @@ mod widget_tests {
     #[gtk::test]
     fn a_retarget_advances_from_the_rebased_target() {
         let window = window();
-        let imp = window.pane().imp();
+        let pane = window.pane();
+        let imp = pane.imp();
         imp.viewport().set_animate_scroll(true);
         slide(imp, 50_000.0, 50_677.0);
 
@@ -2938,7 +3183,8 @@ mod widget_tests {
     #[gtk::test]
     fn a_slow_vertical_lift_off_does_not_coast() {
         let window = window();
-        let imp = window.pane().imp();
+        let pane = window.pane();
+        let imp = pane.imp();
         let vadj = imp.vscrolledwindow.vadjustment();
         vadj.configure(0.0, 0.0, 2000.0, 10.0, 100.0, 500.0);
 
@@ -2954,7 +3200,8 @@ mod widget_tests {
     #[gtk::test]
     fn scroll_controller_runs_before_gtk_coasts() {
         let window = window();
-        let imp = window.pane().imp();
+        let pane = window.pane();
+        let imp = pane.imp();
         let ours = imp.pan_scroll.get();
 
         assert_eq!(ours.propagation_phase(), gtk::PropagationPhase::Capture);
@@ -3015,7 +3262,8 @@ mod widget_tests {
         ));
         window.load(&fixture);
 
-        let imp = window.pane().imp();
+        let pane = window.pane();
+        let imp = pane.imp();
         wait_until(|| imp.mapped_page(0).is_some());
         let page = imp.mapped_page(0).unwrap();
         let (left, top) = imp.page_origin(&page).unwrap();
@@ -3135,7 +3383,8 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
     fn width_fit_aligns_the_visible_range_without_slots() {
         let window = window();
         window.present();
-        let imp = window.pane().imp();
+        let pane = window.pane();
+        let imp = pane.imp();
         window.load(&mixed_heights_document());
         wait_until(|| imp.selection.n_items() == 3);
 
@@ -3175,7 +3424,8 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
     fn width_fit_aligns_when_the_target_exceeds_the_zoom_limit() {
         let window = window();
         window.present();
-        let imp = window.pane().imp();
+        let pane = window.pane();
+        let imp = pane.imp();
         window.load(&narrow_page_document());
         wait_until(|| imp.mapped_page(0).is_some());
 
@@ -3195,7 +3445,8 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
     #[gtk::test]
     fn a_fitted_page_fills_the_viewport_exactly() {
         let window = loaded_window();
-        let imp = window.pane().imp();
+        let pane = window.pane();
+        let imp = pane.imp();
 
         imp.viewport().set_fit_height(true);
         wait_until(|| !imp.fit_pending.get());
@@ -3207,7 +3458,8 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
     #[gtk::test]
     fn a_fitted_page_without_horizontal_overflow_fills_the_viewport() {
         let window = loaded_window();
-        let imp = window.pane().imp();
+        let pane = window.pane();
+        let imp = pane.imp();
         imp.viewport().set_fit_height(true);
 
         window.load(&one_page_document());
@@ -3303,7 +3555,8 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
     #[gtk::test]
     fn fit_keeps_cached_chrome_without_a_mapped_selected_page() {
         let window = loaded_window();
-        let imp = window.pane().imp();
+        let pane = window.pane();
+        let imp = pane.imp();
         imp.viewport().set_fit_height(true);
         wait_until(|| !imp.fit_pending.get());
         let chrome = imp.fit_chrome_height.get().expect("a cached chrome");
@@ -3333,7 +3586,8 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
     #[gtk::test]
     fn turning_fit_off_restores_the_manual_zoom() {
         let window = loaded_window();
-        let imp = window.pane().imp();
+        let pane = window.pane();
+        let imp = pane.imp();
         imp.viewport().zoom_to(2.0);
 
         imp.viewport().set_fit_height(true);
@@ -3349,7 +3603,8 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
     #[gtk::test]
     fn entering_the_displayed_fit_zoom_restores_fit_height() {
         let window = loaded_window();
-        let imp = window.pane().imp();
+        let pane = window.pane();
+        let imp = pane.imp();
         imp.viewport().set_fit_height(true);
         wait_until(|| !imp.fit_pending.get());
         let fit_zoom = zoom_percent_text(imp.viewport().zoom());
@@ -3372,7 +3627,8 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
     #[gtk::test]
     fn cropping_does_not_move_the_fit() {
         let window = loaded_window();
-        let imp = window.pane().imp();
+        let pane = window.pane();
+        let imp = pane.imp();
 
         imp.viewport().set_fit_height(true);
         wait_until(|| !imp.fit_pending.get());
@@ -3391,7 +3647,8 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
     #[gtk::test]
     fn a_shorter_viewport_queues_a_re_fit() {
         let window = loaded_window();
-        let imp = window.pane().imp();
+        let pane = window.pane();
+        let imp = pane.imp();
 
         imp.viewport().set_fit_height(true);
         wait_until(|| !imp.fit_pending.get());
@@ -3414,7 +3671,8 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
     #[gtk::test]
     fn a_zoom_of_the_readers_own_ends_fit_height() {
         let window = loaded_window();
-        let imp = window.pane().imp();
+        let pane = window.pane();
+        let imp = pane.imp();
 
         let zooms: [&dyn Fn(); 4] = [
             &|| imp.zoom_in(),
@@ -3437,7 +3695,8 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
     #[gtk::test]
     fn manual_zoom_from_fit_keeps_its_anchor() {
         let window = loaded_window();
-        let imp = window.pane().imp();
+        let pane = window.pane();
+        let imp = pane.imp();
         imp.viewport().zoom_to(2.0);
         imp.viewport().set_fit_height(true);
         wait_until(|| !imp.fit_pending.get());
@@ -3456,7 +3715,8 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
     fn the_tallest_page_sets_the_fit_for_every_page() {
         let window = window();
         window.present();
-        let imp = window.pane().imp();
+        let pane = window.pane();
+        let imp = pane.imp();
         imp.viewport().set_fit_height(true);
 
         window.load(&mixed_heights_document());
@@ -3509,7 +3769,8 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
     #[gtk::test]
     fn a_jump_to_the_current_page_is_not_recorded() {
         let window = loaded_window();
-        let imp = window.pane().imp();
+        let pane = window.pane();
+        let imp = pane.imp();
 
         imp.goto_page(1);
         assert_eq!(
@@ -3539,7 +3800,8 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         window.set_default_size(500, 400);
         window.present();
         window.load(&gtk::gio::File::for_path(path));
-        let imp = window.pane().imp();
+        let pane = window.pane();
+        let imp = pane.imp();
         wait_until(|| imp.mapped_page(0).is_some());
 
         imp.viewport().zoom_to(10.0);
@@ -3603,7 +3865,8 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
     #[gtk::test]
     fn pinch_keeps_its_document_point_and_follows_the_gesture_center() {
         let window = window();
-        let imp = window.pane().imp();
+        let pane = window.pane();
+        let imp = pane.imp();
         imp.zoom_gesture_base.set(1.0);
         imp.zoom_anchor.set(Some(super::ZoomAnchor {
             page: 3,
@@ -3624,7 +3887,8 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
     #[gtk::test]
     fn zoom_at_a_bound_does_not_leave_a_stale_pointer_anchor() {
         let window = window();
-        let imp = window.pane().imp();
+        let pane = window.pane();
+        let imp = pane.imp();
         imp.viewport().zoom_to(f64::MAX);
         imp.zoom_anchor.set(Some(super::ZoomAnchor {
             page: 0,
@@ -3642,7 +3906,8 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
     fn ctrl_plus_minus_and_equal_zoom() {
         use gtk::gdk::{Key, ModifierType};
         let window = window();
-        let imp = window.pane().imp();
+        let pane = window.pane();
+        let imp = pane.imp();
         let ctrl = ModifierType::CONTROL_MASK;
 
         for key in [Key::plus, Key::equal, Key::KP_Add] {
@@ -3680,7 +3945,8 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         ));
         window.load(&fixture);
 
-        let imp = window.pane().imp();
+        let pane = window.pane();
+        let imp = pane.imp();
         wait_until(|| imp.mapped_page(0).is_some());
         let page = imp.mapped_page(0).unwrap();
         let (left, top) = imp.page_origin(&page).unwrap();
@@ -3720,7 +3986,8 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
     fn ctrl_zero_resets_zoom() {
         use gtk::gdk::{Key, ModifierType};
         let window = window();
-        let imp = window.pane().imp();
+        let pane = window.pane();
+        let imp = pane.imp();
         let ctrl = ModifierType::CONTROL_MASK;
 
         for key in [Key::_0, Key::KP_0] {

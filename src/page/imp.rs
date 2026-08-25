@@ -19,7 +19,7 @@ use once_cell::sync::Lazy;
 
 use super::Rectangle;
 use crate::bg_job::{RenderPool, RenderPriority};
-use crate::links::LinkTarget;
+use crate::links::{LinkAction, LinkRequest, LinkTarget};
 use crate::selection::PageSelection;
 
 // Max bytes in one page buffer. A whole page is rendered at once, so the buffer grows with the
@@ -324,8 +324,8 @@ impl ObjectImpl for Page {
     fn signals() -> &'static [Signal] {
         static SIGNALS: OnceLock<Vec<Signal>> = OnceLock::new();
         SIGNALS.get_or_init(|| {
-            vec![Signal::builder("named-link-clicked")
-                .param_types([i32::static_type()])
+            vec![Signal::builder("internal-link-clicked")
+                .param_types([LinkRequest::static_type()])
                 .build()]
         })
     }
@@ -587,22 +587,24 @@ impl Page {
 
         // indicates that we have "borrowed" global page cursor
         let cursor = Cell::new(false);
+        let tooltip_visible = Rc::new(Cell::new(false));
 
         motion_controller.connect_motion(clone!(
             #[strong]
             obj,
             #[weak(rename_to = imp)]
             self,
+            #[strong]
+            tooltip_visible,
             move |_, x, y| {
-                let Point { x, y } = undo_zoom_and_crop(&obj, x, y);
-                if imp
-                    .document()
-                    .imp()
-                    .links
-                    .borrow_mut()
-                    .get_link(&obj.uri(), obj.index(), x, y)
-                    .is_some()
-                {
+                let target = imp.link_at(&obj, x, y);
+                let visible = matches!(target, Some(LinkTarget::Location(_)));
+                if tooltip_visible.replace(visible) != visible {
+                    obj.set_tooltip_text(
+                        visible.then_some("Middle click opens beside. Right click opens a menu."),
+                    );
+                }
+                if target.is_some() {
                     if !imp.cursor_guard.get() {
                         obj.set_cursor_from_name(Some("pointer"));
                         imp.cursor_guard.set(true);
@@ -618,6 +620,17 @@ impl Page {
                 }
             }
         ));
+        motion_controller.connect_leave(clone!(
+            #[strong]
+            obj,
+            #[strong]
+            tooltip_visible,
+            move |_| {
+                if tooltip_visible.replace(false) {
+                    obj.set_tooltip_text(None);
+                }
+            }
+        ));
         obj.add_controller(motion_controller);
 
         let gc = gtk::GestureClick::builder().button(BUTTON_PRIMARY).build();
@@ -628,31 +641,136 @@ impl Page {
             #[weak(rename_to = imp)]
             self,
             move |gc, _n_press, x, y| {
-                let Point { x, y } = undo_zoom_and_crop(&obj, x, y);
-
-                if let Some(link_target) =
-                    imp.document()
-                        .imp()
-                        .links
-                        .borrow_mut()
-                        .get_link(&obj.uri(), obj.index(), x, y)
-                {
+                if let Some(link_target) = imp.link_at(&obj, x, y) {
                     match link_target {
-                        LinkTarget::Page(page_num) => {
-                            gc.set_state(gtk::EventSequenceState::Claimed); // stop the event from propagating
-                            obj.emit_by_name::<()>("named-link-clicked", &[page_num]);
+                        LinkTarget::Location(location) => {
+                            gc.set_state(gtk::EventSequenceState::Claimed);
+                            let action = if gc
+                                .current_event_state()
+                                .contains(gtk::gdk::ModifierType::CONTROL_MASK)
+                            {
+                                LinkAction::OpenInNewTab
+                            } else {
+                                LinkAction::Open
+                            };
+                            Self::emit_link(&obj, location, action);
                         }
-                        LinkTarget::Uri(uri) => {
-                            let _ = gtk::gio::AppInfo::launch_default_for_uri(
-                                uri,
-                                gtk::gio::AppLaunchContext::NONE,
-                            );
-                        }
+                        LinkTarget::Uri(uri) => Self::open_uri(&uri),
                     }
                 };
             }
         ));
         obj.add_controller(gc);
+
+        let middle_start = Rc::new(RefCell::new(None::<(f64, f64, LinkTarget)>));
+        let middle = gtk::GestureClick::builder().button(2).build();
+        middle.connect_pressed(clone!(
+            #[strong]
+            obj,
+            #[weak(rename_to = imp)]
+            self,
+            #[strong]
+            middle_start,
+            move |_, _, x, y| {
+                let target = imp.link_at(&obj, x, y);
+                middle_start.replace(target.map(|target| (x, y, target)));
+            }
+        ));
+        middle.connect_released(clone!(
+            #[strong]
+            obj,
+            #[strong]
+            middle_start,
+            move |gesture, _, x, y| {
+                let Some((start_x, start_y, target)) = middle_start.take() else {
+                    return;
+                };
+                if (x - start_x).hypot(y - start_y) > 8.0 {
+                    return;
+                }
+                match target {
+                    LinkTarget::Location(location) => {
+                        gesture.set_state(gtk::EventSequenceState::Claimed);
+                        Self::emit_link(&obj, location, LinkAction::OpenBeside);
+                    }
+                    LinkTarget::Uri(uri) => Self::open_uri(&uri),
+                }
+            }
+        ));
+        obj.add_controller(middle);
+
+        let context = gtk::GestureClick::builder().button(3).build();
+        context.connect_pressed(clone!(
+            #[strong]
+            obj,
+            #[weak(rename_to = imp)]
+            self,
+            move |gesture, _, x, y| {
+                let target = imp.link_at(&obj, x, y);
+                let Some(LinkTarget::Location(location)) = target else {
+                    return;
+                };
+                gesture.set_state(gtk::EventSequenceState::Claimed);
+                let popover = gtk::Popover::new();
+                let actions = gtk::Box::new(gtk::Orientation::Vertical, 0);
+                for (label, action) in [
+                    ("Open Link", LinkAction::Open),
+                    ("Open Link Beside", LinkAction::OpenBeside),
+                    ("Open Link in New Tab", LinkAction::OpenInNewTab),
+                ] {
+                    let button = gtk::Button::builder()
+                        .label(label)
+                        .has_frame(false)
+                        .halign(gtk::Align::Fill)
+                        .build();
+                    button.connect_clicked(clone!(
+                        #[strong]
+                        obj,
+                        #[weak]
+                        popover,
+                        move |_| {
+                            popover.popdown();
+                            Self::emit_link(&obj, location, action);
+                        }
+                    ));
+                    actions.append(&button);
+                }
+                popover.set_child(Some(&actions));
+                popover.set_parent(&obj);
+                popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(
+                    x.round() as i32,
+                    y.round() as i32,
+                    1,
+                    1,
+                )));
+                popover.connect_closed(|popover| popover.unparent());
+                popover.popup();
+            }
+        ));
+        obj.add_controller(context);
+    }
+
+    fn link_at(&self, obj: &super::Page, x: f64, y: f64) -> Option<LinkTarget> {
+        let point = undo_zoom_and_crop(obj, x, y);
+        self.document()
+            .imp()
+            .links
+            .borrow_mut()
+            .get_link(&obj.uri(), obj.index(), point.x, point.y)
+            .cloned()
+    }
+
+    fn emit_link(obj: &super::Page, location: crate::links::DocumentLocation, action: LinkAction) {
+        let request = LinkRequest {
+            source_page: obj.index(),
+            location,
+            action,
+        };
+        obj.emit_by_name::<()>("internal-link-clicked", &[&request]);
+    }
+
+    fn open_uri(uri: &str) {
+        let _ = gtk::gio::AppInfo::launch_default_for_uri(uri, gtk::gio::AppLaunchContext::NONE);
     }
 
     fn get_bbox(&self, page: &PageInfo, crop: bool) -> Rectangle {
@@ -1996,6 +2114,18 @@ struct PageInfo {
     index: i32,
     width: f64,
     height: f64,
+}
+
+pub(crate) fn crop_box(uri: &str, index: i32, width: f64, height: f64) -> Rectangle {
+    get_bbox(
+        uri,
+        &PageInfo {
+            index,
+            width,
+            height,
+        },
+        true,
+    )
 }
 
 fn get_bbox(uri: &str, page: &PageInfo, crop: bool) -> Rectangle {

@@ -6,6 +6,7 @@ use gtk::prelude::*;
 use gtk::{gio, glib};
 
 use crate::document::Document;
+use crate::links::DocumentLocation;
 use crate::viewport::Viewport;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -26,6 +27,18 @@ enum ZoomChoiceAction {
     FitHeight(f64),
     FitPages { first: i32, count: usize, zoom: f64 },
     FitVisible,
+}
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct HorizontalChrome {
+    pub pane: f64,
+    pub row: f64,
+}
+
+impl HorizontalChrome {
+    pub(crate) fn total(self) -> f64 {
+        self.pane + self.row
+    }
 }
 
 glib::wrapper! {
@@ -74,6 +87,66 @@ impl DocumentPane {
         self.imp().scrolledwindow.clone()
     }
 
+    pub(crate) fn close_button(&self) -> gtk::Button {
+        self.imp().close_button.clone()
+    }
+
+    pub(crate) fn set_close_visible(&self, visible: bool) {
+        self.imp().close_button.set_visible(visible);
+    }
+
+    pub(crate) fn release_renders(&self) {
+        let viewport = self.viewport().id();
+        crate::page::set_wanted_pages(self.document().id(), viewport, None);
+        crate::page::clear_full_renders(viewport);
+        self.clear_render_pins();
+    }
+
+    pub(crate) fn clear_render_pins(&self) {
+        self.document()
+            .render_cache()
+            .borrow_mut()
+            .clear_pins(self.viewport().id());
+    }
+
+    pub(crate) fn paper_width(&self, page: i32) -> Option<f64> {
+        self.document()
+            .page_bounds(page, self.viewport().crop())
+            .map(|bbox| bbox.size().0)
+    }
+
+    pub(crate) fn apply_split_zoom(&self, zoom: f64) {
+        self.viewport().set_fit_height(false);
+        self.viewport().fit_zoom_to(zoom);
+    }
+
+    pub(crate) fn vertical_position(&self) -> f64 {
+        self.imp().vscrolledwindow.vadjustment().value()
+    }
+
+    pub(crate) fn restore_vertical_position(&self, value: f64) {
+        self.imp().vscrolledwindow.vadjustment().set_value(value);
+    }
+
+    pub(crate) fn reveal_page_horizontally(&self, page: i32) {
+        self.imp().reveal_page_horizontally(page);
+    }
+
+    pub(crate) fn horizontal_chrome(&self, page: i32) -> Option<HorizontalChrome> {
+        let page = self.imp().mapped_page(page)?;
+        let row = page.parent()?;
+        let row_width = row.measure(gtk::Orientation::Horizontal, -1).1;
+        let page_width = page.measure(gtk::Orientation::Horizontal, -1).1;
+        Some(HorizontalChrome {
+            pane: (f64::from(self.width()) - self.viewport_width()).max(0.0),
+            row: (f64::from(row_width) - f64::from(page_width)).max(0.0),
+        })
+    }
+
+    pub(crate) fn viewport_width(&self) -> f64 {
+        self.imp().scrolledwindow.hadjustment().page_size()
+    }
+
     pub(crate) fn redraw_page(&self, index: i32) {
         self.imp().redraw_page(index);
     }
@@ -120,6 +193,14 @@ impl DocumentPane {
         self.imp().goto_page(page_num);
     }
 
+    pub fn navigate_to_location(&self, location: DocumentLocation) {
+        self.imp().navigate_to_location(location);
+    }
+
+    pub(crate) fn follow_link(&self, source_page: i32, location: DocumentLocation) {
+        self.imp().follow_link(source_page, location);
+    }
+
     pub fn apply_zoom_percent(&self, percent: f64) {
         self.imp().apply_zoom_percent(percent);
     }
@@ -143,3 +224,5 @@ impl DocumentPane {
         self.imp().redraw_pages();
     }
 }
+
+pub(crate) use imp::fit_width_zoom;

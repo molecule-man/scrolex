@@ -32,6 +32,47 @@
 	min-height: 1px;
 }
 
+.document-split .active-pane {
+	box-shadow: inset 0 0 0 2px @accent_color;
+}
+
+#main .inactive-pane row {
+	background-color: #666;
+}
+
+#main.dark-mode .inactive-pane row {
+	background-color: #101010;
+}
+
+.document-split > separator {
+	padding: 0 3px 0 2px;
+	border: none;
+	background-color: shade(@window_bg_color, 0.75);
+	background-image: linear-gradient(
+		to bottom,
+		transparent 0,
+		transparent 1px,
+		white 1px,
+		white 3px,
+		transparent 3px,
+		transparent 6px,
+		white 6px,
+		white 8px,
+		transparent 8px,
+		transparent 11px,
+		white 11px,
+		white 13px,
+		transparent 13px
+	);
+	background-size: 6px 14px;
+	background-repeat: no-repeat;
+	background-position: 50% 50%;
+}
+
+.document-split > separator:hover {
+	background-color: alpha(@accent_color, 0.3);
+}
+
 .loading-overlay {
 	padding: 24px 32px;
 	border-radius: 12px;

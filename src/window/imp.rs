@@ -1,6 +1,8 @@
 // Window chrome: the header bar, the settings menu, and the file chooser. The document itself
 // lives in DocumentView.
 use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
+use std::rc::Rc;
 use std::sync::OnceLock;
 
 use glib::clone;
@@ -11,6 +13,7 @@ use gtk::subclass::prelude::*;
 use gtk::{glib, Button, CompositeTemplate, ToggleButton};
 
 use crate::document_view::{DocumentView, ReaderKeyContext};
+use crate::links::{DocumentLocation, LinkRequest};
 
 // Tabs stop being a useful way to hold documents well before this. The cap also limits each
 // document's render state and widget tree.
@@ -33,6 +36,8 @@ pub struct Window {
     pub btn_add_tab: TemplateChild<Button>,
     #[template_child]
     pub btn_menu_add_tab: TemplateChild<Button>,
+    #[template_child]
+    pub btn_menu_split_view: TemplateChild<Button>,
     #[template_child]
     pub btn_crop: TemplateChild<ToggleButton>,
     #[template_child]
@@ -66,6 +71,8 @@ pub struct Window {
 
     // Prevent global animate-scroll updates from calling each other.
     animate_scroll_sync: Cell<bool>,
+
+    animate_scroll_viewports: RefCell<HashSet<crate::viewport::ViewportId>>,
 
     // Prevent application-wide spin updates from saving the same value again.
     setting_controls_sync: Cell<bool>,
@@ -300,12 +307,7 @@ impl Window {
             .document()
             .set_render_threads(self.render_threads.get());
         let viewport = document.viewport();
-        viewport.set_animate_scroll(self.animate_scroll.get());
-        viewport.connect_animate_scroll_notify(clone!(
-            #[weak(rename_to = imp)]
-            self,
-            move |viewport| imp.apply_animate_scroll(viewport.animate_scroll())
-        ));
+        self.connect_animate_scroll(&viewport);
         document.connect_closure(
             "open-requested",
             false,
@@ -313,6 +315,31 @@ impl Window {
                 #[weak(rename_to = imp)]
                 self,
                 move |document: &DocumentView| imp.open_document_into(document)
+            ),
+        );
+        document.connect_closure(
+            "new-tab-location-requested",
+            false,
+            glib::closure_local!(
+                #[weak(rename_to = imp)]
+                self,
+                move |document: &DocumentView, request: LinkRequest| {
+                    imp.open_link_in_tab(document, request.location);
+                }
+            ),
+        );
+        document.connect_notify_local(
+            Some("viewport"),
+            clone!(
+                #[weak(rename_to = imp)]
+                self,
+                move |document, _| {
+                    let viewport = document.viewport();
+                    imp.connect_animate_scroll(&viewport);
+                    if imp.active_document().as_ref() == Some(document) {
+                        imp.bind_header_to_document(document);
+                    }
+                }
             ),
         );
 
@@ -326,6 +353,52 @@ impl Window {
         self.share_cache_budgets();
 
         Some(document)
+    }
+
+    fn connect_animate_scroll(&self, viewport: &crate::viewport::Viewport) {
+        viewport.set_animate_scroll(self.animate_scroll.get());
+        if !self
+            .animate_scroll_viewports
+            .borrow_mut()
+            .insert(viewport.id())
+        {
+            return;
+        }
+        viewport.connect_animate_scroll_notify(clone!(
+            #[weak(rename_to = imp)]
+            self,
+            move |viewport| imp.apply_animate_scroll(viewport.animate_scroll())
+        ));
+    }
+
+    fn open_link_in_tab(&self, source: &DocumentView, location: DocumentLocation) {
+        let Some(document) = self.add_document() else {
+            return;
+        };
+        let pending = Rc::new(Cell::new(Some(location)));
+        let connection = Rc::new(RefCell::new(None));
+        let id = document.document().connect_closure(
+            "loaded",
+            false,
+            glib::closure_local!(
+                #[strong]
+                pending,
+                #[strong]
+                connection,
+                #[weak]
+                document,
+                move |state: crate::document::Document| {
+                    if let Some(location) = pending.take() {
+                        document.pane().navigate_to_location(location);
+                    }
+                    if let Some(id) = connection.take() {
+                        state.disconnect(id);
+                    }
+                }
+            ),
+        );
+        connection.replace(Some(id));
+        document.load(&gtk::gio::File::for_uri(&source.document().uri()));
     }
 
     // The window keeps one document at all times, so the last tab does not close. The notebook
@@ -455,7 +528,9 @@ impl Window {
         self.animate_scroll_sync.set(true);
         self.animate_scroll.set(animate_scroll);
         for document in self.documents() {
-            document.viewport().set_animate_scroll(animate_scroll);
+            for viewport in document.viewports() {
+                viewport.set_animate_scroll(animate_scroll);
+            }
         }
         self.animate_scroll_sync.set(false);
     }
@@ -553,6 +628,11 @@ impl Window {
                 .sync_create()
                 .build(),
             document
+                .bind_property("split-open", &*self.btn_menu_split_view, "sensitive")
+                .transform_to(|_, split_open: bool| Some(!split_open))
+                .sync_create()
+                .build(),
+            document
                 .document()
                 .bind_property("uri", &*self.obj(), "title")
                 .transform_to(|_, uri: String| Some(window_title(&uri)))
@@ -593,6 +673,14 @@ impl Window {
     fn menu_add_tab(&self, btn: &Button) {
         dismiss_menu(btn);
         self.add_tab();
+    }
+
+    #[template_callback]
+    fn menu_split_view(&self, btn: &Button) {
+        dismiss_menu(btn);
+        if let Some(document) = self.active_document() {
+            document.split_here();
+        }
     }
 
     // Fill an idle empty tab instead of adding another tab. Returns false if tab limit is reached.
@@ -806,8 +894,10 @@ impl Window {
             imp.animate_scroll.set(enabled);
         }
         for document in self.application_documents() {
-            if document.viewport().animate_scroll() != enabled {
-                document.viewport().set_animate_scroll(enabled);
+            for viewport in document.viewports() {
+                if viewport.animate_scroll() != enabled {
+                    viewport.set_animate_scroll(enabled);
+                }
             }
         }
         for window in windows {
@@ -1652,6 +1742,26 @@ mod widget_tests {
     }
 
     #[gtk::test]
+    fn split_menu_button_tracks_the_active_document() {
+        let window = loaded_window();
+        let header = window.header();
+        let first = header.active_document().expect("a document");
+        assert!(header.btn_menu_split_view.is_sensitive());
+
+        first.split_here();
+        wait_until(|| first.property::<bool>("split-open"));
+        assert!(!header.btn_menu_split_view.is_sensitive());
+
+        let second = header.add_document().expect("a tab");
+        assert!(header.btn_menu_split_view.is_sensitive());
+        header.notebook.set_current_page(Some(0));
+        assert!(!header.btn_menu_split_view.is_sensitive());
+
+        header.close_document(&second);
+        window.close();
+    }
+
+    #[gtk::test]
     fn global_settings_apply_to_every_document() {
         let window = loaded_window();
         let first = window.header().active_document().expect("first document");
@@ -1671,6 +1781,20 @@ mod widget_tests {
         window.header().obj().apply_dark_mode(false);
         assert!(first.document().doc_epoch() > first_epoch);
         assert!(second.document().doc_epoch() > second_epoch);
+        window.close();
+    }
+
+    #[gtk::test]
+    fn animate_scroll_connects_once_per_viewport() {
+        let window = loaded_window();
+        let header = window.header();
+        let viewport = window.viewport();
+        let before = header.animate_scroll_viewports.borrow().len();
+
+        header.connect_animate_scroll(&viewport);
+        header.connect_animate_scroll(&viewport);
+
+        assert_eq!(header.animate_scroll_viewports.borrow().len(), before);
         window.close();
     }
 
@@ -1778,7 +1902,8 @@ mod widget_tests {
     #[gtk::test]
     fn page_jump_icon_ignores_a_half_filled_model() {
         let window = loaded_window();
-        let imp = window.pane().imp();
+        let pane = window.pane();
+        let imp = pane.imp();
         let entry = window.header().entry_page_num.get();
 
         imp.model.remove_all();

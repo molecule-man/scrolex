@@ -34,12 +34,12 @@ impl DocumentView {
         self.imp().document()
     }
 
-    pub fn viewport(&self) -> &Viewport {
-        self.pane().viewport()
+    pub fn viewport(&self) -> Viewport {
+        self.imp().active_pane().viewport().clone()
     }
 
     pub fn selection(&self) -> gtk::SingleSelection {
-        self.pane().selection()
+        self.imp().active_pane().selection()
     }
 
     pub fn load(&self, file: &gio::File) {
@@ -47,7 +47,7 @@ impl DocumentView {
     }
 
     pub fn save_position(&self) -> std::io::Result<()> {
-        self.viewport().save_position()
+        self.imp().primary_pane().viewport().save_position()
     }
 
     pub fn is_loading(&self) -> bool {
@@ -55,47 +55,51 @@ impl DocumentView {
     }
 
     pub fn zoom_in(&self) {
-        self.pane().zoom_in();
+        self.imp().active_pane().zoom_in();
     }
 
     pub fn zoom_out(&self) {
-        self.pane().zoom_out();
+        self.imp().active_pane().zoom_out();
     }
 
     pub fn fit_width(&self) {
-        self.pane().fit_width();
+        self.imp().active_pane().fit_width();
     }
 
     pub fn reset_zoom(&self) {
-        self.pane().reset_zoom();
+        self.imp().active_pane().reset_zoom();
     }
 
     pub(crate) fn zoom_choices(&self) -> Vec<ZoomChoice> {
-        self.pane().zoom_choices()
+        self.imp().active_pane().zoom_choices()
     }
 
     pub(crate) fn apply_zoom_choice(&self, choice: &ZoomChoice) {
-        self.pane().apply_zoom_choice(choice);
+        self.imp().active_pane().apply_zoom_choice(choice);
     }
 
     pub fn jump_back(&self) {
-        self.pane().jump_back();
+        self.imp().active_pane().jump_back();
     }
 
     pub fn jump_forward(&self) {
-        self.pane().jump_forward();
+        self.imp().active_pane().jump_forward();
     }
 
     pub fn goto_page(&self, page_num: u32) {
-        self.pane().goto_page(page_num);
+        self.imp().active_pane().goto_page(page_num);
     }
 
     pub fn apply_zoom_percent(&self, percent: f64) {
-        self.pane().apply_zoom_percent(percent);
+        self.imp().active_pane().apply_zoom_percent(percent);
     }
 
     pub fn open_search(&self) {
         self.imp().open_search();
+    }
+
+    pub fn split_here(&self) {
+        self.imp().split_here();
     }
 
     pub fn handle_search_key(
@@ -116,14 +120,25 @@ impl DocumentView {
     }
 
     pub fn target_page(&self, page_num: u32) -> Option<u32> {
-        self.pane().target_page(page_num)
+        self.imp().active_pane().target_page(page_num)
     }
 
     pub fn redraw_pages(&self) {
-        self.pane().redraw_pages();
+        self.imp().redraw_pages();
+    }
+
+    pub(crate) fn viewports(&self) -> Vec<Viewport> {
+        self.imp()
+            .panes()
+            .into_iter()
+            .map(|pane| pane.viewport().clone())
+            .collect()
     }
 
     pub fn release_renders(&self) {
+        for pane in self.imp().panes() {
+            pane.clear_render_pins();
+        }
         crate::page::clear_document_renders(self.document().id());
         self.document().clear_render_jobs();
     }
@@ -135,7 +150,7 @@ impl DocumentView {
             .show(self.root().and_downcast::<gtk::Window>().as_ref());
     }
 
-    pub(crate) fn pane(&self) -> &DocumentPane {
-        self.imp().pane()
+    pub(crate) fn pane(&self) -> DocumentPane {
+        self.imp().primary_pane()
     }
 }

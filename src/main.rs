@@ -22,8 +22,27 @@ use scrolex::window;
 
 const APP_ID: &str = "com.andr2i.scrolex";
 const RELEASE_NOTICE_TITLE: &str = "What's New";
-const RELEASE_NOTICE_BODY: &str = "Dark mode is now available.\n\nOpen the Settings menu in the top-right corner and turn on Dark Mode.";
 const RELEASE_NOTICE_BUTTON: &str = "Got It";
+const SPLIT_VIEW_NOTICE_REVISION: u32 = 2;
+
+struct ReleaseNotice {
+    revision: u32,
+    title: &'static str,
+    body: &'static str,
+}
+
+const RELEASE_NOTICES: &[ReleaseNotice] = &[
+    ReleaseNotice {
+        revision: config::DARK_MODE_NOTICE_REVISION,
+        title: "Dark Mode",
+        body: "Recolor document pages for comfortable reading in low light while preserving their original hues.\n\nOpen the Settings menu and turn on Dark Mode.",
+    },
+    ReleaseNotice {
+        revision: SPLIT_VIEW_NOTICE_REVISION,
+        title: "Split View",
+        body: "Research without losing context. Open a second view to check a table, image, or reference on another page.\n\nPress s or select Open Split View in the Settings menu. Or middle-click an internal link to open its destination beside the current page.",
+    },
+];
 
 extern "C" {
     // POSIX _exit: terminate immediately without running atexit handlers or C++ static destructors
@@ -275,14 +294,14 @@ fn build_ui(app: &Application, args: &[OsString], file: Option<&gtk::gio::File>)
 }
 
 fn show_release_notice(window: &window::Window) {
-    let notice = release_notice_id();
-    if config::load_config().dismissed_notice == Some(notice) {
+    let revision = config::load_config().notice_revision;
+    let Some((detail, shown_revision)) = release_notice_text(revision) else {
         return;
-    }
+    };
 
     gtk::AlertDialog::builder()
         .message(RELEASE_NOTICE_TITLE)
-        .detail(RELEASE_NOTICE_BODY)
+        .detail(detail)
         .buttons([RELEASE_NOTICE_BUTTON])
         .default_button(0)
         .cancel_button(0)
@@ -291,12 +310,12 @@ fn show_release_notice(window: &window::Window) {
             Some(window),
             None::<&gtk::gio::Cancellable>,
             move |result| {
-                if result.is_err() {
+                if !notice_was_seen(&result) {
                     return;
                 }
 
                 let mut settings = config::load_config();
-                settings.dismissed_notice = Some(notice);
+                settings.notice_revision = settings.notice_revision.max(shown_revision);
                 if let Err(err) = config::save_config(&settings) {
                     eprintln!("Error saving config: {err}");
                 }
@@ -304,23 +323,25 @@ fn show_release_notice(window: &window::Window) {
         );
 }
 
-fn release_notice_id() -> u64 {
-    content_id(&[
-        RELEASE_NOTICE_TITLE,
-        RELEASE_NOTICE_BODY,
-        RELEASE_NOTICE_BUTTON,
-    ])
+fn notice_was_seen(result: &Result<i32, gtk::glib::Error>) -> bool {
+    match result {
+        Ok(_) => true,
+        Err(err) => err.kind::<gtk::DialogError>() != Some(gtk::DialogError::Failed),
+    }
 }
 
-fn content_id(parts: &[&str]) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-    for part in parts {
-        for byte in part.bytes().chain(std::iter::once(0)) {
-            hash ^= u64::from(byte);
-            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-    }
-    hash
+fn release_notice_text(saved_revision: u32) -> Option<(String, u32)> {
+    let notices: Vec<_> = RELEASE_NOTICES
+        .iter()
+        .filter(|notice| notice.revision > saved_revision)
+        .collect();
+    let shown_revision = notices.last()?.revision;
+    let detail = notices
+        .iter()
+        .map(|notice| format!("— {} —\n{}", notice.title, notice.body))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    Some((detail, shown_revision))
 }
 
 #[cfg(test)]
@@ -355,20 +376,38 @@ mod tests {
     }
 
     #[test]
-    fn release_notice_id_is_stable_and_content_based() {
-        let id = release_notice_id();
-        assert_eq!(id, release_notice_id());
-        assert_ne!(
-            id,
-            content_id(&["Changed", RELEASE_NOTICE_BODY, RELEASE_NOTICE_BUTTON])
-        );
-        assert_ne!(
-            id,
-            content_id(&[RELEASE_NOTICE_TITLE, "Changed", RELEASE_NOTICE_BUTTON])
-        );
-        assert_ne!(
-            id,
-            content_id(&[RELEASE_NOTICE_TITLE, RELEASE_NOTICE_BODY, "Changed"])
-        );
+    fn unseen_notices_are_combined() {
+        let (text, revision) = release_notice_text(0).unwrap();
+
+        assert!(text.contains("— Dark Mode —"));
+        assert!(text.contains("— Split View —"));
+        assert_eq!(revision, SPLIT_VIEW_NOTICE_REVISION);
+    }
+
+    #[test]
+    fn dark_mode_users_see_only_the_split_view_notice() {
+        let (text, revision) = release_notice_text(config::DARK_MODE_NOTICE_REVISION).unwrap();
+
+        assert!(!text.contains("Dark Mode"));
+        assert!(text.contains("Split View"));
+        assert_eq!(revision, SPLIT_VIEW_NOTICE_REVISION);
+    }
+
+    #[test]
+    fn current_users_see_no_notice() {
+        assert!(release_notice_text(SPLIT_VIEW_NOTICE_REVISION).is_none());
+    }
+
+    #[test]
+    fn only_a_dialog_that_never_appeared_is_unseen() {
+        assert!(notice_was_seen(&Ok(0)));
+        assert!(notice_was_seen(&Err(gtk::glib::Error::new(
+            gtk::DialogError::Dismissed,
+            "window closed",
+        ))));
+        assert!(!notice_was_seen(&Err(gtk::glib::Error::new(
+            gtk::DialogError::Failed,
+            "dialog did not show",
+        ))));
     }
 }
