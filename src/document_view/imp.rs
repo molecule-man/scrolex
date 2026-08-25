@@ -2,6 +2,7 @@ use std::cell::{Cell, OnceCell, RefCell};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+use futures::channel::oneshot;
 use futures::StreamExt;
 use glib::clone;
 use glib::subclass::InitializingObject;
@@ -111,6 +112,9 @@ impl DocumentView {
     }
 
     pub(crate) fn load(&self, file: &gtk::gio::File) {
+        self.split_generation
+            .set(self.split_generation.get().wrapping_add(1));
+        self.split_geometry_pending.set(false);
         let secondary = self.secondary.borrow().clone();
         if let Some(secondary) = secondary {
             self.close_pane(&secondary);
@@ -383,6 +387,7 @@ impl DocumentView {
         self.register_toc_close(&pane);
         pane.finish_document_load();
         pane.viewport().set_crop(crop);
+        pane.set_sensitive(!self.loading_spinner.is_spinning());
         let existing = self.paned.borrow().clone();
         let paned = if let Some(paned) = existing {
             paned
@@ -423,7 +428,71 @@ impl DocumentView {
         let generation = self.split_generation.get().wrapping_add(1);
         self.split_generation.set(generation);
         self.split_geometry_pending.set(true);
-        self.apply_beside(source, source_page, location, generation);
+        self.resolve_beside_crop(source, source_page, location, generation);
+    }
+
+    fn resolve_beside_crop(
+        &self,
+        source: &DocumentPane,
+        source_page: i32,
+        location: DocumentLocation,
+        generation: u64,
+    ) {
+        if !source.viewport().crop() {
+            self.apply_beside(source, source_page, location, generation);
+            return;
+        }
+
+        let cache = self.document().bbox_cache();
+        let uri = self.document().uri();
+        let mut missing = Vec::new();
+        for page in [source_page, location.page] {
+            if missing.iter().any(|(index, _, _)| *index == page)
+                || cache.borrow().contains_key(&page)
+            {
+                continue;
+            }
+            if let Some(size) = self.document().page_size(page) {
+                missing.push((page, size.width, size.height));
+            }
+        }
+        if missing.is_empty() {
+            self.apply_beside(source, source_page, location, generation);
+            return;
+        }
+
+        self.loading_spinner.start();
+        self.loading_overlay.set_visible(true);
+        let (sender, receiver) = oneshot::channel();
+        std::thread::spawn(move || {
+            let boxes: Vec<_> = missing
+                .into_iter()
+                .map(|(page, width, height)| {
+                    (page, crate::page::crop_box(&uri, page, width, height))
+                })
+                .collect();
+            let _ = sender.send(boxes);
+        });
+
+        let source = source.clone();
+        glib::spawn_future_local(clone!(
+            #[weak(rename_to = imp)]
+            self,
+            async move {
+                let Ok(boxes) = receiver.await else {
+                    if imp.split_generation.get() == generation {
+                        imp.split_geometry_pending.set(false);
+                        imp.hide_loading();
+                    }
+                    return;
+                };
+                if imp.split_generation.get() != generation {
+                    return;
+                }
+                imp.document().bbox_cache().borrow_mut().extend(boxes);
+                imp.apply_beside(&source, source_page, location, generation);
+            }
+        ));
     }
 
     fn apply_beside(
@@ -537,6 +606,8 @@ impl DocumentView {
                 if Instant::now() >= deadline {
                     source.restore_vertical_position(source_vertical);
                     source.reveal_page_horizontally(source_page);
+                    target.set_sensitive(true);
+                    imp.hide_loading();
                     imp.split_geometry_pending.set(false);
                     return glib::ControlFlow::Break;
                 }
@@ -559,6 +630,8 @@ impl DocumentView {
                 }
                 source.restore_vertical_position(source_vertical);
                 source.reveal_page_horizontally(source_page);
+                target.set_sensitive(true);
+                imp.hide_loading();
                 imp.split_geometry_pending.set(false);
                 glib::ControlFlow::Break
             }
@@ -568,6 +641,9 @@ impl DocumentView {
     fn close_pane(&self, pane: &DocumentPane) {
         if self.secondary.borrow().is_none() {
             return;
+        }
+        if self.split_geometry_pending.get() {
+            self.hide_loading();
         }
         self.split_generation
             .set(self.split_generation.get().wrapping_add(1));
@@ -1343,8 +1419,13 @@ mod tests {
                 y: Some(0.0),
             },
         );
+        assert!(window.is_loading());
+        assert!(imp.secondary.borrow().is_none());
+        wait_until(|| imp.secondary.borrow().is_some());
         let secondary = imp.secondary.borrow().as_ref().unwrap().clone();
         wait_until(|| secondary.viewport().page() == 2 && !imp.split_geometry_pending.get());
+        assert!(!window.is_loading());
+        assert!(secondary.is_sensitive());
 
         let paper_width = window
             .document()

@@ -117,13 +117,8 @@ impl DocumentPane {
         let size = self.document().page_size(page)?;
         if self.viewport().crop() {
             let cache = self.document().bbox_cache();
-            if let Some(bbox) = cache.borrow().get(&page) {
-                return Some(bbox.size().0);
-            }
-            let bbox = crate::page::crop_box(&self.document().uri(), page, size.width, size.height);
-            let width = bbox.size().0;
-            cache.borrow_mut().insert(page, bbox);
-            Some(width)
+            let width = cache.borrow().get(&page).map(|bbox| bbox.size().0);
+            width
         } else {
             Some(size.width)
         }
