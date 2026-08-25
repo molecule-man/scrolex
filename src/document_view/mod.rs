@@ -146,7 +146,7 @@ impl DocumentView {
             .show(self.root().and_downcast::<gtk::Window>().as_ref());
     }
 
-    pub(crate) fn pane(&self) -> &DocumentPane {
+    pub(crate) fn pane(&self) -> DocumentPane {
         self.imp().pane()
     }
 }

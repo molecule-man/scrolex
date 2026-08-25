@@ -593,12 +593,15 @@ impl Page {
 
         // indicates that we have "borrowed" global page cursor
         let cursor = Cell::new(false);
+        let tooltip_visible = Rc::new(Cell::new(false));
 
         motion_controller.connect_motion(clone!(
             #[strong]
             obj,
             #[weak(rename_to = imp)]
             self,
+            #[strong]
+            tooltip_visible,
             move |_, x, y| {
                 let Point { x, y } = undo_zoom_and_crop(&obj, x, y);
                 let target = imp
@@ -609,10 +612,12 @@ impl Page {
                     .get_link(&obj.uri(), obj.index(), x, y)
                     .cloned();
                 if target.is_some() {
-                    if matches!(target, Some(LinkTarget::Location(_))) {
-                        obj.set_tooltip_text(Some("Middle click: open beside this page"));
-                    } else {
-                        obj.set_tooltip_text(None);
+                    let visible = matches!(target, Some(LinkTarget::Location(_)));
+                    if tooltip_visible.replace(visible) != visible {
+                        obj.set_tooltip_text(
+                            visible
+                                .then_some("Middle click opens beside. Right click opens a menu."),
+                        );
                     }
                     if !imp.cursor_guard.get() {
                         obj.set_cursor_from_name(Some("pointer"));
@@ -622,12 +627,25 @@ impl Page {
                     return;
                 }
 
-                obj.set_tooltip_text(None);
+                if tooltip_visible.replace(false) {
+                    obj.set_tooltip_text(None);
+                }
 
                 if Cell::get(&cursor) {
                     obj.set_cursor(None);
                     imp.cursor_guard.set(false);
                     cursor.set(false);
+                }
+            }
+        ));
+        motion_controller.connect_leave(clone!(
+            #[strong]
+            obj,
+            #[strong]
+            tooltip_visible,
+            move |_| {
+                if tooltip_visible.replace(false) {
+                    obj.set_tooltip_text(None);
                 }
             }
         ));
@@ -667,8 +685,8 @@ impl Page {
                                 &[
                                     &obj.index(),
                                     &location.page,
-                                    &location.x,
-                                    &location.y,
+                                    &location.x.unwrap_or(f64::NAN),
+                                    &location.y.unwrap_or(f64::NAN),
                                     &action,
                                 ],
                             );
@@ -726,8 +744,8 @@ impl Page {
                             &[
                                 &obj.index(),
                                 &location.page,
-                                &location.x,
-                                &location.y,
+                                &location.x.unwrap_or(f64::NAN),
+                                &location.y.unwrap_or(f64::NAN),
                                 &1_i32,
                             ],
                         );
@@ -786,8 +804,8 @@ impl Page {
                                 &[
                                     &obj.index(),
                                     &location.page,
-                                    &location.x,
-                                    &location.y,
+                                    &location.x.unwrap_or(f64::NAN),
+                                    &location.y.unwrap_or(f64::NAN),
                                     &action,
                                 ],
                             );

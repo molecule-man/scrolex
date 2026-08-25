@@ -1,6 +1,7 @@
 // Window chrome: the header bar, the settings menu, and the file chooser. The document itself
 // lives in DocumentView.
 use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::OnceLock;
 
@@ -68,6 +69,8 @@ pub struct Window {
 
     // Prevent global animate-scroll updates from calling each other.
     animate_scroll_sync: Cell<bool>,
+
+    animate_scroll_viewports: RefCell<HashSet<crate::viewport::ViewportId>>,
 
     // Prevent application-wide spin updates from saving the same value again.
     setting_controls_sync: Cell<bool>,
@@ -302,12 +305,7 @@ impl Window {
             .document()
             .set_render_threads(self.render_threads.get());
         let viewport = document.viewport();
-        viewport.set_animate_scroll(self.animate_scroll.get());
-        viewport.connect_animate_scroll_notify(clone!(
-            #[weak(rename_to = imp)]
-            self,
-            move |viewport| imp.apply_animate_scroll(viewport.animate_scroll())
-        ));
+        self.connect_animate_scroll(&viewport);
         document.connect_closure(
             "open-requested",
             false,
@@ -324,7 +322,14 @@ impl Window {
                 #[weak(rename_to = imp)]
                 self,
                 move |document: &DocumentView, page: i32, x: f64, y: f64| {
-                    imp.open_link_in_tab(document, DocumentLocation { page, x, y });
+                    imp.open_link_in_tab(
+                        document,
+                        DocumentLocation {
+                            page,
+                            x: (!x.is_nan()).then_some(x),
+                            y: (!y.is_nan()).then_some(y),
+                        },
+                    );
                 }
             ),
         );
@@ -335,12 +340,7 @@ impl Window {
                 self,
                 move |document, _| {
                     let viewport = document.viewport();
-                    viewport.set_animate_scroll(imp.animate_scroll.get());
-                    viewport.connect_animate_scroll_notify(clone!(
-                        #[weak]
-                        imp,
-                        move |viewport| imp.apply_animate_scroll(viewport.animate_scroll())
-                    ));
+                    imp.connect_animate_scroll(&viewport);
                     if imp.active_document().as_ref() == Some(document) {
                         imp.bind_header_to_document(document);
                     }
@@ -358,6 +358,22 @@ impl Window {
         self.share_cache_budgets();
 
         Some(document)
+    }
+
+    fn connect_animate_scroll(&self, viewport: &crate::viewport::Viewport) {
+        viewport.set_animate_scroll(self.animate_scroll.get());
+        if !self
+            .animate_scroll_viewports
+            .borrow_mut()
+            .insert(viewport.id())
+        {
+            return;
+        }
+        viewport.connect_animate_scroll_notify(clone!(
+            #[weak(rename_to = imp)]
+            self,
+            move |viewport| imp.apply_animate_scroll(viewport.animate_scroll())
+        ));
     }
 
     fn open_link_in_tab(&self, source: &DocumentView, location: DocumentLocation) {
@@ -1734,6 +1750,20 @@ mod widget_tests {
     }
 
     #[gtk::test]
+    fn animate_scroll_connects_once_per_viewport() {
+        let window = loaded_window();
+        let header = window.header();
+        let viewport = window.viewport();
+        let before = header.animate_scroll_viewports.borrow().len();
+
+        header.connect_animate_scroll(&viewport);
+        header.connect_animate_scroll(&viewport);
+
+        assert_eq!(header.animate_scroll_viewports.borrow().len(), before);
+        window.close();
+    }
+
+    #[gtk::test]
     fn application_windows_keep_settings_and_cache_in_sync() {
         init();
         let warnings = portal_warning_count();
@@ -1837,7 +1867,8 @@ mod widget_tests {
     #[gtk::test]
     fn page_jump_icon_ignores_a_half_filled_model() {
         let window = loaded_window();
-        let imp = window.pane().imp();
+        let pane = window.pane();
+        let imp = pane.imp();
         let entry = window.header().entry_page_num.get();
 
         imp.model.remove_all();

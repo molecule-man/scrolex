@@ -1,5 +1,6 @@
 use std::cell::{Cell, OnceCell, RefCell};
 use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use glib::clone;
@@ -14,6 +15,7 @@ use crate::document_pane::DocumentPane;
 use crate::links::DocumentLocation;
 
 const SEARCH_DEBOUNCE_MS: u64 = 100;
+const SPLIT_GEOMETRY_TIMEOUT: Duration = Duration::from_secs(2);
 
 struct SplitTargetSize {
     viewport: f64,
@@ -24,7 +26,6 @@ struct SplitTargetSize {
 #[template(resource = "/com/andr2i/scrolex/document_view.ui")]
 pub struct DocumentView {
     document: OnceCell<crate::document::Document>,
-    pane: OnceCell<DocumentPane>,
     primary: RefCell<Option<DocumentPane>>,
     secondary: RefCell<Option<DocumentPane>>,
     active_pane: RefCell<Option<DocumentPane>>,
@@ -73,8 +74,8 @@ impl ObjectSubclass for DocumentView {
 
 #[gtk::template_callbacks]
 impl DocumentView {
-    pub(crate) fn pane(&self) -> &DocumentPane {
-        self.pane.get().expect("a document view has a pane")
+    pub(crate) fn pane(&self) -> DocumentPane {
+        self.primary_pane()
     }
 
     pub(crate) fn active_pane(&self) -> DocumentPane {
@@ -110,7 +111,8 @@ impl DocumentView {
     }
 
     pub(crate) fn load(&self, file: &gtk::gio::File) {
-        if let Some(secondary) = self.secondary.borrow().clone() {
+        let secondary = self.secondary.borrow().clone();
+        if let Some(secondary) = secondary {
             self.close_pane(&secondary);
         }
         if self.document().n_pages() > 0 {
@@ -282,7 +284,16 @@ impl DocumentView {
                 #[weak(rename_to = imp)]
                 self,
                 move |pane: DocumentPane, source: i32, page: i32, x: f64, y: f64, action: i32| {
-                    imp.handle_link(&pane, source, DocumentLocation { page, x, y }, action);
+                    imp.handle_link(
+                        &pane,
+                        source,
+                        DocumentLocation {
+                            page,
+                            x: (!x.is_nan()).then_some(x),
+                            y: (!y.is_nan()).then_some(y),
+                        },
+                        action,
+                    );
                 }
             ),
         );
@@ -333,6 +344,7 @@ impl DocumentView {
         self.active_pane.replace(Some(pane.clone()));
         self.obj().notify("viewport");
         self.obj().notify("selection");
+        self.update_search_status();
     }
 
     fn handle_link(
@@ -347,7 +359,11 @@ impl DocumentView {
             1 => self.open_beside(source, source_page, location),
             2 => self.obj().emit_by_name::<()>(
                 "new-tab-location-requested",
-                &[&location.page, &location.x, &location.y],
+                &[
+                    &location.page,
+                    &location.x.unwrap_or(f64::NAN),
+                    &location.y.unwrap_or(f64::NAN),
+                ],
             ),
             _ => source.follow_link(source_page, location),
         }
@@ -508,6 +524,7 @@ impl DocumentView {
         let paned = self.split_container();
         let source = source.clone();
         let primary = self.primary_pane();
+        let deadline = Instant::now() + SPLIT_GEOMETRY_TIMEOUT;
         paned.add_tick_callback(clone!(
             #[weak(rename_to = imp)]
             self,
@@ -515,6 +532,12 @@ impl DocumentView {
             glib::ControlFlow::Break,
             move |paned, _| {
                 if imp.split_generation.get() != generation {
+                    return glib::ControlFlow::Break;
+                }
+                if Instant::now() >= deadline {
+                    source.restore_vertical_position(source_vertical);
+                    source.reveal_page_horizontally(source_page);
+                    imp.split_geometry_pending.set(false);
                     return glib::ControlFlow::Break;
                 }
                 if (f64::from(target.width()) - target_size.pane).abs() > 1.0 {
@@ -647,9 +670,9 @@ impl DocumentView {
         for page in pages {
             self.redraw_page(page);
         }
-        self.active_pane()
-            .viewport()
-            .set_current_search_result(None);
+        for pane in self.panes() {
+            pane.viewport().set_current_search_result(None);
+        }
         self.update_search_status();
         self.active_pane().focus_reader();
     }
@@ -691,9 +714,9 @@ impl DocumentView {
             search.query = query.clone();
             search.begin_sweep()
         };
-        self.active_pane()
-            .viewport()
-            .set_current_search_result(None);
+        for pane in self.panes() {
+            pane.viewport().set_current_search_result(None);
+        }
         for page in old_pages {
             self.redraw_page(page);
         }
@@ -919,9 +942,6 @@ impl ObjectImpl for DocumentView {
         self.document
             .set(document)
             .expect("one document per document view");
-        self.pane
-            .set(pane.clone())
-            .expect("one pane per document view");
         self.primary.replace(Some(pane.clone()));
         self.active_pane.replace(Some(pane.clone()));
         self.setup_pane(&pane);
@@ -1046,8 +1066,8 @@ mod tests {
             0,
             DocumentLocation {
                 page: 1,
-                x: 0.0,
-                y: 0.0,
+                x: Some(0.0),
+                y: Some(0.0),
             },
             0,
         );
@@ -1074,8 +1094,8 @@ mod tests {
             0,
             DocumentLocation {
                 page: 1,
-                x: 0.0,
-                y: 0.0,
+                x: Some(0.0),
+                y: Some(0.0),
             },
         );
         wait_until(|| {
@@ -1099,8 +1119,8 @@ mod tests {
             1,
             DocumentLocation {
                 page: 2,
-                x: 0.0,
-                y: 0.0,
+                x: Some(0.0),
+                y: Some(0.0),
             },
         );
         wait_until(|| imp.primary_pane().viewport().page() == 2);
@@ -1117,6 +1137,120 @@ mod tests {
     }
 
     #[gtk::test]
+    fn load_closes_an_open_split_without_a_borrow_panic() {
+        let window = loaded_window();
+        let imp = window.imp();
+        let source = imp.primary_pane();
+        imp.open_beside(
+            &source,
+            0,
+            DocumentLocation {
+                page: 1,
+                x: Some(0.0),
+                y: Some(0.0),
+            },
+        );
+        let file = gtk::gio::File::for_uri(&window.document().uri());
+
+        imp.load(&file);
+
+        assert!(imp.secondary.borrow().is_none());
+        window.close();
+    }
+
+    #[gtk::test]
+    fn split_zoom_preserves_the_manual_zoom() {
+        let window = loaded_window();
+        let imp = window.imp();
+        let source = imp.primary_pane();
+        source.viewport().zoom_to(4.0);
+        imp.open_beside(
+            &source,
+            0,
+            DocumentLocation {
+                page: 1,
+                x: Some(0.0),
+                y: Some(0.0),
+            },
+        );
+
+        assert_eq!(source.viewport().manual_zoom(), 4.0);
+        window.close();
+    }
+
+    #[gtk::test]
+    fn clear_search_resets_each_pane_result() {
+        let window = loaded_window();
+        let imp = window.imp();
+        let primary = imp.primary_pane();
+        imp.open_beside(
+            &primary,
+            0,
+            DocumentLocation {
+                page: 1,
+                x: Some(0.0),
+                y: Some(0.0),
+            },
+        );
+        let secondary = imp.secondary.borrow().as_ref().unwrap().clone();
+        primary.viewport().set_current_search_result(Some((0, 0)));
+        secondary.viewport().set_current_search_result(Some((1, 0)));
+
+        imp.clear_search();
+
+        assert_eq!(primary.viewport().current_search_result(), None);
+        assert_eq!(secondary.viewport().current_search_result(), None);
+        window.close();
+    }
+
+    #[gtk::test]
+    fn closing_the_primary_updates_the_pane_access() {
+        let window = loaded_window();
+        let imp = window.imp();
+        let primary = imp.primary_pane();
+        imp.open_beside(
+            &primary,
+            0,
+            DocumentLocation {
+                page: 1,
+                x: Some(0.0),
+                y: Some(0.0),
+            },
+        );
+        let secondary = imp.secondary.borrow().as_ref().unwrap().clone();
+
+        imp.close_pane(&primary);
+
+        assert_eq!(window.pane(), secondary);
+        assert_ne!(window.pane(), primary);
+        window.close();
+    }
+
+    #[gtk::test]
+    fn closing_a_split_releases_the_pane() {
+        let window = loaded_window();
+        let imp = window.imp();
+        let primary = imp.primary_pane();
+        imp.open_beside(
+            &primary,
+            0,
+            DocumentLocation {
+                page: 1,
+                x: Some(0.0),
+                y: Some(0.0),
+            },
+        );
+        let secondary = imp.secondary.borrow().as_ref().unwrap().clone();
+        let weak = secondary.downgrade();
+
+        imp.close_pane(&secondary);
+        drop(secondary);
+
+        assert!(weak.upgrade().is_none());
+        window.close();
+    }
+
+    #[gtk::test]
     fn beside_target_uses_the_source_crop_mode() {
         let window = loaded_window();
         let imp = window.imp();
@@ -1128,8 +1262,8 @@ mod tests {
             0,
             DocumentLocation {
                 page: 1,
-                x: 0.0,
-                y: 0.0,
+                x: Some(0.0),
+                y: Some(0.0),
             },
         );
         let secondary = imp.secondary.borrow().as_ref().unwrap().clone();
@@ -1142,8 +1276,8 @@ mod tests {
             1,
             DocumentLocation {
                 page: 2,
-                x: 0.0,
-                y: 0.0,
+                x: Some(0.0),
+                y: Some(0.0),
             },
         );
         wait_until(|| primary.viewport().page() == 2);
@@ -1166,8 +1300,8 @@ mod tests {
             0,
             DocumentLocation {
                 page: 1,
-                x: 0.0,
-                y: 0.0,
+                x: Some(0.0),
+                y: Some(0.0),
             },
         );
         let secondary = imp.secondary.borrow().as_ref().unwrap().clone();
@@ -1181,8 +1315,8 @@ mod tests {
             0,
             DocumentLocation {
                 page: 2,
-                x: 0.0,
-                y: 0.0,
+                x: Some(0.0),
+                y: Some(0.0),
             },
         );
         let secondary = imp.secondary.borrow().as_ref().unwrap().clone();
@@ -1205,8 +1339,8 @@ mod tests {
             0,
             DocumentLocation {
                 page: 2,
-                x: 0.0,
-                y: 0.0,
+                x: Some(0.0),
+                y: Some(0.0),
             },
         );
         let secondary = imp.secondary.borrow().as_ref().unwrap().clone();
@@ -1237,8 +1371,8 @@ mod tests {
             0,
             DocumentLocation {
                 page: 1,
-                x: 0.0,
-                y: 0.0,
+                x: Some(0.0),
+                y: Some(0.0),
             },
         );
         let secondary = imp.secondary.borrow().as_ref().unwrap().clone();
@@ -1259,8 +1393,8 @@ mod tests {
             1,
             DocumentLocation {
                 page: 2,
-                x: 0.0,
-                y: 0.0,
+                x: Some(0.0),
+                y: Some(0.0),
             },
         );
         wait_until(|| primary.viewport().page() == 2);

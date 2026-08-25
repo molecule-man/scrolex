@@ -131,7 +131,7 @@ impl DocumentPane {
 
     pub(crate) fn apply_split_zoom(&self, zoom: f64) {
         self.viewport().set_fit_height(false);
-        self.viewport().zoom_to(zoom);
+        self.viewport().fit_zoom_to(zoom);
     }
 
     pub(crate) fn vertical_position(&self) -> f64 {
