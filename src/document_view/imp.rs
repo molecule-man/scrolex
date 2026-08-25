@@ -1550,7 +1550,11 @@ mod tests {
         assert!(imp.secondary.borrow().is_none());
         wait_until(|| imp.secondary.borrow().is_some());
         let secondary = imp.secondary.borrow().as_ref().unwrap().clone();
-        wait_until(|| secondary.viewport().page() == 2 && !imp.split_geometry_pending.get());
+        wait_until(|| {
+            secondary.viewport().page() == 2
+                && !imp.split_geometry_pending.get()
+                && secondary.horizontal_chrome(2).is_some()
+        });
         assert!(!window.is_loading());
         assert!(secondary.is_sensitive());
 
