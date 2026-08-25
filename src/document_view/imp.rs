@@ -13,7 +13,7 @@ use gtk::{glib, prelude::*, CompositeTemplate, SearchEntry};
 
 use super::ReaderKeyContext;
 use crate::document_pane::DocumentPane;
-use crate::links::DocumentLocation;
+use crate::links::{DocumentLocation, LinkAction, LinkRequest};
 
 const SEARCH_DEBOUNCE_MS: u64 = 100;
 const SPLIT_GEOMETRY_TIMEOUT: Duration = Duration::from_secs(2);
@@ -287,17 +287,8 @@ impl DocumentView {
             glib::closure_local!(
                 #[weak(rename_to = imp)]
                 self,
-                move |pane: DocumentPane, source: i32, page: i32, x: f64, y: f64, action: i32| {
-                    imp.handle_link(
-                        &pane,
-                        source,
-                        DocumentLocation {
-                            page,
-                            x: (!x.is_nan()).then_some(x),
-                            y: (!y.is_nan()).then_some(y),
-                        },
-                        action,
-                    );
+                move |pane: DocumentPane, request: LinkRequest| {
+                    imp.handle_link(&pane, request);
                 }
             ),
         );
@@ -351,25 +342,16 @@ impl DocumentView {
         self.update_search_status();
     }
 
-    fn handle_link(
-        &self,
-        source: &DocumentPane,
-        source_page: i32,
-        location: DocumentLocation,
-        action: i32,
-    ) {
+    fn handle_link(&self, source: &DocumentPane, request: LinkRequest) {
         self.activate_pane(source);
-        match action {
-            1 => self.open_beside(source, source_page, location),
-            2 => self.obj().emit_by_name::<()>(
-                "new-tab-location-requested",
-                &[
-                    &location.page,
-                    &location.x.unwrap_or(f64::NAN),
-                    &location.y.unwrap_or(f64::NAN),
-                ],
-            ),
-            _ => source.follow_link(source_page, location),
+        match request.action {
+            LinkAction::Open => source.follow_link(request.source_page, request.location),
+            LinkAction::OpenBeside => {
+                self.open_beside(source, request.source_page, request.location)
+            }
+            LinkAction::OpenInNewTab => self
+                .obj()
+                .emit_by_name::<()>("new-tab-location-requested", &[&request]),
         }
     }
 
@@ -1097,7 +1079,7 @@ impl ObjectImpl for DocumentView {
             vec![
                 Signal::builder("open-requested").build(),
                 Signal::builder("new-tab-location-requested")
-                    .param_types([i32::static_type(), f64::static_type(), f64::static_type()])
+                    .param_types([LinkRequest::static_type()])
                     .build(),
             ]
         })
@@ -1120,7 +1102,7 @@ impl WidgetImpl for DocumentView {
 #[cfg(test)]
 mod tests {
     use super::split_zoom;
-    use crate::links::DocumentLocation;
+    use crate::links::{DocumentLocation, LinkAction, LinkRequest};
     use crate::test_support::{loaded_window, wait_until, window};
     use gtk::prelude::*;
     use gtk::subclass::prelude::ObjectSubclassIsExt;
@@ -1140,13 +1122,15 @@ mod tests {
 
         imp.handle_link(
             &pane,
-            0,
-            DocumentLocation {
-                page: 1,
-                x: Some(0.0),
-                y: Some(0.0),
+            LinkRequest {
+                source_page: 0,
+                location: DocumentLocation {
+                    page: 1,
+                    x: Some(0.0),
+                    y: Some(0.0),
+                },
+                action: LinkAction::Open,
             },
-            0,
         );
         wait_until(|| pane.viewport().page() == 1);
         assert_eq!(pane.viewport().prev_page(), 1);

@@ -13,7 +13,7 @@ use gtk::subclass::prelude::*;
 use gtk::{glib, Button, CompositeTemplate, ToggleButton};
 
 use crate::document_view::{DocumentView, ReaderKeyContext};
-use crate::links::DocumentLocation;
+use crate::links::{DocumentLocation, LinkRequest};
 
 // Tabs stop being a useful way to hold documents well before this. The cap also limits each
 // document's render state and widget tree.
@@ -321,15 +321,8 @@ impl Window {
             glib::closure_local!(
                 #[weak(rename_to = imp)]
                 self,
-                move |document: &DocumentView, page: i32, x: f64, y: f64| {
-                    imp.open_link_in_tab(
-                        document,
-                        DocumentLocation {
-                            page,
-                            x: (!x.is_nan()).then_some(x),
-                            y: (!y.is_nan()).then_some(y),
-                        },
-                    );
+                move |document: &DocumentView, request: LinkRequest| {
+                    imp.open_link_in_tab(document, request.location);
                 }
             ),
         );

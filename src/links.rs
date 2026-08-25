@@ -1,3 +1,4 @@
+// Link hit-testing and document targets. Coordinates use page-local top-left points.
 use std::collections::HashMap;
 
 use mupdf::DestinationKind;
@@ -9,6 +10,21 @@ pub struct DocumentLocation {
     pub page: i32,
     pub x: Option<f64>,
     pub y: Option<f64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkAction {
+    Open,
+    OpenBeside,
+    OpenInNewTab,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, glib::Boxed)]
+#[boxed_type(name = "ScrolexLinkRequest")]
+pub struct LinkRequest {
+    pub source_page: i32,
+    pub location: DocumentLocation,
+    pub action: LinkAction,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -24,13 +40,8 @@ struct PageLink {
 }
 
 #[derive(Default, Debug)]
-struct PageLinks {
-    links: Vec<PageLink>,
-}
-
-#[derive(Default, Debug)]
 pub struct Links {
-    pages: HashMap<i32, PageLinks>,
+    pages: HashMap<i32, Vec<PageLink>>,
 }
 
 impl Links {
@@ -39,19 +50,18 @@ impl Links {
     }
 
     pub fn get_link(&mut self, uri: &str, page_num: i32, x: f64, y: f64) -> Option<&LinkTarget> {
-        self.pages
+        let links = self
+            .pages
             .entry(page_num)
             .or_insert_with(|| Self::load(uri, page_num));
-        self.pages
-            .get(&page_num)?
-            .links
+        links
             .iter()
             .find(|link| link.rect.contains(x, y))
             .map(|link| &link.target)
     }
 
-    fn load(uri: &str, page_num: i32) -> PageLinks {
-        let mut page_links = PageLinks::default();
+    fn load(uri: &str, page_num: i32) -> Vec<PageLink> {
+        let mut links = Vec::new();
         crate::mupdf_render::with_doc(uri, |doc| {
             let page = doc.load_page(page_num).ok()?;
             for link in page.links().ok()? {
@@ -64,14 +74,14 @@ impl Links {
                     None => continue,
                 };
                 let b = link.bounds;
-                page_links.links.push(PageLink {
+                links.push(PageLink {
                     rect: Rectangle::new(b.x0 as f64, b.y0 as f64, b.x1 as f64, b.y1 as f64),
                     target,
                 });
             }
             Some(())
         });
-        page_links
+        links
     }
 }
 
@@ -118,6 +128,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
             links.get_link(&uri, 0, 100.0, 125.0),
             Some(&LinkTarget::Uri("https://one.example".into()))
         );
+        assert_eq!(links.get_link(&uri, 0, 10.0, 10.0), None);
         assert_eq!(
             links.get_link(&uri, 1, 50.0, 165.0),
             Some(&LinkTarget::Uri("https://two.example".into()))

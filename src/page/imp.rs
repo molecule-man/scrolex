@@ -19,7 +19,7 @@ use once_cell::sync::Lazy;
 
 use super::Rectangle;
 use crate::bg_job::{RenderPool, RenderPriority};
-use crate::links::LinkTarget;
+use crate::links::{LinkAction, LinkRequest, LinkTarget};
 use crate::selection::PageSelection;
 
 // Max bytes in one page buffer. A whole page is rendered at once, so the buffer grows with the
@@ -325,13 +325,7 @@ impl ObjectImpl for Page {
         static SIGNALS: OnceLock<Vec<Signal>> = OnceLock::new();
         SIGNALS.get_or_init(|| {
             vec![Signal::builder("internal-link-clicked")
-                .param_types([
-                    i32::static_type(),
-                    i32::static_type(),
-                    f64::static_type(),
-                    f64::static_type(),
-                    i32::static_type(),
-                ])
+                .param_types([LinkRequest::static_type()])
                 .build()]
         })
     }
@@ -603,32 +597,20 @@ impl Page {
             #[strong]
             tooltip_visible,
             move |_, x, y| {
-                let Point { x, y } = undo_zoom_and_crop(&obj, x, y);
-                let target = imp
-                    .document()
-                    .imp()
-                    .links
-                    .borrow_mut()
-                    .get_link(&obj.uri(), obj.index(), x, y)
-                    .cloned();
+                let target = imp.link_at(&obj, x, y);
+                let visible = matches!(target, Some(LinkTarget::Location(_)));
+                if tooltip_visible.replace(visible) != visible {
+                    obj.set_tooltip_text(
+                        visible.then_some("Middle click opens beside. Right click opens a menu."),
+                    );
+                }
                 if target.is_some() {
-                    let visible = matches!(target, Some(LinkTarget::Location(_)));
-                    if tooltip_visible.replace(visible) != visible {
-                        obj.set_tooltip_text(
-                            visible
-                                .then_some("Middle click opens beside. Right click opens a menu."),
-                        );
-                    }
                     if !imp.cursor_guard.get() {
                         obj.set_cursor_from_name(Some("pointer"));
                         imp.cursor_guard.set(true);
                         cursor.set(true);
                     }
                     return;
-                }
-
-                if tooltip_visible.replace(false) {
-                    obj.set_tooltip_text(None);
                 }
 
                 if Cell::get(&cursor) {
@@ -659,16 +641,7 @@ impl Page {
             #[weak(rename_to = imp)]
             self,
             move |gc, _n_press, x, y| {
-                let Point { x, y } = undo_zoom_and_crop(&obj, x, y);
-
-                if let Some(link_target) = imp
-                    .document()
-                    .imp()
-                    .links
-                    .borrow_mut()
-                    .get_link(&obj.uri(), obj.index(), x, y)
-                    .cloned()
-                {
+                if let Some(link_target) = imp.link_at(&obj, x, y) {
                     match link_target {
                         LinkTarget::Location(location) => {
                             gc.set_state(gtk::EventSequenceState::Claimed);
@@ -676,27 +649,13 @@ impl Page {
                                 .current_event_state()
                                 .contains(gtk::gdk::ModifierType::CONTROL_MASK)
                             {
-                                2
+                                LinkAction::OpenInNewTab
                             } else {
-                                0
+                                LinkAction::Open
                             };
-                            obj.emit_by_name::<()>(
-                                "internal-link-clicked",
-                                &[
-                                    &obj.index(),
-                                    &location.page,
-                                    &location.x.unwrap_or(f64::NAN),
-                                    &location.y.unwrap_or(f64::NAN),
-                                    &action,
-                                ],
-                            );
+                            Self::emit_link(&obj, location, action);
                         }
-                        LinkTarget::Uri(uri) => {
-                            let _ = gtk::gio::AppInfo::launch_default_for_uri(
-                                &uri,
-                                gtk::gio::AppLaunchContext::NONE,
-                            );
-                        }
+                        LinkTarget::Uri(uri) => Self::open_uri(&uri),
                     }
                 };
             }
@@ -713,14 +672,7 @@ impl Page {
             #[strong]
             middle_start,
             move |_, _, x, y| {
-                let point = undo_zoom_and_crop(&obj, x, y);
-                let target = imp
-                    .document()
-                    .imp()
-                    .links
-                    .borrow_mut()
-                    .get_link(&obj.uri(), obj.index(), point.x, point.y)
-                    .cloned();
+                let target = imp.link_at(&obj, x, y);
                 middle_start.replace(target.map(|target| (x, y, target)));
             }
         ));
@@ -739,23 +691,9 @@ impl Page {
                 match target {
                     LinkTarget::Location(location) => {
                         gesture.set_state(gtk::EventSequenceState::Claimed);
-                        obj.emit_by_name::<()>(
-                            "internal-link-clicked",
-                            &[
-                                &obj.index(),
-                                &location.page,
-                                &location.x.unwrap_or(f64::NAN),
-                                &location.y.unwrap_or(f64::NAN),
-                                &1_i32,
-                            ],
-                        );
+                        Self::emit_link(&obj, location, LinkAction::OpenBeside);
                     }
-                    LinkTarget::Uri(uri) => {
-                        let _ = gtk::gio::AppInfo::launch_default_for_uri(
-                            &uri,
-                            gtk::gio::AppLaunchContext::NONE,
-                        );
-                    }
+                    LinkTarget::Uri(uri) => Self::open_uri(&uri),
                 }
             }
         ));
@@ -768,14 +706,7 @@ impl Page {
             #[weak(rename_to = imp)]
             self,
             move |gesture, _, x, y| {
-                let point = undo_zoom_and_crop(&obj, x, y);
-                let target = imp
-                    .document()
-                    .imp()
-                    .links
-                    .borrow_mut()
-                    .get_link(&obj.uri(), obj.index(), point.x, point.y)
-                    .cloned();
+                let target = imp.link_at(&obj, x, y);
                 let Some(LinkTarget::Location(location)) = target else {
                     return;
                 };
@@ -783,9 +714,9 @@ impl Page {
                 let popover = gtk::Popover::new();
                 let actions = gtk::Box::new(gtk::Orientation::Vertical, 0);
                 for (label, action) in [
-                    ("Open Link", 0_i32),
-                    ("Open Link Beside", 1_i32),
-                    ("Open Link in New Tab", 2_i32),
+                    ("Open Link", LinkAction::Open),
+                    ("Open Link Beside", LinkAction::OpenBeside),
+                    ("Open Link in New Tab", LinkAction::OpenInNewTab),
                 ] {
                     let button = gtk::Button::builder()
                         .label(label)
@@ -799,16 +730,7 @@ impl Page {
                         popover,
                         move |_| {
                             popover.popdown();
-                            obj.emit_by_name::<()>(
-                                "internal-link-clicked",
-                                &[
-                                    &obj.index(),
-                                    &location.page,
-                                    &location.x.unwrap_or(f64::NAN),
-                                    &location.y.unwrap_or(f64::NAN),
-                                    &action,
-                                ],
-                            );
+                            Self::emit_link(&obj, location, action);
                         }
                     ));
                     actions.append(&button);
@@ -826,6 +748,29 @@ impl Page {
             }
         ));
         obj.add_controller(context);
+    }
+
+    fn link_at(&self, obj: &super::Page, x: f64, y: f64) -> Option<LinkTarget> {
+        let point = undo_zoom_and_crop(obj, x, y);
+        self.document()
+            .imp()
+            .links
+            .borrow_mut()
+            .get_link(&obj.uri(), obj.index(), point.x, point.y)
+            .cloned()
+    }
+
+    fn emit_link(obj: &super::Page, location: crate::links::DocumentLocation, action: LinkAction) {
+        let request = LinkRequest {
+            source_page: obj.index(),
+            location,
+            action,
+        };
+        obj.emit_by_name::<()>("internal-link-clicked", &[&request]);
+    }
+
+    fn open_uri(uri: &str) {
+        let _ = gtk::gio::AppInfo::launch_default_for_uri(uri, gtk::gio::AppLaunchContext::NONE);
     }
 
     fn get_bbox(&self, page: &PageInfo, crop: bool) -> Rectangle {

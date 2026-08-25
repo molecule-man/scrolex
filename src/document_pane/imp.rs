@@ -15,7 +15,7 @@ use gtk::{prelude::*, GestureClick};
 
 use super::{ReaderKeyContext, ZoomChoice, ZoomChoiceAction};
 use crate::document::Document;
-use crate::links::DocumentLocation;
+use crate::links::{DocumentLocation, LinkRequest};
 use crate::page;
 use crate::viewport::Viewport;
 
@@ -288,13 +288,7 @@ impl ObjectImpl for DocumentPane {
         static SIGNALS: OnceLock<Vec<Signal>> = OnceLock::new();
         SIGNALS.get_or_init(|| {
             vec![Signal::builder("link-activated")
-                .param_types([
-                    i32::static_type(),
-                    i32::static_type(),
-                    f64::static_type(),
-                    f64::static_type(),
-                    i32::static_type(),
-                ])
+                .param_types([LinkRequest::static_type()])
                 .build()]
         })
     }
@@ -350,16 +344,8 @@ impl DocumentPane {
             closure_local!(
                 #[weak]
                 obj,
-                move |_: &crate::page::Page,
-                      source: i32,
-                      page_num: i32,
-                      x: f64,
-                      y: f64,
-                      action: i32| {
-                    obj.emit_by_name::<()>(
-                        "link-activated",
-                        &[&source, &page_num, &x, &y, &action],
-                    );
+                move |_: &crate::page::Page, request: LinkRequest| {
+                    obj.emit_by_name::<()>("link-activated", &[&request]);
                 }
             ),
         );
