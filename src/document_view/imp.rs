@@ -75,10 +75,6 @@ impl ObjectSubclass for DocumentView {
 
 #[gtk::template_callbacks]
 impl DocumentView {
-    pub(crate) fn pane(&self) -> DocumentPane {
-        self.primary_pane()
-    }
-
     pub(crate) fn active_pane(&self) -> DocumentPane {
         self.active_pane
             .borrow()
@@ -252,24 +248,6 @@ impl DocumentView {
             }
         ));
         self.toc_revealer.add_controller(key);
-
-        self.register_toc_close(&self.active_pane());
-    }
-
-    fn register_toc_close(&self, pane: &DocumentPane) {
-        let click = gtk::GestureClick::new();
-        click.set_propagation_phase(gtk::PropagationPhase::Capture);
-        click.connect_pressed(clone!(
-            #[weak(rename_to = imp)]
-            self,
-            move |gesture, _, _, _| {
-                if imp.toc_revealer.reveals_child() {
-                    imp.toc_revealer.set_reveal_child(false);
-                    gesture.set_state(gtk::EventSequenceState::Claimed);
-                }
-            }
-        ));
-        pane.page_area().add_controller(click);
     }
 
     pub(crate) fn panes(&self) -> Vec<DocumentPane> {
@@ -310,7 +288,13 @@ impl DocumentView {
             self,
             #[weak]
             pane,
-            move |_, _, _, _| imp.activate_pane(&pane)
+            move |gesture, _, _, _| {
+                imp.activate_pane(&pane);
+                if imp.toc_revealer.reveals_child() {
+                    imp.toc_revealer.set_reveal_child(false);
+                    gesture.set_state(gtk::EventSequenceState::Claimed);
+                }
+            }
         ));
         pane.page_area().add_controller(click);
 
@@ -355,42 +339,32 @@ impl DocumentView {
         }
     }
 
-    fn ensure_secondary(&self, crop: bool) -> DocumentPane {
+    fn ensure_secondary(&self) -> DocumentPane {
         if let Some(pane) = self.secondary.borrow().clone() {
             return pane;
         }
+        let primary = self.primary_pane();
         let pane = DocumentPane::new(self.document());
         pane.set_hexpand(true);
         pane.set_vexpand(true);
         pane.add_css_class("inactive-pane");
         pane.viewport()
-            .set_animate_scroll(self.primary_pane().viewport().animate_scroll());
+            .set_animate_scroll(primary.viewport().animate_scroll());
         self.setup_pane(&pane);
-        self.register_toc_close(&pane);
         pane.finish_document_load();
-        pane.viewport().set_crop(crop);
         pane.set_sensitive(!self.split_geometry_pending.get());
-        let existing = self.paned.borrow().clone();
-        let paned = if let Some(paned) = existing {
-            paned
-        } else {
-            let paned = gtk::Paned::new(gtk::Orientation::Horizontal);
-            paned.set_hexpand(true);
-            paned.set_vexpand(true);
-            paned.set_wide_handle(true);
-            paned.add_css_class("document-split");
-            self.paned.replace(Some(paned.clone()));
-            paned
-        };
-        if paned.parent().is_none() {
-            let primary = self.primary_pane();
-            self.pane_host.remove(&primary);
-            paned.set_start_child(Some(&primary));
-            self.pane_host.append(&paned);
-        }
+        let paned = gtk::Paned::new(gtk::Orientation::Horizontal);
+        paned.set_hexpand(true);
+        paned.set_vexpand(true);
+        paned.set_wide_handle(true);
+        paned.add_css_class("document-split");
+        self.paned.replace(Some(paned.clone()));
+        self.pane_host.remove(&primary);
+        paned.set_start_child(Some(&primary));
+        self.pane_host.append(&paned);
         paned.set_end_child(Some(&pane));
         self.secondary.replace(Some(pane.clone()));
-        self.primary_pane().set_close_visible(true);
+        primary.set_close_visible(true);
         pane.set_close_visible(true);
         pane
     }
@@ -488,7 +462,7 @@ impl DocumentView {
             return;
         }
         let source_crop = source.viewport().crop();
-        let secondary = self.ensure_secondary(source_crop);
+        let secondary = self.ensure_secondary();
         let target = if *source == self.primary_pane() {
             secondary
         } else {

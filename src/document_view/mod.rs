@@ -133,7 +133,7 @@ impl DocumentView {
 
     pub fn release_renders(&self) {
         for pane in self.imp().panes() {
-            pane.release_renders();
+            pane.clear_render_pins();
         }
         crate::page::clear_document_renders(self.document().id());
         self.document().clear_render_jobs();
@@ -147,6 +147,6 @@ impl DocumentView {
     }
 
     pub(crate) fn pane(&self) -> DocumentPane {
-        self.imp().pane()
+        self.imp().primary_pane()
     }
 }

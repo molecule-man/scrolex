@@ -99,10 +99,14 @@ impl DocumentPane {
         let viewport = self.viewport().id();
         crate::page::set_wanted_pages(self.document().id(), viewport, None);
         crate::page::clear_full_renders(viewport);
+        self.clear_render_pins();
+    }
+
+    pub(crate) fn clear_render_pins(&self) {
         self.document()
             .render_cache()
             .borrow_mut()
-            .clear_pins(viewport);
+            .clear_pins(self.viewport().id());
     }
 
     pub(crate) fn paper_width(&self, page: i32) -> Option<f64> {
