@@ -2,14 +2,15 @@
 // requested resolution - scanned pages render at fit-to-page cost, not poppler's full-res decode.
 
 use std::cell::RefCell;
-use std::collections::{hash_map::Entry, HashMap};
+use std::collections::{hash_map::Entry, HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{mpsc, Arc, Mutex};
 
 use gtk::cairo::{Format, ImageSurface};
 use gtk::gio::prelude::InputStreamExtManual;
 use gtk::prelude::FileExt;
+use mupdf::display_list::DisplayList;
 use mupdf::{Colorspace, Device, Document, IRect, Matrix, Pixmap, Rect};
 use once_cell::sync::Lazy;
 
@@ -252,6 +253,118 @@ pub fn with_doc<T>(uri: &str, f: impl FnOnce(&Document) -> Option<T>) -> Option<
     })
 }
 
+// One thread owns the documents and records per-page display lists. MuPDF documents are not
+// thread-safe, and one per worker duplicates the xref, the object cache and every store entry. A
+// display list is thread-safe, so the workers rasterize shared lists and open no document.
+struct ListRequest {
+    uri: String,
+    page: i32,
+    reply: mpsc::Sender<Option<Arc<DisplayList>>>,
+}
+
+// Display lists the owner keeps alive. A list holds the page's images and fonts, so this trades
+// memory for parse time.
+const LIST_CACHE_PAGES: usize = 8;
+
+// Documents the owner keeps open. Reopening costs 30us on a small file and 2.8s on a large damaged
+// one. Four covers both split-view panes plus the last two tabs.
+const OPEN_DOCUMENTS: usize = 4;
+
+static LIST_SOURCE: Lazy<mpsc::SyncSender<ListRequest>> = Lazy::new(spawn_list_source);
+
+fn spawn_list_source() -> mpsc::SyncSender<ListRequest> {
+    let (sender, receiver) = mpsc::sync_channel::<ListRequest>(64);
+    std::thread::spawn(move || {
+        // Touch the context first, so it outlives every Document here; see with_doc.
+        let _ctx = Colorspace::device_bgr();
+        let mut documents: VecDeque<(String, Document)> = VecDeque::new();
+        let mut lists: VecDeque<(String, i32, Arc<DisplayList>)> = VecDeque::new();
+        let mut open_generation = GENERATION.load(Ordering::Relaxed);
+
+        while let Ok(req) = receiver.recv() {
+            // A reload leaves every open document and recorded list on the old bytes.
+            let generation = GENERATION.load(Ordering::Relaxed);
+            if generation != open_generation {
+                open_generation = generation;
+                documents.clear();
+                lists.clear();
+            }
+
+            let list = lists
+                .iter()
+                .find(|(uri, page, _)| uri == &req.uri && *page == req.page)
+                .map(|(_, _, list)| list.clone())
+                .or_else(|| {
+                    let list = record(&mut documents, &req.uri, req.page)?;
+                    lists.push_back((req.uri.clone(), req.page, list.clone()));
+                    while lists.len() > LIST_CACHE_PAGES {
+                        lists.pop_front();
+                    }
+                    Some(list)
+                });
+            let _ = req.reply.send(list);
+        }
+    });
+    sender
+}
+
+// Record one page. Opens the document if the owner does not hold it.
+fn record(
+    documents: &mut VecDeque<(String, Document)>,
+    uri: &str,
+    page: i32,
+) -> Option<Arc<DisplayList>> {
+    // Move the used one to the back. The front stays least recently used.
+    let entry = match documents.iter().position(|(open, _)| open == uri) {
+        Some(index) => documents.remove(index)?,
+        None => (uri.to_string(), open_document(&local_path(uri)?)?),
+    };
+    documents.push_back(entry);
+    while documents.len() > OPEN_DOCUMENTS {
+        documents.pop_front();
+    }
+
+    let (_, doc) = documents.back()?;
+    // annotations = true: a full page render shows annotations and widgets.
+    let list = doc.load_page(page).ok()?.to_display_list(true).ok()?;
+    Some(Arc::new(list))
+}
+
+// The page's display list from the owner thread. Blocks until it arrives.
+fn display_list(uri: &str, page_num: i32) -> Option<Arc<DisplayList>> {
+    let (reply, answer) = mpsc::channel();
+    LIST_SOURCE
+        .send(ListRequest {
+            uri: uri.to_string(),
+            page: page_num,
+            reply,
+        })
+        .ok()?;
+    answer.recv().ok()?
+}
+
+// Rasterize `area` (pixel space) of `list` into a fresh pixmap.
+fn raster(list: &DisplayList, ctm: &Matrix, area: IRect) -> Option<Pixmap> {
+    // device_bgr + no alpha yields B,G,R samples, matching cairo Rgb24's byte order.
+    let colorspace = Colorspace::device_bgr();
+    let mut pixmap = Pixmap::new_with_rect(&colorspace, area, false).ok()?;
+    pixmap.clear_with(255).ok()?;
+    let device = Device::from_pixmap(&pixmap).ok()?;
+    list.run(
+        &device,
+        ctm,
+        Rect::new(
+            area.x0 as f32,
+            area.y0 as f32,
+            area.x1 as f32,
+            area.y1 as f32,
+        ),
+    )
+    .ok()?;
+    drop(device);
+    Some(pixmap)
+}
+
 // One raster buffer's raw pixels (cairo Rgb24/BGRx), transferable between render and UI threads.
 pub struct PagePixels {
     pub data: Vec<u8>,
@@ -281,31 +394,30 @@ fn render_page_pixels_with_mode(
     page_pt: Option<(f64, f64)>,
     dark_mode: Option<DarkMode>,
 ) -> Option<PagePixels> {
-    with_doc(uri, |doc| {
-        // device_bgr + no alpha yields B,G,R samples, matching cairo Rgb24's byte order.
-        let colorspace = Colorspace::device_bgr();
-        let page = doc.load_page(page_num).ok()?;
-        let ctm = Matrix::new_scale((scale * dsf) as f32, (scale * dsf) as f32);
-        // show_extras: render annotations/widgets too, matching a full page render.
-        let pixmap = page.to_pixmap(&ctm, &colorspace, false, true).ok()?;
-
-        let (pw, ph) = match page_pt {
-            Some(size) => size,
-            None => {
-                let b = page.bounds().ok()?;
-                ((b.x1 - b.x0) as f64, (b.y1 - b.y0) as f64)
-            }
-        };
+    let ctm = Matrix::new_scale((scale * dsf) as f32, (scale * dsf) as f32);
+    let sized = |pixmap: &Pixmap, bounds: (f64, f64)| {
+        let (pw, ph) = page_pt.unwrap_or(bounds);
         let width = ((pw * scale * dsf) as i32).max(1);
         let height = ((ph * scale * dsf) as i32).max(1);
-        let (data, stride) = pack_pixmap(&pixmap, width, height, dark_mode)?;
+        let (data, stride) = pack_pixmap(pixmap, width, height, dark_mode)?;
         Some(PagePixels {
             data,
             width,
             height,
             stride,
         })
-    })
+    };
+
+    let list = display_list(uri, page_num)?;
+    let bounds = list.bounds();
+    let pixmap = raster(&list, &ctm, bounds.transform(&ctm).round())?;
+    sized(
+        &pixmap,
+        (
+            f64::from(bounds.x1 - bounds.x0),
+            f64::from(bounds.y1 - bounds.y0),
+        ),
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -331,36 +443,17 @@ pub fn render_page_regions(
     dsf: f64,
     regions: &[PixelRect],
 ) -> Option<Vec<PagePixels>> {
-    with_doc(uri, |doc| {
-        let colorspace = Colorspace::device_bgr();
-        let page = doc.load_page(page_num).ok()?;
-        let list = page.to_display_list(true).ok()?;
-        let ctm = Matrix::new_scale((scale * dsf) as f32, (scale * dsf) as f32);
+    let ctm = Matrix::new_scale((scale * dsf) as f32, (scale * dsf) as f32);
+    let dark_mode = dark_mode();
+    let render_all = |list: &DisplayList| {
         let mut rendered = Vec::with_capacity(regions.len());
-        let dark_mode = dark_mode();
-
         for region in regions {
             debug_assert!(region.x0 < region.x1 && region.y0 < region.y1);
             if region.x0 >= region.x1 || region.y0 >= region.y1 {
                 return None;
             }
-            let rect = IRect::new(region.x0, region.y0, region.x1, region.y1);
-            let mut pixmap = Pixmap::new_with_rect(&colorspace, rect, false).ok()?;
-            pixmap.clear_with(255).ok()?;
-            let device = Device::from_pixmap(&pixmap).ok()?;
-            list.run(
-                &device,
-                &ctm,
-                Rect::new(
-                    region.x0 as f32,
-                    region.y0 as f32,
-                    region.x1 as f32,
-                    region.y1 as f32,
-                ),
-            )
-            .ok()?;
-            drop(device);
-
+            let area = IRect::new(region.x0, region.y0, region.x1, region.y1);
+            let pixmap = raster(list, &ctm, area)?;
             let width = region.x1 - region.x0;
             let height = region.y1 - region.y0;
             let (data, stride) = pack_pixmap(&pixmap, width, height, dark_mode)?;
@@ -372,7 +465,10 @@ pub fn render_page_regions(
             });
         }
         Some(rendered)
-    })
+    };
+
+    let list = display_list(uri, page_num)?;
+    render_all(&list)
 }
 
 // `render_page_pixels` as an ImageSurface for benchmarks and tests.
@@ -663,6 +759,42 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         }
     }
 
+    // A shared display list must render identically from any number of threads.
+    #[test]
+    fn concurrent_renders_of_one_page_match() {
+        let uri = margin_pdf_uri();
+        let expected = render_page_pixels(&uri, 0, 1.0, 1.0, Some((200.0, 200.0))).unwrap();
+        let workers: Vec<_> = (0..4)
+            .map(|_| {
+                let uri = uri.clone();
+                std::thread::spawn(move || {
+                    render_page_pixels(&uri, 0, 1.0, 1.0, Some((200.0, 200.0))).unwrap()
+                })
+            })
+            .collect();
+
+        for worker in workers {
+            let rendered = worker.join().unwrap();
+            assert_eq!(
+                (rendered.width, rendered.height, rendered.stride),
+                (expected.width, expected.height, expected.stride)
+            );
+            assert_eq!(rendered.data, expected.data);
+        }
+    }
+
+    // The owner holds both files open, so alternating renders do not reopen either.
+    #[test]
+    fn alternating_documents_render_their_own_pages() {
+        let (small, large) = (margin_pdf_uri(), mixed_size_pdf_uri());
+        for _ in 0..3 {
+            let page = render_page_pixels(&small, 0, 1.0, 1.0, Some((200.0, 200.0))).unwrap();
+            assert_eq!((page.width, page.height), (200, 200));
+            let page = render_page_pixels(&large, 1, 1.0, 1.0, Some((2000.0, 3000.0))).unwrap();
+            assert_eq!((page.width, page.height), (2000, 3000));
+        }
+    }
+
     #[test]
     fn page_count_and_size_read_the_document() {
         let uri = margin_pdf_uri();
@@ -695,13 +827,22 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
 5 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 400] >>\nendobj\n\
 trailer\n<< /Root 1 0 R >>\n%%EOF";
 
+    // Written once, for the same reason as margin_pdf_uri.
+    fn mixed_size_pdf_uri() -> String {
+        static URI: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        URI.get_or_init(|| {
+            let dir = std::env::temp_dir().join("scrolex_mixed_size_test");
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("mixed.pdf");
+            std::fs::write(&path, MIXED_SIZE_PDF).unwrap();
+            crate::test_support::file_uri(&path)
+        })
+        .clone()
+    }
+
     #[test]
     fn probe_reports_the_tallest_page() {
-        let dir = std::env::temp_dir().join("scrolex_mixed_size_test");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("mixed.pdf");
-        std::fs::write(&path, MIXED_SIZE_PDF).unwrap();
-        let uri = crate::test_support::file_uri(&path);
+        let uri = mixed_size_pdf_uri();
 
         assert_eq!(
             stage_candidate(&uri).unwrap().probe(),

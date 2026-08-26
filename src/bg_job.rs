@@ -1,6 +1,6 @@
-// Background worker pool for page rendering. Jobs are self-contained closures (each opens/reuses its
-// own MuPDF Document via the renderer's thread-local), so the pool holds no document itself. One
-// pool serves every kind of job - visible-page renders and low-res previews.
+// Background worker pool for page rendering. Jobs are self-contained closures that rasterize
+// display lists from the renderer's document owner, so the pool holds no document. One pool serves
+// every kind of job - visible-page renders and low-res previews.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Condvar, Mutex};
