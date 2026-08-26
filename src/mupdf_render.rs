@@ -2,15 +2,15 @@
 // requested resolution - scanned pages render at fit-to-page cost, not poppler's full-res decode.
 
 use std::cell::RefCell;
-use std::collections::{hash_map::Entry, HashMap};
+use std::collections::{hash_map::Entry, HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{mpsc, Arc, Mutex};
 
 use gtk::cairo::{Format, ImageSurface};
 use gtk::gio::prelude::InputStreamExtManual;
 use gtk::prelude::FileExt;
-use mupdf::{Colorspace, Device, Document, IRect, Matrix, Pixmap, Rect};
+use mupdf::{Colorspace, Device, DisplayList, Document, IRect, Matrix, Pixmap, Rect};
 use once_cell::sync::Lazy;
 
 #[derive(Clone, Copy)]
@@ -30,8 +30,8 @@ static GREY_LUT: Lazy<[[u8; 3]; 256]> = Lazy::new(|| {
     std::array::from_fn(|value| recolor(value as u8, value as u8, value as u8, DARK_MODE))
 });
 
-// Bumped on document load so every thread's cached Document is reopened - otherwise reloading the
-// same path after the file changed on disk would keep serving the stale document.
+// Identifies the bytes behind each cached document. A document load changes this value.
+// Later cache access reopens files that changed on disk.
 static GENERATION: AtomicU64 = AtomicU64::new(0);
 
 // Non-local GFiles (smb://, sftp://, GVfs mounts) have no local path, and MuPDF opens by path only.
@@ -72,8 +72,8 @@ pub(crate) fn loading_text_rgb() -> [u8; 3] {
     })
 }
 
-// Invalidate every thread's cached Document (call on document load). The next `with_doc` on each
-// thread reopens against the current bytes, and any staged remote copies are re-fetched.
+// Invalidate cached documents and derived data after a document load. Thread-local documents reopen
+// on their next use. The owner clears its documents and display lists on its next request.
 pub fn invalidate() {
     GENERATION.fetch_add(1, Ordering::Relaxed);
     let mut staged = STAGED.lock().unwrap();
@@ -252,6 +252,156 @@ pub fn with_doc<T>(uri: &str, f: impl FnOnce(&Document) -> Option<T>) -> Option<
     })
 }
 
+struct LruCache<K, V> {
+    capacity: usize,
+    entries: VecDeque<(K, V)>,
+}
+
+impl<K: PartialEq, V> LruCache<K, V> {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            capacity,
+            entries: VecDeque::with_capacity(capacity),
+        }
+    }
+
+    fn get(&mut self, key: &K) -> Option<&V> {
+        let index = self
+            .entries
+            .iter()
+            .position(|(entry_key, _)| entry_key == key)?;
+        let entry = self.entries.remove(index)?;
+        self.entries.push_back(entry);
+        self.entries.back().map(|(_, value)| value)
+    }
+
+    fn insert(&mut self, key: K, value: V) {
+        if let Some(index) = self
+            .entries
+            .iter()
+            .position(|(entry_key, _)| entry_key == &key)
+        {
+            self.entries.remove(index);
+        }
+        self.entries.push_back((key, value));
+        while self.entries.len() > self.capacity {
+            self.entries.pop_front();
+        }
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+}
+
+struct ListRequest {
+    uri: String,
+    page: i32,
+    reply: mpsc::Sender<Option<Arc<DisplayList>>>,
+}
+
+// Display lists the owner keeps alive. A list holds the page's images and fonts, so this trades
+// memory for parse time.
+const LIST_CACHE_PAGES: usize = 8;
+
+// Documents the owner keeps open. Reopening costs 30us on a small file and 2.8s on a large damaged
+// one. Four covers both split-view panes plus the last two tabs.
+const OPEN_DOCUMENTS: usize = 4;
+
+static LIST_SOURCE: Lazy<Option<mpsc::Sender<ListRequest>>> = Lazy::new(spawn_list_source);
+
+// One thread owns documents and records page display lists. MuPDF documents cannot cross threads.
+// A document per worker duplicates its xref, object cache, and store entries.
+// Workers can rasterize one recorded list at the same time.
+struct DisplayListOwner {
+    generation: u64,
+    documents: LruCache<String, Document>,
+    lists: LruCache<(String, i32), Arc<DisplayList>>,
+}
+
+impl DisplayListOwner {
+    fn for_generation(generation: u64) -> Self {
+        Self {
+            generation,
+            documents: LruCache::with_capacity(OPEN_DOCUMENTS),
+            lists: LruCache::with_capacity(LIST_CACHE_PAGES),
+        }
+    }
+
+    fn list(&mut self, generation: u64, uri: &str, page: i32) -> Option<Arc<DisplayList>> {
+        if generation != self.generation {
+            self.generation = generation;
+            self.documents.clear();
+            self.lists.clear();
+        }
+
+        let key = (uri.to_string(), page);
+        if let Some(list) = self.lists.get(&key) {
+            return Some(list.clone());
+        }
+
+        if self.documents.get(&key.0).is_none() {
+            let document = open_document(&local_path(&key.0)?)?;
+            self.documents.insert(key.0.clone(), document);
+        }
+        let document = self.documents.get(&key.0)?;
+        let list = Arc::new(document.load_page(page).ok()?.to_display_list(true).ok()?);
+        self.lists.insert(key, list.clone());
+        Some(list)
+    }
+}
+
+fn spawn_list_source() -> Option<mpsc::Sender<ListRequest>> {
+    // Each caller waits for one reply, so the caller count bounds the queue.
+    let (sender, receiver) = mpsc::channel::<ListRequest>();
+    let thread = std::thread::Builder::new()
+        .name("scrolex-display-lists".to_string())
+        .spawn(move || {
+            // Touch the context first, so it outlives every Document here; see with_doc.
+            let _ctx = Colorspace::device_bgr();
+            let mut owner = DisplayListOwner::for_generation(generation());
+
+            while let Ok(req) = receiver.recv() {
+                let current_generation = generation();
+                let list = owner.list(current_generation, &req.uri, req.page);
+                let _ = req.reply.send(list);
+            }
+        });
+    match thread {
+        Ok(_) => Some(sender),
+        Err(err) => {
+            log::error!("could not start the display list thread: {err}");
+            None
+        }
+    }
+}
+
+// The page's display list from the owner thread. Blocks until it arrives.
+fn display_list(uri: &str, page_num: i32) -> Option<Arc<DisplayList>> {
+    let (reply, answer) = mpsc::channel();
+    LIST_SOURCE
+        .as_ref()?
+        .send(ListRequest {
+            uri: uri.to_string(),
+            page: page_num,
+            reply,
+        })
+        .ok()?;
+    answer.recv().ok()?
+}
+
+// Rasterize `area` (pixel space) of `list` into a fresh pixmap.
+fn raster(list: &DisplayList, ctm: &Matrix, area: IRect) -> Option<Pixmap> {
+    // device_bgr + no alpha yields B,G,R samples, matching cairo Rgb24's byte order.
+    let colorspace = Colorspace::device_bgr();
+    let mut pixmap = Pixmap::new_with_rect(&colorspace, area, false).ok()?;
+    pixmap.clear_with(255).ok()?;
+    let device = Device::from_pixmap(&pixmap).ok()?;
+    list.run(&device, ctm, Rect::from(area)).ok()?;
+    drop(device);
+    Some(pixmap)
+}
+
 // One raster buffer's raw pixels (cairo Rgb24/BGRx), transferable between render and UI threads.
 pub struct PagePixels {
     pub data: Vec<u8>,
@@ -270,41 +420,23 @@ pub fn render_page_pixels(
     dsf: f64,
     page_pt: Option<(f64, f64)>,
 ) -> Option<PagePixels> {
-    render_page_pixels_with_mode(uri, page_num, scale, dsf, page_pt, dark_mode())
-}
-
-fn render_page_pixels_with_mode(
-    uri: &str,
-    page_num: i32,
-    scale: f64,
-    dsf: f64,
-    page_pt: Option<(f64, f64)>,
-    dark_mode: Option<DarkMode>,
-) -> Option<PagePixels> {
-    with_doc(uri, |doc| {
-        // device_bgr + no alpha yields B,G,R samples, matching cairo Rgb24's byte order.
-        let colorspace = Colorspace::device_bgr();
-        let page = doc.load_page(page_num).ok()?;
-        let ctm = Matrix::new_scale((scale * dsf) as f32, (scale * dsf) as f32);
-        // show_extras: render annotations/widgets too, matching a full page render.
-        let pixmap = page.to_pixmap(&ctm, &colorspace, false, true).ok()?;
-
-        let (pw, ph) = match page_pt {
-            Some(size) => size,
-            None => {
-                let b = page.bounds().ok()?;
-                ((b.x1 - b.x0) as f64, (b.y1 - b.y0) as f64)
-            }
-        };
-        let width = ((pw * scale * dsf) as i32).max(1);
-        let height = ((ph * scale * dsf) as i32).max(1);
-        let (data, stride) = pack_pixmap(&pixmap, width, height, dark_mode)?;
-        Some(PagePixels {
-            data,
-            width,
-            height,
-            stride,
-        })
+    let ctm = Matrix::new_scale((scale * dsf) as f32, (scale * dsf) as f32);
+    let list = display_list(uri, page_num)?;
+    let bounds = list.bounds();
+    let pixmap = raster(&list, &ctm, bounds.transform(&ctm).round())?;
+    let page_size = (
+        f64::from(bounds.x1 - bounds.x0),
+        f64::from(bounds.y1 - bounds.y0),
+    );
+    let (width_pt, height_pt) = page_pt.unwrap_or(page_size);
+    let width = ((width_pt * scale * dsf) as i32).max(1);
+    let height = ((height_pt * scale * dsf) as i32).max(1);
+    let (data, stride) = pack_pixmap(&pixmap, width, height, dark_mode())?;
+    Some(PagePixels {
+        data,
+        width,
+        height,
+        stride,
     })
 }
 
@@ -331,48 +463,28 @@ pub fn render_page_regions(
     dsf: f64,
     regions: &[PixelRect],
 ) -> Option<Vec<PagePixels>> {
-    with_doc(uri, |doc| {
-        let colorspace = Colorspace::device_bgr();
-        let page = doc.load_page(page_num).ok()?;
-        let list = page.to_display_list(true).ok()?;
-        let ctm = Matrix::new_scale((scale * dsf) as f32, (scale * dsf) as f32);
-        let mut rendered = Vec::with_capacity(regions.len());
-        let dark_mode = dark_mode();
-
-        for region in regions {
-            debug_assert!(region.x0 < region.x1 && region.y0 < region.y1);
-            if region.x0 >= region.x1 || region.y0 >= region.y1 {
-                return None;
-            }
-            let rect = IRect::new(region.x0, region.y0, region.x1, region.y1);
-            let mut pixmap = Pixmap::new_with_rect(&colorspace, rect, false).ok()?;
-            pixmap.clear_with(255).ok()?;
-            let device = Device::from_pixmap(&pixmap).ok()?;
-            list.run(
-                &device,
-                &ctm,
-                Rect::new(
-                    region.x0 as f32,
-                    region.y0 as f32,
-                    region.x1 as f32,
-                    region.y1 as f32,
-                ),
-            )
-            .ok()?;
-            drop(device);
-
-            let width = region.x1 - region.x0;
-            let height = region.y1 - region.y0;
-            let (data, stride) = pack_pixmap(&pixmap, width, height, dark_mode)?;
-            rendered.push(PagePixels {
-                data,
-                width,
-                height,
-                stride,
-            });
+    let ctm = Matrix::new_scale((scale * dsf) as f32, (scale * dsf) as f32);
+    let dark_mode = dark_mode();
+    let list = display_list(uri, page_num)?;
+    let mut rendered = Vec::with_capacity(regions.len());
+    for region in regions {
+        debug_assert!(region.x0 < region.x1 && region.y0 < region.y1);
+        if region.x0 >= region.x1 || region.y0 >= region.y1 {
+            return None;
         }
-        Some(rendered)
-    })
+        let area = IRect::new(region.x0, region.y0, region.x1, region.y1);
+        let pixmap = raster(&list, &ctm, area)?;
+        let width = region.x1 - region.x0;
+        let height = region.y1 - region.y0;
+        let (data, stride) = pack_pixmap(&pixmap, width, height, dark_mode)?;
+        rendered.push(PagePixels {
+            data,
+            width,
+            height,
+            stride,
+        });
+    }
+    Some(rendered)
 }
 
 // `render_page_pixels` as an ImageSurface for benchmarks and tests.
@@ -383,21 +495,10 @@ pub fn render_page_surface(
     dsf: f64,
     page_pt: Option<(f64, f64)>,
 ) -> Option<ImageSurface> {
-    render_page_surface_with_mode(uri, page_num, scale, dsf, page_pt, dark_mode())
-}
-
-fn render_page_surface_with_mode(
-    uri: &str,
-    page_num: i32,
-    scale: f64,
-    dsf: f64,
-    page_pt: Option<(f64, f64)>,
-    dark_mode: Option<DarkMode>,
-) -> Option<ImageSurface> {
     if let Some(cfg) = crate::emulate::config() {
         return Some(crate::emulate::full_surface(cfg, page_num, scale, dsf));
     }
-    let px = render_page_pixels_with_mode(uri, page_num, scale, dsf, page_pt, dark_mode)?;
+    let px = render_page_pixels(uri, page_num, scale, dsf, page_pt)?;
     let surface =
         ImageSurface::create_for_data(px.data, Format::Rgb24, px.width, px.height, px.stride)
             .ok()?;
@@ -418,19 +519,24 @@ pub fn page_size(uri: &str, page_num: i32) -> Option<(f64, f64)> {
 }
 
 // Bounding box of the page's non-white content in page-local top-left points, or None for a blank
-// page. Used for crop-to-content. MuPDF exposes no ink-bbox device via the Rust binding (and a
-// display list's bounds are just its mediabox), so this renders the page small and scans for the
-// tightest non-white rect - robust across text, vector and image content.
+// page. MuPDF exposes no ink-bbox device through Rust. A small page render supplies scan pixels.
+// Crop uses the caller's document, so GTK does not wait behind background list records.
 pub fn content_bbox(uri: &str, page_num: i32) -> Option<(f64, f64, f64, f64)> {
+    if let Some(config) = crate::emulate::config() {
+        return Some((0.0, 0.0, config.page_pt.0, config.page_pt.1));
+    }
     const SCALE: f64 = 0.2; // 1 sampled pixel = 5pt; crop adds a 5pt margin anyway
-    let surface = render_page_surface_with_mode(uri, page_num, SCALE, 1.0, None, None)?;
-    let (w, h, stride) = (surface.width(), surface.height(), surface.stride() as usize);
-
-    let mut pixels = None;
-    surface
-        .with_data(|data| pixels = scan_bbox(data, w, h, stride))
-        .ok()?;
-    let (min_x, min_y, max_x, max_y) = pixels?;
+    let (data, width, height, stride) = with_doc(uri, |doc| {
+        let colorspace = Colorspace::device_bgr();
+        let page = doc.load_page(page_num).ok()?;
+        let ctm = Matrix::new_scale(SCALE as f32, SCALE as f32);
+        let pixmap = page.to_pixmap(&ctm, &colorspace, false, true).ok()?;
+        let width = i32::try_from(pixmap.width()).ok()?;
+        let height = i32::try_from(pixmap.height()).ok()?;
+        let (data, stride) = pack_pixmap(&pixmap, width, height, None)?;
+        Some((data, width, height, stride))
+    })?;
+    let (min_x, min_y, max_x, max_y) = scan_bbox(&data, width, height, stride as usize)?;
     Some((
         min_x as f64 / SCALE,
         min_y as f64 / SCALE,
@@ -561,6 +667,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cache_access_delays_eviction() {
+        let mut cache = LruCache::with_capacity(2);
+        cache.insert(1, "one");
+        cache.insert(2, "two");
+
+        assert_eq!(cache.get(&1), Some(&"one"));
+        cache.insert(3, "three");
+
+        assert_eq!(cache.get(&1), Some(&"one"));
+        assert_eq!(cache.get(&2), None);
+        assert_eq!(cache.get(&3), Some(&"three"));
+    }
+
+    #[test]
     fn dark_mode_maps_page_and_ink_to_configured_colors() {
         assert_eq!(recolor(0, 0, 0, DARK_MODE), DARK_MODE.ink);
         assert_eq!(recolor(255, 255, 255, DARK_MODE), DARK_MODE.paper);
@@ -663,6 +783,63 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         }
     }
 
+    // A shared display list must render identically from any number of threads.
+    #[test]
+    fn concurrent_renders_of_one_page_match() {
+        let uri = margin_pdf_uri();
+        let expected = render_page_pixels(&uri, 0, 1.0, 1.0, Some((200.0, 200.0))).unwrap();
+        let workers: Vec<_> = (0..4)
+            .map(|_| {
+                let uri = uri.clone();
+                std::thread::spawn(move || {
+                    render_page_pixels(&uri, 0, 1.0, 1.0, Some((200.0, 200.0))).unwrap()
+                })
+            })
+            .collect();
+
+        for worker in workers {
+            let rendered = worker.join().unwrap();
+            assert_eq!(
+                (rendered.width, rendered.height, rendered.stride),
+                (expected.width, expected.height, expected.stride)
+            );
+            assert_eq!(rendered.data, expected.data);
+        }
+    }
+
+    #[test]
+    fn owner_generation_discards_recorded_pages() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reload.pdf");
+        let uri = crate::test_support::file_uri(&path);
+        std::fs::write(&path, MARGIN_PDF).unwrap();
+        let mut owner = DisplayListOwner::for_generation(10);
+
+        let first = owner.list(10, &uri, 0).unwrap();
+        assert_eq!(first.bounds(), Rect::new(0.0, 0.0, 200.0, 200.0));
+
+        let larger = String::from_utf8(MARGIN_PDF.to_vec())
+            .unwrap()
+            .replace("/MediaBox [0 0 200 200]", "/MediaBox [0 0 400 400]");
+        std::fs::write(&path, larger).unwrap();
+
+        let reloaded = owner.list(11, &uri, 0).unwrap();
+        assert_eq!(reloaded.bounds(), Rect::new(0.0, 0.0, 400.0, 400.0));
+        assert_eq!(first.bounds(), Rect::new(0.0, 0.0, 200.0, 200.0));
+    }
+
+    #[test]
+    fn owner_serves_each_document_its_own_pages() {
+        let (small, large) = (margin_pdf_uri(), mixed_size_pdf_uri());
+        let mut owner = DisplayListOwner::for_generation(10);
+        for _ in 0..3 {
+            let list = owner.list(10, &small, 0).unwrap();
+            assert_eq!(list.bounds(), Rect::new(0.0, 0.0, 200.0, 200.0));
+            let list = owner.list(10, &large, 1).unwrap();
+            assert_eq!(list.bounds(), Rect::new(0.0, 0.0, 2000.0, 3000.0));
+        }
+    }
+
     #[test]
     fn page_count_and_size_read_the_document() {
         let uri = margin_pdf_uri();
@@ -695,13 +872,22 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
 5 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 400] >>\nendobj\n\
 trailer\n<< /Root 1 0 R >>\n%%EOF";
 
+    // Written once, for the same reason as margin_pdf_uri.
+    fn mixed_size_pdf_uri() -> String {
+        static URI: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        URI.get_or_init(|| {
+            let dir = std::env::temp_dir().join("scrolex_mixed_size_test");
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("mixed.pdf");
+            std::fs::write(&path, MIXED_SIZE_PDF).unwrap();
+            crate::test_support::file_uri(&path)
+        })
+        .clone()
+    }
+
     #[test]
     fn probe_reports_the_tallest_page() {
-        let dir = std::env::temp_dir().join("scrolex_mixed_size_test");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("mixed.pdf");
-        std::fs::write(&path, MIXED_SIZE_PDF).unwrap();
-        let uri = crate::test_support::file_uri(&path);
+        let uri = mixed_size_pdf_uri();
 
         assert_eq!(
             stage_candidate(&uri).unwrap().probe(),

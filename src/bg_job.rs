@@ -1,6 +1,6 @@
-// Background worker pool for page rendering. Jobs are self-contained closures (each opens/reuses its
-// own MuPDF Document via the renderer's thread-local), so the pool holds no document itself. One
-// pool serves every kind of job - visible-page renders and low-res previews.
+// Background worker pool for page rendering. Jobs are self-contained closures that rasterize
+// display lists from the renderer's document owner, so the pool holds no document. One pool serves
+// every kind of job - visible-page renders and low-res previews.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Condvar, Mutex};
@@ -235,8 +235,7 @@ impl RenderPool {
         pool
     }
 
-    // Grow or shrink the worker pool. Growing spawns threads; shrinking asks surplus workers to exit
-    // after their current job, dropping their resident MuPDF Document and freeing its memory.
+    // Grow or shrink the worker pool. A surplus worker exits after its current job.
     pub(crate) fn set_size(&self, n: usize) {
         let (lock, cvar) = &*self.inner;
         let mut queue = lock.lock().unwrap();

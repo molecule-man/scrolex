@@ -3,9 +3,9 @@
 use std::path::PathBuf;
 use std::{fs, io, thread};
 
-// Render threads = resident MuPDF Documents (one per thread), each accruing an unreclaimable
-// per-page cache, so this dial trades memory for parallelism. Rendering scales near-linearly to ~4
-// threads before going memory-bandwidth bound; beyond that, more threads mainly buy prefetch depth.
+// Render threads rasterize shared display lists, so a thread costs its in-flight pixmaps, not a
+// resident MuPDF Document. Rendering scales near-linearly to ~4 threads, then goes
+// memory-bandwidth bound. Beyond that, more threads only buy prefetch depth.
 pub const DEFAULT_RENDER_THREADS: usize = 4;
 
 pub const DEFAULT_PREVIEW_CACHE_PAGES: usize = 65;
