@@ -105,7 +105,7 @@ jobs:
 
     - name: Run tests (Ubuntu)
       if: matrix.os == 'ubuntu-24.04'
-      run: xvfb-run --auto-servernum cargo test --verbose
+      run: ci/test --verbose
 
     - name: Run tests (Windows)
       if: matrix.os == 'windows-latest'

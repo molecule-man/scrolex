@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Run the test suite on a virtual X display.
+set -euo pipefail
+
+cd "$(git rev-parse --show-toplevel)"
+
+exec env -u WAYLAND_DISPLAY \
+  GDK_BACKEND=x11 \
+  GSK_RENDERER=cairo \
+  GDK_DISABLE=gl,vulkan \
+  xvfb-run -a -s "-screen 0 1920x1080x24" \
+  cargo test "$@"
