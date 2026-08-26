@@ -573,6 +573,9 @@ pub fn page_size(uri: &str, page_num: i32) -> Option<(f64, f64)> {
 // display list's bounds are just its mediabox), so this renders the page small and scans for the
 // tightest non-white rect - robust across text, vector and image content.
 pub fn content_bbox(uri: &str, page_num: i32) -> Option<(f64, f64, f64, f64)> {
+    if let Some(config) = crate::emulate::config() {
+        return Some((0.0, 0.0, config.page_pt.0, config.page_pt.1));
+    }
     const SCALE: f64 = 0.2; // 1 sampled pixel = 5pt; crop adds a 5pt margin anyway
     let pixels = with_doc(uri, |doc| {
         let colorspace = Colorspace::device_bgr();
