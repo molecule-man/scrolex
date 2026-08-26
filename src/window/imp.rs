@@ -465,6 +465,18 @@ impl Window {
         label.append(&name);
         label.append(&close);
 
+        let middle_click = gtk::GestureClick::builder()
+            .button(gtk::gdk::BUTTON_MIDDLE)
+            .build();
+        middle_click.connect_pressed(clone!(
+            #[weak(rename_to = imp)]
+            self,
+            #[weak]
+            document,
+            move |_, _, _, _| imp.close_document(&document)
+        ));
+        label.add_controller(middle_click);
+
         let document = document.document();
         document
             .bind_property("uri", &name, "label")
@@ -1453,6 +1465,31 @@ mod widget_tests {
             Some(&third),
             "closing another tab does not move the reader"
         );
+
+        window.close();
+    }
+
+    #[gtk::test]
+    fn middle_click_closes_its_tab() {
+        let window = loaded_window();
+        let first = window.header().active_document().expect("first document");
+        let second = window.header().add_document().expect("a tab");
+        let tab = window
+            .header()
+            .notebook
+            .tab_label(&second)
+            .and_downcast::<gtk::Box>()
+            .expect("the tab label");
+        let middle_click = (0..tab.observe_controllers().n_items())
+            .filter_map(|index| tab.observe_controllers().item(index))
+            .filter_map(|controller| controller.downcast::<gtk::GestureClick>().ok())
+            .find(|controller| controller.button() == gtk::gdk::BUTTON_MIDDLE)
+            .expect("the middle-click gesture");
+
+        middle_click.emit_by_name::<()>("pressed", &[&1i32, &0.0f64, &0.0f64]);
+
+        assert_eq!(window.header().notebook.n_pages(), 1, "the tab closed");
+        assert_eq!(window.header().active_document().as_ref(), Some(&first));
 
         window.close();
     }
