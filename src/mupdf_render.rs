@@ -619,12 +619,18 @@ mod tests {
 4 0 obj\n<< /Length 26 >>\nstream\n0 0 0 rg 60 50 80 100 re f\nendstream\nendobj\n\
 trailer\n<< /Root 1 0 R >>\n%%EOF";
 
+    // Written once. Parallel tests share the path, and a second write truncates the file while
+    // another test opens it.
     fn margin_pdf_uri() -> String {
-        let dir = std::env::temp_dir().join("scrolex_content_bbox_test");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("margins.pdf");
-        std::fs::write(&path, MARGIN_PDF).unwrap();
-        crate::test_support::file_uri(&path)
+        static URI: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        URI.get_or_init(|| {
+            let dir = std::env::temp_dir().join("scrolex_content_bbox_test");
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("margins.pdf");
+            std::fs::write(&path, MARGIN_PDF).unwrap();
+            crate::test_support::file_uri(&path)
+        })
+        .clone()
     }
 
     #[test]
