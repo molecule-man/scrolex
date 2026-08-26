@@ -308,10 +308,7 @@ const LIST_CACHE_PAGES: usize = 8;
 // one. Four covers both split-view panes plus the last two tabs.
 const OPEN_DOCUMENTS: usize = 4;
 
-// Backpressure bounds URI and reply allocations if the owner stalls.
-const LIST_REQUEST_CAPACITY: usize = 64;
-
-static LIST_SOURCE: Lazy<Option<mpsc::SyncSender<ListRequest>>> = Lazy::new(spawn_list_source);
+static LIST_SOURCE: Lazy<Option<mpsc::Sender<ListRequest>>> = Lazy::new(spawn_list_source);
 
 // One thread owns documents and records page display lists. MuPDF documents cannot cross threads.
 // A document per worker duplicates its xref, object cache, and store entries.
@@ -354,8 +351,9 @@ impl DisplayListOwner {
     }
 }
 
-fn spawn_list_source() -> Option<mpsc::SyncSender<ListRequest>> {
-    let (sender, receiver) = mpsc::sync_channel::<ListRequest>(LIST_REQUEST_CAPACITY);
+fn spawn_list_source() -> Option<mpsc::Sender<ListRequest>> {
+    // Each caller waits for one reply, so the caller count bounds the queue.
+    let (sender, receiver) = mpsc::channel::<ListRequest>();
     let thread = std::thread::Builder::new()
         .name("scrolex-display-lists".to_string())
         .spawn(move || {
@@ -426,11 +424,11 @@ pub fn render_page_pixels(
     let list = display_list(uri, page_num)?;
     let bounds = list.bounds();
     let pixmap = raster(&list, &ctm, bounds.transform(&ctm).round())?;
-    let bounds = (
+    let page_size = (
         f64::from(bounds.x1 - bounds.x0),
         f64::from(bounds.y1 - bounds.y0),
     );
-    let (width_pt, height_pt) = page_pt.unwrap_or(bounds);
+    let (width_pt, height_pt) = page_pt.unwrap_or(page_size);
     let width = ((width_pt * scale * dsf) as i32).max(1);
     let height = ((height_pt * scale * dsf) as i32).max(1);
     let (data, stride) = pack_pixmap(&pixmap, width, height, dark_mode())?;
@@ -831,7 +829,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
     }
 
     #[test]
-    fn alternating_documents_render_their_own_pages() {
+    fn owner_serves_each_document_its_own_pages() {
         let (small, large) = (margin_pdf_uri(), mixed_size_pdf_uri());
         let mut owner = DisplayListOwner::for_generation(10);
         for _ in 0..3 {
