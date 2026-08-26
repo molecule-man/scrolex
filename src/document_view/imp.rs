@@ -275,6 +275,19 @@ impl DocumentView {
             }
         ));
         self.toc_revealer.add_controller(key);
+
+        let middle_click = gtk::GestureClick::builder()
+            .button(gtk::gdk::BUTTON_MIDDLE)
+            .build();
+        middle_click.connect_pressed(clone!(
+            #[weak(rename_to = imp)]
+            self,
+            move |gesture, _, _, y| {
+                gesture.set_state(gtk::EventSequenceState::Claimed);
+                imp.toc_row_split(y);
+            }
+        ));
+        self.toc_list.add_controller(middle_click);
     }
 
     pub(crate) fn panes(&self) -> Vec<DocumentPane> {
@@ -1004,19 +1017,33 @@ impl DocumentView {
 
     #[template_callback]
     fn toc_row_activated(&self, row: &gtk::ListBoxRow) {
-        let index = row.index();
-        let page = if index >= 0 {
-            self.toc_pages
-                .borrow()
-                .get(index as usize)
-                .copied()
-                .flatten()
-        } else {
-            None
-        };
-        if let Some(page) = page {
+        if let Some(page) = self.toc_page(row) {
             self.active_pane().goto_page(page as u32);
         }
+        self.toc_revealer.set_reveal_child(false);
+    }
+
+    fn toc_page(&self, row: &gtk::ListBoxRow) -> Option<i32> {
+        let index = usize::try_from(row.index()).ok()?;
+        self.toc_pages.borrow().get(index).copied().flatten()
+    }
+
+    fn toc_row_split(&self, y: f64) {
+        let Some(page) = self
+            .toc_list
+            .row_at_y(y as i32)
+            .and_then(|row| self.toc_page(&row))
+        else {
+            return;
+        };
+        let source = self.active_pane();
+        let source_page = source.viewport().page() as i32;
+        let location = DocumentLocation {
+            page: page - 1,
+            x: None,
+            y: None,
+        };
+        self.open_beside(&source, source_page, location);
         self.toc_revealer.set_reveal_child(false);
     }
 
@@ -1752,6 +1779,33 @@ mod tests {
         );
         assert!(imp.toc_revealer.reveals_child(), "plain t still toggles");
 
+        window.close();
+    }
+
+    #[gtk::test]
+    fn middle_click_on_a_contents_row_opens_the_page_beside() {
+        let window = loaded_window();
+        let imp = window.imp();
+        wait_until(|| !imp.toc_pages.borrow().is_empty());
+        imp.toc_revealer.set_reveal_child(true);
+        let row = imp.toc_list.row_at_index(1).unwrap();
+        wait_until(|| row.height() > 0);
+
+        let point = gtk::graphene::Point::new(0.0, 1.0);
+        let y = row.compute_point(&*imp.toc_list, &point).unwrap().y();
+        imp.toc_row_split(f64::from(y));
+
+        wait_until(|| {
+            imp.secondary
+                .borrow()
+                .as_ref()
+                .is_some_and(|pane| pane.viewport().page() == 1)
+        });
+        assert!(!imp.toc_revealer.reveals_child(), "the panel closes");
+        assert_eq!(imp.active_pane(), imp.primary_pane());
+
+        let secondary = imp.secondary.borrow().as_ref().unwrap().clone();
+        imp.close_pane(&secondary);
         window.close();
     }
 
