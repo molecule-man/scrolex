@@ -235,8 +235,7 @@ impl RenderPool {
         pool
     }
 
-    // Grow or shrink the worker pool. Growing spawns threads; shrinking asks surplus workers to exit
-    // after their current job, dropping their resident MuPDF Document and freeing its memory.
+    // Grow or shrink the worker pool. A surplus worker exits after its current job.
     pub(crate) fn set_size(&self, n: usize) {
         let (lock, cvar) = &*self.inner;
         let mut queue = lock.lock().unwrap();

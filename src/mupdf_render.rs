@@ -253,12 +253,55 @@ pub fn with_doc<T>(uri: &str, f: impl FnOnce(&Document) -> Option<T>) -> Option<
     })
 }
 
-// One thread owns the documents and records per-page display lists. MuPDF documents are not
-// thread-safe, and one per worker duplicates the xref, the object cache and every store entry. A
-// display list is thread-safe, so the workers rasterize shared lists and open no document.
+struct LruCache<K, V> {
+    capacity: usize,
+    entries: VecDeque<(K, V)>,
+}
+
+impl<K: PartialEq, V> LruCache<K, V> {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            capacity,
+            entries: VecDeque::with_capacity(capacity),
+        }
+    }
+
+    fn get(&mut self, key: &K) -> Option<&V> {
+        let index = self
+            .entries
+            .iter()
+            .position(|(entry_key, _)| entry_key == key)?;
+        let entry = self.entries.remove(index)?;
+        self.entries.push_back(entry);
+        self.entries.back().map(|(_, value)| value)
+    }
+
+    fn insert(&mut self, key: K, value: V) {
+        if let Some(index) = self
+            .entries
+            .iter()
+            .position(|(entry_key, _)| entry_key == &key)
+        {
+            self.entries.remove(index);
+        }
+        self.entries.push_back((key, value));
+        while self.entries.len() > self.capacity {
+            self.entries.pop_front();
+        }
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+    }
+}
+
+// One thread owns documents and records page display lists. MuPDF documents cannot cross threads.
+// A document per worker duplicates its xref, object cache, and store entries.
+// Workers can rasterize one recorded list at the same time.
 struct ListRequest {
     uri: String,
     page: i32,
+    generation: u64,
     reply: mpsc::Sender<Option<Arc<DisplayList>>>,
 }
 
@@ -270,42 +313,48 @@ const LIST_CACHE_PAGES: usize = 8;
 // one. Four covers both split-view panes plus the last two tabs.
 const OPEN_DOCUMENTS: usize = 4;
 
-static LIST_SOURCE: Lazy<mpsc::SyncSender<ListRequest>> = Lazy::new(spawn_list_source);
+static LIST_SOURCE: Lazy<Option<mpsc::SyncSender<ListRequest>>> = Lazy::new(spawn_list_source);
 
-fn spawn_list_source() -> mpsc::SyncSender<ListRequest> {
+fn spawn_list_source() -> Option<mpsc::SyncSender<ListRequest>> {
     let (sender, receiver) = mpsc::sync_channel::<ListRequest>(64);
-    std::thread::spawn(move || {
-        // Touch the context first, so it outlives every Document here; see with_doc.
-        let _ctx = Colorspace::device_bgr();
-        let mut documents: VecDeque<(String, Document)> = VecDeque::new();
-        let mut lists: VecDeque<(String, i32, Arc<DisplayList>)> = VecDeque::new();
-        let mut open_generation = GENERATION.load(Ordering::Relaxed);
+    let thread = std::thread::Builder::new()
+        .name("scrolex-display-lists".to_string())
+        .spawn(move || {
+            // Touch the context first, so it outlives every Document here; see with_doc.
+            let _ctx = Colorspace::device_bgr();
+            let mut documents: VecDeque<(String, Document)> = VecDeque::new();
+            let mut lists = LruCache::with_capacity(LIST_CACHE_PAGES);
+            let mut open_generation = generation();
 
-        while let Ok(req) = receiver.recv() {
-            // A reload leaves every open document and recorded list on the old bytes.
-            let generation = GENERATION.load(Ordering::Relaxed);
-            if generation != open_generation {
-                open_generation = generation;
-                documents.clear();
-                lists.clear();
-            }
+            while let Ok(req) = receiver.recv() {
+                let current_generation = generation();
+                if current_generation != open_generation {
+                    open_generation = current_generation;
+                    documents.clear();
+                    lists.clear();
+                }
 
-            let list = lists
-                .iter()
-                .find(|(uri, page, _)| uri == &req.uri && *page == req.page)
-                .map(|(_, _, list)| list.clone())
-                .or_else(|| {
+                if req.generation != current_generation {
+                    let _ = req.reply.send(None);
+                    continue;
+                }
+
+                let key = (req.uri.clone(), req.page);
+                let list = lists.get(&key).cloned().or_else(|| {
                     let list = record(&mut documents, &req.uri, req.page)?;
-                    lists.push_back((req.uri.clone(), req.page, list.clone()));
-                    while lists.len() > LIST_CACHE_PAGES {
-                        lists.pop_front();
-                    }
+                    lists.insert(key, list.clone());
                     Some(list)
                 });
-            let _ = req.reply.send(list);
+                let _ = req.reply.send(list);
+            }
+        });
+    match thread {
+        Ok(_) => Some(sender),
+        Err(err) => {
+            log::error!("could not start the display list thread: {err}");
+            None
         }
-    });
-    sender
+    }
 }
 
 // Record one page. Opens the document if the owner does not hold it.
@@ -334,9 +383,11 @@ fn record(
 fn display_list(uri: &str, page_num: i32) -> Option<Arc<DisplayList>> {
     let (reply, answer) = mpsc::channel();
     LIST_SOURCE
+        .as_ref()?
         .send(ListRequest {
             uri: uri.to_string(),
             page: page_num,
+            generation: generation(),
             reply,
         })
         .ok()?;
@@ -657,6 +708,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cache_access_delays_eviction() {
+        let mut cache = LruCache::with_capacity(2);
+        cache.insert(1, "one");
+        cache.insert(2, "two");
+
+        assert_eq!(cache.get(&1), Some(&"one"));
+        cache.insert(3, "three");
+
+        assert_eq!(cache.get(&1), Some(&"one"));
+        assert_eq!(cache.get(&2), None);
+        assert_eq!(cache.get(&3), Some(&"three"));
+    }
+
+    #[test]
     fn dark_mode_maps_page_and_ink_to_configured_colors() {
         assert_eq!(recolor(0, 0, 0, DARK_MODE), DARK_MODE.ink);
         assert_eq!(recolor(255, 255, 255, DARK_MODE), DARK_MODE.paper);
@@ -781,6 +846,28 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
             );
             assert_eq!(rendered.data, expected.data);
         }
+    }
+
+    #[test]
+    fn invalidate_discards_recorded_pages() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reload.pdf");
+        let uri = crate::test_support::file_uri(&path);
+        std::fs::write(&path, MARGIN_PDF).unwrap();
+        invalidate();
+
+        let first = display_list(&uri, 0).unwrap();
+        assert_eq!(first.bounds(), Rect::new(0.0, 0.0, 200.0, 200.0));
+
+        let larger = String::from_utf8(MARGIN_PDF.to_vec())
+            .unwrap()
+            .replace("/MediaBox [0 0 200 200]", "/MediaBox [0 0 400 400]");
+        std::fs::write(&path, larger).unwrap();
+        invalidate();
+
+        let reloaded = display_list(&uri, 0).unwrap();
+        assert_eq!(reloaded.bounds(), Rect::new(0.0, 0.0, 400.0, 400.0));
+        assert_eq!(first.bounds(), Rect::new(0.0, 0.0, 200.0, 200.0));
     }
 
     // The owner holds both files open, so alternating renders do not reopen either.
