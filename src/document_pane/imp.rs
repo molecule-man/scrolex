@@ -280,6 +280,7 @@ impl ObjectImpl for DocumentPane {
         // The cache budgets are application totals; the window divides them across its documents.
         self.setup_fit_height();
         self.setup_text_selection();
+        self.close_button.set_cursor_from_name(Some("pointer"));
         // Give keyboard focus to the scroll area rather than the header entry
         self.scrolledwindow.set_focusable(true);
         self.listview.set_focusable(false);

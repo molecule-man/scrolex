@@ -1454,6 +1454,29 @@ mod tests {
     }
 
     #[gtk::test]
+    fn the_pane_close_button_shows_a_pointer() {
+        let window = loaded_window();
+        let imp = window.imp();
+        let primary = imp.primary_pane();
+        imp.open_beside(
+            &primary,
+            0,
+            DocumentLocation {
+                page: 1,
+                x: Some(0.0),
+                y: Some(0.0),
+            },
+        );
+        let secondary = imp.secondary.borrow().as_ref().unwrap().clone();
+
+        for pane in [&primary, &secondary] {
+            let cursor = pane.close_button().cursor().expect("a cursor");
+            assert_eq!(cursor.name().as_deref(), Some("pointer"));
+        }
+        window.close();
+    }
+
+    #[gtk::test]
     fn closing_the_primary_updates_the_pane_access() {
         let window = loaded_window();
         let imp = window.imp();

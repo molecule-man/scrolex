@@ -453,6 +453,7 @@ impl Window {
         close.add_css_class("flat");
         close.set_focus_on_click(false);
         close.set_tooltip_text(Some("Close this document (Ctrl+W)"));
+        close.set_cursor_from_name(Some("pointer"));
         close.connect_clicked(clone!(
             #[weak(rename_to = imp)]
             self,
