@@ -1215,7 +1215,8 @@ mod tests {
         let secondary = imp.secondary.borrow().as_ref().unwrap().clone();
         let paned = imp.split_container();
         assert!(paned.has_css_class("document-split"));
-        assert_eq!(paned.width() - source.width() - secondary.width(), 10);
+        // the gutter is the separator min-width in ui/style.css
+        assert_eq!(paned.width() - source.width() - secondary.width(), 8);
         assert_eq!(imp.active_pane(), source);
         assert!(source.has_css_class("active-pane"));
         assert!(secondary.has_css_class("inactive-pane"));
