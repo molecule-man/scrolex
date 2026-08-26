@@ -31,8 +31,8 @@ static GREY_LUT: Lazy<[[u8; 3]; 256]> = Lazy::new(|| {
     std::array::from_fn(|value| recolor(value as u8, value as u8, value as u8, DARK_MODE))
 });
 
-// Bumped on document load so every thread's cached Document is reopened - otherwise reloading the
-// same path after the file changed on disk would keep serving the stale document.
+// Identifies the bytes behind each cached document. A document load changes this value.
+// Later cache access reopens files that changed on disk.
 static GENERATION: AtomicU64 = AtomicU64::new(0);
 
 // Non-local GFiles (smb://, sftp://, GVfs mounts) have no local path, and MuPDF opens by path only.
@@ -73,8 +73,8 @@ pub(crate) fn loading_text_rgb() -> [u8; 3] {
     })
 }
 
-// Invalidate every thread's cached Document (call on document load). The next `with_doc` on each
-// thread reopens against the current bytes, and any staged remote copies are re-fetched.
+// Invalidate cached documents and derived data after a document load. Thread-local documents reopen
+// on their next use. The owner clears its documents and display lists on its next request.
 pub fn invalidate() {
     GENERATION.fetch_add(1, Ordering::Relaxed);
     let mut staged = STAGED.lock().unwrap();
@@ -301,7 +301,6 @@ impl<K: PartialEq, V> LruCache<K, V> {
 struct ListRequest {
     uri: String,
     page: i32,
-    generation: u64,
     reply: mpsc::Sender<Option<Arc<DisplayList>>>,
 }
 
@@ -315,6 +314,45 @@ const OPEN_DOCUMENTS: usize = 4;
 
 static LIST_SOURCE: Lazy<Option<mpsc::SyncSender<ListRequest>>> = Lazy::new(spawn_list_source);
 
+struct DisplayListOwner {
+    generation: u64,
+    documents: LruCache<String, Document>,
+    lists: LruCache<(String, i32), Arc<DisplayList>>,
+}
+
+impl DisplayListOwner {
+    fn for_generation(generation: u64) -> Self {
+        Self {
+            generation,
+            documents: LruCache::with_capacity(OPEN_DOCUMENTS),
+            lists: LruCache::with_capacity(LIST_CACHE_PAGES),
+        }
+    }
+
+    fn list(&mut self, generation: u64, uri: &str, page: i32) -> Option<Arc<DisplayList>> {
+        if generation != self.generation {
+            self.generation = generation;
+            self.documents.clear();
+            self.lists.clear();
+        }
+
+        let key = (uri.to_string(), page);
+        if let Some(list) = self.lists.get(&key) {
+            return Some(list.clone());
+        }
+
+        let uri = uri.to_string();
+        if self.documents.get(&uri).is_none() {
+            let document = open_document(&local_path(&uri)?)?;
+            self.documents.insert(uri.clone(), document);
+        }
+        let document = self.documents.get(&uri)?;
+        let list = Arc::new(document.load_page(page).ok()?.to_display_list(true).ok()?);
+        self.lists.insert(key, list.clone());
+        Some(list)
+    }
+}
+
 fn spawn_list_source() -> Option<mpsc::SyncSender<ListRequest>> {
     let (sender, receiver) = mpsc::sync_channel::<ListRequest>(64);
     let thread = std::thread::Builder::new()
@@ -322,29 +360,11 @@ fn spawn_list_source() -> Option<mpsc::SyncSender<ListRequest>> {
         .spawn(move || {
             // Touch the context first, so it outlives every Document here; see with_doc.
             let _ctx = Colorspace::device_bgr();
-            let mut documents: VecDeque<(String, Document)> = VecDeque::new();
-            let mut lists = LruCache::with_capacity(LIST_CACHE_PAGES);
-            let mut open_generation = generation();
+            let mut owner = DisplayListOwner::for_generation(generation());
 
             while let Ok(req) = receiver.recv() {
                 let current_generation = generation();
-                if current_generation != open_generation {
-                    open_generation = current_generation;
-                    documents.clear();
-                    lists.clear();
-                }
-
-                if req.generation != current_generation {
-                    let _ = req.reply.send(None);
-                    continue;
-                }
-
-                let key = (req.uri.clone(), req.page);
-                let list = lists.get(&key).cloned().or_else(|| {
-                    let list = record(&mut documents, &req.uri, req.page)?;
-                    lists.insert(key, list.clone());
-                    Some(list)
-                });
+                let list = owner.list(current_generation, &req.uri, req.page);
                 let _ = req.reply.send(list);
             }
         });
@@ -357,28 +377,6 @@ fn spawn_list_source() -> Option<mpsc::SyncSender<ListRequest>> {
     }
 }
 
-// Record one page. Opens the document if the owner does not hold it.
-fn record(
-    documents: &mut VecDeque<(String, Document)>,
-    uri: &str,
-    page: i32,
-) -> Option<Arc<DisplayList>> {
-    // Move the used one to the back. The front stays least recently used.
-    let entry = match documents.iter().position(|(open, _)| open == uri) {
-        Some(index) => documents.remove(index)?,
-        None => (uri.to_string(), open_document(&local_path(uri)?)?),
-    };
-    documents.push_back(entry);
-    while documents.len() > OPEN_DOCUMENTS {
-        documents.pop_front();
-    }
-
-    let (_, doc) = documents.back()?;
-    // annotations = true: a full page render shows annotations and widgets.
-    let list = doc.load_page(page).ok()?.to_display_list(true).ok()?;
-    Some(Arc::new(list))
-}
-
 // The page's display list from the owner thread. Blocks until it arrives.
 fn display_list(uri: &str, page_num: i32) -> Option<Arc<DisplayList>> {
     let (reply, answer) = mpsc::channel();
@@ -387,7 +385,6 @@ fn display_list(uri: &str, page_num: i32) -> Option<Arc<DisplayList>> {
         .send(ListRequest {
             uri: uri.to_string(),
             page: page_num,
-            generation: generation(),
             reply,
         })
         .ok()?;
@@ -446,29 +443,40 @@ fn render_page_pixels_with_mode(
     dark_mode: Option<DarkMode>,
 ) -> Option<PagePixels> {
     let ctm = Matrix::new_scale((scale * dsf) as f32, (scale * dsf) as f32);
-    let sized = |pixmap: &Pixmap, bounds: (f64, f64)| {
-        let (pw, ph) = page_pt.unwrap_or(bounds);
-        let width = ((pw * scale * dsf) as i32).max(1);
-        let height = ((ph * scale * dsf) as i32).max(1);
-        let (data, stride) = pack_pixmap(pixmap, width, height, dark_mode)?;
-        Some(PagePixels {
-            data,
-            width,
-            height,
-            stride,
-        })
-    };
-
     let list = display_list(uri, page_num)?;
     let bounds = list.bounds();
     let pixmap = raster(&list, &ctm, bounds.transform(&ctm).round())?;
-    sized(
+    page_pixels(
         &pixmap,
         (
             f64::from(bounds.x1 - bounds.x0),
             f64::from(bounds.y1 - bounds.y0),
         ),
+        scale,
+        dsf,
+        page_pt,
+        dark_mode,
     )
+}
+
+fn page_pixels(
+    pixmap: &Pixmap,
+    bounds: (f64, f64),
+    scale: f64,
+    dsf: f64,
+    page_pt: Option<(f64, f64)>,
+    dark_mode: Option<DarkMode>,
+) -> Option<PagePixels> {
+    let (width_pt, height_pt) = page_pt.unwrap_or(bounds);
+    let width = ((width_pt * scale * dsf) as i32).max(1);
+    let height = ((height_pt * scale * dsf) as i32).max(1);
+    let (data, stride) = pack_pixmap(pixmap, width, height, dark_mode)?;
+    Some(PagePixels {
+        data,
+        width,
+        height,
+        stride,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -496,30 +504,26 @@ pub fn render_page_regions(
 ) -> Option<Vec<PagePixels>> {
     let ctm = Matrix::new_scale((scale * dsf) as f32, (scale * dsf) as f32);
     let dark_mode = dark_mode();
-    let render_all = |list: &DisplayList| {
-        let mut rendered = Vec::with_capacity(regions.len());
-        for region in regions {
-            debug_assert!(region.x0 < region.x1 && region.y0 < region.y1);
-            if region.x0 >= region.x1 || region.y0 >= region.y1 {
-                return None;
-            }
-            let area = IRect::new(region.x0, region.y0, region.x1, region.y1);
-            let pixmap = raster(list, &ctm, area)?;
-            let width = region.x1 - region.x0;
-            let height = region.y1 - region.y0;
-            let (data, stride) = pack_pixmap(&pixmap, width, height, dark_mode)?;
-            rendered.push(PagePixels {
-                data,
-                width,
-                height,
-                stride,
-            });
-        }
-        Some(rendered)
-    };
-
     let list = display_list(uri, page_num)?;
-    render_all(&list)
+    let mut rendered = Vec::with_capacity(regions.len());
+    for region in regions {
+        debug_assert!(region.x0 < region.x1 && region.y0 < region.y1);
+        if region.x0 >= region.x1 || region.y0 >= region.y1 {
+            return None;
+        }
+        let area = IRect::new(region.x0, region.y0, region.x1, region.y1);
+        let pixmap = raster(&list, &ctm, area)?;
+        let width = region.x1 - region.x0;
+        let height = region.y1 - region.y0;
+        let (data, stride) = pack_pixmap(&pixmap, width, height, dark_mode)?;
+        rendered.push(PagePixels {
+            data,
+            width,
+            height,
+            stride,
+        });
+    }
+    Some(rendered)
 }
 
 // `render_page_pixels` as an ImageSurface for benchmarks and tests.
@@ -570,14 +574,30 @@ pub fn page_size(uri: &str, page_num: i32) -> Option<(f64, f64)> {
 // tightest non-white rect - robust across text, vector and image content.
 pub fn content_bbox(uri: &str, page_num: i32) -> Option<(f64, f64, f64, f64)> {
     const SCALE: f64 = 0.2; // 1 sampled pixel = 5pt; crop adds a 5pt margin anyway
-    let surface = render_page_surface_with_mode(uri, page_num, SCALE, 1.0, None, None)?;
-    let (w, h, stride) = (surface.width(), surface.height(), surface.stride() as usize);
-
-    let mut pixels = None;
-    surface
-        .with_data(|data| pixels = scan_bbox(data, w, h, stride))
-        .ok()?;
-    let (min_x, min_y, max_x, max_y) = pixels?;
+    let pixels = with_doc(uri, |doc| {
+        let colorspace = Colorspace::device_bgr();
+        let page = doc.load_page(page_num).ok()?;
+        let ctm = Matrix::new_scale(SCALE as f32, SCALE as f32);
+        let pixmap = page.to_pixmap(&ctm, &colorspace, false, true).ok()?;
+        let bounds = page.bounds().ok()?;
+        page_pixels(
+            &pixmap,
+            (
+                f64::from(bounds.x1 - bounds.x0),
+                f64::from(bounds.y1 - bounds.y0),
+            ),
+            SCALE,
+            1.0,
+            None,
+            None,
+        )
+    })?;
+    let (min_x, min_y, max_x, max_y) = scan_bbox(
+        &pixels.data,
+        pixels.width,
+        pixels.height,
+        pixels.stride as usize,
+    )?;
     Some((
         min_x as f64 / SCALE,
         min_y as f64 / SCALE,
@@ -849,28 +869,26 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
     }
 
     #[test]
-    fn invalidate_discards_recorded_pages() {
+    fn owner_generation_discards_recorded_pages() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("reload.pdf");
         let uri = crate::test_support::file_uri(&path);
         std::fs::write(&path, MARGIN_PDF).unwrap();
-        invalidate();
+        let mut owner = DisplayListOwner::for_generation(10);
 
-        let first = display_list(&uri, 0).unwrap();
+        let first = owner.list(10, &uri, 0).unwrap();
         assert_eq!(first.bounds(), Rect::new(0.0, 0.0, 200.0, 200.0));
 
         let larger = String::from_utf8(MARGIN_PDF.to_vec())
             .unwrap()
             .replace("/MediaBox [0 0 200 200]", "/MediaBox [0 0 400 400]");
         std::fs::write(&path, larger).unwrap();
-        invalidate();
 
-        let reloaded = display_list(&uri, 0).unwrap();
+        let reloaded = owner.list(11, &uri, 0).unwrap();
         assert_eq!(reloaded.bounds(), Rect::new(0.0, 0.0, 400.0, 400.0));
         assert_eq!(first.bounds(), Rect::new(0.0, 0.0, 200.0, 200.0));
     }
 
-    // The owner holds both files open, so alternating renders do not reopen either.
     #[test]
     fn alternating_documents_render_their_own_pages() {
         let (small, large) = (margin_pdf_uri(), mixed_size_pdf_uri());
