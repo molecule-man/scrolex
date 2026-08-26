@@ -215,11 +215,17 @@ impl Window {
                 }
                 // The last document has no tab left to fall back to, so the window goes with it.
                 Key::w | Key::W => {
-                    match self.active_document() {
-                        Some(document) if self.notebook.n_pages() > 1 => {
-                            self.close_document(&document);
+                    let document = self.active_document();
+                    let closed_pane = document
+                        .as_ref()
+                        .is_some_and(DocumentView::close_active_pane);
+                    if !closed_pane {
+                        match document {
+                            Some(document) if self.notebook.n_pages() > 1 => {
+                                self.close_document(&document);
+                            }
+                            _ => self.obj().close(),
                         }
-                        _ => self.obj().close(),
                     }
                     return glib::Propagation::Stop;
                 }
@@ -1533,6 +1539,33 @@ mod widget_tests {
         assert_eq!(taken, gtk::glib::Propagation::Stop, "the window took it");
         assert_eq!(window.header().notebook.n_pages(), 1);
         assert_eq!(window.header().active_document().as_ref(), Some(&first));
+
+        window.close();
+    }
+
+    #[gtk::test]
+    fn ctrl_w_closes_the_split_pane_before_the_tab() {
+        let window = loaded_window();
+        let document = window.header().active_document().expect("a document");
+        window.header().add_document().expect("a tab");
+        window.header().notebook.set_current_page(Some(0));
+        assert_eq!(window.header().active_document().as_ref(), Some(&document));
+
+        document.split_here();
+        wait_until(|| document.property::<bool>("split-open"));
+
+        let press = || {
+            window
+                .header()
+                .handle_window_key(gtk::gdk::Key::w, gtk::gdk::ModifierType::CONTROL_MASK)
+        };
+
+        assert_eq!(press(), gtk::glib::Propagation::Stop);
+        assert!(!document.property::<bool>("split-open"), "the pane closed");
+        assert_eq!(window.header().notebook.n_pages(), 2, "the tab stayed");
+
+        press();
+        assert_eq!(window.header().notebook.n_pages(), 1, "the tab closed");
 
         window.close();
     }

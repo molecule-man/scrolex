@@ -70,10 +70,11 @@ JPEG, TIFF, …) open as well. DjVu is not supported.
 | --------------- | ---------------------------------------- |
 | `o` / Ctrl + o  | Open a document                          |
 | Ctrl + t        | Open a document in a new tab             |
-| Ctrl + w        | Close the current tab or window          |
+| Ctrl + w        | Close the split pane, then the tab, then the window |
 | `t`             | Toggle table of contents                 |
 | `s`             | Open the current page in split view      |
 | Middle-click an internal link | Open the link in split view     |
+| Tab             | Switch between the split panes           |
 | F11             | Toggle full screen                       |
 | `l` / PageDown  | Next page                                |
 | `h` / PageUp    | Previous page                            |

@@ -119,6 +119,10 @@ impl DocumentView {
         self.imp().handle_reader_key(keyval, modifier, context)
     }
 
+    pub(crate) fn close_active_pane(&self) -> bool {
+        self.imp().close_active_pane()
+    }
+
     pub fn target_page(&self, page_num: u32) -> Option<u32> {
         self.imp().active_pane().target_page(page_num)
     }

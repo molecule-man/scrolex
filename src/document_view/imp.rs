@@ -285,6 +285,34 @@ impl DocumentView {
         panes
     }
 
+    fn focused_pane(&self) -> Option<DocumentPane> {
+        let window = self.obj().root().and_downcast::<gtk::Window>()?;
+        let focus = gtk::prelude::GtkWindowExt::focus(&window)?;
+        self.panes()
+            .into_iter()
+            .find(|pane| focus.is_ancestor(pane) || focus == *pane.upcast_ref::<gtk::Widget>())
+    }
+
+    fn switch_pane(&self) -> glib::Propagation {
+        if self.split_geometry_pending.get() {
+            return glib::Propagation::Proceed;
+        }
+        let Some(secondary) = self.secondary.borrow().clone() else {
+            return glib::Propagation::Proceed;
+        };
+        let Some(current) = self.focused_pane() else {
+            return glib::Propagation::Proceed;
+        };
+        let target = if current == secondary {
+            self.primary_pane()
+        } else {
+            secondary
+        };
+        self.activate_pane(&target);
+        target.focus_reader();
+        glib::Propagation::Stop
+    }
+
     fn setup_pane(&self, pane: &DocumentPane) {
         pane.connect_closure(
             "link-activated",
@@ -660,6 +688,14 @@ impl DocumentView {
         ));
     }
 
+    pub(crate) fn close_active_pane(&self) -> bool {
+        if self.secondary.borrow().is_none() {
+            return false;
+        }
+        self.close_pane(&self.active_pane());
+        true
+    }
+
     fn close_pane(&self, pane: &DocumentPane) {
         if self.secondary.borrow().is_none() {
             return;
@@ -955,6 +991,14 @@ impl DocumentView {
         _keycode: u32,
         modifier: ModifierType,
     ) -> glib::Propagation {
+        if !modifier.contains(ModifierType::CONTROL_MASK)
+            && matches!(keyval, Key::Tab | Key::ISO_Left_Tab)
+        {
+            let taken = self.switch_pane();
+            if matches!(taken, glib::Propagation::Stop) {
+                return taken;
+            }
+        }
         self.handle_reader_key(keyval, modifier, ReaderKeyContext::Document)
     }
 
@@ -1270,6 +1314,44 @@ mod tests {
         assert_eq!(imp.secondary.borrow().as_ref(), Some(&target));
         imp.close_pane(&target);
         assert!(!window.property::<bool>("split-open"));
+        window.close();
+    }
+
+    #[gtk::test]
+    fn tab_moves_the_focus_between_the_panes() {
+        let window = loaded_window();
+        let imp = window.imp();
+        let source = imp.primary_pane();
+        source.focus_reader();
+
+        let press = |key| imp.handle_key_press(key, 0, gtk::gdk::ModifierType::empty());
+        assert_eq!(press(gtk::gdk::Key::Tab), glib::Propagation::Proceed);
+
+        imp.split_here();
+        wait_until(|| imp.secondary.borrow().is_some() && !imp.split_geometry_pending.get());
+        let target = imp.secondary.borrow().as_ref().unwrap().clone();
+        assert_eq!(imp.active_pane(), target);
+
+        assert_eq!(press(gtk::gdk::Key::Tab), glib::Propagation::Stop);
+        assert_eq!(imp.active_pane(), source);
+        assert!(source.has_css_class("active-pane"));
+
+        assert_eq!(press(gtk::gdk::Key::ISO_Left_Tab), glib::Propagation::Stop);
+        assert_eq!(imp.active_pane(), target);
+
+        // The search bar keeps Tab, so the focus can reach its buttons.
+        imp.open_search();
+        assert!(imp.focused_pane().is_none());
+        assert_eq!(press(gtk::gdk::Key::Tab), glib::Propagation::Proceed);
+        assert_eq!(imp.active_pane(), target);
+        imp.search_bar.set_search_mode(false);
+        target.focus_reader();
+
+        assert_eq!(
+            imp.handle_key_press(gtk::gdk::Key::Tab, 0, gtk::gdk::ModifierType::CONTROL_MASK,),
+            glib::Propagation::Proceed
+        );
+        assert_eq!(imp.active_pane(), target);
         window.close();
     }
 
