@@ -2132,22 +2132,20 @@ fn get_bbox(uri: &str, page: &PageInfo, crop: bool) -> Rectangle {
     if !crop {
         return Rectangle::new(0.0, 0.0, page.width, page.height);
     }
-    // MuPDF's content bbox is page-local top-left points, same convention as our Rectangle. Fall
-    // back to the full page if it can't be resolved.
-    match crate::mupdf_render::content_bbox(uri, page.index) {
-        Some((x1, y1, x2, y2)) => {
-            apply_crop(Rectangle::new(x1, y1, x2, y2), page.width, page.height)
-        }
+    // MuPDF's content span is page-local points, same convention as our Rectangle. Fall back to the
+    // full page if it can't be resolved.
+    match crate::mupdf_render::content_x_span(uri, page.index) {
+        Some((x1, x2)) => apply_crop(x1, x2, page.width, page.height),
         None => Rectangle::new(0.0, 0.0, page.width, page.height),
     }
 }
 
-// Crop the left and right margins only. Grow the content box by a 5pt margin, enforce a half-page
+// Crop the left and right margins only. Grow the content span by a 5pt margin, enforce a half-page
 // minimum width, and clamp to the page. Pure geometry so the crop behaviour is tested without a
 // rendering backend.
-fn apply_crop(content: Rectangle, width: f64, height: f64) -> Rectangle {
-    let x1 = content.x1 - 5.0;
-    let mut x2 = content.x2 + 5.0;
+fn apply_crop(content_x1: f64, content_x2: f64, width: f64, height: f64) -> Rectangle {
+    let x1 = content_x1 - 5.0;
+    let mut x2 = content_x2 + 5.0;
     if x2 - x1 < width / 2.0 {
         x2 = x1 + width / 2.0;
     }
@@ -2431,18 +2429,18 @@ startxref
         );
     }
 
-    // The crop math is pure geometry over a content box (whatever backend produced it), so it's
+    // The crop math is pure geometry over a content span (whatever backend produced it), so it's
     // tested directly. Page is 250x50.
     #[test]
     fn apply_crop_adds_margin() {
-        let r = apply_crop(Rectangle::new(50.0, 15.0, 200.0, 40.0), 250.0, 50.0);
+        let r = apply_crop(50.0, 200.0, 250.0, 50.0);
         assert!((r.x1 - 45.0).abs() < EPSILON);
         assert!((r.x2 - 205.0).abs() < EPSILON);
     }
 
     #[test]
     fn apply_crop_keeps_full_height() {
-        let r = apply_crop(Rectangle::new(50.0, 15.0, 200.0, 40.0), 250.0, 50.0);
+        let r = apply_crop(50.0, 200.0, 250.0, 50.0);
         assert!((r.y1 - 0.0).abs() < EPSILON);
         assert!((r.y2 - 50.0).abs() < EPSILON);
     }
@@ -2450,7 +2448,7 @@ startxref
     #[test]
     fn apply_crop_enforces_half_page_min() {
         // tiny content grows to at least half the page width
-        let r = apply_crop(Rectangle::new(9.5, 6.0, 20.0, 8.0), 250.0, 50.0);
+        let r = apply_crop(9.5, 20.0, 250.0, 50.0);
         assert!((r.x1 - 4.5).abs() < EPSILON);
         assert!((r.x2 - 129.5).abs() < EPSILON); // 4.5 + 250/2
     }
@@ -2458,7 +2456,7 @@ startxref
     #[test]
     fn apply_crop_clamps_to_page() {
         // margins pushing past the edges clamp back to [0,w]
-        let r = apply_crop(Rectangle::new(2.0, 2.0, 248.0, 48.0), 250.0, 50.0);
+        let r = apply_crop(2.0, 248.0, 250.0, 50.0);
         assert!((r.x1 - 0.0).abs() < EPSILON);
         assert!((r.x2 - 250.0).abs() < EPSILON);
     }
