@@ -85,6 +85,16 @@
     </screenshot>
   </screenshots>
   <releases>
+    <release version="0.12.0" date="2026-08-27">
+      <url>https://github.com/molecule-man/scrolex/releases/tag/0.12.0</url>
+      <description>
+        <ul>
+          <li>Introduce split-view</li>
+          <li>Reduce memory consumption by sharing display lists between threads</li>
+          <li>Close tab on middle-click</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.11.5" date="2026-08-21">
       <url>https://github.com/molecule-man/scrolex/releases/tag/0.11.5</url>
       <description>
