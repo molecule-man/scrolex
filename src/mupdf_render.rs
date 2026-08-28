@@ -13,6 +13,10 @@ use gtk::prelude::FileExt;
 use mupdf::{Colorspace, Device, DisplayList, Document, IRect, Matrix, Pixmap, Rect};
 use once_cell::sync::Lazy;
 
+// Bump this version when content span results can change.
+pub(crate) const CONTENT_SCAN_VERSION: u16 = 1;
+pub(crate) const CONTENT_SCAN_SCALE: f64 = 0.2;
+
 #[derive(Clone, Copy)]
 struct DarkMode {
     paper: [u8; 3],
@@ -518,51 +522,56 @@ pub fn page_size(uri: &str, page_num: i32) -> Option<(f64, f64)> {
     })
 }
 
-// Bounding box of the page's non-white content in page-local top-left points, or None for a blank
-// page. MuPDF exposes no ink-bbox device through Rust. A small page render supplies scan pixels.
-// Crop uses the caller's document, so GTK does not wait behind background list records.
-pub fn content_bbox(uri: &str, page_num: i32) -> Option<(f64, f64, f64, f64)> {
+// Left and right ink edges in page points, None for a blank page. X only: crop trims side margins.
+// Scans rendered pixels because mupdf-rs exposes no ink-bbox api.
+pub fn content_x_span(uri: &str, page_num: i32) -> Option<(f64, f64)> {
     if let Some(config) = crate::emulate::config() {
-        return Some((0.0, 0.0, config.page_pt.0, config.page_pt.1));
+        return Some((0.0, config.page_pt.0));
     }
-    const SCALE: f64 = 0.2; // 1 sampled pixel = 5pt; crop adds a 5pt margin anyway
     let (data, width, height, stride) = with_doc(uri, |doc| {
         let colorspace = Colorspace::device_bgr();
         let page = doc.load_page(page_num).ok()?;
-        let ctm = Matrix::new_scale(SCALE as f32, SCALE as f32);
+        let ctm = Matrix::new_scale(CONTENT_SCAN_SCALE as f32, CONTENT_SCAN_SCALE as f32);
         let pixmap = page.to_pixmap(&ctm, &colorspace, false, true).ok()?;
         let width = i32::try_from(pixmap.width()).ok()?;
         let height = i32::try_from(pixmap.height()).ok()?;
         let (data, stride) = pack_pixmap(&pixmap, width, height, None)?;
         Some((data, width, height, stride))
     })?;
-    let (min_x, min_y, max_x, max_y) = scan_bbox(&data, width, height, stride as usize)?;
+    let (min_x, max_x) = scan_x_span(&data, width, height, stride as usize)?;
     Some((
-        min_x as f64 / SCALE,
-        min_y as f64 / SCALE,
-        (max_x + 1) as f64 / SCALE,
-        (max_y + 1) as f64 / SCALE,
+        min_x as f64 / CONTENT_SCAN_SCALE,
+        (max_x + 1) as f64 / CONTENT_SCAN_SCALE,
     ))
 }
 
-// Tightest pixel bounding box (min_x, min_y, max_x, max_y, inclusive) of non-white content in a
-// Rgb24 (BGRx) buffer, or None if every pixel is near-white.
-fn scan_bbox(data: &[u8], w: i32, h: i32, stride: usize) -> Option<(i32, i32, i32, i32)> {
-    let (mut min_x, mut min_y, mut max_x, mut max_y) = (w, h, -1, -1);
+// Leftmost and rightmost pixel column (inclusive) holding non-white content in a Rgb24 (BGRx)
+// buffer, or None if every pixel is near-white.
+fn scan_x_span(data: &[u8], w: i32, h: i32, stride: usize) -> Option<(i32, i32)> {
+    let (mut min_x, mut max_x) = (w, -1);
     for y in 0..h {
         let row = &data[y as usize * stride..];
-        for x in 0..w {
+        let ink = |x: i32| {
             let p = &row[x as usize * 4..];
-            let background = p[0] >= 245 && p[1] >= 245 && p[2] >= 245;
-            if !background {
-                min_x = min_x.min(x);
-                min_y = min_y.min(y);
-                max_x = max_x.max(x);
-                max_y = max_y.max(y);
+            !(p[0] >= 245 && p[1] >= 245 && p[2] >= 245)
+        };
+        for x in 0..min_x {
+            if ink(x) {
+                min_x = x;
+                break;
             }
         }
+        for x in ((max_x + 1).max(min_x)..w).rev() {
+            if ink(x) {
+                max_x = x;
+                break;
+            }
+        }
+        if min_x == 0 && max_x == w - 1 {
+            break;
+        }
     }
-    (max_x >= min_x && max_y >= min_y).then_some((min_x, min_y, max_x, max_y))
+    (max_x >= min_x).then_some((min_x, max_x))
 }
 
 // Pack a MuPDF BGR pixmap into a Rgb24 (BGRx) buffer of exactly (target_w, target_h) plus its stride.
@@ -744,7 +753,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
     fn margin_pdf_uri() -> String {
         static URI: std::sync::OnceLock<String> = std::sync::OnceLock::new();
         URI.get_or_init(|| {
-            let dir = std::env::temp_dir().join("scrolex_content_bbox_test");
+            let dir = std::env::temp_dir().join("scrolex_content_x_span_test");
             std::fs::create_dir_all(&dir).unwrap();
             let path = dir.join("margins.pdf");
             std::fs::write(&path, MARGIN_PDF).unwrap();
@@ -950,7 +959,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
 4 0 obj\n<< /Length 34 >>\nstream\nBT /F1 24 Tf 40 150 Td (Hello) Tj ET\nendstream\nendobj\n\
 trailer\n<< /Root 1 0 R >>\n%%EOF";
 
-    // /Rotate 90 on a 300x200 page must present as 200x300, and every provider (render→content_bbox,
+    // /Rotate 90 on a 300x200 page must present as 200x300, and every provider (render→content_x_span,
     // and text search) must report in that same rotated display frame so overlays land on the render.
     #[gtk::test]
     fn rotated_page_consistent_across_providers() {
@@ -963,11 +972,11 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         // rotation applied: displayed dimensions are swapped
         assert_eq!(page_size(&uri, 0), Some((200.0, 300.0)));
 
-        let (cx1, cy1, cx2, cy2) = content_bbox(&uri, 0).expect("content_bbox");
+        let (cx1, cx2) = content_x_span(&uri, 0).expect("content_x_span");
         assert!(
-            cx1 >= 0.0 && cy1 >= 0.0 && cx2 <= 200.0 && cy2 <= 300.0,
-            "content bbox outside rotated page: {:?}",
-            (cx1, cy1, cx2, cy2)
+            (135.0..=155.0).contains(&cx1) && (160.0..=180.0).contains(&cx2),
+            "content x span not in the rotated frame: {:?}",
+            (cx1, cx2)
         );
 
         // the "Hello" search hit must fall in the same frame - overlapping the content bbox, not in
@@ -988,47 +997,67 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         .expect("search found 'Hello'");
 
         assert!(
-            quad.0 < cx2 && quad.2 > cx1 && quad.1 < cy2 && quad.3 > cy1,
-            "search hit {quad:?} does not overlap content bbox ({cx1},{cy1},{cx2},{cy2}) - frame mismatch"
+            quad.0 < cx2 && quad.2 > cx1,
+            "search hit {quad:?} does not overlap content x span ({cx1},{cx2}) - frame mismatch"
         );
     }
 
-    #[test]
-    fn scan_bbox_finds_non_white_block() {
-        // 10x10 white buffer with a black block at x 3..=6, y 2..=5
+    // A 10x10 white Rgb24 buffer with black pixels at the given (x, y).
+    fn ink_buffer(pixels: &[(usize, usize)]) -> (Vec<u8>, i32, i32, usize) {
         let (w, h) = (10i32, 10i32);
         let stride = (w * 4) as usize;
         let mut data = vec![0xffu8; stride * h as usize];
-        for y in 2..=5 {
-            for x in 3..=6 {
-                let o = y * stride + (x * 4) as usize;
-                data[o] = 0;
-                data[o + 1] = 0;
-                data[o + 2] = 0;
-            }
+        for &(x, y) in pixels {
+            let o = y * stride + x * 4;
+            data[o..o + 3].fill(0);
         }
-        assert_eq!(scan_bbox(&data, w, h, stride), Some((3, 2, 6, 5)));
+        (data, w, h, stride)
     }
 
     #[test]
-    fn scan_bbox_none_when_all_white() {
-        let stride = 10 * 4;
-        assert_eq!(scan_bbox(&vec![0xffu8; stride * 10], 10, 10, stride), None);
+    fn scan_x_span_finds_non_white_block() {
+        // black block at x 3..=6, y 2..=5
+        let block: Vec<_> = (2..=5).flat_map(|y| (3..=6).map(move |x| (x, y))).collect();
+        let (data, w, h, stride) = ink_buffer(&block);
+        assert_eq!(scan_x_span(&data, w, h, stride), Some((3, 6)));
     }
 
-    // Regression guard for the crop bug: content_bbox must trim to the mark, not return the full
+    // The widest row decides the span, even when a later row sits inside it.
+    #[test]
+    fn scan_x_span_spreads_across_rows() {
+        let (data, w, h, stride) = ink_buffer(&[(4, 0), (1, 3), (8, 7)]);
+        assert_eq!(scan_x_span(&data, w, h, stride), Some((1, 8)));
+    }
+
+    // Content touching both edges reports the full width.
+    #[test]
+    fn scan_x_span_covers_the_full_width() {
+        let (data, w, h, stride) = ink_buffer(&[(0, 4), (9, 4)]);
+        assert_eq!(scan_x_span(&data, w, h, stride), Some((0, 9)));
+    }
+
+    #[test]
+    fn scan_x_span_none_when_all_white() {
+        let stride = 10 * 4;
+        assert_eq!(
+            scan_x_span(&vec![0xffu8; stride * 10], 10, 10, stride),
+            None
+        );
+    }
+
+    // Regression guard for the crop bug: content_x_span must trim to the mark, not return the full
     // page. Renders a real page via MuPDF (opened by path), so it also covers the render+scale path.
     #[gtk::test]
-    fn content_bbox_trims_to_content_not_full_page() {
+    fn content_x_span_trims_to_content_not_full_page() {
         let uri = margin_pdf_uri();
-        let (x1, y1, x2, y2) = content_bbox(&uri, 0).expect("content_bbox on a rendered page");
+        let (x1, x2) = content_x_span(&uri, 0).expect("content_x_span on a rendered page");
         // strictly inside the 200x200 page - the exact assertion the full-mediabox bug failed
         assert!(
-            x1 > 0.0 && y1 > 0.0 && x2 < 200.0 && y2 < 200.0,
-            "bbox not trimmed (returned ~full page?): {:?}",
-            (x1, y1, x2, y2)
+            x1 > 0.0 && x2 < 200.0,
+            "span not trimmed (returned ~full page?): {:?}",
+            (x1, x2)
         );
-        // roughly the mark: PDF rect (60,50)-(140,150) flips to top-left y (60,50)-(140,150)
+        // roughly the mark: PDF rect (60,50)-(140,150)
         assert!((40.0..80.0).contains(&x1), "x1 off: {x1}");
         assert!((120.0..160.0).contains(&x2), "x2 off: {x2}");
     }

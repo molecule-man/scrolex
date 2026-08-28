@@ -97,32 +97,34 @@ pub(crate) fn use_scratch_state_dir() {
 // name, and every uri starts with a scheme colon, so those are replaced there. Paths on other
 // platforms keep their existing layout.
 #[cfg(not(windows))]
-fn uri_components(uri: &str) -> PathBuf {
+pub(crate) fn uri_components(uri: &str) -> PathBuf {
     PathBuf::from(uri)
 }
 
 #[cfg(windows)]
-fn uri_components(uri: &str) -> PathBuf {
+pub(crate) fn uri_components(uri: &str) -> PathBuf {
     uri.split('/')
         .filter(|part| !part.is_empty())
         .map(|part| part.replace([':', '?', '"', '<', '>', '|', '*', '\\'], "_"))
         .collect()
 }
 
-fn get_state_file_path(uri: &str) -> PathBuf {
+pub(crate) fn state_dir() -> PathBuf {
     #[cfg(test)]
-    if let Some(mut state_path) = TEST_STATE.with(|state| {
+    if let Some(state_path) = TEST_STATE.with(|state| {
         state
             .borrow()
             .as_ref()
             .map(|state| state.dir.path().to_path_buf())
     }) {
-        state_path.push(uri_components(uri));
-        state_path.set_extension("ini");
         return state_path;
     }
 
-    let mut state_path = glib::user_state_dir();
+    glib::user_state_dir()
+}
+
+fn get_state_file_path(uri: &str) -> PathBuf {
+    let mut state_path = state_dir();
     state_path.push("pdf-viewer");
     state_path.push(uri_components(uri));
     state_path.set_extension("ini");

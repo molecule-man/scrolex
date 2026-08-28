@@ -5,6 +5,7 @@ mod imp;
 pub(crate) use imp::device_scale;
 mod page_number_imp;
 
+pub(crate) use imp::apply_crop;
 pub(crate) use imp::clear_document_renders;
 pub(crate) use imp::clear_full_renders;
 pub(crate) use imp::crop_box;
