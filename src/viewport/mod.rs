@@ -14,6 +14,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use position::Position;
 
+pub(crate) use position::{state_dir, uri_components};
+
 #[cfg(test)]
 pub(crate) use position::use_scratch_state_dir;
 

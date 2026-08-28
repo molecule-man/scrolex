@@ -201,11 +201,49 @@ impl Document {
         self.imp().slow_main_thread_renders.set([false; 3]);
         self.set_multithread_rendering(false);
 
+        if let Some(cache_path) = crate::crop_cache::path(uri) {
+            if let Some(spans) = crate::crop_cache::read(uri, &cache_path, n_pages) {
+                self.populate_bbox_cache(spans);
+            } else {
+                let epoch = self.doc_epoch();
+                let receiver = crate::crop_cache::spawn_sweep(uri.to_string(), n_pages, cache_path);
+                glib::spawn_future_local(clone!(
+                    #[weak(rename_to = state)]
+                    self,
+                    async move {
+                        let Ok(spans) = receiver.await else {
+                            return;
+                        };
+                        if state.doc_epoch() == epoch {
+                            state.populate_bbox_cache(spans);
+                        }
+                    }
+                ));
+            }
+        }
+
         log::info!(
             "Loaded document: {n_pages} pages, {size_bytes} bytes, tallest page {tallest_page_height:?} pt"
         );
 
         self.emit_by_name::<()>("loaded", &[]);
+    }
+
+    fn populate_bbox_cache(&self, spans: Vec<Option<(f64, f64)>>) {
+        let entries: Vec<_> = spans
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, span)| {
+                let index = i32::try_from(index).ok()?;
+                let size = self.page_size(index)?;
+                let bounds = match span {
+                    Some((x1, x2)) => crate::page::apply_crop(x1, x2, size.width, size.height),
+                    None => page::Rectangle::new(0.0, 0.0, size.width, size.height),
+                };
+                Some((index, bounds))
+            })
+            .collect();
+        self.imp().bbox_cache.borrow_mut().extend(entries);
     }
 
     pub(crate) fn bbox_cache(&self) -> Rc<RefCell<HashMap<i32, page::Rectangle>>> {

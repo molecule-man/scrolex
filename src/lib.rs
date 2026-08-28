@@ -1,6 +1,7 @@
 pub mod about;
 pub mod bg_job;
 pub mod config;
+pub(crate) mod crop_cache;
 pub mod document;
 pub(crate) mod document_pane;
 pub mod document_view;

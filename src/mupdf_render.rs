@@ -13,6 +13,10 @@ use gtk::prelude::FileExt;
 use mupdf::{Colorspace, Device, DisplayList, Document, IRect, Matrix, Pixmap, Rect};
 use once_cell::sync::Lazy;
 
+// Bump this version when content span results can change.
+pub(crate) const CONTENT_SCAN_VERSION: u16 = 1;
+pub(crate) const CONTENT_SCAN_SCALE: f64 = 0.2;
+
 #[derive(Clone, Copy)]
 struct DarkMode {
     paper: [u8; 3],
@@ -524,11 +528,10 @@ pub fn content_x_span(uri: &str, page_num: i32) -> Option<(f64, f64)> {
     if let Some(config) = crate::emulate::config() {
         return Some((0.0, config.page_pt.0));
     }
-    const SCALE: f64 = 0.2; // 1 sampled pixel = 5pt; crop adds a 5pt margin anyway
     let (data, width, height, stride) = with_doc(uri, |doc| {
         let colorspace = Colorspace::device_bgr();
         let page = doc.load_page(page_num).ok()?;
-        let ctm = Matrix::new_scale(SCALE as f32, SCALE as f32);
+        let ctm = Matrix::new_scale(CONTENT_SCAN_SCALE as f32, CONTENT_SCAN_SCALE as f32);
         let pixmap = page.to_pixmap(&ctm, &colorspace, false, true).ok()?;
         let width = i32::try_from(pixmap.width()).ok()?;
         let height = i32::try_from(pixmap.height()).ok()?;
@@ -536,7 +539,10 @@ pub fn content_x_span(uri: &str, page_num: i32) -> Option<(f64, f64)> {
         Some((data, width, height, stride))
     })?;
     let (min_x, max_x) = scan_x_span(&data, width, height, stride as usize)?;
-    Some((min_x as f64 / SCALE, (max_x + 1) as f64 / SCALE))
+    Some((
+        min_x as f64 / CONTENT_SCAN_SCALE,
+        (max_x + 1) as f64 / CONTENT_SCAN_SCALE,
+    ))
 }
 
 // Leftmost and rightmost pixel column (inclusive) holding non-white content in a Rgb24 (BGRx)

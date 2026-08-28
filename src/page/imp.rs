@@ -2143,7 +2143,7 @@ fn get_bbox(uri: &str, page: &PageInfo, crop: bool) -> Rectangle {
 // Crop the left and right margins only. Grow the content span by a 5pt margin, enforce a half-page
 // minimum width, and clamp to the page. Pure geometry so the crop behaviour is tested without a
 // rendering backend.
-fn apply_crop(content_x1: f64, content_x2: f64, width: f64, height: f64) -> Rectangle {
+pub(crate) fn apply_crop(content_x1: f64, content_x2: f64, width: f64, height: f64) -> Rectangle {
     let x1 = content_x1 - 5.0;
     let mut x2 = content_x2 + 5.0;
     if x2 - x1 < width / 2.0 {
