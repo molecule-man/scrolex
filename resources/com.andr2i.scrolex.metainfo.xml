@@ -85,6 +85,15 @@
     </screenshot>
   </screenshots>
   <releases>
+    <release version="0.12.1" date="2026-09-08">
+      <url>https://github.com/molecule-man/scrolex/releases/tag/0.12.1</url>
+      <description>
+        <ul>
+          <li>Cache the bbox spans in fs storage</li>
+          <li>The ham menu not opening when it's taller than screen height</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.12.0" date="2026-08-27">
       <url>https://github.com/molecule-man/scrolex/releases/tag/0.12.0</url>
       <description>
