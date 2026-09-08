@@ -1164,6 +1164,29 @@ mod widget_tests {
     }
 
     #[gtk::test]
+    fn settings_menu_shrinks_to_fit_the_screen() {
+        let window = loaded_window();
+        let popover = window
+            .header()
+            .btn_menu_add_tab
+            .ancestor(gtk::Popover::static_type())
+            .and_downcast::<gtk::Popover>()
+            .expect("settings popover");
+        popover.popup();
+
+        let (minimum, natural, _, _) = popover.measure(gtk::Orientation::Vertical, -1);
+
+        assert!(
+            minimum <= 200,
+            "settings menu needs {minimum} px at minimum. It must collapse, or it cannot open on a short screen"
+        );
+        assert!(
+            natural > 400,
+            "settings menu asks for only {natural} px. It must still request room for every row"
+        );
+    }
+
+    #[gtk::test]
     fn toolbar_buttons_use_the_embedded_icons() {
         let window = loaded_window();
 
