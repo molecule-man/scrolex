@@ -79,6 +79,8 @@ pub struct DocumentView {
     #[template_child]
     pub loading_spinner: TemplateChild<gtk::Spinner>,
     pub toc_pages: RefCell<Vec<Option<i32>>>,
+    // Bumped per outline request. A reply for an older request is stale.
+    toc_seq: Cell<u64>,
     search_debounce: RefCell<Option<glib::SourceId>>,
 }
 
@@ -217,11 +219,34 @@ impl DocumentView {
         self.primary_pane().finish_document_load();
     }
 
+    // The owner thread reads the outline, so a slow document does not freeze the window.
     fn populate_toc(&self) {
         self.toc_list.remove_all();
-        let items = crate::outline::entries(&self.document().uri());
+        self.toc_pages.replace(Vec::new());
+        self.obj().notify("has-toc");
+        self.toc_revealer.set_reveal_child(false);
+
+        let seq = self.toc_seq.get().wrapping_add(1);
+        self.toc_seq.set(seq);
+        let answer = crate::mupdf_render::outline(&self.document().uri());
+        glib::spawn_future_local(clone!(
+            #[weak(rename_to = imp)]
+            self,
+            async move {
+                let Ok(items) = answer.await else {
+                    return;
+                };
+                if imp.toc_seq.get() != seq {
+                    return; // another document loaded meanwhile
+                }
+                imp.fill_toc(&items);
+            }
+        ));
+    }
+
+    fn fill_toc(&self, items: &[crate::outline::OutlineEntry]) {
         let mut pages = Vec::with_capacity(items.len());
-        for item in &items {
+        for item in items {
             let label = gtk::Label::new(Some(&item.title));
             label.set_xalign(0.0);
             label.set_wrap(true);
@@ -240,7 +265,6 @@ impl DocumentView {
         }
         self.toc_pages.replace(pages);
         self.obj().notify("has-toc");
-        self.toc_revealer.set_reveal_child(false);
     }
 
     fn setup_toc(&self) {
@@ -1778,6 +1802,28 @@ mod tests {
             super::ReaderKeyContext::Document,
         );
         assert!(imp.toc_revealer.reveals_child(), "plain t still toggles");
+
+        window.close();
+    }
+
+    #[gtk::test]
+    fn a_stale_outline_reply_does_not_duplicate_the_contents() {
+        let window = loaded_window();
+        let imp = window.imp();
+        wait_until(|| imp.toc_pages.borrow().len() == 3);
+
+        imp.populate_toc();
+        imp.populate_toc();
+        // The owner answers in order, so this sync request returns after both outline replies.
+        crate::mupdf_render::display_list(&imp.document().uri(), 0).expect("owner answers");
+        wait_until(|| imp.toc_pages.borrow().len() == 3);
+        while glib::MainContext::default().iteration(false) {}
+
+        assert!(imp.toc_list.row_at_index(2).is_some());
+        assert!(
+            imp.toc_list.row_at_index(3).is_none(),
+            "contents rows doubled"
+        );
 
         window.close();
     }

@@ -112,7 +112,8 @@ pub(crate) fn spawn_sweep(
         let Some(before) = Identity::read(&uri) else {
             return;
         };
-        if crate::mupdf_render::with_doc(&uri, |_| Some(())).is_none() {
+        // An unopenable document must not write a cache of blank spans. Probe found page 0.
+        if crate::mupdf_render::display_list(&uri, 0).is_none() {
             return;
         }
         let spans: Vec<_> = (0..page_count)

@@ -492,14 +492,11 @@ impl Page {
         );
     }
 
-    // This widget's page index and size (points), from MuPDF. None until a document is loaded or if
-    // the page can't be read.
+    // This widget's page index and size (points), from the load probe. None until a document is
+    // loaded or if the page can't be read.
     fn page_info(&self) -> Option<PageInfo> {
         let index = self.obj().index();
-        let size = self.document().page_size(index).or_else(|| {
-            crate::mupdf_render::page_size(&self.obj().uri(), index)
-                .map(|(width, height)| crate::mupdf_render::PageSize { width, height })
-        })?;
+        let size = self.document().page_size(index)?;
         Some(PageInfo {
             index,
             width: size.width,
@@ -1358,9 +1355,12 @@ impl Page {
     fn schedule_render(&self, page_num: i32, scale: f64, dsf: f64, priority: RenderPriority) {
         let obj = self.obj();
         let uri = obj.uri();
-        // Page size (points) from the main-thread doc, so the worker sizes its pixel buffer to
+        // Page size (points) from the load probe, so the worker sizes its pixel buffer to
         // exactly what the render cache expects (see mupdf_render::render_page_pixels).
-        let page_pt = crate::mupdf_render::page_size(&uri, page_num);
+        let page_pt = obj
+            .document()
+            .page_size(page_num)
+            .map(|size| (size.width, size.height));
 
         // Apply the buffer cap before the cache and job lookups.
         let scale = match page_pt {
@@ -1584,7 +1584,9 @@ impl Page {
         let document = obj.document();
         let demand = crate::bg_job::RenderDemand::from_client(obj.viewport().id().raw());
         let scale = obj.document().preview_scale();
-        let page_pt = crate::mupdf_render::page_size(&uri, page_num);
+        let page_pt = document
+            .page_size(page_num)
+            .map(|size| (size.width, size.height));
 
         let (resp_sender, resp_receiver) = oneshot::channel::<RenderedPixels>();
         let obj_clone = obj.clone();
@@ -2477,9 +2479,13 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         std::fs::write(&path, MIXED_SIZE_PDF).unwrap();
         let uri = crate::test_support::file_uri(&path);
 
+        let info = crate::mupdf_render::stage_candidate(&uri)
+            .and_then(|candidate| candidate.probe())
+            .expect("probe the fixture");
         let document = crate::document::Document::new();
         document.set_uri(uri);
         document.set_n_pages(2);
+        document.imp().page_sizes.replace(info.page_sizes);
         let page = crate::page::Page::new(&crate::viewport::Viewport::new(&document));
 
         // page 1 is 2000x3000pt. At zoom 10 a whole-page buffer would be ~2.4GB, so it renders

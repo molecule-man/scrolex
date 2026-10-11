@@ -7,11 +7,14 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 
+use futures::channel::oneshot;
 use gtk::cairo::{Format, ImageSurface};
 use gtk::gio::prelude::InputStreamExtManual;
 use gtk::prelude::FileExt;
 use mupdf::{Colorspace, Device, DisplayList, Document, IRect, Matrix, Pixmap, Rect};
 use once_cell::sync::Lazy;
+
+use crate::outline::OutlineEntry;
 
 // Bump this version when content span results can change.
 pub(crate) const CONTENT_SCAN_VERSION: u16 = 1;
@@ -298,10 +301,16 @@ impl<K: PartialEq, V> LruCache<K, V> {
     }
 }
 
-struct ListRequest {
-    uri: String,
-    page: i32,
-    reply: mpsc::Sender<Option<Arc<DisplayList>>>,
+enum OwnerRequest {
+    List {
+        uri: String,
+        page: i32,
+        reply: mpsc::Sender<Option<Arc<DisplayList>>>,
+    },
+    Outline {
+        uri: String,
+        reply: oneshot::Sender<Vec<OutlineEntry>>,
+    },
 }
 
 // Display lists the owner keeps alive. A list holds the page's images and fonts, so this trades
@@ -312,18 +321,19 @@ const LIST_CACHE_PAGES: usize = 8;
 // one. Four covers both split-view panes plus the last two tabs.
 const OPEN_DOCUMENTS: usize = 4;
 
-static LIST_SOURCE: Lazy<Option<mpsc::Sender<ListRequest>>> = Lazy::new(spawn_list_source);
+static OWNER: Lazy<Option<mpsc::Sender<OwnerRequest>>> = Lazy::new(spawn_owner);
 
-// One thread owns documents and records page display lists. MuPDF documents cannot cross threads.
-// A document per worker duplicates its xref, object cache, and store entries.
+// One thread owns documents, records page display lists, and reads outlines. MuPDF documents
+// cannot cross threads. A document per thread duplicates its xref, object cache, and store
+// entries, and repeats the open (2.8s for a damaged file).
 // Workers can rasterize one recorded list at the same time.
-struct DisplayListOwner {
+struct DocumentOwner {
     generation: u64,
     documents: LruCache<String, Document>,
     lists: LruCache<(String, i32), Arc<DisplayList>>,
 }
 
-impl DisplayListOwner {
+impl DocumentOwner {
     fn for_generation(generation: u64) -> Self {
         Self {
             generation,
@@ -332,66 +342,99 @@ impl DisplayListOwner {
         }
     }
 
-    fn list(&mut self, generation: u64, uri: &str, page: i32) -> Option<Arc<DisplayList>> {
+    fn sync_generation(&mut self, generation: u64) {
         if generation != self.generation {
             self.generation = generation;
             self.documents.clear();
             self.lists.clear();
         }
+    }
+
+    fn document(&mut self, uri: &String) -> Option<&Document> {
+        if self.documents.get(uri).is_none() {
+            let document = open_document(&local_path(uri)?)?;
+            self.documents.insert(uri.clone(), document);
+        }
+        self.documents.get(uri)
+    }
+
+    fn list(&mut self, generation: u64, uri: &str, page: i32) -> Option<Arc<DisplayList>> {
+        self.sync_generation(generation);
 
         let key = (uri.to_string(), page);
         if let Some(list) = self.lists.get(&key) {
             return Some(list.clone());
         }
 
-        if self.documents.get(&key.0).is_none() {
-            let document = open_document(&local_path(&key.0)?)?;
-            self.documents.insert(key.0.clone(), document);
-        }
-        let document = self.documents.get(&key.0)?;
+        let document = self.document(&key.0)?;
         let list = Arc::new(document.load_page(page).ok()?.to_display_list(true).ok()?);
         self.lists.insert(key, list.clone());
         Some(list)
     }
+
+    fn outline(&mut self, generation: u64, uri: &str) -> Vec<OutlineEntry> {
+        self.sync_generation(generation);
+        self.document(&uri.to_string())
+            .map(crate::outline::from_doc)
+            .unwrap_or_default()
+    }
 }
 
-fn spawn_list_source() -> Option<mpsc::Sender<ListRequest>> {
-    // Each caller waits for one reply, so the caller count bounds the queue.
-    let (sender, receiver) = mpsc::channel::<ListRequest>();
+fn spawn_owner() -> Option<mpsc::Sender<OwnerRequest>> {
+    // List callers wait for one reply each. Outline requests come one per document load.
+    let (sender, receiver) = mpsc::channel::<OwnerRequest>();
     let thread = std::thread::Builder::new()
-        .name("scrolex-display-lists".to_string())
+        .name("scrolex-documents".to_string())
         .spawn(move || {
             // Touch the context first, so it outlives every Document here; see with_doc.
             let _ctx = Colorspace::device_bgr();
-            let mut owner = DisplayListOwner::for_generation(generation());
+            let mut owner = DocumentOwner::for_generation(generation());
 
-            while let Ok(req) = receiver.recv() {
+            while let Ok(request) = receiver.recv() {
                 let current_generation = generation();
-                let list = owner.list(current_generation, &req.uri, req.page);
-                let _ = req.reply.send(list);
+                match request {
+                    OwnerRequest::List { uri, page, reply } => {
+                        let _ = reply.send(owner.list(current_generation, &uri, page));
+                    }
+                    OwnerRequest::Outline { uri, reply } => {
+                        let _ = reply.send(owner.outline(current_generation, &uri));
+                    }
+                }
             }
         });
     match thread {
         Ok(_) => Some(sender),
         Err(err) => {
-            log::error!("could not start the display list thread: {err}");
+            log::error!("could not start the document owner thread: {err}");
             None
         }
     }
 }
 
 // The page's display list from the owner thread. Blocks until it arrives.
-fn display_list(uri: &str, page_num: i32) -> Option<Arc<DisplayList>> {
+pub(crate) fn display_list(uri: &str, page_num: i32) -> Option<Arc<DisplayList>> {
     let (reply, answer) = mpsc::channel();
-    LIST_SOURCE
+    OWNER
         .as_ref()?
-        .send(ListRequest {
+        .send(OwnerRequest::List {
             uri: uri.to_string(),
             page: page_num,
             reply,
         })
         .ok()?;
     answer.recv().ok()?
+}
+
+// The document outline from the owner thread. A dropped receiver means no owner thread.
+pub(crate) fn outline(uri: &str) -> oneshot::Receiver<Vec<OutlineEntry>> {
+    let (reply, answer) = oneshot::channel();
+    if let Some(owner) = OWNER.as_ref() {
+        let _ = owner.send(OwnerRequest::Outline {
+            uri: uri.to_string(),
+            reply,
+        });
+    }
+    answer
 }
 
 // Rasterize `area` (pixel space) of `list` into a fresh pixmap.
@@ -528,16 +571,12 @@ pub fn content_x_span(uri: &str, page_num: i32) -> Option<(f64, f64)> {
     if let Some(config) = crate::emulate::config() {
         return Some((0.0, config.page_pt.0));
     }
-    let (data, width, height, stride) = with_doc(uri, |doc| {
-        let colorspace = Colorspace::device_bgr();
-        let page = doc.load_page(page_num).ok()?;
-        let ctm = Matrix::new_scale(CONTENT_SCAN_SCALE as f32, CONTENT_SCAN_SCALE as f32);
-        let pixmap = page.to_pixmap(&ctm, &colorspace, false, true).ok()?;
-        let width = i32::try_from(pixmap.width()).ok()?;
-        let height = i32::try_from(pixmap.height()).ok()?;
-        let (data, stride) = pack_pixmap(&pixmap, width, height, None)?;
-        Some((data, width, height, stride))
-    })?;
+    let list = display_list(uri, page_num)?;
+    let ctm = Matrix::new_scale(CONTENT_SCAN_SCALE as f32, CONTENT_SCAN_SCALE as f32);
+    let pixmap = raster(&list, &ctm, list.bounds().transform(&ctm).round())?;
+    let width = i32::try_from(pixmap.width()).ok()?;
+    let height = i32::try_from(pixmap.height()).ok()?;
+    let (data, stride) = pack_pixmap(&pixmap, width, height, None)?;
     let (min_x, max_x) = scan_x_span(&data, width, height, stride as usize)?;
     Some((
         min_x as f64 / CONTENT_SCAN_SCALE,
@@ -822,7 +861,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         let path = dir.path().join("reload.pdf");
         let uri = crate::test_support::file_uri(&path);
         std::fs::write(&path, MARGIN_PDF).unwrap();
-        let mut owner = DisplayListOwner::for_generation(10);
+        let mut owner = DocumentOwner::for_generation(10);
 
         let first = owner.list(10, &uri, 0).unwrap();
         assert_eq!(first.bounds(), Rect::new(0.0, 0.0, 200.0, 200.0));
@@ -840,13 +879,50 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
     #[test]
     fn owner_serves_each_document_its_own_pages() {
         let (small, large) = (margin_pdf_uri(), mixed_size_pdf_uri());
-        let mut owner = DisplayListOwner::for_generation(10);
+        let mut owner = DocumentOwner::for_generation(10);
         for _ in 0..3 {
             let list = owner.list(10, &small, 0).unwrap();
             assert_eq!(list.bounds(), Rect::new(0.0, 0.0, 200.0, 200.0));
             let list = owner.list(10, &large, 1).unwrap();
             assert_eq!(list.bounds(), Rect::new(0.0, 0.0, 2000.0, 3000.0));
         }
+    }
+
+    fn outline_fixture_uri() -> String {
+        crate::test_support::fixture("outline.pdf")
+            .uri()
+            .to_string()
+    }
+
+    fn outline_titles(entries: &[OutlineEntry]) -> Vec<String> {
+        entries.iter().map(|entry| entry.title.clone()).collect()
+    }
+
+    #[test]
+    fn owner_reads_the_outline_from_its_open_document() {
+        let uri = outline_fixture_uri();
+        let mut owner = DocumentOwner::for_generation(10);
+        owner.list(10, &uri, 0).expect("page 0");
+
+        let titles = outline_titles(&owner.outline(10, &uri));
+
+        assert_eq!(titles, ["Chapter 1", "Chapter 2", "Section 2.1"]);
+        assert_eq!(
+            owner.documents.entries.len(),
+            1,
+            "outline reuses the open document"
+        );
+        assert!(owner.outline(10, "file:///no/such/file.pdf").is_empty());
+    }
+
+    #[test]
+    fn outline_request_is_answered_by_the_owner_thread() {
+        let entries = futures::executor::block_on(outline(&outline_fixture_uri())).expect("reply");
+
+        assert_eq!(
+            outline_titles(&entries),
+            ["Chapter 1", "Chapter 2", "Section 2.1"]
+        );
     }
 
     #[test]
