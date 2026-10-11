@@ -14,6 +14,7 @@ use gtk::prelude::FileExt;
 use mupdf::{Colorspace, Device, DisplayList, Document, IRect, Matrix, Pixmap, Rect};
 use once_cell::sync::Lazy;
 
+use crate::links::PageLink;
 use crate::outline::OutlineEntry;
 
 // Bump this version when content span results can change.
@@ -311,6 +312,11 @@ enum OwnerRequest {
         uri: String,
         reply: oneshot::Sender<Vec<OutlineEntry>>,
     },
+    Links {
+        uri: String,
+        page: i32,
+        reply: oneshot::Sender<Vec<PageLink>>,
+    },
 }
 
 // Display lists the owner keeps alive. A list holds the page's images and fonts, so this trades
@@ -323,9 +329,9 @@ const OPEN_DOCUMENTS: usize = 4;
 
 static OWNER: Lazy<Option<mpsc::Sender<OwnerRequest>>> = Lazy::new(spawn_owner);
 
-// One thread owns documents, records page display lists, and reads outlines. MuPDF documents
-// cannot cross threads. A document per thread duplicates its xref, object cache, and store
-// entries, and repeats the open (2.8s for a damaged file).
+// One thread owns documents, records page display lists, and reads outlines and links. MuPDF
+// documents cannot cross threads. A document per thread duplicates its xref, object cache, and
+// store entries, and repeats the open (2.8s for a damaged file).
 // Workers can rasterize one recorded list at the same time.
 struct DocumentOwner {
     generation: u64,
@@ -378,6 +384,13 @@ impl DocumentOwner {
             .map(crate::outline::from_doc)
             .unwrap_or_default()
     }
+
+    fn links(&mut self, generation: u64, uri: &str, page: i32) -> Vec<PageLink> {
+        self.sync_generation(generation);
+        self.document(&uri.to_string())
+            .map(|document| crate::links::read_page(document, page))
+            .unwrap_or_default()
+    }
 }
 
 fn spawn_owner() -> Option<mpsc::Sender<OwnerRequest>> {
@@ -398,6 +411,9 @@ fn spawn_owner() -> Option<mpsc::Sender<OwnerRequest>> {
                     }
                     OwnerRequest::Outline { uri, reply } => {
                         let _ = reply.send(owner.outline(current_generation, &uri));
+                    }
+                    OwnerRequest::Links { uri, page, reply } => {
+                        let _ = reply.send(owner.links(current_generation, &uri, page));
                     }
                 }
             }
@@ -431,6 +447,19 @@ pub(crate) fn outline(uri: &str) -> oneshot::Receiver<Vec<OutlineEntry>> {
     if let Some(owner) = OWNER.as_ref() {
         let _ = owner.send(OwnerRequest::Outline {
             uri: uri.to_string(),
+            reply,
+        });
+    }
+    answer
+}
+
+// The page's links from the owner thread. A dropped receiver means no owner thread.
+pub(crate) fn page_links(uri: &str, page_num: i32) -> oneshot::Receiver<Vec<PageLink>> {
+    let (reply, answer) = oneshot::channel();
+    if let Some(owner) = OWNER.as_ref() {
+        let _ = owner.send(OwnerRequest::Links {
+            uri: uri.to_string(),
+            page: page_num,
             reply,
         });
     }

@@ -747,14 +747,13 @@ impl Page {
         obj.add_controller(context);
     }
 
+    // None while the page's links are still on the way from the owner thread.
     fn link_at(&self, obj: &super::Page, x: f64, y: f64) -> Option<LinkTarget> {
         let point = undo_zoom_and_crop(obj, x, y);
-        self.document()
-            .imp()
-            .links
-            .borrow_mut()
-            .get_link(&obj.uri(), obj.index(), point.x, point.y)
-            .cloned()
+        let document = self.document();
+        document.request_links(obj.index());
+        let links = document.imp().links.borrow();
+        links.get_link(obj.index(), point.x, point.y).cloned()
     }
 
     fn emit_link(obj: &super::Page, location: crate::links::DocumentLocation, action: LinkAction) {
@@ -850,6 +849,8 @@ impl Page {
 
         let scale = obj.zoom();
         let render_scale = render_scale((page.width, page.height), scale, dsf);
+        // Load links before the first hover, in both render modes.
+        obj.document().request_links(page.index);
 
         if render_scale < scale {
             // Viewport regions are rendered off the UI thread; entering this path also keeps later
