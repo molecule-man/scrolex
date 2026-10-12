@@ -507,6 +507,9 @@ impl Page {
     fn setup_text_selection(&self) {
         let obj = self.obj();
         let mouse_coords = Rc::new(RefCell::new(None));
+        // The latest drag point, so glyphs that arrive late still select up to it.
+        let drag_end = Rc::new(Cell::new(None));
+        let dragging = Rc::new(Cell::new(false));
         let gc = gtk::GestureClick::builder().button(BUTTON_PRIMARY).build();
 
         // indicates that we have "borrowed" global page cursor
@@ -515,6 +518,10 @@ impl Page {
         gc.connect_pressed(clone!(
             #[strong]
             mouse_coords,
+            #[strong]
+            drag_end,
+            #[strong]
+            dragging,
             #[strong(rename_to = page)]
             obj,
             #[weak(rename_to = imp)]
@@ -524,11 +531,43 @@ impl Page {
             move |_gc, _n_press, x, y| {
                 page.viewport().clear_selection();
                 mouse_coords.replace(Some((x, y)));
+                drag_end.set(None);
+                dragging.set(true);
                 if !imp.cursor_guard.get() {
                     page.set_cursor_from_name(Some("text"));
                     imp.cursor_guard.set(true);
                     cursor.set(true);
                 }
+
+                let index = page.index();
+                let Some(loaded) = crate::selection::load_glyphs(&page.uri(), index) else {
+                    return;
+                };
+                glib::spawn_future_local(clone!(
+                    #[weak]
+                    page,
+                    #[strong]
+                    mouse_coords,
+                    #[strong]
+                    drag_end,
+                    #[strong]
+                    dragging,
+                    async move {
+                        loaded.await;
+                        // The list recycled this widget for another page meanwhile.
+                        if page.index() != index {
+                            return;
+                        }
+                        let (Some(start), Some(end)) = (*mouse_coords.borrow(), drag_end.get())
+                        else {
+                            return;
+                        };
+                        apply_text_selection(&page, start, end);
+                        if !dragging.get() {
+                            set_primary_selection(&page);
+                        }
+                    }
+                ));
             }
         ));
 
@@ -536,38 +575,24 @@ impl Page {
         gc.connect_update(clone!(
             #[strong]
             mouse_coords,
+            #[strong]
+            drag_end,
             move |gc, seq| {
-                let Some((start_x, start_y)) = *mouse_coords.borrow() else {
+                let Some(start) = *mouse_coords.borrow() else {
                     return;
                 };
-                let Some((end_x, end_y)) = gc.point(seq) else {
+                let Some(end) = gc.point(seq) else {
                     return;
                 };
-
-                let Point { x: x1, y: y1 } = undo_zoom_and_crop(&obj, start_x, start_y);
-                let Point { x: x2, y: y2 } = undo_zoom_and_crop(&obj, end_x, end_y);
-
-                let selection =
-                    crate::selection::selection(&obj.uri(), obj.index(), (x1, y1), (x2, y2));
-                match selection {
-                    Some(sel) if !sel.rects.is_empty() => {
-                        obj.viewport().set_selection(Some(PageSelection {
-                            page: obj.index(),
-                            rects: sel.rects.into_iter().map(Rectangle::from).collect(),
-                            text: sel.text,
-                        }));
-                    }
-                    _ => obj.viewport().clear_selection(),
-                }
+                drag_end.set(Some(end));
+                apply_text_selection(&obj, start, end);
             }
         ));
 
         let obj = self.obj().clone();
         gc.connect_end(move |_, _| {
-            // Primary selection only (middle-click paste); the clipboard needs an explicit copy.
-            if let Some(text) = obj.viewport().selected_text() {
-                obj.primary_clipboard().set_text(&text);
-            }
+            dragging.set(false);
+            set_primary_selection(&obj);
             if Cell::get(&cursor) {
                 cursor.set(false);
                 obj.set_cursor(None);
@@ -2129,6 +2154,29 @@ pub(crate) fn crop_box(uri: &str, index: i32, width: f64, height: f64) -> Rectan
         },
         true,
     )
+}
+
+// Select from `start` to `end` (widget coordinates). Clears the selection while glyphs load.
+fn apply_text_selection(page: &super::Page, start: (f64, f64), end: (f64, f64)) {
+    let Point { x: x1, y: y1 } = undo_zoom_and_crop(page, start.0, start.1);
+    let Point { x: x2, y: y2 } = undo_zoom_and_crop(page, end.0, end.1);
+    match crate::selection::selection(&page.uri(), page.index(), (x1, y1), (x2, y2)) {
+        Some(sel) if !sel.rects.is_empty() => {
+            page.viewport().set_selection(Some(PageSelection {
+                page: page.index(),
+                rects: sel.rects.into_iter().map(Rectangle::from).collect(),
+                text: sel.text,
+            }));
+        }
+        _ => page.viewport().clear_selection(),
+    }
+}
+
+// Primary selection only (middle-click paste); the clipboard needs an explicit copy.
+fn set_primary_selection(page: &super::Page) {
+    if let Some(text) = page.viewport().selected_text() {
+        page.primary_clipboard().set_text(&text);
+    }
 }
 
 fn get_bbox(uri: &str, page: &PageInfo, crop: bool) -> Rectangle {
