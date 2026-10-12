@@ -350,7 +350,6 @@ impl WidgetImpl for Page {
             return;
         }
 
-        // Load links before the first hover or click.
         self.obj().document().request_links(page.index);
         if self.obj().document().multithread_rendering() {
             self.multithread_snapshot(snapshot, &page);
@@ -494,8 +493,6 @@ impl Page {
         );
     }
 
-    // This widget's page index and size (points), from the load probe. None until a document is
-    // loaded or if the page can't be read.
     fn page_info(&self) -> Option<PageInfo> {
         let index = self.obj().index();
         let size = self.document().page_size(index)?;
@@ -509,7 +506,7 @@ impl Page {
     fn setup_text_selection(&self) {
         let obj = self.obj();
         let mouse_coords = Rc::new(RefCell::new(None));
-        // The latest drag point, so glyphs that arrive late still select up to it.
+        // Preserve the drag end until the glyph reply arrives.
         let drag_end = Rc::new(Cell::new(None));
         let dragging = Rc::new(Cell::new(false));
         let gc = gtk::GestureClick::builder().button(BUTTON_PRIMARY).build();
@@ -555,11 +552,10 @@ impl Page {
                     #[strong]
                     dragging,
                     async move {
-                        // A newer press or a reload replaced this request.
                         if !loaded.await {
                             return;
                         }
-                        // The list recycled this widget for another page meanwhile.
+                        // A list widget can show another page after a drag starts.
                         if page.index() != index {
                             return;
                         }
@@ -777,7 +773,6 @@ impl Page {
         obj.add_controller(context);
     }
 
-    // None while the page's links are still on the way from the owner thread.
     fn link_at(&self, obj: &super::Page, x: f64, y: f64) -> Option<LinkTarget> {
         let point = undo_zoom_and_crop(obj, x, y);
         let document = self.document();
@@ -1384,8 +1379,7 @@ impl Page {
     fn schedule_render(&self, page_num: i32, scale: f64, dsf: f64, priority: RenderPriority) {
         let obj = self.obj();
         let uri = obj.uri();
-        // Page size (points) from the load probe, so the worker sizes its pixel buffer to
-        // exactly what the render cache expects (see mupdf_render::render_page_pixels).
+        // Use the probe size so the worker's pixel buffer matches the render cache.
         let page_pt = obj
             .document()
             .page_size(page_num)
@@ -2159,7 +2153,7 @@ pub(crate) fn crop_box(uri: &str, index: i32, width: f64, height: f64) -> Rectan
     )
 }
 
-// Select from `start` to `end` (widget coordinates). Clears the selection while glyphs load.
+// A missing glyph cache clears the selection.
 fn apply_text_selection(page: &super::Page, start: (f64, f64), end: (f64, f64)) {
     let Point { x: x1, y: y1 } = undo_zoom_and_crop(page, start.0, start.1);
     let Point { x: x2, y: y2 } = undo_zoom_and_crop(page, end.0, end.1);
@@ -2175,7 +2169,7 @@ fn apply_text_selection(page: &super::Page, start: (f64, f64), end: (f64, f64)) 
     }
 }
 
-// Primary selection only (middle-click paste); the clipboard needs an explicit copy.
+// Set PRIMARY for middle-click paste. Copy sets the clipboard separately.
 fn set_primary_selection(page: &super::Page) {
     if let Some(text) = page.viewport().selected_text() {
         page.primary_clipboard().set_text(&text);

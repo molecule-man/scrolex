@@ -307,10 +307,8 @@ const OPEN_DOCUMENTS: usize = 4;
 
 static OWNER: Lazy<Option<mpsc::Sender<OwnerRequest>>> = Lazy::new(spawn_owner);
 
-// One thread owns documents, records page display lists, and reads outlines, links, and glyphs.
-// MuPDF documents cannot cross threads. A document per thread duplicates its xref, object cache,
-// and store entries, and repeats the open (2.8s for a damaged file).
-// Workers can rasterize one recorded list at the same time.
+// MuPDF Document is !Send. One owner keeps its xref and store data in one place.
+// Render workers can share the owner's display lists.
 struct DocumentOwner {
     generation: u64,
     documents: LruCache<String, Document>,
@@ -379,13 +377,11 @@ impl DocumentOwner {
 }
 
 fn spawn_owner() -> Option<mpsc::Sender<OwnerRequest>> {
-    // List callers wait for one reply each. Outline requests come one per document load.
     let (sender, receiver) = mpsc::channel::<OwnerRequest>();
     let thread = std::thread::Builder::new()
         .name("scrolex-documents".to_string())
         .spawn(move || {
-            // Touch the TLS fz_context first, so its destructor registers first and runs last. A
-            // Document's Drop needs a live context, else it aborts ("thread local panicked on drop").
+            // Initialize the MuPDF context before any Document. Documents must drop first.
             let _ctx = Colorspace::device_bgr();
             let mut owner = DocumentOwner::for_generation(generation());
 
@@ -430,7 +426,6 @@ pub(crate) fn display_list(uri: &str, page_num: i32) -> Option<Arc<DisplayList>>
     answer.recv().ok()?
 }
 
-// The document outline from the owner thread. A dropped receiver means no owner thread.
 pub(crate) fn outline(uri: &str) -> oneshot::Receiver<Vec<OutlineEntry>> {
     let (reply, answer) = oneshot::channel();
     if let Some(owner) = OWNER.as_ref() {
@@ -442,7 +437,6 @@ pub(crate) fn outline(uri: &str) -> oneshot::Receiver<Vec<OutlineEntry>> {
     answer
 }
 
-// The page's links from the owner thread. A dropped receiver means no owner thread.
 pub(crate) fn page_links(uri: &str, page_num: i32) -> oneshot::Receiver<Vec<PageLink>> {
     let (reply, answer) = oneshot::channel();
     if let Some(owner) = OWNER.as_ref() {
@@ -455,7 +449,6 @@ pub(crate) fn page_links(uri: &str, page_num: i32) -> oneshot::Receiver<Vec<Page
     answer
 }
 
-// The page's selectable glyphs from the owner thread. A dropped receiver means no owner thread.
 pub(crate) fn page_glyphs(uri: &str, page_num: i32) -> oneshot::Receiver<Vec<Glyph>> {
     let (reply, answer) = oneshot::channel();
     if let Some(owner) = OWNER.as_ref() {
@@ -1102,7 +1095,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
             "search hit {quad:?} does not overlap content x span ({cx1},{cx2}) - frame mismatch"
         );
 
-        // selection glyphs from the owner thread: same frame, same text
+        // Glyph bounds and crop spans use the same page coordinates.
         let glyphs = futures::executor::block_on(page_glyphs(&uri, 0)).expect("owner reply");
         let text: String = glyphs.iter().map(|glyph| glyph.ch).collect();
         assert_eq!(text, "Hello");

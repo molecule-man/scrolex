@@ -79,7 +79,7 @@ pub struct DocumentView {
     #[template_child]
     pub loading_spinner: TemplateChild<gtk::Spinner>,
     pub toc_pages: RefCell<Vec<Option<i32>>>,
-    // Bumped per outline request. A reply for an older request is stale.
+    // Each request changes this value so stale outline replies have no effect.
     toc_seq: Cell<u64>,
     search_debounce: RefCell<Option<glib::SourceId>>,
 }
@@ -219,7 +219,6 @@ impl DocumentView {
         self.primary_pane().finish_document_load();
     }
 
-    // The owner thread reads the outline, so a slow document does not freeze the window.
     fn populate_toc(&self) {
         self.toc_list.remove_all();
         self.toc_pages.replace(Vec::new());
@@ -237,7 +236,7 @@ impl DocumentView {
                     return;
                 };
                 if imp.toc_seq.get() != seq {
-                    return; // another document loaded meanwhile
+                    return;
                 }
                 imp.fill_toc(&items);
             }
@@ -1814,7 +1813,7 @@ mod tests {
 
         imp.populate_toc();
         imp.populate_toc();
-        // The owner answers in order, so this sync request returns after both outline replies.
+        // This request waits until the owner answers both outline requests.
         crate::mupdf_render::display_list(&imp.document().uri(), 0).expect("owner answers");
         wait_until(|| imp.toc_pages.borrow().len() == 3);
         while glib::MainContext::default().iteration(false) {}

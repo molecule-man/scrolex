@@ -1,7 +1,5 @@
-// Text selection. Given the drag's start and end points (page-local top-left points), find the run
-// of characters between them in reading order via MuPDF's structured text, and return per-line
-// highlight rects plus the selected text. The document owner thread reads the page's glyphs once
-// per drag page. Each pointer move then selects from the cached glyphs.
+// Text selection uses page-local top-left points. MuPDF provides glyphs in text order.
+// The owner reads glyphs once per page. Pointer moves use cached glyphs.
 
 use std::cell::RefCell;
 use std::future::Future;
@@ -36,7 +34,7 @@ pub(crate) struct Glyph {
     line: usize,
 }
 
-// One page's glyphs. `glyphs` is None while the owner thread reads them.
+// One page's glyphs. None means that the owner has not replied.
 struct GlyphCache {
     uri: String,
     page: i32,
@@ -51,11 +49,11 @@ impl GlyphCache {
 }
 
 thread_local! {
-    // Keyed on the generation so a reload rebuilds.
+    // A reload changes the generation and invalidates the cache.
     static GLYPHS: RefCell<Option<GlyphCache>> = const { RefCell::new(None) };
 }
 
-// None while the page's glyphs are not loaded. Call load_glyphs() first.
+// Call load_glyphs() before selection().
 pub fn selection(uri: &str, page_num: i32, a: (f64, f64), b: (f64, f64)) -> Option<Selection> {
     let generation = mupdf_render::generation();
     let glyphs = GLYPHS.with(|cell| {
@@ -69,8 +67,8 @@ pub fn selection(uri: &str, page_num: i32, a: (f64, f64), b: (f64, f64)) -> Opti
     select_between(&glyphs, a, b)
 }
 
-// Ask the owner thread for the page's glyphs. The future resolves to true when this reply is cached,
-// false when a later request replaced it. None when they are cached or requested already.
+// Return None if the glyphs are present or a request exists.
+// The future returns true only if its reply enters the cache.
 pub fn load_glyphs(uri: &str, page_num: i32) -> Option<impl Future<Output = bool>> {
     let generation = mupdf_render::generation();
     let requested = GLYPHS.with(|cell| {
@@ -96,13 +94,12 @@ pub fn load_glyphs(uri: &str, page_num: i32) -> Option<impl Future<Output = bool
     let uri = uri.to_string();
     Some(async move {
         let reply = answer.await;
-        // A reload during the request: these glyphs belong to the previous bytes.
+        // A reload makes this reply stale, even if the URI is the same.
         if generation != mupdf_render::generation() {
             return false;
         }
         GLYPHS.with(|cell| {
             let mut cache = cell.borrow_mut();
-            // A later request for another page or generation replaced this one.
             let Some(entry) = cache
                 .as_mut()
                 .filter(|cache| cache.is_for(&uri, page_num, generation))
@@ -114,7 +111,7 @@ pub fn load_glyphs(uri: &str, page_num: i32) -> Option<impl Future<Output = bool
                     entry.glyphs = Some(Rc::new(glyphs));
                     true
                 }
-                // No owner thread: forget the request so a later press retries.
+                // Remove a failed request so the next press can retry.
                 Err(_) => {
                     *cache = None;
                     false
@@ -124,8 +121,7 @@ pub fn load_glyphs(uri: &str, page_num: i32) -> Option<impl Future<Output = bool
     })
 }
 
-// Flatten the page's glyphs in reading order, numbering lines so a selection can be broken back into
-// per-line highlight rects. Empty when the page can't be read.
+// Keep MuPDF's text order and line boundaries. Return no glyphs if the page fails.
 pub(crate) fn read_glyphs(doc: &Document, page_num: i32) -> Vec<Glyph> {
     let mut glyphs: Vec<Glyph> = Vec::new();
     let Ok(page) = doc.load_page(page_num) else {
@@ -267,7 +263,7 @@ mod tests {
         assert_eq!(sel.rects.len(), 2, "two lines => a rect each");
     }
 
-    // A 300x200 page with "Hello" at PDF (40, 150), so fitz y is about 26..50.
+    // "Hello" starts at PDF (40, 150) on a 300x200 page.
     const HELLO_PDF: &[u8] = b"%PDF-1.4\n\
 1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n\
 2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 300 200] >>\nendobj\n\
@@ -283,7 +279,6 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         crate::test_support::file_uri(&path)
     }
 
-    // gtk::test runs these one at a time with the widget tests, whose loads bump the generation.
     #[gtk::test]
     fn glyphs_load_once_and_select_only_after_the_reply() {
         let uri = hello_uri("hello.pdf");

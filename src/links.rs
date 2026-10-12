@@ -39,13 +39,12 @@ pub(crate) struct PageLink {
     target: LinkTarget,
 }
 
-// Link cache for one document. The document owner thread reads the links. Hover and clicks read
-// only this cache, so they never open a document on the main thread.
+// Pointer events use cached links. Only the owner thread reads links from MuPDF.
 #[derive(Default, Debug)]
 pub struct Links {
     pages: HashMap<i32, Vec<PageLink>>,
     pending: HashSet<i32>,
-    // Bumped by clear(). A reply for an older epoch is stale.
+    // clear() changes the epoch so old replies have no effect.
     epoch: u64,
 }
 
@@ -56,7 +55,6 @@ impl Links {
         self.epoch = self.epoch.wrapping_add(1);
     }
 
-    // None also while the page's links are not loaded yet.
     pub fn get_link(&self, page_num: i32, x: f64, y: f64) -> Option<&LinkTarget> {
         self.pages
             .get(&page_num)?
@@ -65,7 +63,6 @@ impl Links {
             .map(|link| &link.target)
     }
 
-    // The epoch for the reply, or None when the page is loaded or already requested.
     pub(crate) fn begin_load(&mut self, page_num: i32) -> Option<u64> {
         if self.pages.contains_key(&page_num) || !self.pending.insert(page_num) {
             return None;
@@ -87,7 +84,7 @@ impl Links {
     }
 }
 
-// The page's links in page-local top-left points. Empty when the page can't be read.
+// Link bounds use page-local top-left points.
 pub(crate) fn read_page(doc: &Document, page_num: i32) -> Vec<PageLink> {
     let Ok(page) = doc.load_page(page_num) else {
         return Vec::new();
@@ -134,7 +131,6 @@ fn destination_location(page: i32, kind: DestinationKind) -> DocumentLocation {
 mod tests {
     use super::*;
 
-    // Load `pages` the way the app does: request, owner thread reply, then finish.
     fn owner_links(uri: &str, pages: &[i32]) -> Links {
         let mut links = Links::default();
         for &page in pages {

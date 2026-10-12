@@ -366,7 +366,6 @@ impl Document {
         jobs.clear();
     }
 
-    // Ask the owner thread for the page's links, unless they are loaded or requested.
     pub(crate) fn request_links(&self, page_num: i32) {
         let Some(epoch) = self.imp().links.borrow_mut().begin_load(page_num) else {
             return;
