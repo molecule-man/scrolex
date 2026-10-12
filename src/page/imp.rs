@@ -350,6 +350,8 @@ impl WidgetImpl for Page {
             return;
         }
 
+        // Load links before the first hover or click.
+        self.obj().document().request_links(page.index);
         if self.obj().document().multithread_rendering() {
             self.multithread_snapshot(snapshot, &page);
         } else {
@@ -874,8 +876,6 @@ impl Page {
 
         let scale = obj.zoom();
         let render_scale = render_scale((page.width, page.height), scale, dsf);
-        // Load links before the first hover, in both render modes.
-        obj.document().request_links(page.index);
 
         if render_scale < scale {
             // Viewport regions are rendered off the UI thread; entering this path also keeps later
@@ -2207,6 +2207,21 @@ pub(crate) fn apply_crop(content_x1: f64, content_x2: f64, width: f64, height: f
 mod tests {
     use super::*;
     use std::env;
+
+    #[gtk::test]
+    fn a_page_drawn_in_multithread_mode_requests_its_links() {
+        let window = crate::test_support::loaded_window();
+        let pane = window.pane();
+        let document = pane.document();
+        document.set_multithread_rendering(true);
+        document.imp().links.borrow_mut().clear();
+
+        let page = pane.imp().mapped_page(0).expect("page 0 is shown");
+        page.queue_draw();
+        crate::test_support::wait_until(|| document.imp().links.borrow().is_requested(0));
+
+        window.close();
+    }
 
     #[test]
     fn prefetch_depth_bounds() {

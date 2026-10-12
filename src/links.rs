@@ -73,6 +73,11 @@ impl Links {
         Some(self.epoch)
     }
 
+    #[cfg(test)]
+    pub(crate) fn is_requested(&self, page_num: i32) -> bool {
+        self.pages.contains_key(&page_num) || self.pending.contains(&page_num)
+    }
+
     pub(crate) fn finish_load(&mut self, epoch: u64, page_num: i32, links: Vec<PageLink>) {
         if epoch != self.epoch {
             return;
