@@ -555,7 +555,10 @@ impl Page {
                     #[strong]
                     dragging,
                     async move {
-                        loaded.await;
+                        // A newer press or a reload replaced this request.
+                        if !loaded.await {
+                            return;
+                        }
                         // The list recycled this widget for another page meanwhile.
                         if page.index() != index {
                             return;

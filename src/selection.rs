@@ -69,9 +69,9 @@ pub fn selection(uri: &str, page_num: i32, a: (f64, f64), b: (f64, f64)) -> Opti
     select_between(&glyphs, a, b)
 }
 
-// Ask the owner thread for the page's glyphs. The future resolves when they are cached. None when
-// they are cached or requested already.
-pub fn load_glyphs(uri: &str, page_num: i32) -> Option<impl Future<Output = ()>> {
+// Ask the owner thread for the page's glyphs. The future resolves to true when this reply is cached,
+// false when a later request replaced it. None when they are cached or requested already.
+pub fn load_glyphs(uri: &str, page_num: i32) -> Option<impl Future<Output = bool>> {
     let generation = mupdf_render::generation();
     let requested = GLYPHS.with(|cell| {
         let mut cache = cell.borrow_mut();
@@ -96,6 +96,10 @@ pub fn load_glyphs(uri: &str, page_num: i32) -> Option<impl Future<Output = ()>>
     let uri = uri.to_string();
     Some(async move {
         let reply = answer.await;
+        // A reload during the request: these glyphs belong to the previous bytes.
+        if generation != mupdf_render::generation() {
+            return false;
+        }
         GLYPHS.with(|cell| {
             let mut cache = cell.borrow_mut();
             // A later request for another page or generation replaced this one.
@@ -103,14 +107,20 @@ pub fn load_glyphs(uri: &str, page_num: i32) -> Option<impl Future<Output = ()>>
                 .as_mut()
                 .filter(|cache| cache.is_for(&uri, page_num, generation))
             else {
-                return;
+                return false;
             };
             match reply {
-                Ok(glyphs) => entry.glyphs = Some(Rc::new(glyphs)),
+                Ok(glyphs) => {
+                    entry.glyphs = Some(Rc::new(glyphs));
+                    true
+                }
                 // No owner thread: forget the request so a later press retries.
-                Err(_) => *cache = None,
+                Err(_) => {
+                    *cache = None;
+                    false
+                }
             }
-        });
+        })
     })
 }
 
@@ -273,7 +283,8 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         crate::test_support::file_uri(&path)
     }
 
-    #[test]
+    // gtk::test runs these one at a time with the widget tests, whose loads bump the generation.
+    #[gtk::test]
     fn glyphs_load_once_and_select_only_after_the_reply() {
         let uri = hello_uri("hello.pdf");
         let whole_page = ((0.0, 0.0), (300.0, 200.0));
@@ -282,7 +293,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         assert!(load_glyphs(&uri, 0).is_none(), "already pending");
         assert!(selection(&uri, 0, whole_page.0, whole_page.1).is_none());
 
-        futures::executor::block_on(loaded);
+        assert!(futures::executor::block_on(loaded), "reply cached");
 
         let sel = selection(&uri, 0, whole_page.0, whole_page.1).expect("glyphs cached");
         assert_eq!(sel.text, "Hello");
@@ -290,19 +301,35 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         assert!(load_glyphs(&uri, 0).is_none(), "already cached");
     }
 
-    #[test]
+    #[gtk::test]
     fn a_reply_for_a_replaced_request_is_dropped() {
         let (first, second) = (hello_uri("first.pdf"), hello_uri("second.pdf"));
         let whole_page = ((0.0, 0.0), (300.0, 200.0));
         let stale = load_glyphs(&first, 0).expect("first request");
         let fresh = load_glyphs(&second, 0).expect("second request replaces the first");
 
-        futures::executor::block_on(stale);
+        assert!(
+            !futures::executor::block_on(stale),
+            "replaced reply is not cached"
+        );
         assert!(selection(&first, 0, whole_page.0, whole_page.1).is_none());
         assert!(selection(&second, 0, whole_page.0, whole_page.1).is_none());
 
-        futures::executor::block_on(fresh);
+        assert!(futures::executor::block_on(fresh));
         assert!(selection(&second, 0, whole_page.0, whole_page.1).is_some());
+    }
+
+    #[gtk::test]
+    fn a_reply_from_before_a_reload_is_dropped() {
+        let uri = hello_uri("reload.pdf");
+        let loaded = load_glyphs(&uri, 0).expect("first request");
+        mupdf_render::invalidate();
+
+        assert!(
+            !futures::executor::block_on(loaded),
+            "reply for the old bytes"
+        );
+        assert!(load_glyphs(&uri, 0).is_some(), "a new press requests again");
     }
 
     #[test]
