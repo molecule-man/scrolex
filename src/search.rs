@@ -239,7 +239,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
 
     #[test]
     fn search_page_counts_and_groups_hits() {
-        let doc = mupdf::Document::from_bytes(TWO_HELLO_PDF, "pdf").unwrap();
+        let doc = mupdf::Document::from_copied_bytes(TWO_HELLO_PDF, "pdf").unwrap();
         // two occurrences => two matches, each a single line (one rect) - NOT one match per quad
         let hits = search_page(&doc, 0, "Hello");
         assert_eq!(hits.len(), 2, "expected 2 matches, got {}", hits.len());
