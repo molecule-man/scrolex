@@ -41,7 +41,7 @@ mod tests {
     use super::*;
 
     fn from_bytes(bytes: &[u8]) -> Vec<OutlineEntry> {
-        from_doc(&Document::from_bytes(bytes, "pdf").unwrap())
+        from_doc(&Document::from_copied_bytes(bytes, "pdf").unwrap())
     }
 
     #[test]
