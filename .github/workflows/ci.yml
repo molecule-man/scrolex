@@ -15,6 +15,11 @@ jobs:
     env:
       RUST_BACKTRACE: 1
       GVSBUILD_VERSION: 2026.8.0
+      # No debug info: faster codegen and linking. Panics still report file:line.
+      CARGO_PROFILE_DEV_DEBUG: 0
+      # mupdf-sys stopped passing /MP, so cl.exe compiles MuPDF serially.
+      # cl.exe appends _CL_ to its flags, and mupdf-sys only overwrites CL.
+      _CL_: /MP
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -81,6 +86,18 @@ jobs:
           "LIBCLANG_PATH=C:\Program Files\LLVM\bin"
         ) | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
+    # A trusted ReFS Dev Drive skips most Defender scanning of the many small
+    # files that cargo, MSBuild and the linker write.
+    - name: Set up Dev Drive (Windows)
+      if: matrix.os == 'windows-latest'
+      uses: samypr100/setup-dev-drive@v4.1.0
+      with:
+        drive-size: 10GB
+        trusted-dev-drive: true
+        env-mapping: |
+          CARGO_HOME,{{ DEV_DRIVE }}/.cargo
+          CARGO_TARGET_DIR,{{ DEV_DRIVE }}/target
+
     - name: Install Rust
       uses: dtolnay/rust-toolchain@master
       with:
@@ -93,6 +110,7 @@ jobs:
       run: cargo fmt --all -- --check
 
     - name: Run Clippy
+      if: matrix.os == 'ubuntu-24.04'
       # No --all-features: it would enable `bench` and pull criterion back in.
       run: cargo clippy --all-targets -- -D warnings
 

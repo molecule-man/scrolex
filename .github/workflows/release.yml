@@ -393,6 +393,7 @@ jobs:
     env:
       RUST_BACKTRACE: 1
       GVSBUILD_VERSION: 2026.8.0
+      _CL_: /MP
 
     steps:
     - name: Checkout repository
