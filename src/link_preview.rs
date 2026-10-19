@@ -683,20 +683,8 @@ impl LinkPreview {
                 disable_from_popup();
             }
         });
-        let hint = gtk::Label::builder()
-            .label("Middle-click link: open beside. Right-click link: menu.")
-            .wrap(true)
-            .xalign(0.0)
-            .css_classes(["dim-label", "caption"])
-            .build();
-        let footer = gtk::Box::builder()
-            .orientation(gtk::Orientation::Vertical)
-            .spacing(2)
-            .css_classes(["link-preview-footer"])
-            .build();
-        footer.append(&checkbox);
-        footer.append(&hint);
-        root.append(&footer);
+        checkbox.add_css_class("link-preview-footer");
+        root.append(&checkbox);
 
         self.add_input_controllers(&root);
         (root, scroller, checkbox)
