@@ -528,7 +528,9 @@ impl LinkPreview {
                     self.dismiss();
                     return Some(glib::Propagation::Stop);
                 }
-                return Some(glib::Propagation::Proceed);
+                // Send plain Space and Enter to the checkbox. Let other keys reach window shortcuts.
+                let activates = matches!(keyval, Key::space | Key::Return | Key::KP_Enter);
+                return (plain && activates).then_some(glib::Propagation::Proceed);
             }
             if plain && keyval == Key::Tab {
                 let previous = popup.root.root().and_then(|root| root.focus());
@@ -740,13 +742,28 @@ impl LinkPreview {
                 }
             }
         ));
-        motion.connect_leave(move |_| {
+        motion.connect_leave(clone!(
+            #[strong]
+            weak,
+            move |_| {
+                if let Some(preview) = Self::upgrade(&weak) {
+                    preview.state.pointer_in_popup.set(false);
+                    preview.schedule_close();
+                }
+            }
+        ));
+        root.add_controller(motion);
+
+        // If focus leaves after the pointer, restart the close timer.
+        let focus = gtk::EventControllerFocus::new();
+        focus.connect_leave(move |_| {
             if let Some(preview) = Self::upgrade(&weak) {
-                preview.state.pointer_in_popup.set(false);
-                preview.schedule_close();
+                if !preview.state.pointer_in_popup.get() {
+                    preview.schedule_close();
+                }
             }
         });
-        root.add_controller(motion);
+        root.add_controller(focus);
     }
 
     fn child_position(
@@ -1347,6 +1364,42 @@ mod widget_tests {
 
     fn source_page_mapped(window: &TestWindow) -> bool {
         window.pane().imp().mapped_page(0).is_some()
+    }
+
+    #[gtk::test]
+    fn window_shortcuts_work_while_the_checkbox_has_focus() {
+        let window = links_window();
+        let first = window.header().active_document().unwrap();
+        window.header().add_document().expect("a second tab");
+        window.header().notebook.set_current_page(Some(0));
+        wait_until(|| source_page_mapped(&window));
+        let preview = open(&window, TO_LONG_PAGE);
+        key(&window, Key::Tab, ModifierType::empty());
+        assert!(preview.checkbox().unwrap().has_focus());
+
+        assert_eq!(
+            key(&window, Key::Tab, ModifierType::CONTROL_MASK),
+            glib::Propagation::Stop
+        );
+
+        assert_ne!(window.header().active_document().as_ref(), Some(&first));
+        wait_until(|| !preview.is_open());
+        window.close();
+    }
+
+    #[gtk::test]
+    fn the_popup_closes_when_focus_and_pointer_leave() {
+        let window = links_window();
+        let preview = open(&window, TO_LONG_PAGE);
+        key(&window, Key::Tab, ModifierType::empty());
+        leave_link(&window);
+        run_for(CLOSE * 5);
+        assert!(preview.is_open(), "focus inside keeps the popup");
+
+        window.pane().focus_reader();
+
+        wait_until(|| !preview.is_open());
+        window.close();
     }
 
     #[gtk::test]
