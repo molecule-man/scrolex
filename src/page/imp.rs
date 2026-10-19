@@ -350,6 +350,7 @@ impl WidgetImpl for Page {
             return;
         }
 
+        self.obj().document().request_links(page.index);
         if self.obj().document().multithread_rendering() {
             self.multithread_snapshot(snapshot, &page);
         } else {
@@ -492,14 +493,9 @@ impl Page {
         );
     }
 
-    // This widget's page index and size (points), from MuPDF. None until a document is loaded or if
-    // the page can't be read.
     fn page_info(&self) -> Option<PageInfo> {
         let index = self.obj().index();
-        let size = self.document().page_size(index).or_else(|| {
-            crate::mupdf_render::page_size(&self.obj().uri(), index)
-                .map(|(width, height)| crate::mupdf_render::PageSize { width, height })
-        })?;
+        let size = self.document().page_size(index)?;
         Some(PageInfo {
             index,
             width: size.width,
@@ -510,6 +506,9 @@ impl Page {
     fn setup_text_selection(&self) {
         let obj = self.obj();
         let mouse_coords = Rc::new(RefCell::new(None));
+        // Preserve the drag end until the glyph reply arrives.
+        let drag_end = Rc::new(Cell::new(None));
+        let dragging = Rc::new(Cell::new(false));
         let gc = gtk::GestureClick::builder().button(BUTTON_PRIMARY).build();
 
         // indicates that we have "borrowed" global page cursor
@@ -518,6 +517,10 @@ impl Page {
         gc.connect_pressed(clone!(
             #[strong]
             mouse_coords,
+            #[strong]
+            drag_end,
+            #[strong]
+            dragging,
             #[strong(rename_to = page)]
             obj,
             #[weak(rename_to = imp)]
@@ -527,11 +530,45 @@ impl Page {
             move |_gc, _n_press, x, y| {
                 page.viewport().clear_selection();
                 mouse_coords.replace(Some((x, y)));
+                drag_end.set(None);
+                dragging.set(true);
                 if !imp.cursor_guard.get() {
                     page.set_cursor_from_name(Some("text"));
                     imp.cursor_guard.set(true);
                     cursor.set(true);
                 }
+
+                let index = page.index();
+                let Some(loaded) = crate::selection::load_glyphs(&page.uri(), index) else {
+                    return;
+                };
+                glib::spawn_future_local(clone!(
+                    #[weak]
+                    page,
+                    #[strong]
+                    mouse_coords,
+                    #[strong]
+                    drag_end,
+                    #[strong]
+                    dragging,
+                    async move {
+                        if !loaded.await {
+                            return;
+                        }
+                        // A list widget can show another page after a drag starts.
+                        if page.index() != index {
+                            return;
+                        }
+                        let (Some(start), Some(end)) = (*mouse_coords.borrow(), drag_end.get())
+                        else {
+                            return;
+                        };
+                        apply_text_selection(&page, start, end);
+                        if !dragging.get() {
+                            set_primary_selection(&page);
+                        }
+                    }
+                ));
             }
         ));
 
@@ -539,38 +576,24 @@ impl Page {
         gc.connect_update(clone!(
             #[strong]
             mouse_coords,
+            #[strong]
+            drag_end,
             move |gc, seq| {
-                let Some((start_x, start_y)) = *mouse_coords.borrow() else {
+                let Some(start) = *mouse_coords.borrow() else {
                     return;
                 };
-                let Some((end_x, end_y)) = gc.point(seq) else {
+                let Some(end) = gc.point(seq) else {
                     return;
                 };
-
-                let Point { x: x1, y: y1 } = undo_zoom_and_crop(&obj, start_x, start_y);
-                let Point { x: x2, y: y2 } = undo_zoom_and_crop(&obj, end_x, end_y);
-
-                let selection =
-                    crate::selection::selection(&obj.uri(), obj.index(), (x1, y1), (x2, y2));
-                match selection {
-                    Some(sel) if !sel.rects.is_empty() => {
-                        obj.viewport().set_selection(Some(PageSelection {
-                            page: obj.index(),
-                            rects: sel.rects.into_iter().map(Rectangle::from).collect(),
-                            text: sel.text,
-                        }));
-                    }
-                    _ => obj.viewport().clear_selection(),
-                }
+                drag_end.set(Some(end));
+                apply_text_selection(&obj, start, end);
             }
         ));
 
         let obj = self.obj().clone();
         gc.connect_end(move |_, _| {
-            // Primary selection only (middle-click paste); the clipboard needs an explicit copy.
-            if let Some(text) = obj.viewport().selected_text() {
-                obj.primary_clipboard().set_text(&text);
-            }
+            dragging.set(false);
+            set_primary_selection(&obj);
             if Cell::get(&cursor) {
                 cursor.set(false);
                 obj.set_cursor(None);
@@ -752,12 +775,10 @@ impl Page {
 
     fn link_at(&self, obj: &super::Page, x: f64, y: f64) -> Option<LinkTarget> {
         let point = undo_zoom_and_crop(obj, x, y);
-        self.document()
-            .imp()
-            .links
-            .borrow_mut()
-            .get_link(&obj.uri(), obj.index(), point.x, point.y)
-            .cloned()
+        let document = self.document();
+        document.request_links(obj.index());
+        let links = document.imp().links.borrow();
+        links.get_link(obj.index(), point.x, point.y).cloned()
     }
 
     fn emit_link(obj: &super::Page, location: crate::links::DocumentLocation, action: LinkAction) {
@@ -1358,9 +1379,11 @@ impl Page {
     fn schedule_render(&self, page_num: i32, scale: f64, dsf: f64, priority: RenderPriority) {
         let obj = self.obj();
         let uri = obj.uri();
-        // Page size (points) from the main-thread doc, so the worker sizes its pixel buffer to
-        // exactly what the render cache expects (see mupdf_render::render_page_pixels).
-        let page_pt = crate::mupdf_render::page_size(&uri, page_num);
+        // Use the probe size so the worker's pixel buffer matches the render cache.
+        let page_pt = obj
+            .document()
+            .page_size(page_num)
+            .map(|size| (size.width, size.height));
 
         // Apply the buffer cap before the cache and job lookups.
         let scale = match page_pt {
@@ -1584,7 +1607,9 @@ impl Page {
         let document = obj.document();
         let demand = crate::bg_job::RenderDemand::from_client(obj.viewport().id().raw());
         let scale = obj.document().preview_scale();
-        let page_pt = crate::mupdf_render::page_size(&uri, page_num);
+        let page_pt = document
+            .page_size(page_num)
+            .map(|size| (size.width, size.height));
 
         let (resp_sender, resp_receiver) = oneshot::channel::<RenderedPixels>();
         let obj_clone = obj.clone();
@@ -2128,6 +2153,29 @@ pub(crate) fn crop_box(uri: &str, index: i32, width: f64, height: f64) -> Rectan
     )
 }
 
+// A missing glyph cache clears the selection.
+fn apply_text_selection(page: &super::Page, start: (f64, f64), end: (f64, f64)) {
+    let Point { x: x1, y: y1 } = undo_zoom_and_crop(page, start.0, start.1);
+    let Point { x: x2, y: y2 } = undo_zoom_and_crop(page, end.0, end.1);
+    match crate::selection::selection(&page.uri(), page.index(), (x1, y1), (x2, y2)) {
+        Some(sel) if !sel.rects.is_empty() => {
+            page.viewport().set_selection(Some(PageSelection {
+                page: page.index(),
+                rects: sel.rects.into_iter().map(Rectangle::from).collect(),
+                text: sel.text,
+            }));
+        }
+        _ => page.viewport().clear_selection(),
+    }
+}
+
+// Set PRIMARY for middle-click paste. Copy sets the clipboard separately.
+fn set_primary_selection(page: &super::Page) {
+    if let Some(text) = page.viewport().selected_text() {
+        page.primary_clipboard().set_text(&text);
+    }
+}
+
 fn get_bbox(uri: &str, page: &PageInfo, crop: bool) -> Rectangle {
     if !crop {
         return Rectangle::new(0.0, 0.0, page.width, page.height);
@@ -2156,6 +2204,21 @@ pub(crate) fn apply_crop(content_x1: f64, content_x2: f64, width: f64, height: f
 mod tests {
     use super::*;
     use std::env;
+
+    #[gtk::test]
+    fn a_page_drawn_in_multithread_mode_requests_its_links() {
+        let window = crate::test_support::loaded_window();
+        let pane = window.pane();
+        let document = pane.document();
+        document.set_multithread_rendering(true);
+        document.imp().links.borrow_mut().clear();
+
+        let page = pane.imp().mapped_page(0).expect("page 0 is shown");
+        page.queue_draw();
+        crate::test_support::wait_until(|| document.imp().links.borrow().is_requested(0));
+
+        window.close();
+    }
 
     #[test]
     fn prefetch_depth_bounds() {
@@ -2477,9 +2540,13 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         std::fs::write(&path, MIXED_SIZE_PDF).unwrap();
         let uri = crate::test_support::file_uri(&path);
 
+        let info = crate::mupdf_render::stage_candidate(&uri)
+            .and_then(|candidate| candidate.probe())
+            .expect("probe the fixture");
         let document = crate::document::Document::new();
         document.set_uri(uri);
         document.set_n_pages(2);
+        document.imp().page_sizes.replace(info.page_sizes);
         let page = crate::page::Page::new(&crate::viewport::Viewport::new(&document));
 
         // page 1 is 2000x3000pt. At zoom 10 a whole-page buffer would be ~2.4GB, so it renders

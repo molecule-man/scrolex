@@ -366,6 +366,26 @@ impl Document {
         jobs.clear();
     }
 
+    pub(crate) fn request_links(&self, page_num: i32) {
+        let Some(epoch) = self.imp().links.borrow_mut().begin_load(page_num) else {
+            return;
+        };
+        let answer = crate::mupdf_render::page_links(&self.uri(), page_num);
+        glib::spawn_future_local(clone!(
+            #[weak(rename_to = document)]
+            self,
+            async move {
+                if let Ok(links) = answer.await {
+                    document
+                        .imp()
+                        .links
+                        .borrow_mut()
+                        .finish_load(epoch, page_num, links);
+                }
+            }
+        ));
+    }
+
     #[cfg(test)]
     pub(crate) fn has_render_job(&self, key: &RenderJobKey) -> bool {
         self.imp().render_jobs.borrow().contains_key(key)

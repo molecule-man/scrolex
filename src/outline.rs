@@ -11,11 +11,7 @@ pub struct OutlineEntry {
 }
 
 // Flattened outline in document order; empty when the document has no index.
-pub fn entries(uri: &str) -> Vec<OutlineEntry> {
-    crate::mupdf_render::with_doc(uri, |doc| Some(from_doc(doc))).unwrap_or_default()
-}
-
-fn from_doc(doc: &Document) -> Vec<OutlineEntry> {
+pub(crate) fn from_doc(doc: &Document) -> Vec<OutlineEntry> {
     match doc.outlines() {
         Ok(items) => flatten(&items, 0),
         Err(_) => Vec::new(),

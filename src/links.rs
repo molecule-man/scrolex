@@ -1,7 +1,7 @@
 // Link hit-testing and document targets. Coordinates use page-local top-left points.
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use mupdf::DestinationKind;
+use mupdf::{DestinationKind, Document};
 
 use crate::page::Rectangle;
 
@@ -34,55 +34,80 @@ pub enum LinkTarget {
 }
 
 #[derive(Debug, Clone)]
-struct PageLink {
+pub(crate) struct PageLink {
     rect: Rectangle,
     target: LinkTarget,
 }
 
+// Pointer events use cached links. Only the owner thread reads links from MuPDF.
 #[derive(Default, Debug)]
 pub struct Links {
     pages: HashMap<i32, Vec<PageLink>>,
+    pending: HashSet<i32>,
+    // clear() changes the epoch so old replies have no effect.
+    epoch: u64,
 }
 
 impl Links {
     pub(crate) fn clear(&mut self) {
         self.pages.clear();
+        self.pending.clear();
+        self.epoch = self.epoch.wrapping_add(1);
     }
 
-    pub fn get_link(&mut self, uri: &str, page_num: i32, x: f64, y: f64) -> Option<&LinkTarget> {
-        let links = self
-            .pages
-            .entry(page_num)
-            .or_insert_with(|| Self::load(uri, page_num));
-        links
+    pub fn get_link(&self, page_num: i32, x: f64, y: f64) -> Option<&LinkTarget> {
+        self.pages
+            .get(&page_num)?
             .iter()
             .find(|link| link.rect.contains(x, y))
             .map(|link| &link.target)
     }
 
-    fn load(uri: &str, page_num: i32) -> Vec<PageLink> {
-        let mut links = Vec::new();
-        crate::mupdf_render::with_doc(uri, |doc| {
-            let page = doc.load_page(page_num).ok()?;
-            for link in page.links().ok()? {
-                let target = match &link.dest {
-                    Some(dest) => LinkTarget::Location(destination_location(
-                        dest.loc.page_number as i32,
-                        dest.kind,
-                    )),
-                    None if !link.uri.is_empty() => LinkTarget::Uri(link.uri.clone()),
-                    None => continue,
-                };
-                let b = link.bounds;
-                links.push(PageLink {
-                    rect: Rectangle::new(b.x0 as f64, b.y0 as f64, b.x1 as f64, b.y1 as f64),
-                    target,
-                });
-            }
-            Some(())
-        });
-        links
+    pub(crate) fn begin_load(&mut self, page_num: i32) -> Option<u64> {
+        if self.pages.contains_key(&page_num) || !self.pending.insert(page_num) {
+            return None;
+        }
+        Some(self.epoch)
     }
+
+    #[cfg(test)]
+    pub(crate) fn is_requested(&self, page_num: i32) -> bool {
+        self.pages.contains_key(&page_num) || self.pending.contains(&page_num)
+    }
+
+    pub(crate) fn finish_load(&mut self, epoch: u64, page_num: i32, links: Vec<PageLink>) {
+        if epoch != self.epoch {
+            return;
+        }
+        self.pending.remove(&page_num);
+        self.pages.insert(page_num, links);
+    }
+}
+
+// Link bounds use page-local top-left points.
+pub(crate) fn read_page(doc: &Document, page_num: i32) -> Vec<PageLink> {
+    let Ok(page) = doc.load_page(page_num) else {
+        return Vec::new();
+    };
+    let Ok(page_links) = page.links() else {
+        return Vec::new();
+    };
+    let mut links = Vec::new();
+    for link in page_links {
+        let target = match &link.dest {
+            Some(dest) => {
+                LinkTarget::Location(destination_location(dest.loc.page_number as i32, dest.kind))
+            }
+            None if !link.uri.is_empty() => LinkTarget::Uri(link.uri.clone()),
+            None => continue,
+        };
+        let b = link.bounds;
+        links.push(PageLink {
+            rect: Rectangle::new(b.x0 as f64, b.y0 as f64, b.x1 as f64, b.y1 as f64),
+            target,
+        });
+    }
+    links
 }
 
 fn destination_location(page: i32, kind: DestinationKind) -> DocumentLocation {
@@ -106,6 +131,57 @@ fn destination_location(page: i32, kind: DestinationKind) -> DocumentLocation {
 mod tests {
     use super::*;
 
+    fn owner_links(uri: &str, pages: &[i32]) -> Links {
+        let mut links = Links::default();
+        for &page in pages {
+            let epoch = links.begin_load(page).expect("first request");
+            let answer = crate::mupdf_render::page_links(uri, page);
+            let page_links = futures::executor::block_on(answer).expect("owner reply");
+            links.finish_load(epoch, page, page_links);
+        }
+        links
+    }
+
+    fn uri_link(target: &str) -> Vec<PageLink> {
+        vec![PageLink {
+            rect: Rectangle::new(0.0, 0.0, 10.0, 10.0),
+            target: LinkTarget::Uri(target.into()),
+        }]
+    }
+
+    #[test]
+    fn a_page_is_requested_once_and_hit_tests_only_after_its_reply() {
+        let mut links = Links::default();
+        let epoch = links.begin_load(3).expect("first request");
+        assert_eq!(links.begin_load(3), None, "already pending");
+        assert_eq!(links.get_link(3, 5.0, 5.0), None, "no reply yet");
+
+        links.finish_load(epoch, 3, uri_link("https://a.example"));
+
+        assert_eq!(
+            links.get_link(3, 5.0, 5.0),
+            Some(&LinkTarget::Uri("https://a.example".into()))
+        );
+        assert_eq!(links.begin_load(3), None, "already loaded");
+    }
+
+    #[test]
+    fn a_reply_from_before_clear_is_dropped() {
+        let mut links = Links::default();
+        let stale = links.begin_load(0).expect("first request");
+        links.clear();
+        let fresh = links.begin_load(0).expect("request again after clear");
+
+        links.finish_load(stale, 0, uri_link("https://old.example"));
+        assert_eq!(links.get_link(0, 5.0, 5.0), None);
+
+        links.finish_load(fresh, 0, uri_link("https://new.example"));
+        assert_eq!(
+            links.get_link(0, 5.0, 5.0),
+            Some(&LinkTarget::Uri("https://new.example".into()))
+        );
+    }
+
     const LINK_PDF: &[u8] = b"%PDF-1.4\n\
 1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n\
 2 0 obj\n<< /Type /Pages /Kids [3 0 R 5 0 R] /Count 2 /MediaBox [0 0 200 200] >>\nendobj\n\
@@ -122,22 +198,49 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         let path = dir.join("links.pdf");
         std::fs::write(&path, LINK_PDF).unwrap();
         let uri = crate::test_support::file_uri(&path);
-        let mut links = Links::default();
+        let links = owner_links(&uri, &[0, 1]);
 
         assert_eq!(
-            links.get_link(&uri, 0, 100.0, 125.0),
+            links.get_link(0, 100.0, 125.0),
             Some(&LinkTarget::Uri("https://one.example".into()))
         );
-        assert_eq!(links.get_link(&uri, 0, 10.0, 10.0), None);
+        assert_eq!(links.get_link(0, 10.0, 10.0), None);
         assert_eq!(
-            links.get_link(&uri, 1, 50.0, 165.0),
+            links.get_link(1, 50.0, 165.0),
             Some(&LinkTarget::Uri("https://two.example".into()))
         );
         assert_eq!(
-            links.get_link(&uri, 0, 100.0, 125.0),
+            links.get_link(0, 100.0, 125.0),
             Some(&LinkTarget::Uri("https://one.example".into()))
         );
         assert_eq!(links.pages.len(), 2);
+    }
+
+    #[gtk::test]
+    fn document_request_fills_the_links_from_the_owner_thread() {
+        use gtk::subclass::prelude::ObjectSubclassIsExt;
+
+        let dir = std::env::temp_dir().join("scrolex_links_request_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("links.pdf");
+        std::fs::write(&path, LINK_PDF).unwrap();
+        let document = crate::document::Document::new();
+        document.set_uri(crate::test_support::file_uri(&path));
+
+        document.request_links(1);
+        crate::test_support::wait_until(|| {
+            document
+                .imp()
+                .links
+                .borrow()
+                .get_link(1, 50.0, 165.0)
+                .is_some()
+        });
+
+        assert_eq!(
+            document.imp().links.borrow().get_link(1, 50.0, 165.0),
+            Some(&LinkTarget::Uri("https://two.example".into()))
+        );
     }
 
     // A 792pt page, so a mirrored y stands out: PDF 592 flips to 200, and back to 592.
@@ -159,27 +262,27 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         let path = dir.join("goto.pdf");
         std::fs::write(&path, GOTO_PDF).unwrap();
         let uri = crate::test_support::file_uri(&path);
-        let mut links = Links::default();
+        let links = owner_links(&uri, &[0]);
         let location = |x, y| Some(LinkTarget::Location(DocumentLocation { page: 1, x, y }));
 
         // Rect [50 700 150 730] -> fitz y 62..92. Top of the page -> y 0.
         assert_eq!(
-            links.get_link(&uri, 0, 100.0, 75.0).cloned(),
+            links.get_link(0, 100.0, 75.0).cloned(),
             location(Some(20.0), Some(0.0))
         );
         // Rect [50 600 150 630] -> fitz y 162..192. PDF y 592 -> fitz y 200.
         assert_eq!(
-            links.get_link(&uri, 0, 100.0, 175.0).cloned(),
+            links.get_link(0, 100.0, 175.0).cloned(),
             location(Some(20.0), Some(200.0))
         );
         // FitR: the upper edge is PDF y 592 -> fitz y 200, which mupdf names `bottom`.
         assert_eq!(
-            links.get_link(&uri, 0, 100.0, 275.0).cloned(),
+            links.get_link(0, 100.0, 275.0).cloned(),
             location(Some(30.0), Some(200.0))
         );
         // Fit names no coordinate.
         assert_eq!(
-            links.get_link(&uri, 0, 100.0, 375.0).cloned(),
+            links.get_link(0, 100.0, 375.0).cloned(),
             location(None, None)
         );
     }

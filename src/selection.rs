@@ -1,14 +1,13 @@
-// Text selection. Given the drag's start and end points (page-local top-left points), find the run
-// of characters between them in reading order via MuPDF's structured text, and return per-line
-// highlight rects plus the selected text. The page's glyph list is cached (a drag fires per pointer
-// move, so rebuilding the whole text page each time would be a real per-motion cost).
+// Text selection uses page-local top-left points. MuPDF provides glyphs in text order.
+// The owner reads glyphs once per page. Pointer moves use cached glyphs.
 
 use std::cell::RefCell;
+use std::future::Future;
 use std::rc::Rc;
 
-use mupdf::TextPageFlags;
+use mupdf::{Document, TextPageFlags};
 
-use crate::mupdf_render::{self, with_doc};
+use crate::mupdf_render;
 use crate::page::Rectangle;
 
 pub struct Selection {
@@ -27,72 +26,132 @@ pub struct PageSelection {
 }
 
 // One selectable glyph: character, quad centre and bbox, and the line it belongs to.
-struct Glyph {
-    ch: char,
+pub(crate) struct Glyph {
+    pub(crate) ch: char,
     cx: f64,
     cy: f64,
-    bbox: (f64, f64, f64, f64),
+    pub(crate) bbox: (f64, f64, f64, f64),
     line: usize,
 }
 
-// (uri, page, doc-generation) -> reading-order glyphs.
-type GlyphCache = Option<(String, i32, u64, Rc<Vec<Glyph>>)>;
-
-thread_local! {
-    // Reused across the many motion events of a single drag; keyed on the generation so a reload
-    // rebuilds.
-    static GLYPHS: RefCell<GlyphCache> = const { RefCell::new(None) };
+// One page's glyphs. None means that the owner has not replied.
+struct GlyphCache {
+    uri: String,
+    page: i32,
+    generation: u64,
+    glyphs: Option<Rc<Vec<Glyph>>>,
 }
 
+impl GlyphCache {
+    fn is_for(&self, uri: &str, page: i32, generation: u64) -> bool {
+        self.uri == uri && self.page == page && self.generation == generation
+    }
+}
+
+thread_local! {
+    // A reload changes the generation and invalidates the cache.
+    static GLYPHS: RefCell<Option<GlyphCache>> = const { RefCell::new(None) };
+}
+
+// Call load_glyphs() before selection().
 pub fn selection(uri: &str, page_num: i32, a: (f64, f64), b: (f64, f64)) -> Option<Selection> {
-    let glyphs = cached_glyphs(uri, page_num)?;
+    let generation = mupdf_render::generation();
+    let glyphs = GLYPHS.with(|cell| {
+        let cache = cell.borrow();
+        let cache = cache.as_ref()?;
+        if !cache.is_for(uri, page_num, generation) {
+            return None;
+        }
+        cache.glyphs.clone()
+    })?;
     select_between(&glyphs, a, b)
 }
 
-fn cached_glyphs(uri: &str, page_num: i32) -> Option<Rc<Vec<Glyph>>> {
+// Return None if the glyphs are present or a request exists.
+// The future returns true only if its reply enters the cache.
+pub fn load_glyphs(uri: &str, page_num: i32) -> Option<impl Future<Output = bool>> {
     let generation = mupdf_render::generation();
-    GLYPHS.with(|cell| {
-        if let Some((u, p, g, glyphs)) = cell.borrow().as_ref() {
-            if u == uri && *p == page_num && *g == generation {
-                return Some(glyphs.clone());
-            }
+    let requested = GLYPHS.with(|cell| {
+        let mut cache = cell.borrow_mut();
+        if cache
+            .as_ref()
+            .is_some_and(|cache| cache.is_for(uri, page_num, generation))
+        {
+            return false;
         }
-        let glyphs = Rc::new(build_glyphs(uri, page_num)?);
-        *cell.borrow_mut() = Some((uri.to_string(), page_num, generation, glyphs.clone()));
-        Some(glyphs)
+        *cache = Some(GlyphCache {
+            uri: uri.to_string(),
+            page: page_num,
+            generation,
+            glyphs: None,
+        });
+        true
+    });
+    if !requested {
+        return None;
+    }
+    let answer = mupdf_render::page_glyphs(uri, page_num);
+    let uri = uri.to_string();
+    Some(async move {
+        let reply = answer.await;
+        // A reload makes this reply stale, even if the URI is the same.
+        if generation != mupdf_render::generation() {
+            return false;
+        }
+        GLYPHS.with(|cell| {
+            let mut cache = cell.borrow_mut();
+            let Some(entry) = cache
+                .as_mut()
+                .filter(|cache| cache.is_for(&uri, page_num, generation))
+            else {
+                return false;
+            };
+            match reply {
+                Ok(glyphs) => {
+                    entry.glyphs = Some(Rc::new(glyphs));
+                    true
+                }
+                // Remove a failed request so the next press can retry.
+                Err(_) => {
+                    *cache = None;
+                    false
+                }
+            }
+        })
     })
 }
 
-// Flatten the page's glyphs in reading order, numbering lines so a selection can be broken back into
-// per-line highlight rects.
-fn build_glyphs(uri: &str, page_num: i32) -> Option<Vec<Glyph>> {
-    with_doc(uri, |doc| {
-        let page = doc.load_page(page_num).ok()?;
-        let text_page = page.to_text_page(TextPageFlags::PRESERVE_WHITESPACE).ok()?;
+// Keep MuPDF's text order and line boundaries. Return no glyphs if the page fails.
+pub(crate) fn read_glyphs(doc: &Document, page_num: i32) -> Vec<Glyph> {
+    let mut glyphs: Vec<Glyph> = Vec::new();
+    let Ok(page) = doc.load_page(page_num) else {
+        return glyphs;
+    };
+    let Ok(text_page) = page.to_text_page(TextPageFlags::PRESERVE_WHITESPACE) else {
+        return glyphs;
+    };
 
-        let mut glyphs: Vec<Glyph> = Vec::new();
-        let mut line_id = 0usize;
-        for block in text_page.blocks() {
-            for line in block.lines() {
-                let before = glyphs.len();
-                for tc in line.chars() {
-                    let Some(ch) = tc.char() else { continue };
-                    let bbox = quad_bbox(&tc.quad());
-                    glyphs.push(Glyph {
-                        ch,
-                        cx: (bbox.0 + bbox.2) / 2.0,
-                        cy: (bbox.1 + bbox.3) / 2.0,
-                        bbox,
-                        line: line_id,
-                    });
-                }
-                if glyphs.len() > before {
-                    line_id += 1;
-                }
+    let mut line_id = 0usize;
+    for block in text_page.blocks() {
+        for line in block.lines() {
+            let before = glyphs.len();
+            for tc in line.chars() {
+                let Some(ch) = tc.char() else { continue };
+                let bbox = quad_bbox(&tc.quad());
+                glyphs.push(Glyph {
+                    ch,
+                    cx: (bbox.0 + bbox.2) / 2.0,
+                    cy: (bbox.1 + bbox.3) / 2.0,
+                    bbox,
+                    line: line_id,
+                });
+            }
+            if glyphs.len() > before {
+                line_id += 1;
             }
         }
-        Some(glyphs)
-    })
+    }
+    glyphs
 }
 
 fn select_between(glyphs: &[Glyph], a: (f64, f64), b: (f64, f64)) -> Option<Selection> {
@@ -202,6 +261,70 @@ mod tests {
         let sel = select_between(&glyphs, (8.0, 5.0), (22.0, 25.0)).unwrap();
         assert_eq!(sel.text, "ab\ncd");
         assert_eq!(sel.rects.len(), 2, "two lines => a rect each");
+    }
+
+    // "Hello" starts at PDF (40, 150) on a 300x200 page.
+    const HELLO_PDF: &[u8] = b"%PDF-1.4\n\
+1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n\
+2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 300 200] >>\nendobj\n\
+3 0 obj\n<< /Type /Page /Parent 2 0 R /Resources << /Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> >> >> /Contents 4 0 R >>\nendobj\n\
+4 0 obj\n<< /Length 34 >>\nstream\nBT /F1 24 Tf 40 150 Td (Hello) Tj ET\nendstream\nendobj\n\
+trailer\n<< /Root 1 0 R >>\n%%EOF";
+
+    fn hello_uri(name: &str) -> String {
+        let dir = std::env::temp_dir().join("scrolex_selection_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, HELLO_PDF).unwrap();
+        crate::test_support::file_uri(&path)
+    }
+
+    #[gtk::test]
+    fn glyphs_load_once_and_select_only_after_the_reply() {
+        let uri = hello_uri("hello.pdf");
+        let whole_page = ((0.0, 0.0), (300.0, 200.0));
+
+        let loaded = load_glyphs(&uri, 0).expect("first request");
+        assert!(load_glyphs(&uri, 0).is_none(), "already pending");
+        assert!(selection(&uri, 0, whole_page.0, whole_page.1).is_none());
+
+        assert!(futures::executor::block_on(loaded), "reply cached");
+
+        let sel = selection(&uri, 0, whole_page.0, whole_page.1).expect("glyphs cached");
+        assert_eq!(sel.text, "Hello");
+        assert_eq!(sel.rects.len(), 1);
+        assert!(load_glyphs(&uri, 0).is_none(), "already cached");
+    }
+
+    #[gtk::test]
+    fn a_reply_for_a_replaced_request_is_dropped() {
+        let (first, second) = (hello_uri("first.pdf"), hello_uri("second.pdf"));
+        let whole_page = ((0.0, 0.0), (300.0, 200.0));
+        let stale = load_glyphs(&first, 0).expect("first request");
+        let fresh = load_glyphs(&second, 0).expect("second request replaces the first");
+
+        assert!(
+            !futures::executor::block_on(stale),
+            "replaced reply is not cached"
+        );
+        assert!(selection(&first, 0, whole_page.0, whole_page.1).is_none());
+        assert!(selection(&second, 0, whole_page.0, whole_page.1).is_none());
+
+        assert!(futures::executor::block_on(fresh));
+        assert!(selection(&second, 0, whole_page.0, whole_page.1).is_some());
+    }
+
+    #[gtk::test]
+    fn a_reply_from_before_a_reload_is_dropped() {
+        let uri = hello_uri("reload.pdf");
+        let loaded = load_glyphs(&uri, 0).expect("first request");
+        mupdf_render::invalidate();
+
+        assert!(
+            !futures::executor::block_on(loaded),
+            "reply for the old bytes"
+        );
+        assert!(load_glyphs(&uri, 0).is_some(), "a new press requests again");
     }
 
     #[test]

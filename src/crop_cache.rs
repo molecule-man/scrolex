@@ -112,7 +112,8 @@ pub(crate) fn spawn_sweep(
         let Some(before) = Identity::read(&uri) else {
             return;
         };
-        if crate::mupdf_render::with_doc(&uri, |_| Some(())).is_none() {
+        // Do not cache blank spans if no page can load.
+        if !(0..n_pages).any(|page| crate::mupdf_render::display_list(&uri, page).is_some()) {
             return;
         }
         let spans: Vec<_> = (0..page_count)
@@ -268,6 +269,47 @@ mod tests {
 
         assert_eq!(swept, direct);
         assert_eq!(read(&uri, &cache_path, 3), Some(direct));
+    }
+
+    // Page 0 has a page-tree cycle. Page 1 has ink at x 50..90.
+    const BROKEN_FIRST_PAGE_PDF: &[u8] = b"%PDF-1.4\n\
+1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n\
+2 0 obj\n<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 /MediaBox [0 0 200 200] >>\nendobj\n\
+3 0 obj\n<< /Type /Pages /Parent 2 0 R /Kids [3 0 R] /Count 1 >>\nendobj\n\
+4 0 obj\n<< /Type /Page /Parent 2 0 R /Contents 5 0 R >>\nendobj\n\
+5 0 obj\n<< /Length 25 >>\nstream\n0 0 0 rg 50 50 40 40 re f\nendstream\nendobj\n\
+trailer\n<< /Root 1 0 R >>\n%%EOF";
+
+    #[test]
+    fn a_broken_first_page_does_not_stop_the_sweep() {
+        let dir = tempfile::tempdir().expect("document directory");
+        let pdf = dir.path().join("broken_first.pdf");
+        fs::write(&pdf, BROKEN_FIRST_PAGE_PDF).expect("write document");
+        let uri = crate::test_support::file_uri(&pdf);
+        let cache_path = dir.path().join("broken_first.pdf.crop");
+
+        let swept = futures::executor::block_on(spawn_sweep(uri.clone(), 2, cache_path.clone()))
+            .expect("sweep result");
+
+        assert_eq!(swept, vec![None, Some((50.0, 90.0))]);
+        assert_eq!(read(&uri, &cache_path, 2), Some(swept));
+    }
+
+    #[test]
+    fn an_unopenable_document_writes_no_cache() {
+        let dir = tempfile::tempdir().expect("document directory");
+        let pdf = dir.path().join("garbage.pdf");
+        fs::write(&pdf, b"not a pdf").expect("write document");
+        let cache_path = dir.path().join("garbage.pdf.crop");
+
+        let swept = futures::executor::block_on(spawn_sweep(
+            crate::test_support::file_uri(&pdf),
+            2,
+            cache_path.clone(),
+        ));
+
+        assert!(swept.is_err(), "the sweep sends no spans");
+        assert!(!cache_path.exists());
     }
 
     #[test]

@@ -1,17 +1,21 @@
 // Rasterize PDF pages with MuPDF, which downscale-decodes embedded images (JPEG/JPEG2000) to the
 // requested resolution - scanned pages render at fit-to-page cost, not poppler's full-res decode.
 
-use std::cell::RefCell;
 use std::collections::{hash_map::Entry, HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 
+use futures::channel::oneshot;
 use gtk::cairo::{Format, ImageSurface};
 use gtk::gio::prelude::InputStreamExtManual;
 use gtk::prelude::FileExt;
 use mupdf::{Colorspace, Device, DisplayList, Document, IRect, Matrix, Pixmap, Rect};
 use once_cell::sync::Lazy;
+
+use crate::links::PageLink;
+use crate::outline::OutlineEntry;
+use crate::selection::Glyph;
 
 // Bump this version when content span results can change.
 pub(crate) const CONTENT_SCAN_VERSION: u16 = 1;
@@ -43,12 +47,6 @@ static GENERATION: AtomicU64 = AtomicU64::new(0);
 // file re-stages. Shutdown skips destructors (main.rs _exit), so the last session's staged file
 // lingers in the temp dir - harmless, and left for the OS temp cleaner.
 static STAGED: Lazy<Mutex<HashMap<String, PathBuf>>> = Lazy::new(|| Mutex::new(HashMap::new()));
-
-thread_local! {
-    // (uri, generation-at-open, Document). One Document per thread: it's bound to the thread's
-    // fz_context, so it can't cross threads. Reopened when the uri or the generation changes.
-    static DOC: RefCell<Option<(String, u64, Document)>> = const { RefCell::new(None) };
-}
 
 // Current document generation, bumped by invalidate(). Callers that cache derived data (e.g. the
 // selection glyph list) can key on it so a reload rebuilds.
@@ -235,27 +233,6 @@ pub(crate) fn local_path(uri: &str) -> Option<PathBuf> {
     }
 }
 
-// Run `f` with this thread's MuPDF Document for `uri`, opening it (or reusing the cached one,
-// reopening on a uri change). Touches the TLS fz_context before the DOC thread-local so its
-// destructor registers first and runs last: our Document's Drop needs a live context, else it aborts
-// ("thread local panicked on drop") when a pool worker exits.
-pub fn with_doc<T>(uri: &str, f: impl FnOnce(&Document) -> Option<T>) -> Option<T> {
-    let _ctx = Colorspace::device_bgr();
-    let generation = GENERATION.load(Ordering::Relaxed);
-    DOC.with(|cell| {
-        let mut slot = cell.borrow_mut();
-        let fresh = slot
-            .as_ref()
-            .is_some_and(|(u, g, _)| u == uri && *g == generation);
-        if !fresh {
-            let path = local_path(uri)?;
-            let doc = open_document(&path)?;
-            *slot = Some((uri.to_string(), generation, doc));
-        }
-        f(&slot.as_ref().unwrap().2)
-    })
-}
-
 struct LruCache<K, V> {
     capacity: usize,
     entries: VecDeque<(K, V)>,
@@ -298,10 +275,26 @@ impl<K: PartialEq, V> LruCache<K, V> {
     }
 }
 
-struct ListRequest {
-    uri: String,
-    page: i32,
-    reply: mpsc::Sender<Option<Arc<DisplayList>>>,
+enum OwnerRequest {
+    List {
+        uri: String,
+        page: i32,
+        reply: mpsc::Sender<Option<Arc<DisplayList>>>,
+    },
+    Outline {
+        uri: String,
+        reply: oneshot::Sender<Vec<OutlineEntry>>,
+    },
+    Links {
+        uri: String,
+        page: i32,
+        reply: oneshot::Sender<Vec<PageLink>>,
+    },
+    Glyphs {
+        uri: String,
+        page: i32,
+        reply: oneshot::Sender<Vec<Glyph>>,
+    },
 }
 
 // Display lists the owner keeps alive. A list holds the page's images and fonts, so this trades
@@ -312,18 +305,17 @@ const LIST_CACHE_PAGES: usize = 8;
 // one. Four covers both split-view panes plus the last two tabs.
 const OPEN_DOCUMENTS: usize = 4;
 
-static LIST_SOURCE: Lazy<Option<mpsc::Sender<ListRequest>>> = Lazy::new(spawn_list_source);
+static OWNER: Lazy<Option<mpsc::Sender<OwnerRequest>>> = Lazy::new(spawn_owner);
 
-// One thread owns documents and records page display lists. MuPDF documents cannot cross threads.
-// A document per worker duplicates its xref, object cache, and store entries.
-// Workers can rasterize one recorded list at the same time.
-struct DisplayListOwner {
+// MuPDF Document is !Send. One owner keeps its xref and store data in one place.
+// Render workers can share the owner's display lists.
+struct DocumentOwner {
     generation: u64,
     documents: LruCache<String, Document>,
     lists: LruCache<(String, i32), Arc<DisplayList>>,
 }
 
-impl DisplayListOwner {
+impl DocumentOwner {
     fn for_generation(generation: u64) -> Self {
         Self {
             generation,
@@ -332,66 +324,141 @@ impl DisplayListOwner {
         }
     }
 
-    fn list(&mut self, generation: u64, uri: &str, page: i32) -> Option<Arc<DisplayList>> {
+    fn sync_generation(&mut self, generation: u64) {
         if generation != self.generation {
             self.generation = generation;
             self.documents.clear();
             self.lists.clear();
         }
+    }
+
+    fn document(&mut self, uri: &String) -> Option<&Document> {
+        if self.documents.get(uri).is_none() {
+            let document = open_document(&local_path(uri)?)?;
+            self.documents.insert(uri.clone(), document);
+        }
+        self.documents.get(uri)
+    }
+
+    fn list(&mut self, generation: u64, uri: &str, page: i32) -> Option<Arc<DisplayList>> {
+        self.sync_generation(generation);
 
         let key = (uri.to_string(), page);
         if let Some(list) = self.lists.get(&key) {
             return Some(list.clone());
         }
 
-        if self.documents.get(&key.0).is_none() {
-            let document = open_document(&local_path(&key.0)?)?;
-            self.documents.insert(key.0.clone(), document);
-        }
-        let document = self.documents.get(&key.0)?;
+        let document = self.document(&key.0)?;
         let list = Arc::new(document.load_page(page).ok()?.to_display_list(true).ok()?);
         self.lists.insert(key, list.clone());
         Some(list)
     }
+
+    fn outline(&mut self, generation: u64, uri: &str) -> Vec<OutlineEntry> {
+        self.sync_generation(generation);
+        self.document(&uri.to_string())
+            .map(crate::outline::from_doc)
+            .unwrap_or_default()
+    }
+
+    fn links(&mut self, generation: u64, uri: &str, page: i32) -> Vec<PageLink> {
+        self.sync_generation(generation);
+        self.document(&uri.to_string())
+            .map(|document| crate::links::read_page(document, page))
+            .unwrap_or_default()
+    }
+
+    fn glyphs(&mut self, generation: u64, uri: &str, page: i32) -> Vec<Glyph> {
+        self.sync_generation(generation);
+        self.document(&uri.to_string())
+            .map(|document| crate::selection::read_glyphs(document, page))
+            .unwrap_or_default()
+    }
 }
 
-fn spawn_list_source() -> Option<mpsc::Sender<ListRequest>> {
-    // Each caller waits for one reply, so the caller count bounds the queue.
-    let (sender, receiver) = mpsc::channel::<ListRequest>();
+fn spawn_owner() -> Option<mpsc::Sender<OwnerRequest>> {
+    let (sender, receiver) = mpsc::channel::<OwnerRequest>();
     let thread = std::thread::Builder::new()
-        .name("scrolex-display-lists".to_string())
+        .name("scrolex-documents".to_string())
         .spawn(move || {
-            // Touch the context first, so it outlives every Document here; see with_doc.
+            // Initialize the MuPDF context before any Document. Documents must drop first.
             let _ctx = Colorspace::device_bgr();
-            let mut owner = DisplayListOwner::for_generation(generation());
+            let mut owner = DocumentOwner::for_generation(generation());
 
-            while let Ok(req) = receiver.recv() {
+            while let Ok(request) = receiver.recv() {
                 let current_generation = generation();
-                let list = owner.list(current_generation, &req.uri, req.page);
-                let _ = req.reply.send(list);
+                match request {
+                    OwnerRequest::List { uri, page, reply } => {
+                        let _ = reply.send(owner.list(current_generation, &uri, page));
+                    }
+                    OwnerRequest::Outline { uri, reply } => {
+                        let _ = reply.send(owner.outline(current_generation, &uri));
+                    }
+                    OwnerRequest::Links { uri, page, reply } => {
+                        let _ = reply.send(owner.links(current_generation, &uri, page));
+                    }
+                    OwnerRequest::Glyphs { uri, page, reply } => {
+                        let _ = reply.send(owner.glyphs(current_generation, &uri, page));
+                    }
+                }
             }
         });
     match thread {
         Ok(_) => Some(sender),
         Err(err) => {
-            log::error!("could not start the display list thread: {err}");
+            log::error!("could not start the document owner thread: {err}");
             None
         }
     }
 }
 
 // The page's display list from the owner thread. Blocks until it arrives.
-fn display_list(uri: &str, page_num: i32) -> Option<Arc<DisplayList>> {
+pub(crate) fn display_list(uri: &str, page_num: i32) -> Option<Arc<DisplayList>> {
     let (reply, answer) = mpsc::channel();
-    LIST_SOURCE
+    OWNER
         .as_ref()?
-        .send(ListRequest {
+        .send(OwnerRequest::List {
             uri: uri.to_string(),
             page: page_num,
             reply,
         })
         .ok()?;
     answer.recv().ok()?
+}
+
+pub(crate) fn outline(uri: &str) -> oneshot::Receiver<Vec<OutlineEntry>> {
+    let (reply, answer) = oneshot::channel();
+    if let Some(owner) = OWNER.as_ref() {
+        let _ = owner.send(OwnerRequest::Outline {
+            uri: uri.to_string(),
+            reply,
+        });
+    }
+    answer
+}
+
+pub(crate) fn page_links(uri: &str, page_num: i32) -> oneshot::Receiver<Vec<PageLink>> {
+    let (reply, answer) = oneshot::channel();
+    if let Some(owner) = OWNER.as_ref() {
+        let _ = owner.send(OwnerRequest::Links {
+            uri: uri.to_string(),
+            page: page_num,
+            reply,
+        });
+    }
+    answer
+}
+
+pub(crate) fn page_glyphs(uri: &str, page_num: i32) -> oneshot::Receiver<Vec<Glyph>> {
+    let (reply, answer) = oneshot::channel();
+    if let Some(owner) = OWNER.as_ref() {
+        let _ = owner.send(OwnerRequest::Glyphs {
+            uri: uri.to_string(),
+            page: page_num,
+            reply,
+        });
+    }
+    answer
 }
 
 // Rasterize `area` (pixel space) of `list` into a fresh pixmap.
@@ -510,34 +577,18 @@ pub fn render_page_surface(
     Some(surface)
 }
 
-// Page size in points (width, height), or None.
-pub fn page_size(uri: &str, page_num: i32) -> Option<(f64, f64)> {
-    if let Some(cfg) = crate::emulate::config() {
-        let _ = page_num;
-        return Some(cfg.page_pt);
-    }
-    with_doc(uri, |doc| {
-        let b = doc.load_page(page_num).ok()?.bounds().ok()?;
-        Some(((b.x1 - b.x0) as f64, (b.y1 - b.y0) as f64))
-    })
-}
-
 // Left and right ink edges in page points, None for a blank page. X only: crop trims side margins.
 // Scans rendered pixels because mupdf-rs exposes no ink-bbox api.
 pub fn content_x_span(uri: &str, page_num: i32) -> Option<(f64, f64)> {
     if let Some(config) = crate::emulate::config() {
         return Some((0.0, config.page_pt.0));
     }
-    let (data, width, height, stride) = with_doc(uri, |doc| {
-        let colorspace = Colorspace::device_bgr();
-        let page = doc.load_page(page_num).ok()?;
-        let ctm = Matrix::new_scale(CONTENT_SCAN_SCALE as f32, CONTENT_SCAN_SCALE as f32);
-        let pixmap = page.to_pixmap(&ctm, &colorspace, false, true).ok()?;
-        let width = i32::try_from(pixmap.width()).ok()?;
-        let height = i32::try_from(pixmap.height()).ok()?;
-        let (data, stride) = pack_pixmap(&pixmap, width, height, None)?;
-        Some((data, width, height, stride))
-    })?;
+    let list = display_list(uri, page_num)?;
+    let ctm = Matrix::new_scale(CONTENT_SCAN_SCALE as f32, CONTENT_SCAN_SCALE as f32);
+    let pixmap = raster(&list, &ctm, list.bounds().transform(&ctm).round())?;
+    let width = i32::try_from(pixmap.width()).ok()?;
+    let height = i32::try_from(pixmap.height()).ok()?;
+    let (data, stride) = pack_pixmap(&pixmap, width, height, None)?;
     let (min_x, max_x) = scan_x_span(&data, width, height, stride as usize)?;
     Some((
         min_x as f64 / CONTENT_SCAN_SCALE,
@@ -822,7 +873,7 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         let path = dir.path().join("reload.pdf");
         let uri = crate::test_support::file_uri(&path);
         std::fs::write(&path, MARGIN_PDF).unwrap();
-        let mut owner = DisplayListOwner::for_generation(10);
+        let mut owner = DocumentOwner::for_generation(10);
 
         let first = owner.list(10, &uri, 0).unwrap();
         assert_eq!(first.bounds(), Rect::new(0.0, 0.0, 200.0, 200.0));
@@ -840,13 +891,50 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
     #[test]
     fn owner_serves_each_document_its_own_pages() {
         let (small, large) = (margin_pdf_uri(), mixed_size_pdf_uri());
-        let mut owner = DisplayListOwner::for_generation(10);
+        let mut owner = DocumentOwner::for_generation(10);
         for _ in 0..3 {
             let list = owner.list(10, &small, 0).unwrap();
             assert_eq!(list.bounds(), Rect::new(0.0, 0.0, 200.0, 200.0));
             let list = owner.list(10, &large, 1).unwrap();
             assert_eq!(list.bounds(), Rect::new(0.0, 0.0, 2000.0, 3000.0));
         }
+    }
+
+    fn outline_fixture_uri() -> String {
+        crate::test_support::fixture("outline.pdf")
+            .uri()
+            .to_string()
+    }
+
+    fn outline_titles(entries: &[OutlineEntry]) -> Vec<String> {
+        entries.iter().map(|entry| entry.title.clone()).collect()
+    }
+
+    #[test]
+    fn owner_reads_the_outline_from_its_open_document() {
+        let uri = outline_fixture_uri();
+        let mut owner = DocumentOwner::for_generation(10);
+        owner.list(10, &uri, 0).expect("page 0");
+
+        let titles = outline_titles(&owner.outline(10, &uri));
+
+        assert_eq!(titles, ["Chapter 1", "Chapter 2", "Section 2.1"]);
+        assert_eq!(
+            owner.documents.entries.len(),
+            1,
+            "outline reuses the open document"
+        );
+        assert!(owner.outline(10, "file:///no/such/file.pdf").is_empty());
+    }
+
+    #[test]
+    fn outline_request_is_answered_by_the_owner_thread() {
+        let entries = futures::executor::block_on(outline(&outline_fixture_uri())).expect("reply");
+
+        assert_eq!(
+            outline_titles(&entries),
+            ["Chapter 1", "Chapter 2", "Section 2.1"]
+        );
     }
 
     #[test]
@@ -861,9 +949,8 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
                 })],
             })
         );
-        assert_eq!(page_size(&uri, 0), Some((200.0, 200.0)));
         // out-of-range / unopenable degrade rather than panic
-        assert_eq!(page_size(&uri, 99), None);
+        assert!(display_list(&uri, 99).is_none());
         // a local uri always stages (the path exists as a value); an unopenable file fails to probe
         assert_eq!(
             stage_candidate("file:///no/such/file.pdf").unwrap().probe(),
@@ -970,7 +1057,13 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
         let uri = crate::test_support::file_uri(&path);
 
         // rotation applied: displayed dimensions are swapped
-        assert_eq!(page_size(&uri, 0), Some((200.0, 300.0)));
+        assert_eq!(
+            stage_candidate(&uri).unwrap().probe().unwrap().page_sizes,
+            vec![Some(PageSize {
+                width: 200.0,
+                height: 300.0,
+            })]
+        );
 
         let (cx1, cx2) = content_x_span(&uri, 0).expect("content_x_span");
         assert!(
@@ -981,7 +1074,8 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
 
         // the "Hello" search hit must fall in the same frame - overlapping the content bbox, not in
         // an unrotated frame (which would mean overlays are misplaced on rotated pages).
-        let quad = with_doc(&uri, |doc| {
+        let doc = open_document(&path).unwrap();
+        let quad = (|| {
             let quads = doc.load_page(0).ok()?.search("Hello", 4).ok()?;
             quads.iter().next().map(|q| {
                 let xs = [q.ul.x, q.ur.x, q.ll.x, q.lr.x];
@@ -993,12 +1087,26 @@ trailer\n<< /Root 1 0 R >>\n%%EOF";
                     ys.iter().cloned().fold(f32::NEG_INFINITY, f32::max) as f64,
                 )
             })
-        })
+        })()
         .expect("search found 'Hello'");
 
         assert!(
             quad.0 < cx2 && quad.2 > cx1,
             "search hit {quad:?} does not overlap content x span ({cx1},{cx2}) - frame mismatch"
+        );
+
+        // Glyph bounds and crop spans use the same page coordinates.
+        let glyphs = futures::executor::block_on(page_glyphs(&uri, 0)).expect("owner reply");
+        let text: String = glyphs.iter().map(|glyph| glyph.ch).collect();
+        assert_eq!(text, "Hello");
+        let (gx1, gx2) = glyphs
+            .iter()
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), glyph| {
+                (lo.min(glyph.bbox.0), hi.max(glyph.bbox.2))
+            });
+        assert!(
+            gx1 < cx2 && gx2 > cx1,
+            "glyphs ({gx1},{gx2}) do not overlap content x span ({cx1},{cx2}) - frame mismatch"
         );
     }
 
