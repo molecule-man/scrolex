@@ -26,6 +26,7 @@ pub struct Config {
     pub animate_scroll: bool,
     pub dark_mode: bool,
     pub always_open_in_tabs: bool,
+    pub show_link_previews: bool,
     pub notice_revision: u32,
     pub geometry: Option<Geometry>,
 }
@@ -47,6 +48,7 @@ impl Default for Config {
             animate_scroll: true,
             dark_mode: false,
             always_open_in_tabs: false,
+            show_link_previews: true,
             notice_revision: 0,
             geometry: None,
         }
@@ -136,6 +138,7 @@ pub fn load_config() -> Config {
     let mut animate_scroll = true;
     let mut dark_mode = false;
     let mut always_open_in_tabs = false;
+    let mut show_link_previews = true;
     let mut notice_revision = None;
     let mut dismissed_notice = None;
     let mut width = None;
@@ -162,6 +165,9 @@ pub fn load_config() -> Config {
             Some(("animate_scroll", v)) => animate_scroll = v.trim().parse().unwrap_or(true),
             Some(("dark_mode", v)) => dark_mode = v.trim().parse().unwrap_or(false),
             Some(("open_in_tabs", v)) => always_open_in_tabs = v.trim().parse().unwrap_or(false),
+            Some(("show_link_previews", v)) => {
+                show_link_previews = v.trim().parse().unwrap_or(true);
+            }
             Some(("dismissed_notice", v)) => {
                 dismissed_notice = u64::from_str_radix(v.trim(), 16).ok();
             }
@@ -193,6 +199,7 @@ pub fn load_config() -> Config {
         animate_scroll,
         dark_mode,
         always_open_in_tabs,
+        show_link_previews,
         notice_revision,
         geometry,
     }
@@ -213,6 +220,10 @@ pub fn save_config(config: &Config) -> io::Result<()> {
     out.push_str(&format!("animate_scroll={}\n", config.animate_scroll));
     out.push_str(&format!("dark_mode={}\n", config.dark_mode));
     out.push_str(&format!("open_in_tabs={}\n", config.always_open_in_tabs));
+    out.push_str(&format!(
+        "show_link_previews={}\n",
+        config.show_link_previews
+    ));
     out.push_str(&format!("notice_revision={}\n", config.notice_revision));
     if let Some(g) = config.geometry {
         out.push_str(&format!("width={}\n", g.width));
@@ -258,6 +269,7 @@ mod tests {
             animate_scroll: false,
             dark_mode: true,
             always_open_in_tabs: true,
+            show_link_previews: false,
             notice_revision: 2,
             geometry: Some(Geometry {
                 width: 1000,
@@ -273,6 +285,7 @@ mod tests {
         assert!(!loaded.animate_scroll);
         assert!(loaded.dark_mode);
         assert!(loaded.always_open_in_tabs);
+        assert!(!loaded.show_link_previews);
         assert_eq!(loaded.notice_revision, 2);
         let g = loaded.geometry.expect("geometry persisted");
         assert_eq!((g.width, g.height, g.maximized), (1000, 700, true));
@@ -285,6 +298,7 @@ mod tests {
             animate_scroll: true,
             dark_mode: false,
             always_open_in_tabs: false,
+            show_link_previews: true,
             notice_revision: 0,
             geometry: None,
         })
@@ -294,6 +308,7 @@ mod tests {
         assert!(loaded.animate_scroll);
         assert!(!loaded.dark_mode);
         assert!(!loaded.always_open_in_tabs);
+        assert!(loaded.show_link_previews);
         assert_eq!(loaded.notice_revision, 0);
         assert!(loaded.geometry.is_none());
     }

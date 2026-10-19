@@ -202,6 +202,12 @@ impl Window {
         let control = gtk::gdk::ModifierType::CONTROL_MASK;
         let control_shift = control | gtk::gdk::ModifierType::SHIFT_MASK;
         let modifiers = modifier & gtk::accelerator_get_default_mod_mask();
+        if let Some(taken) = self
+            .active_document()
+            .and_then(|document| document.handle_link_preview_key(keyval, modifiers))
+        {
+            return taken;
+        }
         if modifiers.is_empty() && keyval == Key::F11 {
             let window = self.obj();
             window.set_fullscreened(!window.is_fullscreen());

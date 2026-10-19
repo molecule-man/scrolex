@@ -13,7 +13,7 @@ use gtk::{glib, prelude::*, CompositeTemplate, SearchEntry};
 
 use super::ReaderKeyContext;
 use crate::document_pane::DocumentPane;
-use crate::links::{DocumentLocation, LinkAction, LinkRequest};
+use crate::links::{DocumentLocation, LinkAction, LinkHover, LinkRequest};
 
 const SEARCH_DEBOUNCE_MS: u64 = 100;
 const SPLIT_GEOMETRY_TIMEOUT: Duration = Duration::from_secs(2);
@@ -62,6 +62,9 @@ pub struct DocumentView {
     split_geometry_pending: Cell<bool>,
     #[template_child]
     pane_host: TemplateChild<gtk::Box>,
+    #[template_child]
+    pane_overlay: TemplateChild<gtk::Overlay>,
+    pub(crate) link_preview: OnceCell<crate::link_preview::LinkPreview>,
     #[template_child]
     pub search_bar: TemplateChild<gtk::SearchBar>,
     #[template_child]
@@ -136,7 +139,19 @@ impl DocumentView {
         self.obj().first_child()
     }
 
+    #[cfg(test)]
+    pub(crate) fn split_settled(&self) -> bool {
+        self.secondary.borrow().is_some() && !self.split_geometry_pending.get()
+    }
+
+    pub(crate) fn link_preview(&self) -> &crate::link_preview::LinkPreview {
+        self.link_preview
+            .get()
+            .expect("a document view has a link preview")
+    }
+
     pub(crate) fn load(&self, file: &gtk::gio::File) {
+        self.link_preview().dismiss();
         self.split_generation
             .set(self.split_generation.get().wrapping_add(1));
         self.split_geometry_pending.set(false);
@@ -361,6 +376,52 @@ impl DocumentView {
                 }
             ),
         );
+        pane.connect_closure(
+            "link-hovered",
+            false,
+            glib::closure_local!(
+                #[weak(rename_to = imp)]
+                self,
+                move |pane: DocumentPane, page: crate::page::Page, hover: LinkHover| {
+                    imp.link_preview().hover(&pane, &page, hover);
+                }
+            ),
+        );
+        pane.connect_closure(
+            "scroll-motion-cancelled",
+            false,
+            glib::closure_local!(
+                #[weak(rename_to = imp)]
+                self,
+                move |pane: DocumentPane| imp.link_preview().dismiss_for(&pane)
+            ),
+        );
+        for property in ["zoom", "crop"] {
+            pane.viewport().connect_notify_local(
+                Some(property),
+                clone!(
+                    #[weak(rename_to = imp)]
+                    self,
+                    #[weak]
+                    pane,
+                    move |_, _| imp.link_preview().dismiss_for(&pane)
+                ),
+            );
+        }
+        // Dismiss the preview before the pane scroll handler runs.
+        let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::BOTH_AXES);
+        scroll.set_propagation_phase(gtk::PropagationPhase::Capture);
+        scroll.connect_scroll(clone!(
+            #[weak(rename_to = imp)]
+            self,
+            #[upgrade_or]
+            glib::Propagation::Proceed,
+            move |_, _, _| {
+                imp.link_preview().dismiss();
+                glib::Propagation::Proceed
+            }
+        ));
+        pane.add_controller(scroll);
 
         let focus = gtk::EventControllerFocus::new();
         focus.connect_enter(clone!(
@@ -743,6 +804,7 @@ impl DocumentView {
             .set(self.split_generation.get().wrapping_add(1));
         self.split_geometry_pending.set(false);
         let active_closed = self.active_pane.borrow().as_ref() == Some(pane);
+        self.link_preview().dismiss();
         pane.release_renders();
         let paned = self.split_container();
         let remaining;
@@ -1128,6 +1190,14 @@ impl ObjectImpl for DocumentView {
     fn constructed(&self) {
         self.parent_constructed();
 
+        self.link_preview
+            .set(crate::link_preview::LinkPreview::new(&self.pane_overlay))
+            .ok()
+            .expect("one link preview per document view");
+        // Dismiss the preview when its tab becomes hidden.
+        self.obj()
+            .connect_unmap(|view| view.imp().link_preview().dismiss());
+
         let document = crate::document::Document::new();
         let pane = DocumentPane::new(&document);
         pane.set_hexpand(true);
@@ -1146,6 +1216,9 @@ impl ObjectImpl for DocumentView {
     }
 
     fn dispose(&self) {
+        if let Some(preview) = self.link_preview.get() {
+            preview.dismiss();
+        }
         if let Some(source) = self.search_debounce.take() {
             source.remove();
         }

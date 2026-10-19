@@ -83,6 +83,10 @@ impl DocumentPane {
         self.imp().scrolledwindow.grab_focus();
     }
 
+    pub(crate) fn is_moving(&self) -> bool {
+        self.imp().is_moving()
+    }
+
     pub(crate) fn page_area(&self) -> gtk::ScrolledWindow {
         self.imp().scrolledwindow.clone()
     }

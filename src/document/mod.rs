@@ -387,6 +387,15 @@ impl Document {
     }
 
     #[cfg(test)]
+    pub(crate) fn has_render_interest(&self, viewport: crate::viewport::ViewportId) -> bool {
+        self.imp()
+            .render_jobs
+            .borrow()
+            .values()
+            .any(|job| job.interests.contains_key(&viewport))
+    }
+
+    #[cfg(test)]
     pub(crate) fn has_render_job(&self, key: &RenderJobKey) -> bool {
         self.imp().render_jobs.borrow().contains_key(key)
     }

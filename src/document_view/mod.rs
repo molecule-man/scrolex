@@ -127,6 +127,19 @@ impl DocumentView {
         self.imp().active_pane().target_page(page_num)
     }
 
+    pub(crate) fn dismiss_link_preview(&self) {
+        self.imp().link_preview().dismiss();
+    }
+
+    // Some skips the window shortcuts, even when propagation is Proceed.
+    pub(crate) fn handle_link_preview_key(
+        &self,
+        keyval: gtk::gdk::Key,
+        modifiers: gtk::gdk::ModifierType,
+    ) -> Option<glib::Propagation> {
+        self.imp().link_preview().handle_key(keyval, modifiers)
+    }
+
     pub fn redraw_pages(&self) {
         self.imp().redraw_pages();
     }

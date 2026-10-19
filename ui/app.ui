@@ -187,6 +187,13 @@
 												</object>
 											</child>
 											<child>
+												<object class="GtkToggleButton" id="btn_link_previews">
+													<property name="action-name">app.show-link-previews</property>
+													<property name="label">Show Link Previews</property>
+													<property name="tooltip-text">Show the link destination when the pointer rests on an internal link</property>
+												</object>
+											</child>
+											<child>
 												<object class="GtkToggleButton" id="btn_fullscreen">
 													<property name="label">Full Screen</property>
 													<property name="tooltip-text">Enter Fullscreen mode (F11)</property>
