@@ -140,7 +140,7 @@ pub(crate) struct Placement {
     region: Bounds,
     link: Bounds,
     pub width: f64,
-    pub max_height: f64,
+    pub max_page_height: f64,
 }
 
 // Keep the popup inside the area without overlap with the link.
@@ -209,14 +209,14 @@ pub(crate) fn place(link: Bounds, area: Bounds, preferred: (f64, f64)) -> Option
         region,
         link,
         width: preferred_width.min(region.width),
-        max_height: preferred_height.min(region.height),
+        max_page_height: preferred_height.min(region.height),
     })
 }
 
 impl Placement {
     // Center the popup along the link, within the available region.
     pub(crate) fn bounds(&self, height: f64) -> Bounds {
-        let height = height.min(self.max_height);
+        let height = height.min(self.region.height);
         let r = self.region;
         let (cx, cy) = self.link.center();
         let along_y = (cy - height / 2.0).clamp(r.y, r.bottom() - height);
@@ -769,7 +769,10 @@ impl LinkPreview {
         }
         let width = popup.placement.width.round() as i32;
         let (_, natural, _, _) = popup.root.measure(gtk::Orientation::Vertical, width);
-        let bounds = popup.placement.bounds(f64::from(natural));
+        let (_, page, _, _) = popup.scroller.measure(gtk::Orientation::Vertical, width);
+        let footer = f64::from(natural - page);
+        let height = f64::from(natural).min(popup.placement.max_page_height + footer);
+        let bounds = popup.placement.bounds(height);
         Some(gtk::gdk::Rectangle::new(
             bounds.x.round() as i32,
             bounds.y.round() as i32,
@@ -1458,6 +1461,26 @@ mod widget_tests {
         let (width, height) = source_page(&window).size_request();
         assert!(f64::from(bounds.width()) <= f64::from(width) + 0.5);
         assert!(f64::from(bounds.height()) <= f64::from(height) + 0.5);
+        window.close();
+    }
+
+    #[gtk::test]
+    fn a_page_that_fits_shows_whole_with_the_footer() {
+        let window = links_window();
+        window.pane().viewport().zoom_to(0.5);
+        wait_until(|| source_page(&window).size_request().1 < 450);
+        let preview = open(&window, TO_SECOND_FIT);
+        let vadj = preview.scroller().unwrap().vadjustment();
+        let checkbox = preview.checkbox().unwrap();
+
+        wait_until(|| vadj.page_size() > 0.0 && checkbox.height() > 0);
+
+        assert!(
+            vadj.upper() <= vadj.page_size() + 0.5,
+            "{} > {}",
+            vadj.upper(),
+            vadj.page_size()
+        );
         window.close();
     }
 
