@@ -13,7 +13,7 @@ use crate::links::{DocumentLocation, LinkHover};
 use crate::page::{Page, Rectangle};
 use crate::viewport::Viewport;
 
-pub const OPEN_DELAY: Duration = Duration::from_millis(500);
+pub const OPEN_DELAY: Duration = Duration::from_millis(300);
 pub const CLOSE_DELAY: Duration = Duration::from_millis(300);
 const MARGIN: f64 = 12.0;
 // Minimum readable preview size.
