@@ -195,6 +195,10 @@ pub(crate) fn place(link: Bounds, area: Bounds, preferred: (f64, f64)) -> Option
         r.width >= MIN_SIZE && r.height >= MIN_SIZE
     };
 
+    let fits_vertically = [Side::Below, Side::Above].into_iter().find(|side| {
+        let r = region(*side);
+        readable(side) && r.width >= preferred_width && r.height >= preferred_height
+    });
     let beside = [Side::Right, Side::Left]
         .into_iter()
         .find(|side| readable(side) && region(*side).width >= preferred_width);
@@ -210,7 +214,8 @@ pub(crate) fn place(link: Bounds, area: Bounds, preferred: (f64, f64)) -> Option
             .filter(readable)
             .max_by(|a, b| region(*a).area().total_cmp(&region(*b).area()))
     };
-    let side = beside
+    let side = fits_vertically
+        .or(beside)
         .or_else(|| vertical().filter(|side| region(*side).width >= preferred_width))
         .or_else(largest)?;
     let region = region(side);
@@ -576,19 +581,21 @@ impl LinkPreview {
             width: f64::from(overlay.width()),
             height: f64::from(overlay.height()),
         };
-        // Use the page size request because the list row can exceed the page height.
-        let (width, height) = source.size_request();
-        let preferred = (f64::from(width), f64::from(height));
-        let Some(mut placement) = place(link, area, preferred) else {
-            return;
-        };
-
         let document = source.document();
         let crop = source.crop();
         let Some(bbox) = document.page_bounds(hover.location.page, crop) else {
             return;
         };
         let (page_width, page_height) = bbox.size();
+
+        // Use the page size request because the list row can exceed the page height.
+        let (width, _) = source.size_request();
+        let height = page_height * source.zoom() * f64::from(height_percent()) / 100.0;
+        let preferred = (f64::from(width), height);
+        let Some(mut placement) = place(link, area, preferred) else {
+            return;
+        };
+
         let viewport = Viewport::new(&document);
         viewport.set_crop(crop);
         let zoom = source
@@ -884,6 +891,27 @@ mod tests {
         let p = place(low, area, (600.0, 500.0)).unwrap();
         assert_eq!(p.side, Side::Above);
         assert_valid(p.bounds(500.0), low, area);
+    }
+
+    #[test]
+    fn a_short_popup_prefers_below_then_above() {
+        let l = link(300.0, 400.0);
+        let p = place(l, AREA, (500.0, 300.0)).unwrap();
+        assert_eq!(p.side, Side::Below);
+        assert_valid(p.bounds(300.0), l, AREA);
+
+        let low = link(300.0, 700.0);
+        let p = place(low, AREA, (500.0, 300.0)).unwrap();
+        assert_eq!(p.side, Side::Above);
+        assert_valid(p.bounds(300.0), low, AREA);
+    }
+
+    #[test]
+    fn a_popup_too_tall_for_above_and_below_goes_beside() {
+        let l = link(300.0, 400.0);
+        let p = place(l, AREA, (500.0, 480.0)).unwrap();
+        assert_eq!(p.side, Side::Right);
+        assert_valid(p.bounds(480.0), l, AREA);
     }
 
     #[test]
@@ -1573,6 +1601,35 @@ mod widget_tests {
             vadj.page_size()
         );
         assert!(vadj.upper() > vadj.page_size() + 1.0);
+        window.close();
+    }
+
+    #[gtk::test]
+    fn a_short_height_setting_places_the_popup_above_or_below() {
+        let _height = HeightPercent::set(30);
+        let window = links_window();
+        let preview = open(&window, TO_SECOND_FIT);
+        let popup = preview.popup_widget().unwrap();
+        let overlay = popup.parent().expect("the overlay");
+        wait_until(|| popup.width() > 0);
+
+        let page = source_page(&window);
+        let bbox = page.document().page_bounds(0, page.crop()).unwrap();
+        let (x, y) = TO_SECOND_FIT;
+        let point = gtk::graphene::Point::new(
+            ((x - bbox.x1) * page.zoom()) as f32,
+            ((y - bbox.y1) * page.zoom()) as f32,
+        );
+        let link = page.compute_point(&overlay, &point).unwrap();
+        let bounds = popup.compute_bounds(&overlay).unwrap();
+        assert!(
+            bounds.x() <= link.x() && link.x() <= bounds.x() + bounds.width(),
+            "{bounds:?} is beside {link:?}"
+        );
+        assert!(
+            link.y() < bounds.y() || bounds.y() + bounds.height() < link.y(),
+            "{bounds:?} covers {link:?}"
+        );
         window.close();
     }
 
