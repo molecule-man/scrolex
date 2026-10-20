@@ -629,6 +629,7 @@ impl LinkPreview {
 
     // The change signal runs during allocation, after GTK positions the child.
     // Defer the scroll until idle so GTK can apply the destination offset.
+    // The destination shows at 1/3 of the popup height.
     fn scroll_once_allocated(vadj: &gtk::Adjustment, start: f64) {
         if start <= 0.0 {
             return;
@@ -648,7 +649,10 @@ impl LinkPreview {
                 glib::idle_add_local_once(clone!(
                     #[weak]
                     vadj,
-                    move || vadj.set_value(start.min(vadj.upper() - vadj.page_size()))
+                    move || {
+                        let value = start - vadj.page_size() / 3.0;
+                        vadj.set_value(value.clamp(0.0, vadj.upper() - vadj.page_size()));
+                    }
                 ));
             }
         ));
@@ -1431,7 +1435,7 @@ mod widget_tests {
     }
 
     #[gtk::test]
-    fn an_xyz_link_starts_at_its_coordinates() {
+    fn an_xyz_link_shows_its_coordinates_at_a_third_of_the_popup() {
         let window = links_window();
         let preview = open(&window, TO_LONG_PAGE);
         let vadj = preview.scroller().unwrap().vadjustment();
@@ -1439,7 +1443,8 @@ mod widget_tests {
 
         wait_until(|| vadj.value() > 0.0);
 
-        let expected = (LONG_PAGE_DEST_Y * zoom).min(vadj.upper() - vadj.page_size());
+        let expected = LONG_PAGE_DEST_Y * zoom - vadj.page_size() / 3.0;
+        assert!(expected > 0.0 && expected < vadj.upper() - vadj.page_size());
         assert!(
             (vadj.value() - expected).abs() < 1.0,
             "{} vs {expected}",
