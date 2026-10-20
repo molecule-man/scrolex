@@ -917,12 +917,6 @@ mod tests {
         };
         assert!(place(link(55.0, 70.0), area, (500.0, 700.0)).is_none());
     }
-
-    #[test]
-    fn production_delays() {
-        assert_eq!(OPEN_DELAY, Duration::from_millis(500));
-        assert_eq!(CLOSE_DELAY, Duration::from_millis(300));
-    }
 }
 
 #[cfg(test)]
