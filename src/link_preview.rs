@@ -674,6 +674,7 @@ impl LinkPreview {
         let root = gtk::Box::builder()
             .orientation(gtk::Orientation::Vertical)
             .focusable(false)
+            .overflow(gtk::Overflow::Hidden)
             .css_classes(["link-preview"])
             .build();
 
