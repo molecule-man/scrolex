@@ -141,7 +141,9 @@ fn setup_open_in_tabs(app: &Application) {
 }
 
 fn setup_link_previews(app: &Application) {
-    scrolex::link_preview::set_enabled(config::load_config().show_link_previews);
+    let config = config::load_config();
+    scrolex::link_preview::set_enabled(config.show_link_previews);
+    scrolex::link_preview::set_height_percent(config.link_preview_height_percent);
     app.add_action(&scrolex::link_preview::preference_action());
 }
 

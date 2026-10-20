@@ -15,6 +15,10 @@ pub const DEFAULT_RENDER_CACHE_MB: usize = 64;
 pub const MIN_RENDER_CACHE_MB: usize = 32;
 pub const MAX_RENDER_CACHE_MB: usize = 512;
 
+pub const DEFAULT_LINK_PREVIEW_HEIGHT_PERCENT: u32 = 100;
+pub const MIN_LINK_PREVIEW_HEIGHT_PERCENT: u32 = 10;
+pub const LINK_PREVIEW_HEIGHT_STEP: u32 = 10;
+
 pub const DARK_MODE_NOTICE_REVISION: u32 = 1;
 const DARK_MODE_NOTICE_ID: u64 = 0x28a9_9587_3f4d_6d3a;
 
@@ -27,6 +31,7 @@ pub struct Config {
     pub dark_mode: bool,
     pub always_open_in_tabs: bool,
     pub show_link_previews: bool,
+    pub link_preview_height_percent: u32,
     pub notice_revision: u32,
     pub geometry: Option<Geometry>,
 }
@@ -49,6 +54,7 @@ impl Default for Config {
             dark_mode: false,
             always_open_in_tabs: false,
             show_link_previews: true,
+            link_preview_height_percent: DEFAULT_LINK_PREVIEW_HEIGHT_PERCENT,
             notice_revision: 0,
             geometry: None,
         }
@@ -139,6 +145,7 @@ pub fn load_config() -> Config {
     let mut dark_mode = false;
     let mut always_open_in_tabs = false;
     let mut show_link_previews = true;
+    let mut link_preview_height_percent = DEFAULT_LINK_PREVIEW_HEIGHT_PERCENT;
     let mut notice_revision = None;
     let mut dismissed_notice = None;
     let mut width = None;
@@ -167,6 +174,11 @@ pub fn load_config() -> Config {
             Some(("open_in_tabs", v)) => always_open_in_tabs = v.trim().parse().unwrap_or(false),
             Some(("show_link_previews", v)) => {
                 show_link_previews = v.trim().parse().unwrap_or(true);
+            }
+            Some(("link_preview_height_percent", v)) => {
+                if let Ok(n) = v.trim().parse() {
+                    link_preview_height_percent = n;
+                }
             }
             Some(("dismissed_notice", v)) => {
                 dismissed_notice = u64::from_str_radix(v.trim(), 16).ok();
@@ -200,9 +212,20 @@ pub fn load_config() -> Config {
         dark_mode,
         always_open_in_tabs,
         show_link_previews,
+        link_preview_height_percent: link_preview_height_step(link_preview_height_percent),
         notice_revision,
         geometry,
     }
+}
+
+// Round to the nearest menu step within the menu range.
+pub fn link_preview_height_step(percent: u32) -> u32 {
+    let step = LINK_PREVIEW_HEIGHT_STEP;
+    let rounded = percent.saturating_add(step / 2) / step * step;
+    rounded.clamp(
+        MIN_LINK_PREVIEW_HEIGHT_PERCENT,
+        DEFAULT_LINK_PREVIEW_HEIGHT_PERCENT,
+    )
 }
 
 pub fn save_config(config: &Config) -> io::Result<()> {
@@ -223,6 +246,10 @@ pub fn save_config(config: &Config) -> io::Result<()> {
     out.push_str(&format!(
         "show_link_previews={}\n",
         config.show_link_previews
+    ));
+    out.push_str(&format!(
+        "link_preview_height_percent={}\n",
+        config.link_preview_height_percent
     ));
     out.push_str(&format!("notice_revision={}\n", config.notice_revision));
     if let Some(g) = config.geometry {
@@ -259,6 +286,15 @@ mod tests {
     }
 
     #[test]
+    fn link_preview_height_snaps_to_the_menu_steps() {
+        assert_eq!(link_preview_height_step(0), 10);
+        assert_eq!(link_preview_height_step(34), 30);
+        assert_eq!(link_preview_height_step(35), 40);
+        assert_eq!(link_preview_height_step(100), 100);
+        assert_eq!(link_preview_height_step(u32::MAX), 100);
+    }
+
+    #[test]
     fn round_trips_and_clamps_to_max() {
         use_scratch_config();
 
@@ -270,6 +306,7 @@ mod tests {
             dark_mode: true,
             always_open_in_tabs: true,
             show_link_previews: false,
+            link_preview_height_percent: 30,
             notice_revision: 2,
             geometry: Some(Geometry {
                 width: 1000,
@@ -286,6 +323,7 @@ mod tests {
         assert!(loaded.dark_mode);
         assert!(loaded.always_open_in_tabs);
         assert!(!loaded.show_link_previews);
+        assert_eq!(loaded.link_preview_height_percent, 30);
         assert_eq!(loaded.notice_revision, 2);
         let g = loaded.geometry.expect("geometry persisted");
         assert_eq!((g.width, g.height, g.maximized), (1000, 700, true));
@@ -299,6 +337,7 @@ mod tests {
             dark_mode: false,
             always_open_in_tabs: false,
             show_link_previews: true,
+            link_preview_height_percent: 9999,
             notice_revision: 0,
             geometry: None,
         })
@@ -309,6 +348,7 @@ mod tests {
         assert!(!loaded.dark_mode);
         assert!(!loaded.always_open_in_tabs);
         assert!(loaded.show_link_previews);
+        assert_eq!(loaded.link_preview_height_percent, 100);
         assert_eq!(loaded.notice_revision, 0);
         assert!(loaded.geometry.is_none());
     }

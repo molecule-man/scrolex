@@ -1,6 +1,6 @@
 use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 use gtk::gdk::{Key, ModifierType};
@@ -23,6 +23,8 @@ const BORDER: f64 = 1.0;
 const ACTION: &str = "show-link-previews";
 
 static ENABLED: AtomicBool = AtomicBool::new(true);
+static HEIGHT_PERCENT: AtomicU32 =
+    AtomicU32::new(crate::config::DEFAULT_LINK_PREVIEW_HEIGHT_PERCENT);
 
 pub fn enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
@@ -30,6 +32,15 @@ pub fn enabled() -> bool {
 
 pub fn set_enabled(enabled: bool) {
     ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+// The popup page height limit, as a percentage of the target page height.
+pub fn height_percent() -> u32 {
+    HEIGHT_PERCENT.load(Ordering::Relaxed)
+}
+
+pub fn set_height_percent(percent: u32) {
+    HEIGHT_PERCENT.store(percent, Ordering::Relaxed);
 }
 
 // The action state keeps the menu toggle in sync with the preference.
@@ -568,7 +579,7 @@ impl LinkPreview {
         // Use the page size request because the list row can exceed the page height.
         let (width, height) = source.size_request();
         let preferred = (f64::from(width), f64::from(height));
-        let Some(placement) = place(link, area, preferred) else {
+        let Some(mut placement) = place(link, area, preferred) else {
             return;
         };
 
@@ -577,13 +588,15 @@ impl LinkPreview {
         let Some(bbox) = document.page_bounds(hover.location.page, crop) else {
             return;
         };
-        let (page_width, _) = bbox.size();
+        let (page_width, page_height) = bbox.size();
         let viewport = Viewport::new(&document);
         viewport.set_crop(crop);
         let zoom = source
             .zoom()
             .min((placement.width - 2.0 * BORDER) / page_width);
         viewport.fit_zoom_to(zoom);
+        let height_limit = page_height * viewport.zoom() * f64::from(height_percent()) / 100.0;
+        placement.max_page_height = placement.max_page_height.min(height_limit);
 
         let target = Page::new_link_target(&viewport, hover.location.page);
         target.set_halign(gtk::Align::Start);
@@ -1522,6 +1535,44 @@ mod widget_tests {
             vadj.upper(),
             vadj.page_size()
         );
+        window.close();
+    }
+
+    // Restore the global setting, also when a test fails.
+    struct HeightPercent;
+
+    impl HeightPercent {
+        fn set(percent: u32) -> Self {
+            set_height_percent(percent);
+            Self
+        }
+    }
+
+    impl Drop for HeightPercent {
+        fn drop(&mut self) {
+            set_height_percent(crate::config::DEFAULT_LINK_PREVIEW_HEIGHT_PERCENT);
+        }
+    }
+
+    #[gtk::test]
+    fn the_height_setting_shows_part_of_the_page_with_a_scroll() {
+        let _height = HeightPercent::set(30);
+        let window = links_window();
+        window.pane().viewport().zoom_to(0.5);
+        wait_until(|| source_page(&window).size_request().1 < 450);
+        let preview = open(&window, TO_SECOND_FIT);
+        let vadj = preview.scroller().unwrap().vadjustment();
+        let target = target_page(&preview);
+
+        wait_until(|| vadj.page_size() > 0.0 && target.height() > 0);
+
+        let expected = f64::from(target.height()) * 0.3;
+        assert!(
+            (vadj.page_size() - expected).abs() <= 1.0,
+            "{} != {expected}",
+            vadj.page_size()
+        );
+        assert!(vadj.upper() > vadj.page_size() + 1.0);
         window.close();
     }
 
