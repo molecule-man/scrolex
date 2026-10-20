@@ -89,6 +89,10 @@
 	box-shadow: 0 2px 12px alpha(black, 0.3);
 }
 
+#main.dark-mode .link-preview {
+	border-color: #666;
+}
+
 .link-preview-footer {
 	padding: 6px 10px;
 	border-top: 1px solid @borders;
