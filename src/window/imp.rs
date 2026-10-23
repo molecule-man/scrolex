@@ -879,7 +879,7 @@ impl Window {
         let step = f64::from(crate::config::LINK_PREVIEW_HEIGHT_STEP);
         self.spin_link_preview_height.set_range(
             f64::from(crate::config::MIN_LINK_PREVIEW_HEIGHT_PERCENT),
-            f64::from(crate::config::DEFAULT_LINK_PREVIEW_HEIGHT_PERCENT),
+            f64::from(crate::config::MAX_LINK_PREVIEW_HEIGHT_PERCENT),
         );
         self.spin_link_preview_height.set_increments(step, step);
         self.spin_link_preview_height

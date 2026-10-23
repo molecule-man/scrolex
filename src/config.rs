@@ -17,6 +17,7 @@ pub const MAX_RENDER_CACHE_MB: usize = 512;
 
 pub const DEFAULT_LINK_PREVIEW_HEIGHT_PERCENT: u32 = 50;
 pub const MIN_LINK_PREVIEW_HEIGHT_PERCENT: u32 = 10;
+pub const MAX_LINK_PREVIEW_HEIGHT_PERCENT: u32 = 100;
 pub const LINK_PREVIEW_HEIGHT_STEP: u32 = 10;
 
 pub const DARK_MODE_NOTICE_REVISION: u32 = 1;
@@ -224,7 +225,7 @@ pub fn link_preview_height_step(percent: u32) -> u32 {
     let rounded = percent.saturating_add(step / 2) / step * step;
     rounded.clamp(
         MIN_LINK_PREVIEW_HEIGHT_PERCENT,
-        DEFAULT_LINK_PREVIEW_HEIGHT_PERCENT,
+        MAX_LINK_PREVIEW_HEIGHT_PERCENT,
     )
 }
 

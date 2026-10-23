@@ -2121,6 +2121,7 @@ mod widget_tests {
 
     #[gtk::test]
     fn a_page_that_fits_shows_whole_with_the_footer() {
+        let _height = HeightPercent::set(100);
         let window = links_window();
         window.pane().viewport().zoom_to(0.5);
         wait_until(|| source_page(&window).size_request().1 < 450);
