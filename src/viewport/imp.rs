@@ -82,16 +82,7 @@ impl ObjectImpl for Viewport {
 
         // A zoom removes this viewport from obsolete jobs and cache pins.
         self.obj()
-            .connect_notify_local(Some("zoom"), |viewport, _| {
-                let document = viewport.document();
-                document.remove_render_interests(viewport.id());
-                document
-                    .imp()
-                    .render_cache
-                    .borrow_mut()
-                    .clear_pins(viewport.id());
-                crate::page::clear_full_renders(viewport.id());
-            });
+            .connect_notify_local(Some("zoom"), |viewport, _| viewport.release_renders());
     }
 
     fn signals() -> &'static [Signal] {

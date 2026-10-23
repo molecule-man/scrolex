@@ -17,9 +17,9 @@ use gtk::prelude::*;
 use gtk::subclass::prelude::*;
 use once_cell::sync::Lazy;
 
-use super::Rectangle;
+use super::{PageRole, Rectangle};
 use crate::bg_job::{RenderPool, RenderPriority};
-use crate::links::{LinkAction, LinkRequest, LinkTarget};
+use crate::links::{DocumentLocation, LinkAction, LinkHover, LinkRequest, LinkTarget};
 use crate::selection::PageSelection;
 
 // Max bytes in one page buffer. A whole page is rendered at once, so the buffer grows with the
@@ -248,6 +248,9 @@ pub struct Page {
     #[property(get = Self::viewport, set, construct_only, type = crate::viewport::Viewport)]
     viewport: RefCell<Option<crate::viewport::Viewport>>,
 
+    #[property(get, set, construct_only, builder(PageRole::Document))]
+    role: Cell<PageRole>,
+
     #[property(get, set)]
     pub(crate) binding: RefCell<Option<glib::Binding>>,
 
@@ -307,8 +310,10 @@ impl ObjectImpl for Page {
 
         self.setup_scale_tracking();
         self.setup_viewport_listeners();
-        self.setup_text_selection();
-        self.setup_link_handling();
+        if self.role.get() == PageRole::Document {
+            self.setup_text_selection();
+            self.setup_link_handling();
+        }
 
         self.obj().connect_unmap(|page| page.imp().unpin_render());
 
@@ -324,9 +329,14 @@ impl ObjectImpl for Page {
     fn signals() -> &'static [Signal] {
         static SIGNALS: OnceLock<Vec<Signal>> = OnceLock::new();
         SIGNALS.get_or_init(|| {
-            vec![Signal::builder("internal-link-clicked")
-                .param_types([LinkRequest::static_type()])
-                .build()]
+            vec![
+                Signal::builder("internal-link-clicked")
+                    .param_types([LinkRequest::static_type()])
+                    .build(),
+                Signal::builder("link-hovered")
+                    .param_types([LinkHover::static_type()])
+                    .build(),
+            ]
         })
     }
 }
@@ -611,6 +621,7 @@ impl Page {
         // indicates that we have "borrowed" global page cursor
         let cursor = Cell::new(false);
         let tooltip_visible = Rc::new(Cell::new(false));
+        let hovered = Rc::new(Cell::new(None::<(DocumentLocation, Rectangle)>));
 
         motion_controller.connect_motion(clone!(
             #[strong]
@@ -619,13 +630,27 @@ impl Page {
             self,
             #[strong]
             tooltip_visible,
-            move |_, x, y| {
-                let target = imp.link_at(&obj, x, y);
-                let visible = matches!(target, Some(LinkTarget::Location(_)));
+            #[strong]
+            hovered,
+            move |motion, x, y| {
+                let hit = imp.link_hit_at(&obj, x, y);
+                let target = hit.as_ref().map(|(_, target)| target);
+                let internal = match &hit {
+                    Some((rect, LinkTarget::Location(location))) => Some((*location, *rect)),
+                    _ => None,
+                };
+                let visible = internal.is_some() && !crate::link_preview::enabled();
                 if tooltip_visible.replace(visible) != visible {
                     obj.set_tooltip_text(
                         visible.then_some("Middle click opens beside. Right click opens a menu."),
                     );
+                }
+                let buttons = gtk::gdk::ModifierType::BUTTON1_MASK
+                    | gtk::gdk::ModifierType::BUTTON2_MASK
+                    | gtk::gdk::ModifierType::BUTTON3_MASK;
+                let link = internal.filter(|_| !motion.current_event_state().intersects(buttons));
+                if hovered.replace(link) != link {
+                    obj.emit_by_name::<()>("link-hovered", &[&LinkHover { link }]);
                 }
                 if target.is_some() {
                     if !imp.cursor_guard.get() {
@@ -648,9 +673,14 @@ impl Page {
             obj,
             #[strong]
             tooltip_visible,
+            #[strong]
+            hovered,
             move |_| {
                 if tooltip_visible.replace(false) {
                     obj.set_tooltip_text(None);
+                }
+                if hovered.take().is_some() {
+                    obj.emit_by_name::<()>("link-hovered", &[&LinkHover { link: None }]);
                 }
             }
         ));
@@ -774,11 +804,17 @@ impl Page {
     }
 
     fn link_at(&self, obj: &super::Page, x: f64, y: f64) -> Option<LinkTarget> {
+        self.link_hit_at(obj, x, y).map(|(_, target)| target)
+    }
+
+    // Both the input point and the result bounds use page widget coordinates.
+    fn link_hit_at(&self, obj: &super::Page, x: f64, y: f64) -> Option<(Rectangle, LinkTarget)> {
         let point = undo_zoom_and_crop(obj, x, y);
         let document = self.document();
         document.request_links(obj.index());
         let links = document.imp().links.borrow();
-        links.get_link(obj.index(), point.x, point.y).cloned()
+        let (rect, target) = links.link_at(obj.index(), point.x, point.y)?;
+        Some((apply_zoom_and_crop(obj, rect), target.clone()))
     }
 
     fn emit_link(obj: &super::Page, location: crate::links::DocumentLocation, action: LinkAction) {
@@ -1034,6 +1070,9 @@ impl Page {
     // Paint match rects for this page: matches yellow, the current match orange. Same zoom/crop
     // transform as the page render, so highlights land on the words.
     fn snapshot_search_overlay(&self, snapshot: &gtk::Snapshot, page: &PageInfo) {
+        if self.role.get() == PageRole::LinkTarget {
+            return;
+        }
         let obj = self.obj();
         let index = obj.index();
         let search = obj.document().search();
@@ -1349,6 +1388,9 @@ impl Page {
     // cached/queued pages; lowest priority, dropped at the queue if the scroll leaves its range.
     // `page_bytes` is the current page's render size, which bounds the depth.
     fn prefetch_next(&self, current: i32, page_bytes: usize) {
+        if self.role.get() == PageRole::LinkTarget {
+            return;
+        }
         let obj = self.obj();
         let viewport = obj.viewport();
         let document = viewport.document();
@@ -1558,6 +1600,9 @@ impl Page {
     // Prefetch low-res previews over a symmetric window (they're cheap and tiny), so scrolling
     // either way shows blurry pages instead of blank ones.
     fn prefetch_previews(&self, current: i32) {
+        if self.role.get() == PageRole::LinkTarget {
+            return;
+        }
         let obj = self.obj();
         if !obj.document().preview_enabled() {
             return;
@@ -2119,6 +2164,22 @@ fn current_rss_mb() -> f64 {
 struct Point {
     x: f64,
     y: f64,
+}
+
+fn apply_zoom_and_crop(page: &super::Page, rect: Rectangle) -> Rectangle {
+    let zoom = page.zoom();
+    let (dx, dy) = if page.crop() {
+        let bbox = page.imp().bbox.borrow();
+        (bbox.x1, bbox.y1)
+    } else {
+        (0.0, 0.0)
+    };
+    Rectangle::new(
+        (rect.x1 - dx) * zoom,
+        (rect.y1 - dy) * zoom,
+        (rect.x2 - dx) * zoom,
+        (rect.y2 - dy) * zoom,
+    )
 }
 
 fn undo_zoom_and_crop(page: &super::Page, x: f64, y: f64) -> Point {

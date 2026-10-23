@@ -15,7 +15,7 @@ use gtk::{prelude::*, GestureClick};
 
 use super::{ReaderKeyContext, ZoomChoice, ZoomChoiceAction};
 use crate::document::Document;
-use crate::links::{DocumentLocation, LinkRequest};
+use crate::links::{DocumentLocation, LinkHover, LinkRequest};
 use crate::page;
 use crate::viewport::Viewport;
 
@@ -293,9 +293,15 @@ impl ObjectImpl for DocumentPane {
     fn signals() -> &'static [Signal] {
         static SIGNALS: OnceLock<Vec<Signal>> = OnceLock::new();
         SIGNALS.get_or_init(|| {
-            vec![Signal::builder("link-activated")
-                .param_types([LinkRequest::static_type()])
-                .build()]
+            vec![
+                Signal::builder("link-activated")
+                    .param_types([LinkRequest::static_type()])
+                    .build(),
+                Signal::builder("link-hovered")
+                    .param_types([page::Page::static_type(), LinkHover::static_type()])
+                    .build(),
+                Signal::builder("scroll-motion-cancelled").build(),
+            ]
         })
     }
 
@@ -352,6 +358,17 @@ impl DocumentPane {
                 obj,
                 move |_: &crate::page::Page, request: LinkRequest| {
                     obj.emit_by_name::<()>("link-activated", &[&request]);
+                }
+            ),
+        );
+        page.connect_closure(
+            "link-hovered",
+            false,
+            closure_local!(
+                #[weak]
+                obj,
+                move |page: &crate::page::Page, hover: LinkHover| {
+                    obj.emit_by_name::<()>("link-hovered", &[page, &hover]);
                 }
             ),
         );
@@ -607,6 +624,15 @@ impl DocumentPane {
     pub(crate) fn cancel_scroll_motion(&self) {
         *self.scroll_anim.borrow_mut() = None;
         self.vscroll_anim.set(None);
+        self.obj()
+            .emit_by_name::<()>("scroll-motion-cancelled", &[]);
+    }
+
+    // Includes page slides, kinetic scroll, and pinch zoom.
+    pub(crate) fn is_moving(&self) -> bool {
+        self.scroll_anim.borrow().is_some()
+            || self.vscroll_anim.get().is_some()
+            || self.zoom_gesturing.get()
     }
 
     // Stop the coasts, on both axes. A page slide survives: it aims at a page and re-reads where that

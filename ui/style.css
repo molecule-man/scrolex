@@ -82,6 +82,31 @@
 	box-shadow: 0 2px 12px alpha(black, 0.3);
 }
 
+.link-preview {
+	border: 1px solid @borders;
+	border-radius: 8px;
+	background-color: @theme_bg_color;
+	box-shadow: 0 2px 12px alpha(black, 0.3);
+}
+
+#main.dark-mode .link-preview {
+	border-color: #666;
+}
+
+/* Some themes lack @accent_color. */
+.link-arrow {
+	color: #1c71d8;
+}
+
+#main.dark-mode .link-arrow {
+	color: #62a0ea;
+}
+
+.link-preview-footer {
+	padding: 6px 10px;
+	border-top: 1px solid @borders;
+}
+
 .toc-panel {
 	background-color: @theme_bg_color;
 	border-right: 1px solid @borders;

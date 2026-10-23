@@ -57,6 +57,8 @@ pub struct Window {
     #[template_child]
     pub spin_cache: TemplateChild<gtk::SpinButton>,
     #[template_child]
+    pub spin_link_preview_height: TemplateChild<gtk::SpinButton>,
+    #[template_child]
     pub label_title: TemplateChild<gtk::Label>,
     #[template_child]
     pub entry_page_num: TemplateChild<gtk::Entry>,
@@ -143,6 +145,7 @@ impl ObjectImpl for Window {
         self.add_document();
         self.setup_thread_setting();
         self.setup_cache_setting();
+        self.setup_link_preview_height_setting();
         self.setup_drop_target();
         self.setup_window_keys();
 
@@ -202,6 +205,12 @@ impl Window {
         let control = gtk::gdk::ModifierType::CONTROL_MASK;
         let control_shift = control | gtk::gdk::ModifierType::SHIFT_MASK;
         let modifiers = modifier & gtk::accelerator_get_default_mod_mask();
+        if let Some(taken) = self
+            .active_document()
+            .and_then(|document| document.handle_link_preview_key(keyval, modifiers))
+        {
+            return taken;
+        }
         if modifiers.is_empty() && keyval == Key::F11 {
             let window = self.obj();
             window.set_fullscreened(!window.is_fullscreen());
@@ -864,6 +873,47 @@ impl Window {
                 }
             }
         ));
+    }
+
+    fn setup_link_preview_height_setting(&self) {
+        let step = f64::from(crate::config::LINK_PREVIEW_HEIGHT_STEP);
+        self.spin_link_preview_height.set_range(
+            f64::from(crate::config::MIN_LINK_PREVIEW_HEIGHT_PERCENT),
+            f64::from(crate::config::MAX_LINK_PREVIEW_HEIGHT_PERCENT),
+        );
+        self.spin_link_preview_height.set_increments(step, step);
+        self.spin_link_preview_height
+            .set_value(f64::from(crate::link_preview::height_percent()));
+
+        self.spin_link_preview_height.connect_value_changed(clone!(
+            #[weak(rename_to = imp)]
+            self,
+            move |spin| {
+                if imp.setting_controls_sync.get() {
+                    return;
+                }
+                let percent = crate::config::link_preview_height_step(spin.value() as u32);
+                imp.apply_link_preview_height(percent);
+                let mut config = crate::config::load_config();
+                config.link_preview_height_percent = percent;
+                if let Err(e) = crate::config::save_config(&config) {
+                    eprintln!("Error saving config: {e}");
+                }
+            }
+        ));
+    }
+
+    fn apply_link_preview_height(&self, percent: u32) {
+        crate::link_preview::set_height_percent(percent);
+        let windows = self.application_windows();
+        for window in &windows {
+            let imp = window.imp();
+            imp.setting_controls_sync.set(true);
+            imp.spin_link_preview_height.set_value(f64::from(percent));
+        }
+        for window in windows {
+            window.imp().setting_controls_sync.set(false);
+        }
     }
 
     fn apply_cache_budgets(&self, render_cache_mb: usize) {
@@ -1927,6 +1977,12 @@ mod widget_tests {
 
         second.imp().spin_cache.set_value(128.0);
         assert_eq!(first.imp().spin_cache.value(), 128.0);
+
+        second.imp().spin_link_preview_height.set_value(40.0);
+        assert_eq!(first.imp().spin_link_preview_height.value(), 40.0);
+        assert_eq!(crate::link_preview::height_percent(), 40);
+        assert_eq!(crate::config::load_config().link_preview_height_percent, 40);
+        second.imp().spin_link_preview_height.set_value(100.0);
 
         second.close();
         wait_until(|| !second.is_visible());

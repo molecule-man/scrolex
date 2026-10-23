@@ -17,7 +17,7 @@ use gtk::gio::prelude::*;
 use gtk::glib;
 use gtk::subclass::prelude::ObjectSubclassIsExt;
 
-#[derive(Default, Debug, Copy, Clone)]
+#[derive(Default, Debug, Copy, Clone, PartialEq)]
 pub struct Rectangle {
     pub x1: f64,
     pub y1: f64,
@@ -58,6 +58,15 @@ impl PageNumber {
     }
 }
 
+// LinkTarget disables links, text selection, search highlights, and prefetch for preview pages.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, glib::Enum)]
+#[enum_type(name = "ScrolexPageRole")]
+pub enum PageRole {
+    #[default]
+    Document,
+    LinkTarget,
+}
+
 glib::wrapper! {
     pub struct Page(ObjectSubclass<imp::Page>)
         @extends gtk::Widget,
@@ -69,6 +78,16 @@ impl Page {
         glib::Object::builder()
             .property("viewport", viewport)
             .build()
+    }
+
+    pub(crate) fn new_link_target(viewport: &crate::viewport::Viewport, index: i32) -> Self {
+        let page: Self = glib::Object::builder()
+            .property("viewport", viewport)
+            .property("role", PageRole::LinkTarget)
+            .build();
+        page.set_index(index);
+        page.imp().resize();
+        page
     }
 
     pub(crate) fn document(&self) -> crate::document::Document {

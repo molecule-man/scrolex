@@ -63,7 +63,7 @@
 				</object>
 			</child>
 			<child>
-			<object class="GtkOverlay">
+			<object class="GtkOverlay" id="pane_overlay">
 			<property name="child">
 		<object class="GtkBox" id="pane_host">
 			<property name="hexpand">true</property>

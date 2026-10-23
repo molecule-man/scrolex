@@ -83,6 +83,10 @@ impl DocumentPane {
         self.imp().scrolledwindow.grab_focus();
     }
 
+    pub(crate) fn is_moving(&self) -> bool {
+        self.imp().is_moving()
+    }
+
     pub(crate) fn page_area(&self) -> gtk::ScrolledWindow {
         self.imp().scrolledwindow.clone()
     }
@@ -141,6 +145,10 @@ impl DocumentPane {
             pane: (f64::from(self.width()) - self.viewport_width()).max(0.0),
             row: (f64::from(row_width) - f64::from(page_width)).max(0.0),
         })
+    }
+
+    pub(crate) fn mapped_page(&self, index: i32) -> Option<crate::page::Page> {
+        self.imp().mapped_page(index)
     }
 
     pub(crate) fn viewport_width(&self) -> f64 {
