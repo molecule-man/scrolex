@@ -93,6 +93,15 @@
 	border-color: #666;
 }
 
+/* Some themes lack @accent_color. */
+.link-arrow {
+	color: #1c71d8;
+}
+
+#main.dark-mode .link-arrow {
+	color: #62a0ea;
+}
+
 .link-preview-footer {
 	padding: 6px 10px;
 	border-top: 1px solid @borders;

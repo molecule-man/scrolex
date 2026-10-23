@@ -147,6 +147,10 @@ impl DocumentPane {
         })
     }
 
+    pub(crate) fn mapped_page(&self, index: i32) -> Option<crate::page::Page> {
+        self.imp().mapped_page(index)
+    }
+
     pub(crate) fn viewport_width(&self) -> f64 {
         self.imp().scrolledwindow.hadjustment().page_size()
     }

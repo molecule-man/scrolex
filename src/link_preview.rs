@@ -13,20 +13,25 @@ use crate::links::{DocumentLocation, LinkHover};
 use crate::page::{Page, Rectangle};
 use crate::viewport::Viewport;
 
-pub const OPEN_DELAY: Duration = Duration::from_millis(300);
-pub const CLOSE_DELAY: Duration = Duration::from_millis(300);
+const OPEN_DELAY: Duration = Duration::from_millis(300);
+const CLOSE_DELAY: Duration = Duration::from_millis(300);
 const MARGIN: f64 = 12.0;
 // Minimum readable preview size.
 const MIN_SIZE: f64 = 120.0;
 // Matches the .link-preview border in style.css.
 const BORDER: f64 = 1.0;
+const ARROW_PAGE_FRACTION: f64 = 1.0;
+const ARROW_WIDTH: f64 = 2.0;
+const ARROW_HEAD: f64 = 10.0;
+const ARROW_BOW: f64 = 0.2;
+const ARROW_LINE_ALPHA: f64 = 0.4;
 const ACTION: &str = "show-link-previews";
 
 static ENABLED: AtomicBool = AtomicBool::new(true);
 static HEIGHT_PERCENT: AtomicU32 =
     AtomicU32::new(crate::config::DEFAULT_LINK_PREVIEW_HEIGHT_PERCENT);
 
-pub fn enabled() -> bool {
+pub(crate) fn enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
 }
 
@@ -35,7 +40,7 @@ pub fn set_enabled(enabled: bool) {
 }
 
 // The popup page height limit, as a percentage of the target page height.
-pub fn height_percent() -> u32 {
+pub(crate) fn height_percent() -> u32 {
     HEIGHT_PERCENT.load(Ordering::Relaxed)
 }
 
@@ -61,7 +66,7 @@ pub fn preference_action() -> gtk::gio::SimpleAction {
 }
 
 // Save the preference. If disabled, dismiss previews across all open documents.
-pub fn apply_preference(enabled: bool) {
+fn apply_preference(enabled: bool) {
     set_enabled(enabled);
 
     let mut settings = crate::config::load_config();
@@ -112,11 +117,11 @@ fn is_modifier(keyval: Key) -> bool {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct Bounds {
-    pub x: f64,
-    pub y: f64,
-    pub width: f64,
-    pub height: f64,
+struct Bounds {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
 }
 
 impl Bounds {
@@ -146,17 +151,17 @@ enum Side {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct Placement {
+struct Placement {
     side: Side,
     region: Bounds,
     link: Bounds,
-    pub width: f64,
-    pub max_page_height: f64,
+    width: f64,
+    max_page_height: f64,
 }
 
 // Keep the popup inside the area without overlap with the link.
 // Return None if no side has room for a readable popup.
-pub(crate) fn place(link: Bounds, area: Bounds, preferred: (f64, f64)) -> Option<Placement> {
+fn place(link: Bounds, area: Bounds, preferred: (f64, f64)) -> Option<Placement> {
     let inner = Bounds {
         x: area.x + MARGIN,
         y: area.y + MARGIN,
@@ -231,7 +236,7 @@ pub(crate) fn place(link: Bounds, area: Bounds, preferred: (f64, f64)) -> Option
 
 impl Placement {
     // Center the popup along the link, within the available region.
-    pub(crate) fn bounds(&self, height: f64) -> Bounds {
+    fn bounds(&self, height: f64) -> Bounds {
         let height = height.min(self.region.height);
         let r = self.region;
         let (cx, cy) = self.link.center();
@@ -248,6 +253,84 @@ impl Placement {
             y,
             width: self.width,
             height,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Arrow {
+    from: (f64, f64),
+    to: (f64, f64),
+    same_page: bool,
+    // A destination without x uses a text edge.
+    on_edge: bool,
+}
+
+// Use an arrow when the target page text is visible and the destination is near.
+fn arrow(
+    link: Bounds,
+    page: Bounds,
+    content: (f64, f64),
+    point: (Option<f64>, f64),
+    view: Bounds,
+    max_length: f64,
+    same_page: bool,
+) -> Option<Arrow> {
+    // Check the text width and full page height. Hidden side margins do not matter.
+    let (left, right) = content;
+    let visible = view.x <= left
+        && right <= view.right()
+        && view.y <= page.y
+        && page.bottom() <= view.bottom();
+    if !visible {
+        return None;
+    }
+    let on_edge = point.0.is_none();
+    // Keep the head inside the text span so cropped adjacent pages remain distinct.
+    let edge = if link.x > right {
+        right - ARROW_HEAD
+    } else {
+        left + ARROW_HEAD
+    };
+    let to = (
+        point.0.unwrap_or(edge).clamp(page.x, page.right()),
+        point.1.clamp(page.y, page.bottom()),
+    );
+    let from = (
+        to.0.clamp(link.x, link.right()),
+        to.1.clamp(link.y, link.bottom()),
+    );
+    let length = (to.0 - from.0).hypot(to.1 - from.1);
+    (length <= max_length).then_some(Arrow {
+        from,
+        to,
+        same_page,
+        on_edge,
+    })
+}
+
+impl Arrow {
+    // Choose how the curve enters the target.
+    fn control(&self) -> (f64, f64) {
+        let (from, to) = (self.from, self.to);
+        let (dx, dy) = (to.0 - from.0, to.1 - from.1);
+        if self.on_edge {
+            return if self.same_page {
+                (to.0, from.1)
+            } else {
+                ((from.0 + to.0) / 2.0, (from.1 + to.1) / 2.0)
+            };
+        }
+        if dx > 0.0 {
+            (from.0, to.1)
+        } else if self.same_page {
+            (to.0, from.1)
+        } else {
+            // Bow above the direct path.
+            (
+                (from.0 + to.0) / 2.0 - dy * ARROW_BOW,
+                (from.1 + to.1) / 2.0 + dx * ARROW_BOW,
+            )
         }
     }
 }
@@ -281,6 +364,14 @@ struct Popup {
     previous_focus: RefCell<Option<glib::WeakRef<gtk::Widget>>>,
 }
 
+struct TargetIndicator {
+    widget: gtk::DrawingArea,
+    #[cfg(test)]
+    arrow: Arrow,
+    link: Hover,
+    area: (i32, i32),
+}
+
 struct State {
     overlay: glib::WeakRef<gtk::Overlay>,
     open_delay: Cell<Duration>,
@@ -291,6 +382,9 @@ struct State {
     pending: RefCell<Option<glib::SourceId>>,
     closing: RefCell<Option<glib::SourceId>>,
     popup: RefCell<Option<Rc<Popup>>>,
+    // A visible destination uses this indicator instead of the popup.
+    indicator: RefCell<Option<Rc<TargetIndicator>>>,
+    arrow_page_fraction: Cell<f64>,
     pointer_in_popup: Cell<bool>,
 }
 
@@ -312,6 +406,8 @@ impl LinkPreview {
             pending: RefCell::new(None),
             closing: RefCell::new(None),
             popup: RefCell::new(None),
+            indicator: RefCell::new(None),
+            arrow_page_fraction: Cell::new(ARROW_PAGE_FRACTION),
             pointer_in_popup: Cell::new(false),
         });
         let weak = Rc::downgrade(&state);
@@ -331,41 +427,76 @@ impl LinkPreview {
     }
 
     #[cfg(test)]
-    pub(crate) fn set_delays(&self, open: Duration, close: Duration) {
+    fn set_delays(&self, open: Duration, close: Duration) {
         self.state.open_delay.set(open);
         self.state.close_delay.set(close);
     }
 
-    pub(crate) fn is_open(&self) -> bool {
+    #[cfg(test)]
+    fn set_arrow_page_fraction(&self, fraction: f64) {
+        self.state.arrow_page_fraction.set(fraction);
+    }
+
+    fn is_open(&self) -> bool {
         self.state.popup.borrow().is_some()
     }
 
-    pub(crate) fn is_pending(&self) -> bool {
+    #[cfg(test)]
+    fn has_indicator(&self) -> bool {
+        self.state.indicator.borrow().is_some()
+    }
+
+    #[cfg(test)]
+    fn shown_arrow(&self) -> Option<Arrow> {
+        let indicator = self.state.indicator.borrow();
+        indicator.as_ref().map(|indicator| indicator.arrow)
+    }
+
+    #[cfg(test)]
+    fn indicator_widget(&self) -> Option<gtk::DrawingArea> {
+        let indicator = self.state.indicator.borrow();
+        indicator.as_ref().map(|indicator| indicator.widget.clone())
+    }
+
+    fn is_shown(&self) -> bool {
+        self.is_open() || self.state.indicator.borrow().is_some()
+    }
+
+    // The link of the open popup or arrow.
+    fn shown_link(&self) -> Option<Hover> {
+        if let Some(popup) = self.popup() {
+            return Some(popup.link.clone());
+        }
+        let indicator = self.state.indicator.borrow();
+        indicator.as_ref().map(|indicator| indicator.link.clone())
+    }
+
+    fn is_pending(&self) -> bool {
         self.state.pending.borrow().is_some()
     }
 
     #[cfg(test)]
-    pub(crate) fn popup_widget(&self) -> Option<gtk::Box> {
+    fn popup_widget(&self) -> Option<gtk::Box> {
         self.popup().map(|popup| popup.root.clone())
     }
 
     #[cfg(test)]
-    pub(crate) fn scroller(&self) -> Option<gtk::ScrolledWindow> {
+    fn scroller(&self) -> Option<gtk::ScrolledWindow> {
         self.popup().map(|popup| popup.scroller.clone())
     }
 
     #[cfg(test)]
-    pub(crate) fn checkbox(&self) -> Option<gtk::CheckButton> {
+    fn checkbox(&self) -> Option<gtk::CheckButton> {
         self.popup().map(|popup| popup.checkbox.clone())
     }
 
     #[cfg(test)]
-    pub(crate) fn viewport(&self) -> Option<Viewport> {
+    fn viewport(&self) -> Option<Viewport> {
         self.popup().map(|popup| popup.viewport.clone())
     }
 
     #[cfg(test)]
-    pub(crate) fn open_location(&self) -> Option<DocumentLocation> {
+    fn open_location(&self) -> Option<DocumentLocation> {
         self.popup().map(|popup| popup.link.location)
     }
 
@@ -382,9 +513,9 @@ impl LinkPreview {
         });
         self.cancel_pending();
         let over_popup_link = self
-            .popup()
+            .shown_link()
             .zip(hover.as_ref())
-            .is_some_and(|(popup, hover)| popup.link.same_link(hover));
+            .is_some_and(|(shown, hover)| shown.same_link(hover));
         self.state.hover.replace(hover.clone());
 
         if over_popup_link {
@@ -396,7 +527,7 @@ impl LinkPreview {
                 self.schedule_open();
             }
         }
-        if self.is_open() && !self.state.pointer_in_popup.get() {
+        if self.is_shown() && !self.state.pointer_in_popup.get() {
             self.schedule_close();
         }
     }
@@ -442,9 +573,9 @@ impl LinkPreview {
                 return;
             }
             let over_link = preview
-                .popup()
+                .shown_link()
                 .zip(preview.state.hover.borrow().as_ref())
-                .is_some_and(|(popup, hover)| popup.link.same_link(hover));
+                .is_some_and(|(shown, hover)| shown.same_link(hover));
             if !over_link {
                 preview.close_popup();
             }
@@ -473,7 +604,7 @@ impl LinkPreview {
         self.close_popup();
     }
 
-    // Dismiss only when this pane owns the pending or open preview.
+    // Dismiss only when this pane owns the hovered link or shown preview.
     pub(crate) fn dismiss_for(&self, pane: &DocumentPane) {
         let hovered = self
             .state
@@ -481,7 +612,7 @@ impl LinkPreview {
             .borrow()
             .as_ref()
             .is_some_and(|hover| hover.pane == *pane);
-        let shown = self.popup().is_some_and(|popup| popup.link.pane == *pane);
+        let shown = self.shown_link().is_some_and(|link| link.pane == *pane);
         if hovered || shown {
             self.dismiss();
         }
@@ -490,6 +621,11 @@ impl LinkPreview {
     fn close_popup(&self) {
         self.cancel_closing();
         self.state.pointer_in_popup.set(false);
+        if let Some(indicator) = self.state.indicator.take() {
+            if let Some(overlay) = self.state.overlay.upgrade() {
+                overlay.remove_overlay(&indicator.widget);
+            }
+        }
         let Some(popup) = self.state.popup.take() else {
             return;
         };
@@ -534,7 +670,7 @@ impl LinkPreview {
         modifiers: ModifierType,
     ) -> Option<glib::Propagation> {
         let popup = self.popup();
-        if popup.is_none() && !self.is_pending() || is_modifier(keyval) {
+        if !self.is_shown() && !self.is_pending() || is_modifier(keyval) {
             return None;
         }
         let plain = modifiers.is_empty();
@@ -560,8 +696,12 @@ impl LinkPreview {
             self.dismiss();
             return (plain && keyval == Key::Escape).then_some(glib::Propagation::Stop);
         }
-        // Let the key reach the document when the preview is not visible.
+        let indicator_shown = self.state.indicator.borrow().is_some();
         self.dismiss();
+        if indicator_shown && plain && keyval == Key::Escape {
+            return Some(glib::Propagation::Stop);
+        }
+        // Let other keys reach the document after dismissal.
         None
     }
 
@@ -575,6 +715,10 @@ impl LinkPreview {
         let Some(link) = link else {
             return;
         };
+        if let Some(arrow) = self.find_arrow(hover, &overlay, link) {
+            self.show_arrow(hover, &overlay, arrow);
+            return;
+        }
         let area = Bounds {
             x: 0.0,
             y: 0.0,
@@ -632,6 +776,105 @@ impl LinkPreview {
             .y
             .map_or(0.0, |y| (y - bbox.y1).max(0.0) * viewport.zoom());
         Self::scroll_once_allocated(&vadj, start);
+    }
+
+    // The hovered pane must show the destination page.
+    fn find_arrow(&self, hover: &Hover, overlay: &gtk::Overlay, link: Bounds) -> Option<Arrow> {
+        let index = hover.location.page;
+        let target = hover.pane.mapped_page(index)?;
+        let document = target.document();
+        let bbox = document.page_bounds(index, target.crop())?;
+        // Without y, the arrow cannot mark a row.
+        let y = hover.location.y?;
+        let zoom = target.zoom();
+        let (page_width, page_height) = (bbox.size().0 * zoom, bbox.size().1 * zoom);
+        let x = hover.location.x.map(|x| (x - bbox.x1) * zoom);
+        let y = (y - bbox.y1) * zoom;
+        let page = Rectangle::new(0.0, 0.0, page_width, page_height);
+        let page = Self::overlay_bounds(&target, overlay, page)?;
+        let point = Rectangle::new(x.unwrap_or(0.0), y, x.unwrap_or(0.0), y);
+        let point = Self::overlay_bounds(&target, overlay, point)?;
+        let point = (x.map(|_| point.x), point.y);
+        // The crop sweep supplies the text span even with crop off.
+        let text = document.page_bounds(index, true)?;
+        let content = (
+            page.x + (text.x1 - bbox.x1) * zoom,
+            page.x + (text.x2 - bbox.x1) * zoom,
+        );
+        let view = hover.pane.page_area().compute_bounds(overlay)?;
+        let view = Bounds {
+            x: f64::from(view.x()),
+            y: f64::from(view.y()),
+            width: f64::from(view.width()),
+            height: f64::from(view.height()),
+        };
+        let max_length = page_height * self.state.arrow_page_fraction.get();
+        let same_page = index == hover.page.index();
+        arrow(link, page, content, point, view, max_length, same_page)
+    }
+
+    fn show_arrow(&self, hover: &Hover, overlay: &gtk::Overlay, arrow: Arrow) {
+        let widget = gtk::DrawingArea::builder()
+            .can_target(false)
+            .css_classes(["link-arrow"])
+            .build();
+        widget.set_draw_func(move |widget, cr, _, _| {
+            let color = widget.color();
+            let rgba = |alpha: f64| {
+                cr.set_source_rgba(
+                    f64::from(color.red()),
+                    f64::from(color.green()),
+                    f64::from(color.blue()),
+                    f64::from(color.alpha()) * alpha,
+                );
+            };
+            cr.set_line_width(ARROW_WIDTH);
+            cr.set_line_cap(gtk::cairo::LineCap::Round);
+            let (from, to) = (arrow.from, arrow.to);
+            let control = arrow.control();
+            // If the control point meets the target, aim from the link.
+            let aim = if control == to { from } else { control };
+            let angle = (to.1 - aim.1).atan2(to.0 - aim.0);
+            // Stop the line under the arrowhead.
+            let base = (
+                to.0 - ARROW_HEAD * 0.8 * angle.cos(),
+                to.1 - ARROW_HEAD * 0.8 * angle.sin(),
+            );
+            // Convert the quadratic control point to Cairo's cubic curve.
+            let third = |a: (f64, f64)| {
+                (
+                    a.0 + (control.0 - a.0) * 2.0 / 3.0,
+                    a.1 + (control.1 - a.1) * 2.0 / 3.0,
+                )
+            };
+            let (c1, c2) = (third(from), third(base));
+            cr.move_to(from.0, from.1);
+            cr.curve_to(c1.0, c1.1, c2.0, c2.1, base.0, base.1);
+            rgba(ARROW_LINE_ALPHA);
+            let _ = cr.stroke();
+
+            rgba(1.0);
+            let wing = 0.45;
+            cr.move_to(to.0, to.1);
+            cr.line_to(
+                to.0 - ARROW_HEAD * (angle - wing).cos(),
+                to.1 - ARROW_HEAD * (angle - wing).sin(),
+            );
+            cr.line_to(
+                to.0 - ARROW_HEAD * (angle + wing).cos(),
+                to.1 - ARROW_HEAD * (angle + wing).sin(),
+            );
+            cr.close_path();
+            let _ = cr.fill();
+        });
+        self.state.indicator.replace(Some(Rc::new(TargetIndicator {
+            widget: widget.clone(),
+            #[cfg(test)]
+            arrow,
+            link: hover.clone(),
+            area: (overlay.width(), overlay.height()),
+        })));
+        overlay.add_overlay(&widget);
     }
 
     // The change signal runs during allocation, after GTK positions the child.
@@ -784,18 +1027,25 @@ impl LinkPreview {
         overlay: &gtk::Overlay,
         widget: &gtk::Widget,
     ) -> Option<gtk::gdk::Rectangle> {
+        let indicator_area = self
+            .state
+            .indicator
+            .borrow()
+            .as_ref()
+            .filter(|indicator| widget == indicator.widget.upcast_ref::<gtk::Widget>())
+            .map(|indicator| indicator.area);
+        if let Some(area) = indicator_area {
+            if (overlay.width(), overlay.height()) != area {
+                self.dismiss_later();
+            }
+            return Some(gtk::gdk::Rectangle::new(0, 0, area.0, area.1));
+        }
         let popup = self.popup()?;
         if widget != popup.root.upcast_ref::<gtk::Widget>() {
             return None;
         }
         if (overlay.width(), overlay.height()) != popup.area {
-            // Defer dismissal because GTK must not remove children during allocation.
-            let weak = self.weak();
-            glib::idle_add_local_once(move || {
-                if let Some(preview) = Self::upgrade(&weak) {
-                    preview.dismiss();
-                }
-            });
+            self.dismiss_later();
         }
         let width = popup.placement.width.round() as i32;
         let (_, natural, _, _) = popup.root.measure(gtk::Orientation::Vertical, width);
@@ -809,6 +1059,16 @@ impl LinkPreview {
             width,
             bounds.height.round() as i32,
         ))
+    }
+
+    // Defer dismissal because GTK must not remove children during allocation.
+    fn dismiss_later(&self) {
+        let weak = self.weak();
+        glib::idle_add_local_once(move || {
+            if let Some(preview) = Self::upgrade(&weak) {
+                preview.dismiss();
+            }
+        });
     }
 }
 
@@ -949,6 +1209,198 @@ mod tests {
         };
         assert!(place(link(55.0, 70.0), area, (500.0, 700.0)).is_none());
     }
+
+    fn page(x: f64, y: f64, width: f64, height: f64) -> Bounds {
+        Bounds {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    #[test]
+    fn an_arrow_goes_from_the_nearest_link_edge_to_the_target() {
+        let l = link(300.0, 400.0);
+        let p = page(700.0, 50.0, 500.0, 800.0);
+        let a = arrow(
+            l,
+            p,
+            (p.x, p.right()),
+            (Some(800.0), 100.0),
+            AREA,
+            800.0,
+            false,
+        )
+        .unwrap();
+        assert_eq!(a.from, (l.right(), l.y));
+        assert_eq!(a.to, (800.0, 100.0));
+    }
+
+    #[test]
+    fn a_target_below_the_link_starts_the_arrow_at_the_link_bottom() {
+        let l = link(300.0, 100.0);
+        let p = page(0.0, 50.0, 600.0, 800.0);
+        let a = arrow(
+            l,
+            p,
+            (p.x, p.right()),
+            (Some(310.0), 700.0),
+            AREA,
+            800.0,
+            true,
+        )
+        .unwrap();
+        assert_eq!(a.from, (310.0, l.bottom()));
+    }
+
+    #[test]
+    fn a_target_in_a_cropped_margin_moves_onto_the_page() {
+        let l = link(300.0, 400.0);
+        let p = page(700.0, 50.0, 500.0, 800.0);
+        let a = arrow(
+            l,
+            p,
+            (p.x, p.right()),
+            (Some(650.0), 20.0),
+            AREA,
+            800.0,
+            false,
+        )
+        .unwrap();
+        assert_eq!(a.to, (700.0, 50.0));
+    }
+
+    // Return the direction from the target toward the control point.
+    fn arrives_from(from: (f64, f64), to: (f64, f64), same_page: bool) -> (f64, f64) {
+        let control = Arrow {
+            from,
+            to,
+            same_page,
+            on_edge: false,
+        }
+        .control();
+        (control.0 - to.0, control.1 - to.1)
+    }
+
+    #[test]
+    fn a_link_left_of_the_target_arrives_from_the_left() {
+        for same_page in [true, false] {
+            let (x, y) = arrives_from((100.0, 400.0), (700.0, 100.0), same_page);
+            assert!(x < 0.0 && y == 0.0, "{x} {y}");
+        }
+    }
+
+    #[test]
+    fn a_link_below_on_the_same_page_arrives_along_the_left_edge() {
+        let (x, y) = arrives_from((250.0, 330.0), (0.0, 100.0), true);
+        assert!(x == 0.0 && y > 0.0, "{x} {y}");
+    }
+
+    #[test]
+    fn a_link_on_a_page_to_the_right_arrives_from_above() {
+        let (from, to) = ((900.0, 160.0), (0.0, 15.0));
+        let (x, y) = arrives_from(from, to, false);
+        assert!(x > 0.0 && y < 0.0, "{x} {y}");
+    }
+
+    #[test]
+    fn without_x_the_arrow_ends_at_the_left_text_edge_unless_the_link_is_right_of_it() {
+        let left = page(0.0, 50.0, 500.0, 800.0);
+        let right = page(1000.0, 50.0, 500.0, 800.0);
+        let (left_text, right_text) = ((60.0, 440.0), (1060.0, 1440.0));
+        let l = link(700.0, 400.0);
+        let a = arrow(l, left, left_text, (None, 100.0), AREA, 2000.0, false).unwrap();
+        assert_eq!(a.to, (440.0 - ARROW_HEAD, 100.0));
+        let a = arrow(l, right, right_text, (None, 100.0), AREA, 2000.0, false).unwrap();
+        assert_eq!(a.to, (1060.0 + ARROW_HEAD, 100.0));
+
+        let same = link(340.0, 400.0);
+        let a = arrow(same, left, left_text, (None, 100.0), AREA, 2000.0, true).unwrap();
+        assert_eq!(a.to, (60.0 + ARROW_HEAD, 100.0));
+        let overlaps = link(420.0, 400.0);
+        let a = arrow(
+            overlaps,
+            left,
+            left_text,
+            (None, 100.0),
+            AREA,
+            2000.0,
+            false,
+        )
+        .unwrap();
+        assert_eq!(a.to, (60.0 + ARROW_HEAD, 100.0));
+    }
+
+    #[test]
+    fn an_edge_target_on_the_same_page_routes_along_the_margin() {
+        let a = Arrow {
+            from: (380.0, 400.0),
+            to: (500.0, 100.0),
+            same_page: true,
+            on_edge: true,
+        };
+        assert_eq!(a.control(), (500.0, 400.0));
+    }
+
+    #[test]
+    fn a_far_target_gets_no_arrow() {
+        let l = link(100.0, 50.0);
+        let p = page(700.0, 50.0, 600.0, 800.0);
+        assert!(arrow(
+            l,
+            p,
+            (p.x, p.right()),
+            (Some(900.0), 700.0),
+            AREA,
+            800.0,
+            false
+        )
+        .is_none());
+        assert!(arrow(
+            l,
+            p,
+            (p.x, p.right()),
+            (Some(900.0), 700.0),
+            AREA,
+            1000.0,
+            false
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn a_partly_hidden_target_page_gets_no_arrow() {
+        let l = link(300.0, 400.0);
+        let point = (Some(900.0), 100.0);
+        let hidden = [
+            page(1200.0, 50.0, 500.0, 800.0),
+            page(-10.0, 50.0, 500.0, 800.0),
+            page(700.0, -10.0, 500.0, 800.0),
+            page(700.0, 50.0, 500.0, 860.0),
+        ];
+        for p in hidden {
+            assert!(
+                arrow(l, p, (p.x, p.right()), point, AREA, 2000.0, false).is_none(),
+                "{p:?}"
+            );
+        }
+        // A hidden blank margin does not hide the text.
+        let margin = page(1200.0, 50.0, 500.0, 800.0);
+        assert!(arrow(l, margin, (1260.0, 1580.0), point, AREA, 2000.0, false).is_some());
+
+        let shown = page(700.0, 50.0, 500.0, 850.0);
+        assert!(arrow(
+            l,
+            shown,
+            (shown.x, shown.right()),
+            point,
+            AREA,
+            2000.0,
+            false
+        )
+        .is_some());
+    }
 }
 
 #[cfg(test)]
@@ -965,6 +1417,8 @@ mod widget_tests {
     const TO_SECOND_FIT: (f64, f64) = (100.0, 177.0); // page 1, Fit
     const TO_SECOND_TOP: (f64, f64) = (350.0, 77.0); // page 1, XYZ y 0
     const LONG_PAGE_DEST_Y: f64 = 20000.0;
+    // Destination for TO_SECOND_TOP, in page points.
+    const SECOND_TOP_DEST: (f64, f64) = (20.0, 0.0);
     // Short delays limit test time because wait_until uses real time.
     const OPEN: Duration = Duration::from_millis(30);
     const CLOSE: Duration = Duration::from_millis(20);
@@ -976,7 +1430,126 @@ mod widget_tests {
         wait_until(|| window.pane().imp().mapped_page(0).is_some());
         wait_until(|| window.pane().imp().selection.n_items() == 3);
         preview(&window).set_delays(OPEN, CLOSE);
+        // Keep popup tests on the popup path.
+        preview(&window).set_arrow_page_fraction(0.0);
         window
+    }
+
+    fn arrow_window() -> TestWindow {
+        let window = links_window();
+        preview(&window).set_arrow_page_fraction(ARROW_PAGE_FRACTION);
+        window.set_default_size(1400, crate::test_support::TEST_WINDOW.1);
+        let pane = window.pane();
+        wait_until(|| {
+            let (Some(page), Some(view)) =
+                (pane.mapped_page(1), pane.page_area().compute_bounds(&pane))
+            else {
+                return false;
+            };
+            page.compute_bounds(&pane)
+                .is_some_and(|b| b.x() + b.width() <= view.x() + view.width())
+        });
+        window
+    }
+
+    #[gtk::test]
+    fn a_link_without_a_destination_y_gets_the_popup() {
+        let window = arrow_window();
+        let preview = open(&window, TO_SECOND_FIT);
+        assert!(!preview.has_indicator());
+        window.close();
+    }
+
+    fn point_at(window: &TestWindow, link: (f64, f64)) -> LinkPreview {
+        hover(window, link);
+        let preview = preview(window);
+        wait_until(|| preview.has_indicator());
+        preview
+    }
+
+    #[gtk::test]
+    fn a_visible_near_target_gets_an_arrow_and_no_popup() {
+        let window = arrow_window();
+        let preview = point_at(&window, TO_SECOND_TOP);
+        assert!(!preview.is_open());
+
+        let widget = preview.indicator_widget().unwrap();
+        let overlay = widget.parent().expect("the overlay");
+        let target = window.pane().mapped_page(1).unwrap();
+        let bbox = target.document().page_bounds(1, target.crop()).unwrap();
+        let (x, y) = SECOND_TOP_DEST;
+        let point = gtk::graphene::Point::new(
+            ((x - bbox.x1) * target.zoom()) as f32,
+            ((y - bbox.y1) * target.zoom()) as f32,
+        );
+        let dest = target.compute_point(&overlay, &point).unwrap();
+        let arrow = preview.shown_arrow().unwrap();
+        assert!(
+            (arrow.to.0 - f64::from(dest.x())).abs() < 0.5,
+            "{arrow:?} {dest:?}"
+        );
+        assert!(
+            (arrow.to.1 - f64::from(dest.y())).abs() < 0.5,
+            "{arrow:?} {dest:?}"
+        );
+        wait_until(|| widget.width() == overlay.width() && widget.height() == overlay.height());
+        assert!(!widget.can_target());
+        window.close();
+    }
+
+    #[gtk::test]
+    fn a_hidden_target_gets_the_popup() {
+        let window = arrow_window();
+        let preview = open(&window, TO_LONG_PAGE);
+        assert!(!preview.has_indicator());
+        window.close();
+    }
+
+    #[gtk::test]
+    fn a_long_arrow_becomes_the_popup() {
+        let window = arrow_window();
+        preview(&window).set_arrow_page_fraction(0.1);
+        let preview = open(&window, TO_SECOND_TOP);
+        assert!(!preview.has_indicator());
+        window.close();
+    }
+
+    #[gtk::test]
+    fn leaving_the_link_removes_the_arrow() {
+        let window = arrow_window();
+        let preview = point_at(&window, TO_SECOND_TOP);
+        let widget = preview.indicator_widget().unwrap();
+
+        leave_link(&window);
+
+        wait_until(|| !preview.has_indicator());
+        assert!(widget.parent().is_none());
+        window.close();
+    }
+
+    #[gtk::test]
+    fn escape_removes_the_arrow_and_is_consumed() {
+        let window = arrow_window();
+        let preview = point_at(&window, TO_SECOND_TOP);
+
+        assert_eq!(
+            key(&window, Key::Escape, ModifierType::empty()),
+            glib::Propagation::Stop
+        );
+        assert!(!preview.has_indicator());
+        window.close();
+    }
+
+    #[gtk::test]
+    fn scrolling_the_document_removes_the_arrow() {
+        let window = arrow_window();
+        let preview = point_at(&window, TO_SECOND_TOP);
+        let scroll = controller::<gtk::EventControllerScroll>(&window.pane());
+
+        scroll.emit_by_name::<bool>("scroll", &[&0.0f64, &1.0f64]);
+
+        assert!(!preview.has_indicator());
+        window.close();
     }
 
     fn preview(window: &TestWindow) -> LinkPreview {
