@@ -94,11 +94,11 @@
 }
 
 /* Some themes lack @accent_color. */
-.link-arrow {
+.link-highlight {
 	color: #1c71d8;
 }
 
-#main.dark-mode .link-arrow {
+#main.dark-mode .link-highlight {
 	color: #62a0ea;
 }
 

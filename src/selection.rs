@@ -31,7 +31,7 @@ pub(crate) struct Glyph {
     cx: f64,
     cy: f64,
     pub(crate) bbox: (f64, f64, f64, f64),
-    line: usize,
+    pub(crate) line: usize,
 }
 
 // One page's glyphs. None means that the owner has not replied.

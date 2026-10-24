@@ -20,11 +20,16 @@ const MARGIN: f64 = 12.0;
 const MIN_SIZE: f64 = 120.0;
 // Matches the .link-preview border in style.css.
 const BORDER: f64 = 1.0;
-const ARROW_PAGE_FRACTION: f64 = 1.0;
-const ARROW_WIDTH: f64 = 2.0;
-const ARROW_HEAD: f64 = 10.0;
-const ARROW_BOW: f64 = 0.2;
-const ARROW_LINE_ALPHA: f64 = 0.4;
+const HIGHLIGHT_PAGE_FRACTION: f64 = 1.0;
+const MIN_VISIBLE_TEXT: f64 = 0.6;
+// About three lines of 10pt text.
+const BAND_PAGE_FRACTION: f64 = 0.05;
+const BAND_PAD: f64 = 4.0;
+const BAND_ALPHA: f64 = 0.35;
+// Columns are decided from the lines this far above and below the target.
+const COLUMN_WINDOW_PAGE_FRACTION: f64 = 0.1;
+const MAX_GUTTER_CROSSING: f64 = 0.25;
+const MIN_COLUMN_WIDTH: f64 = 0.2;
 const ACTION: &str = "show-link-previews";
 
 static ENABLED: AtomicBool = AtomicBool::new(true);
@@ -257,82 +262,174 @@ impl Placement {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct Arrow {
-    from: (f64, f64),
-    to: (f64, f64),
-    same_page: bool,
-    // A destination without x uses a text edge.
-    on_edge: bool,
-}
-
-// Use an arrow when the target page text is visible and the destination is near.
-fn arrow(
+// Use the popup when the target row or most page text is hidden.
+fn highlight(
     link: Bounds,
     page: Bounds,
     content: (f64, f64),
     point: (Option<f64>, f64),
     view: Bounds,
-    max_length: f64,
-    same_page: bool,
-) -> Option<Arrow> {
-    // Check the text width and full page height. Hidden side margins do not matter.
+    max_distance: f64,
+) -> Option<(f64, f64)> {
+    // Hidden side margins do not matter.
     let (left, right) = content;
-    let visible = view.x <= left
-        && right <= view.right()
-        && view.y <= page.y
-        && page.bottom() <= view.bottom();
-    if !visible {
+    let text = Bounds {
+        x: left,
+        width: right - left,
+        ..page
+    };
+    let shown = Bounds {
+        x: text.x.max(view.x),
+        y: text.y.max(view.y),
+        width: text.right().min(view.right()) - text.x.max(view.x),
+        height: text.bottom().min(view.bottom()) - text.y.max(view.y),
+    };
+    if text.area() <= 0.0 || shown.area() < text.area() * MIN_VISIBLE_TEXT {
         return None;
     }
-    let on_edge = point.0.is_none();
-    // Keep the head inside the text span so cropped adjacent pages remain distinct.
-    let edge = if link.x > right {
-        right - ARROW_HEAD
-    } else {
-        left + ARROW_HEAD
-    };
-    let to = (
-        point.0.unwrap_or(edge).clamp(page.x, page.right()),
-        point.1.clamp(page.y, page.bottom()),
-    );
+    let y = point.1.clamp(page.y, page.bottom());
+    let x = point
+        .0
+        .unwrap_or_else(|| link.center().0)
+        .clamp(left, right);
+    let row = band(page, content, point.0, y);
+    let row_shown = row.height >= page.height * BAND_PAGE_FRACTION / 2.0
+        && view.y <= row.y
+        && row.bottom() <= view.bottom()
+        && (point.0.is_none() || (view.x <= x && x <= view.right()));
+    if !row_shown {
+        return None;
+    }
     let from = (
-        to.0.clamp(link.x, link.right()),
-        to.1.clamp(link.y, link.bottom()),
+        x.clamp(link.x, link.right()),
+        y.clamp(link.y, link.bottom()),
     );
-    let length = (to.0 - from.0).hypot(to.1 - from.1);
-    (length <= max_length).then_some(Arrow {
-        from,
-        to,
-        same_page,
-        on_edge,
-    })
+    let distance = (x - from.0).hypot(y - from.1);
+    (distance <= max_distance).then_some((x, y))
 }
 
-impl Arrow {
-    // Choose how the curve enters the target.
-    fn control(&self) -> (f64, f64) {
-        let (from, to) = (self.from, self.to);
-        let (dx, dy) = (to.0 - from.0, to.1 - from.1);
-        if self.on_edge {
-            return if self.same_page {
-                (to.0, from.1)
-            } else {
-                ((from.0 + to.0) / 2.0, (from.1 + to.1) / 2.0)
-            };
+// The gutter is the x in the middle third that the fewest nearby lines cross.
+// Line widths weigh the decision because math splits text lines into short pieces.
+fn column(lines: &[Bounds], content: (f64, f64), x: f64, y: f64, window: f64) -> (f64, f64) {
+    let near: Vec<(f64, f64)> = lines
+        .iter()
+        .filter(|line| line.bottom() >= y - window && line.y <= y + window)
+        .map(|line| (line.x, line.right()))
+        .collect();
+    let width = |keep: &dyn Fn(f64, f64) -> bool| -> f64 {
+        near.iter()
+            .filter(|(x1, x2)| keep(*x1, *x2))
+            .map(|(x1, x2)| x2 - x1)
+            .sum()
+    };
+    let total = width(&|_, _| true);
+    let (left, right) = content;
+    let mid = (left + right) / 2.0;
+    let mut gutter = (f64::INFINITY, mid);
+    let mut offset = 0.0;
+    // Search from the centre outward so a tie keeps the gutter nearest the centre.
+    while offset < (right - left) / 6.0 {
+        for c in [mid + offset, mid - offset] {
+            let crossing = width(&|x1, x2| x1 < c && c < x2);
+            if crossing < gutter.0 {
+                gutter = (crossing, c);
+            }
         }
-        if dx > 0.0 {
-            (from.0, to.1)
-        } else if self.same_page {
-            (to.0, from.1)
-        } else {
-            // Bow above the direct path.
-            (
-                (from.0 + to.0) / 2.0 - dy * ARROW_BOW,
-                (from.1 + to.1) / 2.0 + dx * ARROW_BOW,
-            )
-        }
+        offset += 1.0;
     }
+    let (crossing, c) = gutter;
+    let two_columns = total > 0.0
+        && crossing < total * MAX_GUTTER_CROSSING
+        && width(&|_, x2| x2 <= c) >= total * MIN_COLUMN_WIDTH
+        && width(&|x1, _| x1 >= c) >= total * MIN_COLUMN_WIDTH;
+    match (two_columns, x < c) {
+        (false, _) => content,
+        (true, true) => (left, c),
+        (true, false) => (c, right),
+    }
+}
+
+fn band(page: Bounds, span: (f64, f64), x: Option<f64>, y: f64) -> Bounds {
+    let (left, right) = span;
+    let start = x.map_or(left, |x| x.clamp(left, right)) - BAND_PAD;
+    let height = (page.height * BAND_PAGE_FRACTION).min(page.bottom() - y);
+    Bounds {
+        x: start,
+        y,
+        width: right + BAND_PAD - start,
+        height: height.max(0.0),
+    }
+}
+
+// Overlay geometry of the target page for the band.
+struct BandSource {
+    uri: String,
+    // Page text from another document load does not match this geometry.
+    generation: u64,
+    index: i32,
+    page: Bounds,
+    content: (f64, f64),
+    x: Option<f64>,
+    // Overlay point = origin + page point * zoom.
+    origin: (f64, f64),
+    zoom: f64,
+}
+
+// Text line bounds of one page, in page points.
+struct PageLines {
+    uri: String,
+    generation: u64,
+    index: i32,
+    // None while the owner thread reads the page.
+    lines: Option<Rc<Vec<Bounds>>>,
+}
+
+// Group glyphs into line bounds, in page points.
+fn page_lines(glyphs: &[crate::selection::Glyph]) -> Vec<Bounds> {
+    let mut lines: Vec<Bounds> = Vec::new();
+    let mut last = None;
+    for glyph in glyphs {
+        let (x1, y1, x2, y2) = glyph.bbox;
+        match lines.last_mut() {
+            Some(line) if last == Some(glyph.line) => {
+                let (left, top) = (line.x.min(x1), line.y.min(y1));
+                let (right, bottom) = (line.right().max(x2), line.bottom().max(y2));
+                *line = Bounds {
+                    x: left,
+                    y: top,
+                    width: right - left,
+                    height: bottom - top,
+                };
+            }
+            _ => lines.push(Bounds {
+                x: x1,
+                y: y1,
+                width: x2 - x1,
+                height: y2 - y1,
+            }),
+        }
+        last = Some(glyph.line);
+    }
+    lines
+}
+
+fn column_band(source: &BandSource, lines: &[Bounds], y: f64) -> Bounds {
+    let (ox, oy) = source.origin;
+    let zoom = source.zoom;
+    let lines: Vec<Bounds> = lines
+        .iter()
+        .map(|line| Bounds {
+            x: ox + line.x * zoom,
+            y: oy + line.y * zoom,
+            width: line.width * zoom,
+            height: line.height * zoom,
+        })
+        .collect();
+    let window = source.page.height * COLUMN_WINDOW_PAGE_FRACTION;
+    let span = source.x.map_or(source.content, |x| {
+        column(&lines, source.content, x, y, window)
+    });
+    band(source.page, span, source.x, y)
 }
 
 #[derive(Clone)]
@@ -366,8 +463,10 @@ struct Popup {
 
 struct TargetIndicator {
     widget: gtk::DrawingArea,
-    #[cfg(test)]
-    arrow: Arrow,
+    target: (f64, f64),
+    source: BandSource,
+    // None until the target page text arrives.
+    band: Rc<Cell<Option<Bounds>>>,
     link: Hover,
     area: (i32, i32),
 }
@@ -384,7 +483,8 @@ struct State {
     popup: RefCell<Option<Rc<Popup>>>,
     // A visible destination uses this indicator instead of the popup.
     indicator: RefCell<Option<Rc<TargetIndicator>>>,
-    arrow_page_fraction: Cell<f64>,
+    highlight_page_fraction: Cell<f64>,
+    page_lines: RefCell<Option<PageLines>>,
     pointer_in_popup: Cell<bool>,
 }
 
@@ -407,7 +507,8 @@ impl LinkPreview {
             closing: RefCell::new(None),
             popup: RefCell::new(None),
             indicator: RefCell::new(None),
-            arrow_page_fraction: Cell::new(ARROW_PAGE_FRACTION),
+            highlight_page_fraction: Cell::new(HIGHLIGHT_PAGE_FRACTION),
+            page_lines: RefCell::new(None),
             pointer_in_popup: Cell::new(false),
         });
         let weak = Rc::downgrade(&state);
@@ -433,8 +534,8 @@ impl LinkPreview {
     }
 
     #[cfg(test)]
-    fn set_arrow_page_fraction(&self, fraction: f64) {
-        self.state.arrow_page_fraction.set(fraction);
+    fn set_highlight_page_fraction(&self, fraction: f64) {
+        self.state.highlight_page_fraction.set(fraction);
     }
 
     fn is_open(&self) -> bool {
@@ -447,9 +548,17 @@ impl LinkPreview {
     }
 
     #[cfg(test)]
-    fn shown_arrow(&self) -> Option<Arrow> {
+    fn shown_target(&self) -> Option<(f64, f64)> {
         let indicator = self.state.indicator.borrow();
-        indicator.as_ref().map(|indicator| indicator.arrow)
+        indicator.as_ref().map(|indicator| indicator.target)
+    }
+
+    #[cfg(test)]
+    fn shown_band(&self) -> Option<Bounds> {
+        let indicator = self.state.indicator.borrow();
+        indicator
+            .as_ref()
+            .and_then(|indicator| indicator.band.get())
     }
 
     #[cfg(test)]
@@ -462,7 +571,6 @@ impl LinkPreview {
         self.is_open() || self.state.indicator.borrow().is_some()
     }
 
-    // The link of the open popup or arrow.
     fn shown_link(&self) -> Option<Hover> {
         if let Some(popup) = self.popup() {
             return Some(popup.link.clone());
@@ -715,8 +823,8 @@ impl LinkPreview {
         let Some(link) = link else {
             return;
         };
-        if let Some(arrow) = self.find_arrow(hover, &overlay, link) {
-            self.show_arrow(hover, &overlay, arrow);
+        if let Some((target, source)) = self.find_highlight(hover, &overlay, link) {
+            self.show_highlight(hover, &overlay, target, source);
             return;
         }
         let area = Bounds {
@@ -779,12 +887,16 @@ impl LinkPreview {
     }
 
     // The hovered pane must show the destination page.
-    fn find_arrow(&self, hover: &Hover, overlay: &gtk::Overlay, link: Bounds) -> Option<Arrow> {
+    fn find_highlight(
+        &self,
+        hover: &Hover,
+        overlay: &gtk::Overlay,
+        link: Bounds,
+    ) -> Option<((f64, f64), BandSource)> {
         let index = hover.location.page;
         let target = hover.pane.mapped_page(index)?;
         let document = target.document();
         let bbox = document.page_bounds(index, target.crop())?;
-        // Without y, the arrow cannot mark a row.
         let y = hover.location.y?;
         let zoom = target.zoom();
         let (page_width, page_height) = (bbox.size().0 * zoom, bbox.size().1 * zoom);
@@ -808,73 +920,145 @@ impl LinkPreview {
             width: f64::from(view.width()),
             height: f64::from(view.height()),
         };
-        let max_length = page_height * self.state.arrow_page_fraction.get();
-        let same_page = index == hover.page.index();
-        arrow(link, page, content, point, view, max_length, same_page)
+        let max_distance = page_height * self.state.highlight_page_fraction.get();
+        let target_point = highlight(link, page, content, point, view, max_distance)?;
+        let source = BandSource {
+            uri: target.uri(),
+            generation: crate::mupdf_render::generation(),
+            index,
+            page,
+            content,
+            x: point.0,
+            origin: (page.x - bbox.x1 * zoom, page.y - bbox.y1 * zoom),
+            zoom,
+        };
+        Some((target_point, source))
     }
 
-    fn show_arrow(&self, hover: &Hover, overlay: &gtk::Overlay, arrow: Arrow) {
+    fn show_highlight(
+        &self,
+        hover: &Hover,
+        overlay: &gtk::Overlay,
+        target: (f64, f64),
+        source: BandSource,
+    ) {
         let widget = gtk::DrawingArea::builder()
             .can_target(false)
-            .css_classes(["link-arrow"])
+            .css_classes(["link-highlight"])
             .build();
-        widget.set_draw_func(move |widget, cr, _, _| {
-            let color = widget.color();
-            let rgba = |alpha: f64| {
-                cr.set_source_rgba(
+        let shown_band = Rc::new(Cell::new(None::<Bounds>));
+        widget.set_draw_func(clone!(
+            #[strong]
+            shown_band,
+            move |widget, cr, _, _| {
+                let Some(band) = shown_band.get() else {
+                    return;
+                };
+                let color = widget.color();
+                let fade = gtk::cairo::LinearGradient::new(0.0, band.y, 0.0, band.bottom());
+                let (r, g, b, a) = (
                     f64::from(color.red()),
                     f64::from(color.green()),
                     f64::from(color.blue()),
-                    f64::from(color.alpha()) * alpha,
+                    f64::from(color.alpha()) * BAND_ALPHA,
                 );
-            };
-            cr.set_line_width(ARROW_WIDTH);
-            cr.set_line_cap(gtk::cairo::LineCap::Round);
-            let (from, to) = (arrow.from, arrow.to);
-            let control = arrow.control();
-            // If the control point meets the target, aim from the link.
-            let aim = if control == to { from } else { control };
-            let angle = (to.1 - aim.1).atan2(to.0 - aim.0);
-            // Stop the line under the arrowhead.
-            let base = (
-                to.0 - ARROW_HEAD * 0.8 * angle.cos(),
-                to.1 - ARROW_HEAD * 0.8 * angle.sin(),
-            );
-            // Convert the quadratic control point to Cairo's cubic curve.
-            let third = |a: (f64, f64)| {
-                (
-                    a.0 + (control.0 - a.0) * 2.0 / 3.0,
-                    a.1 + (control.1 - a.1) * 2.0 / 3.0,
-                )
-            };
-            let (c1, c2) = (third(from), third(base));
-            cr.move_to(from.0, from.1);
-            cr.curve_to(c1.0, c1.1, c2.0, c2.1, base.0, base.1);
-            rgba(ARROW_LINE_ALPHA);
-            let _ = cr.stroke();
-
-            rgba(1.0);
-            let wing = 0.45;
-            cr.move_to(to.0, to.1);
-            cr.line_to(
-                to.0 - ARROW_HEAD * (angle - wing).cos(),
-                to.1 - ARROW_HEAD * (angle - wing).sin(),
-            );
-            cr.line_to(
-                to.0 - ARROW_HEAD * (angle + wing).cos(),
-                to.1 - ARROW_HEAD * (angle + wing).sin(),
-            );
-            cr.close_path();
-            let _ = cr.fill();
-        });
-        self.state.indicator.replace(Some(Rc::new(TargetIndicator {
+                fade.add_color_stop_rgba(0.0, r, g, b, a);
+                fade.add_color_stop_rgba(0.4, r, g, b, a * 0.4);
+                fade.add_color_stop_rgba(1.0, r, g, b, 0.0);
+                cr.rectangle(band.x, band.y, band.width, band.height);
+                let _ = cr.set_source(&fade);
+                let _ = cr.fill();
+            }
+        ));
+        let indicator = Rc::new(TargetIndicator {
             widget: widget.clone(),
-            #[cfg(test)]
-            arrow,
+            target,
+            source,
+            band: shown_band.clone(),
             link: hover.clone(),
             area: (overlay.width(), overlay.height()),
-        })));
+        });
+        self.state.indicator.replace(Some(indicator));
         overlay.add_overlay(&widget);
+
+        let indicator = self.state.indicator.borrow().clone();
+        let Some(indicator) = indicator else {
+            return;
+        };
+        let source = &indicator.source;
+        let generation = source.generation;
+        let cached = self.state.page_lines.borrow().as_ref().and_then(|cache| {
+            let same = cache.uri == source.uri
+                && cache.generation == generation
+                && cache.index == source.index;
+            same.then(|| cache.lines.clone())
+        });
+        match cached {
+            Some(Some(lines)) => {
+                shown_band.set(Some(column_band(source, &lines, target.1)));
+                return;
+            }
+            // The running request fills the band.
+            Some(None) => return,
+            None => {}
+        }
+        self.state.page_lines.replace(Some(PageLines {
+            uri: source.uri.clone(),
+            generation,
+            index: source.index,
+            lines: None,
+        }));
+
+        // The column needs the target page text from the owner thread.
+        let answer = crate::mupdf_render::page_glyphs(&source.uri, source.index);
+        let (uri, index) = (source.uri.clone(), source.index);
+        let preview = self.weak();
+        glib::spawn_future_local(async move {
+            let lines = answer.await.ok().map(|glyphs| Rc::new(page_lines(&glyphs)));
+            if let Some(preview) = Self::upgrade(&preview) {
+                preview.receive_page_lines(&uri, generation, index, lines);
+            }
+        });
+    }
+
+    // A reply can fill a later hover on the same page. None means that the read failed.
+    fn receive_page_lines(
+        &self,
+        uri: &str,
+        generation: u64,
+        index: i32,
+        lines: Option<Rc<Vec<Bounds>>>,
+    ) {
+        {
+            let mut cache = self.state.page_lines.borrow_mut();
+            let ours = cache.as_ref().is_some_and(|cache| {
+                cache.uri == uri && cache.generation == generation && cache.index == index
+            });
+            if ours {
+                // Remove a failed request so the next hover can retry.
+                *cache = lines.clone().map(|lines| PageLines {
+                    uri: uri.to_string(),
+                    generation,
+                    index,
+                    lines: Some(lines),
+                });
+            }
+        }
+        let indicator = self.state.indicator.borrow().clone();
+        let Some(indicator) = indicator else {
+            return;
+        };
+        let source = &indicator.source;
+        let same_page =
+            source.uri == uri && source.generation == generation && source.index == index;
+        if !same_page || indicator.band.get().is_some() {
+            return;
+        }
+        // Without the page text, the band spans the full text width.
+        let lines = lines.unwrap_or_default();
+        let band = column_band(source, &lines, indicator.target.1);
+        indicator.band.set(Some(band));
+        indicator.widget.queue_draw();
     }
 
     // The change signal runs during allocation, after GTK positions the child.
@@ -1220,186 +1404,174 @@ mod tests {
     }
 
     #[test]
-    fn an_arrow_goes_from_the_nearest_link_edge_to_the_target() {
-        let l = link(300.0, 400.0);
-        let p = page(700.0, 50.0, 500.0, 800.0);
-        let a = arrow(
-            l,
-            p,
-            (p.x, p.right()),
-            (Some(800.0), 100.0),
-            AREA,
-            800.0,
-            false,
-        )
-        .unwrap();
-        assert_eq!(a.from, (l.right(), l.y));
-        assert_eq!(a.to, (800.0, 100.0));
+    fn the_band_spans_the_text_and_stays_within_the_page() {
+        let p = page(0.0, 50.0, 500.0, 1000.0);
+        let b = band(p, (60.0, 440.0), None, 100.0);
+        assert_eq!(
+            b,
+            page(
+                60.0 - BAND_PAD,
+                100.0,
+                380.0 + 2.0 * BAND_PAD,
+                1000.0 * BAND_PAGE_FRACTION
+            )
+        );
+        let b = band(p, (60.0, 440.0), None, p.bottom() - 5.0);
+        assert_eq!(b.bottom(), p.bottom());
     }
 
     #[test]
-    fn a_target_below_the_link_starts_the_arrow_at_the_link_bottom() {
-        let l = link(300.0, 100.0);
-        let p = page(0.0, 50.0, 600.0, 800.0);
-        let a = arrow(
-            l,
-            p,
-            (p.x, p.right()),
-            (Some(310.0), 700.0),
-            AREA,
-            800.0,
-            true,
-        )
-        .unwrap();
-        assert_eq!(a.from, (310.0, l.bottom()));
+    fn the_band_starts_at_x_inside_the_span() {
+        let p = page(0.0, 50.0, 500.0, 1000.0);
+        let b = band(p, (60.0, 440.0), Some(200.0), 100.0);
+        assert_eq!((b.x, b.right()), (200.0 - BAND_PAD, 440.0 + BAND_PAD));
+        let b = band(p, (60.0, 440.0), Some(20.0), 100.0);
+        assert_eq!(b.x, 60.0 - BAND_PAD);
+    }
+
+    // Text lines as (x1, x2, y), 10 high.
+    fn lines(spans: &[(f64, f64, f64)]) -> Vec<Bounds> {
+        spans
+            .iter()
+            .map(|&(x1, x2, y)| page(x1, y, x2 - x1, 10.0))
+            .collect()
     }
 
     #[test]
-    fn a_target_in_a_cropped_margin_moves_onto_the_page() {
-        let l = link(300.0, 400.0);
-        let p = page(700.0, 50.0, 500.0, 800.0);
-        let a = arrow(
-            l,
-            p,
-            (p.x, p.right()),
-            (Some(650.0), 20.0),
-            AREA,
-            800.0,
-            false,
-        )
-        .unwrap();
-        assert_eq!(a.to, (700.0, 50.0));
-    }
-
-    // Return the direction from the target toward the control point.
-    fn arrives_from(from: (f64, f64), to: (f64, f64), same_page: bool) -> (f64, f64) {
-        let control = Arrow {
-            from,
-            to,
-            same_page,
-            on_edge: false,
+    fn two_column_text_gives_the_column_of_x() {
+        let mut spans: Vec<(f64, f64, f64)> = Vec::new();
+        for row in 0..30 {
+            let y = 100.0 + 12.0 * f64::from(row);
+            // An off-centre gutter at 260..270.
+            spans.extend([(60.0, 260.0, y), (270.0, 440.0, y)]);
         }
-        .control();
-        (control.0 - to.0, control.1 - to.1)
+        // A caption crosses the gutter.
+        spans.push((60.0, 440.0, 200.0));
+        let l = lines(&spans);
+        let (left, gutter) = column(&l, (60.0, 440.0), 100.0, 200.0, 100.0);
+        assert_eq!(left, 60.0);
+        assert!((260.0..=270.0).contains(&gutter), "{gutter}");
+        let (gutter, right) = column(&l, (60.0, 440.0), 300.0, 200.0, 100.0);
+        assert!((260.0..=270.0).contains(&gutter), "{gutter}");
+        assert_eq!(right, 440.0);
     }
 
     #[test]
-    fn a_link_left_of_the_target_arrives_from_the_left() {
-        for same_page in [true, false] {
-            let (x, y) = arrives_from((100.0, 400.0), (700.0, 100.0), same_page);
-            assert!(x < 0.0 && y == 0.0, "{x} {y}");
+    fn one_column_text_with_math_pieces_gives_the_full_span() {
+        let mut spans: Vec<(f64, f64, f64)> = Vec::new();
+        for row in 0..10 {
+            let y = 100.0 + 12.0 * f64::from(row);
+            spans.push((60.0, 440.0, y));
+            // Inline math splits lines into many short pieces.
+            for i in 0..6 {
+                let x = 200.0 + 20.0 * f64::from(i);
+                spans.push((x, x + 8.0, y));
+            }
         }
+        let l = lines(&spans);
+        assert_eq!(
+            column(&l, (60.0, 440.0), 100.0, 150.0, 100.0),
+            (60.0, 440.0)
+        );
+        assert_eq!(
+            column(&[], (60.0, 440.0), 100.0, 150.0, 100.0),
+            (60.0, 440.0)
+        );
     }
 
     #[test]
-    fn a_link_below_on_the_same_page_arrives_along_the_left_edge() {
-        let (x, y) = arrives_from((250.0, 330.0), (0.0, 100.0), true);
-        assert!(x == 0.0 && y > 0.0, "{x} {y}");
+    fn only_lines_near_the_target_decide_the_columns() {
+        let mut spans: Vec<(f64, f64, f64)> = Vec::new();
+        for row in 0..10 {
+            // A full-width abstract above two columns.
+            spans.push((60.0, 440.0, 100.0 + 12.0 * f64::from(row)));
+            let y = 500.0 + 12.0 * f64::from(row);
+            spans.extend([(60.0, 240.0, y), (260.0, 440.0, y)]);
+        }
+        let l = lines(&spans);
+        assert_eq!(column(&l, (60.0, 440.0), 100.0, 150.0, 60.0), (60.0, 440.0));
+        assert_ne!(column(&l, (60.0, 440.0), 100.0, 550.0, 60.0), (60.0, 440.0));
     }
 
     #[test]
-    fn a_link_on_a_page_to_the_right_arrives_from_above() {
-        let (from, to) = ((900.0, 160.0), (0.0, 15.0));
-        let (x, y) = arrives_from(from, to, false);
-        assert!(x > 0.0 && y < 0.0, "{x} {y}");
-    }
-
-    #[test]
-    fn without_x_the_arrow_ends_at_the_left_text_edge_unless_the_link_is_right_of_it() {
-        let left = page(0.0, 50.0, 500.0, 800.0);
-        let right = page(1000.0, 50.0, 500.0, 800.0);
-        let (left_text, right_text) = ((60.0, 440.0), (1060.0, 1440.0));
-        let l = link(700.0, 400.0);
-        let a = arrow(l, left, left_text, (None, 100.0), AREA, 2000.0, false).unwrap();
-        assert_eq!(a.to, (440.0 - ARROW_HEAD, 100.0));
-        let a = arrow(l, right, right_text, (None, 100.0), AREA, 2000.0, false).unwrap();
-        assert_eq!(a.to, (1060.0 + ARROW_HEAD, 100.0));
-
-        let same = link(340.0, 400.0);
-        let a = arrow(same, left, left_text, (None, 100.0), AREA, 2000.0, true).unwrap();
-        assert_eq!(a.to, (60.0 + ARROW_HEAD, 100.0));
-        let overlaps = link(420.0, 400.0);
-        let a = arrow(
-            overlaps,
-            left,
-            left_text,
-            (None, 100.0),
-            AREA,
-            2000.0,
-            false,
-        )
-        .unwrap();
-        assert_eq!(a.to, (60.0 + ARROW_HEAD, 100.0));
-    }
-
-    #[test]
-    fn an_edge_target_on_the_same_page_routes_along_the_margin() {
-        let a = Arrow {
-            from: (380.0, 400.0),
-            to: (500.0, 100.0),
-            same_page: true,
-            on_edge: true,
-        };
-        assert_eq!(a.control(), (500.0, 400.0));
-    }
-
-    #[test]
-    fn a_far_target_gets_no_arrow() {
-        let l = link(100.0, 50.0);
-        let p = page(700.0, 50.0, 600.0, 800.0);
-        assert!(arrow(
+    fn a_mostly_visible_target_page_gets_the_highlight() {
+        let l = link(300.0, 400.0);
+        let point = (Some(900.0), 300.0);
+        let p = page(700.0, 50.0, 500.0, 800.0);
+        let at = |p: Bounds| highlight(l, p, (p.x, p.right()), point, AREA, 2000.0);
+        assert_eq!(at(p), Some((900.0, 300.0)));
+        // 75% of the text is visible.
+        assert!(at(page(700.0, -150.0, 500.0, 800.0)).is_some());
+        assert!(at(page(-125.0, 50.0, 500.0, 800.0)).is_some());
+        // 56% of the text is visible.
+        let half = page(700.0, -350.0, 500.0, 800.0);
+        assert!(highlight(
             l,
-            p,
-            (p.x, p.right()),
-            (Some(900.0), 700.0),
+            half,
+            (half.x, half.right()),
+            (Some(900.0), 100.0),
             AREA,
-            800.0,
-            false
+            2000.0
         )
         .is_none());
-        assert!(arrow(
+        // A hidden blank margin does not hide the text.
+        let margin = page(1200.0, 50.0, 500.0, 800.0);
+        let shown = highlight(
             l,
-            p,
-            (p.x, p.right()),
-            (Some(900.0), 700.0),
+            margin,
+            (1260.0, 1580.0),
+            (Some(1300.0), 300.0),
             AREA,
-            1000.0,
-            false
-        )
-        .is_some());
+            2000.0,
+        );
+        assert!(shown.is_some());
     }
 
     #[test]
-    fn a_partly_hidden_target_page_gets_no_arrow() {
+    fn a_hidden_row_gets_no_highlight() {
         let l = link(300.0, 400.0);
-        let point = (Some(900.0), 100.0);
-        let hidden = [
-            page(1200.0, 50.0, 500.0, 800.0),
-            page(-10.0, 50.0, 500.0, 800.0),
-            page(700.0, -10.0, 500.0, 800.0),
-            page(700.0, 50.0, 500.0, 860.0),
-        ];
-        for p in hidden {
-            assert!(
-                arrow(l, p, (p.x, p.right()), point, AREA, 2000.0, false).is_none(),
-                "{p:?}"
-            );
-        }
-        // A hidden blank margin does not hide the text.
-        let margin = page(1200.0, 50.0, 500.0, 800.0);
-        assert!(arrow(l, margin, (1260.0, 1580.0), point, AREA, 2000.0, false).is_some());
-
-        let shown = page(700.0, 50.0, 500.0, 850.0);
-        assert!(arrow(
+        // 81% of the text is visible, but the row is below the view.
+        let p = page(700.0, 250.0, 500.0, 800.0);
+        let row = |y: f64| highlight(l, p, (p.x, p.right()), (Some(900.0), y), AREA, 2000.0);
+        assert!(row(600.0).is_some());
+        assert!(row(AREA.bottom() - 5.0).is_none());
+        let wide = page(1200.0, 50.0, 500.0, 800.0);
+        let far_x = highlight(
             l,
-            shown,
-            (shown.x, shown.right()),
-            point,
+            wide,
+            (wide.x, wide.right()),
+            (Some(1650.0), 300.0),
             AREA,
             2000.0,
-            false
-        )
-        .is_some());
+        );
+        assert!(far_x.is_none());
+    }
+
+    #[test]
+    fn a_row_at_the_page_bottom_gets_no_highlight() {
+        let l = link(300.0, 400.0);
+        let p = page(700.0, 50.0, 500.0, 800.0);
+        let at = |y: f64| highlight(l, p, (p.x, p.right()), (Some(900.0), y), AREA, 2000.0);
+        assert!(at(p.bottom()).is_none());
+        assert!(at(p.bottom() + 100.0).is_none());
+        assert!(at(p.bottom() - p.height * BAND_PAGE_FRACTION).is_some());
+    }
+
+    #[test]
+    fn a_far_target_gets_no_highlight() {
+        let l = link(100.0, 50.0);
+        let p = page(700.0, 50.0, 600.0, 800.0);
+        let at = |max| highlight(l, p, (p.x, p.right()), (Some(900.0), 700.0), AREA, max);
+        assert!(at(800.0).is_none());
+        assert!(at(1000.0).is_some());
+    }
+
+    #[test]
+    fn without_x_the_highlight_point_follows_the_link_inside_the_text() {
+        let l = link(300.0, 400.0);
+        let p = page(700.0, 50.0, 500.0, 800.0);
+        let target = highlight(l, p, (760.0, 1140.0), (None, 300.0), AREA, 2000.0);
+        assert_eq!(target, Some((760.0, 300.0)));
     }
 }
 
@@ -1431,13 +1603,13 @@ mod widget_tests {
         wait_until(|| window.pane().imp().selection.n_items() == 3);
         preview(&window).set_delays(OPEN, CLOSE);
         // Keep popup tests on the popup path.
-        preview(&window).set_arrow_page_fraction(0.0);
+        preview(&window).set_highlight_page_fraction(0.0);
         window
     }
 
-    fn arrow_window() -> TestWindow {
+    fn highlight_window() -> TestWindow {
         let window = links_window();
-        preview(&window).set_arrow_page_fraction(ARROW_PAGE_FRACTION);
+        preview(&window).set_highlight_page_fraction(HIGHLIGHT_PAGE_FRACTION);
         window.set_default_size(1400, crate::test_support::TEST_WINDOW.1);
         let pane = window.pane();
         wait_until(|| {
@@ -1454,7 +1626,7 @@ mod widget_tests {
 
     #[gtk::test]
     fn a_link_without_a_destination_y_gets_the_popup() {
-        let window = arrow_window();
+        let window = highlight_window();
         let preview = open(&window, TO_SECOND_FIT);
         assert!(!preview.has_indicator());
         window.close();
@@ -1468,8 +1640,8 @@ mod widget_tests {
     }
 
     #[gtk::test]
-    fn a_visible_near_target_gets_an_arrow_and_no_popup() {
-        let window = arrow_window();
+    fn a_visible_near_target_gets_a_highlight_and_no_popup() {
+        let window = highlight_window();
         let preview = point_at(&window, TO_SECOND_TOP);
         assert!(!preview.is_open());
 
@@ -1483,15 +1655,20 @@ mod widget_tests {
             ((y - bbox.y1) * target.zoom()) as f32,
         );
         let dest = target.compute_point(&overlay, &point).unwrap();
-        let arrow = preview.shown_arrow().unwrap();
+        let target = preview.shown_target().unwrap();
         assert!(
-            (arrow.to.0 - f64::from(dest.x())).abs() < 0.5,
-            "{arrow:?} {dest:?}"
+            (target.1 - f64::from(dest.y())).abs() < 0.5,
+            "{target:?} {dest:?}"
         );
-        assert!(
-            (arrow.to.1 - f64::from(dest.y())).abs() < 0.5,
-            "{arrow:?} {dest:?}"
-        );
+        wait_until(|| preview.shown_band().is_some());
+        let band = preview.shown_band().unwrap();
+        assert_eq!(band.y, target.1);
+        let indicator = preview.state.indicator.borrow();
+        let content = indicator.as_ref().unwrap().source.content;
+        drop(indicator);
+        let expected_x = f64::from(dest.x()).clamp(content.0, content.1) - BAND_PAD;
+        assert!((band.x - expected_x).abs() < 0.5, "{band:?} {dest:?}");
+        assert!(band.width > 0.0 && band.height > 0.0, "{band:?}");
         wait_until(|| widget.width() == overlay.width() && widget.height() == overlay.height());
         assert!(!widget.can_target());
         window.close();
@@ -1499,24 +1676,24 @@ mod widget_tests {
 
     #[gtk::test]
     fn a_hidden_target_gets_the_popup() {
-        let window = arrow_window();
+        let window = highlight_window();
         let preview = open(&window, TO_LONG_PAGE);
         assert!(!preview.has_indicator());
         window.close();
     }
 
     #[gtk::test]
-    fn a_long_arrow_becomes_the_popup() {
-        let window = arrow_window();
-        preview(&window).set_arrow_page_fraction(0.1);
+    fn a_far_highlight_becomes_the_popup() {
+        let window = highlight_window();
+        preview(&window).set_highlight_page_fraction(0.1);
         let preview = open(&window, TO_SECOND_TOP);
         assert!(!preview.has_indicator());
         window.close();
     }
 
     #[gtk::test]
-    fn leaving_the_link_removes_the_arrow() {
-        let window = arrow_window();
+    fn leaving_the_link_removes_the_highlight() {
+        let window = highlight_window();
         let preview = point_at(&window, TO_SECOND_TOP);
         let widget = preview.indicator_widget().unwrap();
 
@@ -1528,8 +1705,60 @@ mod widget_tests {
     }
 
     #[gtk::test]
-    fn escape_removes_the_arrow_and_is_consumed() {
-        let window = arrow_window();
+    fn a_second_hover_reuses_the_target_page_lines() {
+        let window = highlight_window();
+        let preview = point_at(&window, TO_SECOND_TOP);
+        wait_until(|| preview.shown_band().is_some());
+        let first = preview.shown_band();
+        let lines = {
+            let cache = preview.state.page_lines.borrow();
+            let cache = cache.as_ref().expect("the cached lines");
+            assert_eq!(cache.index, 1);
+            cache.lines.clone().expect("the read lines")
+        };
+        leave_link(&window);
+        wait_until(|| !preview.has_indicator());
+
+        let preview = point_at(&window, TO_SECOND_TOP);
+        assert_eq!(preview.shown_band(), first);
+        let cache = preview.state.page_lines.borrow();
+        let cached = cache.as_ref().unwrap().lines.as_ref().unwrap();
+        assert!(Rc::ptr_eq(cached, &lines));
+        drop(cache);
+        window.close();
+    }
+
+    #[gtk::test]
+    fn a_reply_from_an_old_document_load_does_not_fill_the_highlight() {
+        let window = highlight_window();
+        let preview = preview(&window);
+        let uri = source_page(&window).uri();
+        let generation = crate::mupdf_render::generation();
+        // A running read keeps the hover from sending a request.
+        preview.state.page_lines.replace(Some(PageLines {
+            uri: uri.clone(),
+            generation,
+            index: 1,
+            lines: None,
+        }));
+        let preview = point_at(&window, TO_SECOND_TOP);
+
+        preview.receive_page_lines(&uri, generation.wrapping_sub(1), 1, None);
+        assert_eq!(preview.shown_band(), None);
+
+        preview.receive_page_lines(&uri, generation, 1, None);
+        let band = preview.shown_band().expect("the fallback band");
+        let indicator = preview.state.indicator.borrow();
+        let source = &indicator.as_ref().unwrap().source;
+        assert_eq!(band.right(), source.content.1 + BAND_PAD);
+        drop(indicator);
+        assert!(preview.state.page_lines.borrow().is_none());
+        window.close();
+    }
+
+    #[gtk::test]
+    fn escape_removes_the_highlight_and_is_consumed() {
+        let window = highlight_window();
         let preview = point_at(&window, TO_SECOND_TOP);
 
         assert_eq!(
@@ -1541,8 +1770,8 @@ mod widget_tests {
     }
 
     #[gtk::test]
-    fn scrolling_the_document_removes_the_arrow() {
-        let window = arrow_window();
+    fn scrolling_the_document_removes_the_highlight() {
+        let window = highlight_window();
         let preview = point_at(&window, TO_SECOND_TOP);
         let scroll = controller::<gtk::EventControllerScroll>(&window.pane());
 
