@@ -1,10 +1,10 @@
 id: com.andr2i.scrolex
 runtime: org.gnome.Platform
-runtime-version: '50'
+runtime-version: '51'
 sdk: org.gnome.Sdk
 sdk-extensions:
   - org.freedesktop.Sdk.Extension.rust-stable
-  - org.freedesktop.Sdk.Extension.llvm20
+  - org.freedesktop.Sdk.Extension.llvm22
 command: scrolex
 
 finish-args:
@@ -17,12 +17,12 @@ modules:
   - name: scrolex
     buildsystem: simple
     build-options:
-      append-path: /usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/llvm20/bin
+      append-path: /usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/llvm22/bin
       env:
         CARGO_HOME: /run/build/scrolex/cargo
         # mupdf-sys compiles its bundled C library and runs bindgen, which
         # needs libclang from the llvm SDK extension.
-        LIBCLANG_PATH: /usr/lib/sdk/llvm20/lib
+        LIBCLANG_PATH: /usr/lib/sdk/llvm22/lib
     build-commands:
       - cargo build --offline --release
       - install -Dm755 target/release/scrolex /app/bin/scrolex
