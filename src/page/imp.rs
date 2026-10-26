@@ -729,18 +729,47 @@ impl Page {
             #[weak(rename_to = imp)]
             self,
             move |gesture, _, x, y| {
-                let target = imp.link_at(&obj, x, y);
-                let Some(LinkTarget::Location(location)) = target else {
+                let Some(target) = imp.link_at(&obj, x, y) else {
                     return;
                 };
                 gesture.set_state(gtk::EventSequenceState::Claimed);
+                type MenuItem = (&'static str, Box<dyn Fn(&super::Page)>);
+                let menu: Vec<MenuItem> = match target {
+                    LinkTarget::Location(location) => vec![
+                        (
+                            "Open Link",
+                            Box::new(move |obj| Self::emit_link(obj, location, LinkAction::Open)),
+                        ),
+                        (
+                            "Open Link in Split View",
+                            Box::new(move |obj| {
+                                Self::emit_link(obj, location, LinkAction::OpenBeside)
+                            }),
+                        ),
+                        (
+                            "Open Link in New Tab",
+                            Box::new(move |obj| {
+                                Self::emit_link(obj, location, LinkAction::OpenInNewTab)
+                            }),
+                        ),
+                    ],
+                    LinkTarget::Uri(uri) => vec![
+                        (
+                            "Open Link",
+                            Box::new({
+                                let uri = uri.clone();
+                                move |_| Self::open_uri(&uri)
+                            }),
+                        ),
+                        (
+                            "Copy Link Address",
+                            Box::new(move |obj| obj.clipboard().set_text(&uri)),
+                        ),
+                    ],
+                };
                 let popover = gtk::Popover::new();
                 let actions = gtk::Box::new(gtk::Orientation::Vertical, 0);
-                for (label, action) in [
-                    ("Open Link", LinkAction::Open),
-                    ("Open Link Beside", LinkAction::OpenBeside),
-                    ("Open Link in New Tab", LinkAction::OpenInNewTab),
-                ] {
+                for (label, run) in menu {
                     let button = gtk::Button::builder()
                         .label(label)
                         .has_frame(false)
@@ -753,7 +782,7 @@ impl Page {
                         popover,
                         move |_| {
                             popover.popdown();
-                            Self::emit_link(&obj, location, action);
+                            run(&obj);
                         }
                     ));
                     actions.append(&button);
@@ -793,7 +822,7 @@ impl Page {
         let tooltip = match &hit {
             Some((_, LinkTarget::Uri(uri))) => Some(shorten_uri(uri)),
             Some((_, LinkTarget::Location(_))) if !crate::link_preview::enabled() => {
-                Some("Middle click opens beside. Right click opens a menu.".to_string())
+                Some("Middle click opens in split view. Right click opens a menu.".to_string())
             }
             _ => None,
         };

@@ -2253,7 +2253,76 @@ mod widget_tests {
         assert!(!preview.is_pending());
         run_for(OPEN * 4);
         assert!(!preview.is_open());
-        assert!(source_page(&window).tooltip_text().is_some());
+        assert_eq!(
+            source_page(&window).tooltip_text().as_deref(),
+            Some("Middle click opens in split view. Right click opens a menu.")
+        );
+        window.close();
+    }
+
+    fn context_menu(window: &TestWindow, (x, y): (f64, f64)) -> Vec<gtk::Button> {
+        hover(window, (x, y));
+        let page = source_page(window);
+        let bbox = page
+            .document()
+            .page_bounds(0, page.crop())
+            .expect("page 0 bounds");
+        let zoom = page.zoom();
+        let controllers = page.observe_controllers();
+        let gesture = (0..controllers.n_items())
+            .filter_map(|index| controllers.item(index))
+            .filter_map(|controller| controller.downcast::<gtk::GestureClick>().ok())
+            .find(|gesture| gesture.button() == 3)
+            .expect("the context menu gesture");
+        gesture.emit_by_name::<()>(
+            "pressed",
+            &[&1i32, &((x - bbox.x1) * zoom), &((y - bbox.y1) * zoom)],
+        );
+        let popover = std::iter::successors(page.first_child(), |child| child.next_sibling())
+            .find_map(|child| child.downcast::<gtk::Popover>().ok())
+            .expect("the link menu");
+        let actions = popover.child().expect("the menu box");
+        std::iter::successors(actions.first_child(), |child| child.next_sibling())
+            .map(|child| child.downcast::<gtk::Button>().expect("a menu button"))
+            .collect()
+    }
+
+    fn labels(buttons: &[gtk::Button]) -> Vec<String> {
+        buttons
+            .iter()
+            .map(|button| button.label().expect("a label").to_string())
+            .collect()
+    }
+
+    #[gtk::test]
+    fn the_internal_link_menu_offers_the_open_actions() {
+        let window = links_window();
+        let buttons = context_menu(&window, TO_SECOND_TOP);
+        assert_eq!(
+            labels(&buttons),
+            [
+                "Open Link",
+                "Open Link in Split View",
+                "Open Link in New Tab"
+            ]
+        );
+        buttons[1].emit_clicked();
+        wait_until(|| window.imp().panes().len() == 2);
+        window.close();
+    }
+
+    #[gtk::test]
+    fn the_uri_link_menu_copies_the_link_address() {
+        let window = links_window();
+        let buttons = context_menu(&window, SHORT_URI);
+        assert_eq!(labels(&buttons), ["Open Link", "Copy Link Address"]);
+
+        buttons[1].emit_clicked();
+        let clipboard = source_page(&window).clipboard();
+        let text = glib::MainContext::default()
+            .block_on(clipboard.read_text_future())
+            .expect("the clipboard text");
+        assert_eq!(text.as_deref(), Some("https://short.example/page"));
         window.close();
     }
 
