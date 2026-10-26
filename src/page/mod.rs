@@ -122,6 +122,11 @@ impl Page {
         self.document().uri()
     }
 
+    pub(crate) fn refresh_link_hover(&self, x: f64, y: f64, state: gtk::gdk::ModifierType) {
+        self.imp()
+            .refresh_link_hover(self, x, y, state, imp::HoverCause::Scroll);
+    }
+
     pub(crate) fn uses_tiles(&self) -> bool {
         self.imp().uses_tiles()
     }

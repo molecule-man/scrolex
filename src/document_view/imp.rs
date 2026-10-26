@@ -414,10 +414,19 @@ impl DocumentView {
         scroll.connect_scroll(clone!(
             #[weak(rename_to = imp)]
             self,
+            #[weak]
+            pane,
             #[upgrade_or]
             glib::Propagation::Proceed,
-            move |_, _, _| {
-                imp.link_preview().dismiss();
+            move |scroll, _, _| {
+                if scroll
+                    .current_event_state()
+                    .contains(ModifierType::CONTROL_MASK)
+                {
+                    imp.link_preview().dismiss();
+                } else {
+                    imp.link_preview().scroll_event(&pane);
+                }
                 glib::Propagation::Proceed
             }
         ));

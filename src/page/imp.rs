@@ -8,7 +8,7 @@ use std::sync::OnceLock;
 use futures::channel::oneshot;
 use gtk::cairo::{FontSlant, FontWeight};
 use gtk::gdk::prelude::*;
-use gtk::gdk::{MemoryFormat, MemoryTexture, BUTTON_PRIMARY, RGBA};
+use gtk::gdk::{MemoryFormat, MemoryTexture, ModifierType, BUTTON_PRIMARY, RGBA};
 use gtk::glib;
 use gtk::glib::clone;
 use gtk::glib::subclass::{prelude::*, Signal};
@@ -259,6 +259,9 @@ pub struct Page {
 
     bbox: RefCell<Rectangle>,
     cursor_guard: Cell<bool>,
+    link_cursor: Cell<bool>,
+    link_tooltip: Cell<bool>,
+    hovered_link: Cell<Option<(DocumentLocation, Rectangle)>>,
 
     // False prevents a discarded render at a provisional display scale.
     scale_known: Cell<bool>,
@@ -281,6 +284,11 @@ enum Paint {
     Preview,
     Placeholder,
     Blank,
+}
+
+pub(super) enum HoverCause {
+    Motion,
+    Scroll,
 }
 
 impl Paint {
@@ -617,69 +625,31 @@ impl Page {
     fn setup_link_handling(&self) {
         let obj = self.obj();
         let motion_controller = gtk::EventControllerMotion::new();
-
-        // indicates that we have "borrowed" global page cursor
-        let cursor = Cell::new(false);
-        let tooltip_visible = Rc::new(Cell::new(false));
-        let hovered = Rc::new(Cell::new(None::<(DocumentLocation, Rectangle)>));
-
         motion_controller.connect_motion(clone!(
             #[strong]
             obj,
             #[weak(rename_to = imp)]
             self,
-            #[strong]
-            tooltip_visible,
-            #[strong]
-            hovered,
             move |motion, x, y| {
-                let hit = imp.link_hit_at(&obj, x, y);
-                let target = hit.as_ref().map(|(_, target)| target);
-                let internal = match &hit {
-                    Some((rect, LinkTarget::Location(location))) => Some((*location, *rect)),
-                    _ => None,
-                };
-                let visible = internal.is_some() && !crate::link_preview::enabled();
-                if tooltip_visible.replace(visible) != visible {
-                    obj.set_tooltip_text(
-                        visible.then_some("Middle click opens beside. Right click opens a menu."),
-                    );
-                }
-                let buttons = gtk::gdk::ModifierType::BUTTON1_MASK
-                    | gtk::gdk::ModifierType::BUTTON2_MASK
-                    | gtk::gdk::ModifierType::BUTTON3_MASK;
-                let link = internal.filter(|_| !motion.current_event_state().intersects(buttons));
-                if hovered.replace(link) != link {
-                    obj.emit_by_name::<()>("link-hovered", &[&LinkHover { link }]);
-                }
-                if target.is_some() {
-                    if !imp.cursor_guard.get() {
-                        obj.set_cursor_from_name(Some("pointer"));
-                        imp.cursor_guard.set(true);
-                        cursor.set(true);
-                    }
-                    return;
-                }
-
-                if Cell::get(&cursor) {
-                    obj.set_cursor(None);
-                    imp.cursor_guard.set(false);
-                    cursor.set(false);
-                }
+                imp.refresh_link_hover(
+                    &obj,
+                    x,
+                    y,
+                    motion.current_event_state(),
+                    HoverCause::Motion,
+                );
             }
         ));
         motion_controller.connect_leave(clone!(
             #[strong]
             obj,
-            #[strong]
-            tooltip_visible,
-            #[strong]
-            hovered,
+            #[weak(rename_to = imp)]
+            self,
             move |_| {
-                if tooltip_visible.replace(false) {
+                if imp.link_tooltip.replace(false) {
                     obj.set_tooltip_text(None);
                 }
-                if hovered.take().is_some() {
+                if imp.hovered_link.take().is_some() {
                     obj.emit_by_name::<()>("link-hovered", &[&LinkHover { link: None }]);
                 }
             }
@@ -805,6 +775,45 @@ impl Page {
 
     fn link_at(&self, obj: &super::Page, x: f64, y: f64) -> Option<LinkTarget> {
         self.link_hit_at(obj, x, y).map(|(_, target)| target)
+    }
+
+    pub(super) fn refresh_link_hover(
+        &self,
+        obj: &super::Page,
+        x: f64,
+        y: f64,
+        state: ModifierType,
+        cause: HoverCause,
+    ) {
+        let hit = self.link_hit_at(obj, x, y);
+        let internal = match &hit {
+            Some((rect, LinkTarget::Location(location))) => Some((*location, *rect)),
+            _ => None,
+        };
+        let visible = internal.is_some() && !crate::link_preview::enabled();
+        if self.link_tooltip.replace(visible) != visible {
+            obj.set_tooltip_text(
+                visible.then_some("Middle click opens beside. Right click opens a menu."),
+            );
+        }
+        let buttons =
+            ModifierType::BUTTON1_MASK | ModifierType::BUTTON2_MASK | ModifierType::BUTTON3_MASK;
+        let link = internal.filter(|_| !state.intersects(buttons));
+        if self.hovered_link.replace(link) != link
+            || (matches!(cause, HoverCause::Scroll) && link.is_some())
+        {
+            obj.emit_by_name::<()>("link-hovered", &[&LinkHover { link }]);
+        }
+        if hit.is_some() {
+            if !self.cursor_guard.get() {
+                obj.set_cursor_from_name(Some("pointer"));
+                self.cursor_guard.set(true);
+                self.link_cursor.set(true);
+            }
+        } else if self.link_cursor.replace(false) {
+            obj.set_cursor(None);
+            self.cursor_guard.set(false);
+        }
     }
 
     // Both the input point and the result bounds use page widget coordinates.

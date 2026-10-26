@@ -15,6 +15,7 @@ use crate::viewport::Viewport;
 
 const OPEN_DELAY: Duration = Duration::from_millis(300);
 const CLOSE_DELAY: Duration = Duration::from_millis(300);
+const SCROLL_SETTLE_DELAY: Duration = Duration::from_millis(120);
 const MARGIN: f64 = 12.0;
 // Minimum readable preview size.
 const MIN_SIZE: f64 = 120.0;
@@ -495,6 +496,11 @@ struct TargetIndicator {
     area: (i32, i32),
 }
 
+struct ScrollStart {
+    pane: glib::WeakRef<DocumentPane>,
+    position: (f64, f64),
+}
+
 struct State {
     overlay: glib::WeakRef<gtk::Overlay>,
     open_delay: Cell<Duration>,
@@ -503,6 +509,8 @@ struct State {
     generation: Cell<u64>,
     hover: RefCell<Option<Hover>>,
     pending: RefCell<Option<glib::SourceId>>,
+    refresh: RefCell<Option<glib::SourceId>>,
+    scroll_start: RefCell<Option<ScrollStart>>,
     closing: RefCell<Option<glib::SourceId>>,
     popup: RefCell<Option<Rc<Popup>>>,
     // A visible destination uses this indicator instead of the popup.
@@ -531,6 +539,8 @@ impl LinkPreview {
             generation: Cell::new(0),
             hover: RefCell::new(None),
             pending: RefCell::new(None),
+            refresh: RefCell::new(None),
+            scroll_start: RefCell::new(None),
             closing: RefCell::new(None),
             popup: RefCell::new(None),
             indicator: RefCell::new(None),
@@ -655,6 +665,16 @@ impl LinkPreview {
     }
 
     pub(crate) fn hover(&self, pane: &DocumentPane, page: &Page, hover: LinkHover) {
+        if hover.link.is_none()
+            && self
+                .state
+                .hover
+                .borrow()
+                .as_ref()
+                .is_some_and(|shown| shown.pane != *pane || shown.page != *page)
+        {
+            return;
+        }
         let hover = hover.link.map(|(location, rect)| Hover {
             pane: pane.clone(),
             page: page.clone(),
@@ -739,6 +759,74 @@ impl LinkPreview {
         }
     }
 
+    fn cancel_refresh(&self) {
+        if let Some(source) = self.state.refresh.take() {
+            source.remove();
+        }
+    }
+
+    pub(crate) fn scroll_event(&self, pane: &DocumentPane) {
+        let start = self
+            .state
+            .scroll_start
+            .borrow()
+            .as_ref()
+            .and_then(|start| {
+                start
+                    .pane
+                    .upgrade()
+                    .filter(|shown| shown == pane)
+                    .map(|_| start.position)
+            })
+            .unwrap_or_else(|| pane.scroll_position());
+        self.dismiss();
+        self.state.scroll_start.replace(Some(ScrollStart {
+            pane: pane.downgrade(),
+            position: start,
+        }));
+        self.schedule_refresh(pane);
+    }
+
+    fn schedule_refresh(&self, pane: &DocumentPane) {
+        self.cancel_refresh();
+        if !enabled() {
+            return;
+        }
+        let pane = pane.downgrade();
+        let weak = self.weak();
+        let source = glib::timeout_add_local_once(SCROLL_SETTLE_DELAY, move || {
+            let Some(preview) = Self::upgrade(&weak) else {
+                return;
+            };
+            preview.state.refresh.take();
+            let Some(pane) = pane.upgrade() else {
+                preview.state.scroll_start.take();
+                return;
+            };
+            if !pane.is_mapped() {
+                preview.state.scroll_start.take();
+                return;
+            }
+            let start = preview
+                .state
+                .scroll_start
+                .borrow()
+                .as_ref()
+                .map(|start| start.position);
+            if start == Some(pane.scroll_position()) && !pane.is_moving() {
+                preview.state.scroll_start.take();
+                return;
+            }
+            if pane.is_moving() {
+                preview.schedule_refresh(&pane);
+                return;
+            }
+            preview.state.scroll_start.take();
+            pane.refresh_link_hover_at_pointer();
+        });
+        self.state.refresh.replace(Some(source));
+    }
+
     fn cancel_closing(&self) {
         if let Some(source) = self.state.closing.take() {
             source.remove();
@@ -751,6 +839,8 @@ impl LinkPreview {
             .set(self.state.generation.get().wrapping_add(1));
         self.state.hover.replace(None);
         self.cancel_pending();
+        self.cancel_refresh();
+        self.state.scroll_start.take();
         self.close_popup();
     }
 
@@ -1898,6 +1988,97 @@ mod widget_tests {
         scroll.emit_by_name::<bool>("scroll", &[&0.0f64, &1.0f64]);
 
         assert!(!preview.has_indicator());
+        run_for(OPEN + SCROLL_SETTLE_DELAY);
+        assert!(!preview.has_indicator());
+        window.close();
+    }
+
+    #[gtk::test]
+    fn a_still_pointer_opens_after_scroll_and_closes_on_motion_or_leave() {
+        let window = highlight_window();
+        let page = source_page(&window);
+        let document = page.document();
+        document.request_links(0);
+        wait_until(|| {
+            document
+                .imp()
+                .links
+                .borrow()
+                .get_link(0, TO_SECOND_TOP.0, TO_SECOND_TOP.1)
+                .is_some()
+        });
+        let bbox = document.page_bounds(0, page.crop()).unwrap();
+        let point = gtk::graphene::Point::new(
+            ((TO_SECOND_TOP.0 - bbox.x1) * page.zoom()) as f32,
+            ((TO_SECOND_TOP.1 - bbox.y1) * page.zoom()) as f32,
+        );
+        let pane = window.pane();
+        let outer = &*pane.imp().vscrolledwindow;
+        let pointer = page.compute_point(outer, &point).unwrap();
+        // The page receives no motion event.
+        controller::<gtk::EventControllerMotion>(outer).emit_by_name::<()>(
+            "motion",
+            &[&f64::from(pointer.x()), &f64::from(pointer.y())],
+        );
+
+        let preview = preview(&window);
+        assert!(!preview.has_indicator());
+        let adjustment = pane.page_area().hadjustment();
+        let before = adjustment.value();
+        let after = if before + 1.0 < adjustment.upper() - adjustment.page_size() {
+            before + 1.0
+        } else {
+            before - 1.0
+        };
+        adjustment.set_value(after);
+        assert_ne!(adjustment.value(), before);
+        run_for(OPEN + SCROLL_SETTLE_DELAY);
+        assert!(!preview.has_indicator());
+
+        controller::<gtk::EventControllerScroll>(&pane)
+            .emit_by_name::<bool>("scroll", &[&0.0f64, &1.0f64]);
+        adjustment.set_value(before);
+        wait_until(|| preview.has_indicator());
+        assert_eq!(
+            page.cursor().and_then(|cursor| cursor.name()).as_deref(),
+            Some("pointer")
+        );
+
+        controller::<gtk::EventControllerScroll>(&pane)
+            .emit_by_name::<bool>("scroll", &[&0.0f64, &1.0f64]);
+        adjustment.set_value(after);
+        wait_until(|| preview.has_indicator());
+
+        controller::<gtk::EventControllerMotion>(&page).emit_by_name::<()>(
+            "motion",
+            &[
+                &((500.0 - bbox.x1) * page.zoom()),
+                &((500.0 - bbox.y1) * page.zoom()),
+            ],
+        );
+        wait_until(|| !preview.has_indicator());
+        assert!(page.cursor().is_none());
+
+        controller::<gtk::EventControllerScroll>(&pane)
+            .emit_by_name::<bool>("scroll", &[&0.0f64, &1.0f64]);
+        adjustment.set_value(before);
+        wait_until(|| preview.has_indicator());
+        leave_link(&window);
+        wait_until(|| !preview.has_indicator());
+        window.close();
+    }
+
+    #[gtk::test]
+    fn leave_from_another_page_does_not_close_the_highlight() {
+        let window = highlight_window();
+        let preview = point_at(&window, TO_SECOND_TOP);
+        let pane = window.pane();
+        let other_page = pane.mapped_page(1).unwrap();
+
+        preview.hover(&pane, &other_page, LinkHover { link: None });
+        run_for(CLOSE * 2);
+
+        assert!(preview.has_indicator());
         window.close();
     }
 

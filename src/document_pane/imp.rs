@@ -196,6 +196,7 @@ pub struct DocumentPane {
 
     // pointer position in the viewport, None while the pointer is elsewhere
     pointer: Cell<Option<(f64, f64)>>,
+    pointer_state: Cell<Option<ModifierType>>,
 
     // document point a zoom must hold still, pending until the pages have relayouted
     zoom_anchor: Cell<Option<ZoomAnchor>>,
@@ -1901,20 +1902,45 @@ impl DocumentPane {
         None
     }
 
+    pub(crate) fn refresh_link_hover_at_pointer(&self) {
+        let Some((x, y)) = self.pointer.get() else {
+            return;
+        };
+        let point = gtk::graphene::Point::new(x as f32, y as f32);
+        let mut node = self.vscrolledwindow.pick(x, y, gtk::PickFlags::DEFAULT);
+        while let Some(widget) = node {
+            if let Ok(page) = widget.clone().downcast::<page::Page>() {
+                if let Some(point) = self.vscrolledwindow.compute_point(&page, &point) {
+                    page.refresh_link_hover(
+                        f64::from(point.x()),
+                        f64::from(point.y()),
+                        self.pointer_state.get().unwrap_or_else(ModifierType::empty),
+                    );
+                }
+                return;
+            }
+            node = widget.parent();
+        }
+    }
+
     // Follow the pointer, so a zoom knows which document point to hold still.
     fn setup_pointer_tracking(&self) {
         let motion = gtk::EventControllerMotion::new();
         motion.connect_motion(clone!(
             #[weak(rename_to = imp)]
             self,
-            move |_, x, y| {
+            move |motion, x, y| {
                 imp.pointer.set(Some((x, y)));
+                imp.pointer_state.set(Some(motion.current_event_state()));
             }
         ));
         motion.connect_leave(clone!(
             #[weak(rename_to = imp)]
             self,
-            move |_| imp.pointer.set(None)
+            move |_| {
+                imp.pointer.set(None);
+                imp.pointer_state.set(None);
+            }
         ));
         self.vscrolledwindow.add_controller(motion);
     }

@@ -151,6 +151,17 @@ impl DocumentPane {
         self.imp().mapped_page(index)
     }
 
+    pub(crate) fn refresh_link_hover_at_pointer(&self) {
+        self.imp().refresh_link_hover_at_pointer();
+    }
+
+    pub(crate) fn scroll_position(&self) -> (f64, f64) {
+        (
+            self.imp().scrolledwindow.hadjustment().value(),
+            self.imp().vscrolledwindow.vadjustment().value(),
+        )
+    }
+
     pub(crate) fn viewport_width(&self) -> f64 {
         self.imp().scrolledwindow.hadjustment().page_size()
     }
