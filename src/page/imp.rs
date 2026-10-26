@@ -260,7 +260,7 @@ pub struct Page {
     bbox: RefCell<Rectangle>,
     cursor_guard: Cell<bool>,
     link_cursor: Cell<bool>,
-    link_tooltip: Cell<bool>,
+    link_tooltip: RefCell<Option<String>>,
     hovered_link: Cell<Option<(DocumentLocation, Rectangle)>>,
 
     // False prevents a discarded render at a provisional display scale.
@@ -646,7 +646,7 @@ impl Page {
             #[weak(rename_to = imp)]
             self,
             move |_| {
-                if imp.link_tooltip.replace(false) {
+                if imp.link_tooltip.take().is_some() {
                     obj.set_tooltip_text(None);
                 }
                 if imp.hovered_link.take().is_some() {
@@ -790,11 +790,16 @@ impl Page {
             Some((rect, LinkTarget::Location(location))) => Some((*location, *rect)),
             _ => None,
         };
-        let visible = internal.is_some() && !crate::link_preview::enabled();
-        if self.link_tooltip.replace(visible) != visible {
-            obj.set_tooltip_text(
-                visible.then_some("Middle click opens beside. Right click opens a menu."),
-            );
+        let tooltip = match &hit {
+            Some((_, LinkTarget::Uri(uri))) => Some(shorten_uri(uri)),
+            Some((_, LinkTarget::Location(_))) if !crate::link_preview::enabled() => {
+                Some("Middle click opens beside. Right click opens a menu.".to_string())
+            }
+            _ => None,
+        };
+        if *self.link_tooltip.borrow() != tooltip {
+            obj.set_tooltip_text(tooltip.as_deref());
+            self.link_tooltip.replace(tooltip);
         }
         let buttons =
             ModifierType::BUTTON1_MASK | ModifierType::BUTTON2_MASK | ModifierType::BUTTON3_MASK;
@@ -2203,6 +2208,21 @@ fn undo_zoom_and_crop(page: &super::Page, x: f64, y: f64) -> Point {
     Point { x, y }
 }
 
+// Long tracking URLs make huge tooltips. Keep the host and the end of the path.
+fn shorten_uri(uri: &str) -> String {
+    const MAX_CHARS: usize = 120;
+    let count = uri.chars().count();
+    if count <= MAX_CHARS {
+        return uri.to_string();
+    }
+    let head = (MAX_CHARS - 1) / 2;
+    let tail = MAX_CHARS - 1 - head;
+    let mut short: String = uri.chars().take(head).collect();
+    short.push('…');
+    short.extend(uri.chars().skip(count - tail));
+    short
+}
+
 // A page's index and size in points - the page facts the widget needs, sourced from MuPDF instead
 // of holding a live page object.
 struct PageInfo {
@@ -2288,6 +2308,20 @@ mod tests {
         crate::test_support::wait_until(|| document.imp().links.borrow().is_requested(0));
 
         window.close();
+    }
+
+    #[test]
+    fn shorten_uri_keeps_short_uris_and_cuts_the_middle_of_long_ones() {
+        assert_eq!(shorten_uri("https://a.example"), "https://a.example");
+        let exact = "x".repeat(120);
+        assert_eq!(shorten_uri(&exact), exact);
+
+        let long = format!("https://host.example/{}end", "é".repeat(200));
+        let short = shorten_uri(&long);
+        assert_eq!(short.chars().count(), 120);
+        assert!(short.starts_with("https://host.example/"));
+        assert!(short.ends_with("end"));
+        assert!(short.contains('…'));
     }
 
     #[test]

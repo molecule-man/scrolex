@@ -1783,6 +1783,8 @@ mod widget_tests {
     const TO_SECOND_FIT: (f64, f64) = (100.0, 177.0); // page 1, Fit
     const TO_SECOND_TOP: (f64, f64) = (350.0, 77.0); // page 1, XYZ y 0
     const TO_FIRST_TOP: (f64, f64) = (350.0, 677.0); // page 0, XYZ y 0
+    const SHORT_URI: (f64, f64) = (350.0, 177.0); // https://short.example/page
+    const LONG_URI: (f64, f64) = (350.0, 277.0); // 261 characters
     const LONG_PAGE_DEST_Y: f64 = 20000.0;
     // Destination for TO_SECOND_TOP, in page points.
     const SECOND_TOP_DEST: (f64, f64) = (20.0, 0.0);
@@ -2252,6 +2254,36 @@ mod widget_tests {
         run_for(OPEN * 4);
         assert!(!preview.is_open());
         assert!(source_page(&window).tooltip_text().is_some());
+        window.close();
+    }
+
+    #[gtk::test]
+    fn uri_links_show_the_uri_as_tooltip_and_start_no_preview() {
+        let window = links_window();
+        let preview = preview(&window);
+        let page = source_page(&window);
+
+        hover(&window, SHORT_URI);
+        assert_eq!(
+            page.tooltip_text().as_deref(),
+            Some("https://short.example/page")
+        );
+        assert!(!preview.is_pending());
+
+        hover(&window, LONG_URI);
+        let tooltip = page.tooltip_text().expect("the long URI tooltip");
+        assert!(tooltip.starts_with("https://tracking.example/click?"));
+        assert!(tooltip.ends_with("&target=end"));
+        assert!(tooltip.contains('…'));
+
+        hover(&window, TO_LONG_PAGE);
+        assert_eq!(page.tooltip_text(), None);
+
+        hover(&window, SHORT_URI);
+        leave_link(&window);
+        assert_eq!(page.tooltip_text(), None);
+        run_for(OPEN * 4);
+        assert!(!preview.is_open());
         window.close();
     }
 
