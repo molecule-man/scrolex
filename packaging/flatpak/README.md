@@ -12,9 +12,9 @@ repo. The manifest here is the one to edit; the Flathub copy is derived from it
 ## Prerequisites
 
 ```sh
-flatpak install flathub org.gnome.Platform//50 org.gnome.Sdk//50 \
-    org.freedesktop.Sdk.Extension.rust-stable//25.08 \
-    org.freedesktop.Sdk.Extension.llvm20//25.08
+flatpak install flathub org.gnome.Platform//51 org.gnome.Sdk//51 \
+    org.freedesktop.Sdk.Extension.rust-stable//26.08 \
+    org.freedesktop.Sdk.Extension.llvm22//26.08
 ```
 
 `flatpak-builder` is also required (e.g. `pacman -S flatpak-builder`).
@@ -37,7 +37,7 @@ flatpak run com.andr2i.scrolex
 
 - The PDF engine (mupdf) is vendored and statically linked by the `mupdf`
   crate, so no PDF library is built as a separate module. Its build compiles C
-  and runs bindgen, hence the `llvm20` SDK extension for libclang.
+  and runs bindgen, hence the `llvm22` SDK extension for libclang.
 - The build is offline. Every crate is fetched by flatpak-builder as a pinned
   archive listed in `cargo-sources.json`, vendored into `cargo/vendor`, and
   built with `cargo build --offline`.
