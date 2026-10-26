@@ -15,7 +15,7 @@ use gtk::{prelude::*, GestureClick};
 
 use super::{ReaderKeyContext, ZoomChoice, ZoomChoiceAction};
 use crate::document::Document;
-use crate::links::{DocumentLocation, LinkRequest};
+use crate::links::{DocumentLocation, LinkHover, LinkRequest};
 use crate::page;
 use crate::viewport::Viewport;
 
@@ -196,6 +196,7 @@ pub struct DocumentPane {
 
     // pointer position in the viewport, None while the pointer is elsewhere
     pointer: Cell<Option<(f64, f64)>>,
+    pointer_state: Cell<Option<ModifierType>>,
 
     // document point a zoom must hold still, pending until the pages have relayouted
     zoom_anchor: Cell<Option<ZoomAnchor>>,
@@ -293,9 +294,15 @@ impl ObjectImpl for DocumentPane {
     fn signals() -> &'static [Signal] {
         static SIGNALS: OnceLock<Vec<Signal>> = OnceLock::new();
         SIGNALS.get_or_init(|| {
-            vec![Signal::builder("link-activated")
-                .param_types([LinkRequest::static_type()])
-                .build()]
+            vec![
+                Signal::builder("link-activated")
+                    .param_types([LinkRequest::static_type()])
+                    .build(),
+                Signal::builder("link-hovered")
+                    .param_types([page::Page::static_type(), LinkHover::static_type()])
+                    .build(),
+                Signal::builder("scroll-motion-cancelled").build(),
+            ]
         })
     }
 
@@ -352,6 +359,17 @@ impl DocumentPane {
                 obj,
                 move |_: &crate::page::Page, request: LinkRequest| {
                     obj.emit_by_name::<()>("link-activated", &[&request]);
+                }
+            ),
+        );
+        page.connect_closure(
+            "link-hovered",
+            false,
+            closure_local!(
+                #[weak]
+                obj,
+                move |page: &crate::page::Page, hover: LinkHover| {
+                    obj.emit_by_name::<()>("link-hovered", &[page, &hover]);
                 }
             ),
         );
@@ -607,6 +625,15 @@ impl DocumentPane {
     pub(crate) fn cancel_scroll_motion(&self) {
         *self.scroll_anim.borrow_mut() = None;
         self.vscroll_anim.set(None);
+        self.obj()
+            .emit_by_name::<()>("scroll-motion-cancelled", &[]);
+    }
+
+    // Includes page slides, kinetic scroll, and pinch zoom.
+    pub(crate) fn is_moving(&self) -> bool {
+        self.scroll_anim.borrow().is_some()
+            || self.vscroll_anim.get().is_some()
+            || self.zoom_gesturing.get()
     }
 
     // Stop the coasts, on both axes. A page slide survives: it aims at a page and re-reads where that
@@ -1875,20 +1902,45 @@ impl DocumentPane {
         None
     }
 
+    pub(crate) fn refresh_link_hover_at_pointer(&self) {
+        let Some((x, y)) = self.pointer.get() else {
+            return;
+        };
+        let point = gtk::graphene::Point::new(x as f32, y as f32);
+        let mut node = self.vscrolledwindow.pick(x, y, gtk::PickFlags::DEFAULT);
+        while let Some(widget) = node {
+            if let Ok(page) = widget.clone().downcast::<page::Page>() {
+                if let Some(point) = self.vscrolledwindow.compute_point(&page, &point) {
+                    page.refresh_link_hover(
+                        f64::from(point.x()),
+                        f64::from(point.y()),
+                        self.pointer_state.get().unwrap_or_else(ModifierType::empty),
+                    );
+                }
+                return;
+            }
+            node = widget.parent();
+        }
+    }
+
     // Follow the pointer, so a zoom knows which document point to hold still.
     fn setup_pointer_tracking(&self) {
         let motion = gtk::EventControllerMotion::new();
         motion.connect_motion(clone!(
             #[weak(rename_to = imp)]
             self,
-            move |_, x, y| {
+            move |motion, x, y| {
                 imp.pointer.set(Some((x, y)));
+                imp.pointer_state.set(Some(motion.current_event_state()));
             }
         ));
         motion.connect_leave(clone!(
             #[weak(rename_to = imp)]
             self,
-            move |_| imp.pointer.set(None)
+            move |_| {
+                imp.pointer.set(None);
+                imp.pointer_state.set(None);
+            }
         ));
         self.vscrolledwindow.add_controller(motion);
     }

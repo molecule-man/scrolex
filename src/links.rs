@@ -27,6 +27,13 @@ pub struct LinkRequest {
     pub action: LinkAction,
 }
 
+// The internal link under the pointer, or None. The rectangle uses page widget coordinates.
+#[derive(Debug, Clone, Copy, PartialEq, glib::Boxed)]
+#[boxed_type(name = "ScrolexLinkHover")]
+pub struct LinkHover {
+    pub link: Option<(DocumentLocation, Rectangle)>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum LinkTarget {
     Location(DocumentLocation),
@@ -56,11 +63,20 @@ impl Links {
     }
 
     pub fn get_link(&self, page_num: i32, x: f64, y: f64) -> Option<&LinkTarget> {
+        self.link_at(page_num, x, y).map(|(_, target)| target)
+    }
+
+    pub(crate) fn link_at(
+        &self,
+        page_num: i32,
+        x: f64,
+        y: f64,
+    ) -> Option<(Rectangle, &LinkTarget)> {
         self.pages
             .get(&page_num)?
             .iter()
             .find(|link| link.rect.contains(x, y))
-            .map(|link| &link.target)
+            .map(|link| (link.rect, &link.target))
     }
 
     pub(crate) fn begin_load(&mut self, page_num: i32) -> Option<u64> {

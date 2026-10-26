@@ -214,6 +214,26 @@ impl RenderCache {
         self.evict();
     }
 
+    #[cfg(test)]
+    pub(crate) fn pinned_tiles(&self, viewport: ViewportId) -> Vec<TileId> {
+        self.pinned_by_page
+            .iter()
+            .filter(|((owner, _), _)| *owner == viewport)
+            .flat_map(|(_, keys)| keys)
+            .filter_map(|key| match key {
+                CacheKey::Tile(tile) => Some(*tile),
+                CacheKey::Page(_) => None,
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_pins(&self, viewport: ViewportId) -> bool {
+        self.pinned_by_page
+            .keys()
+            .any(|(owner, _)| *owner == viewport)
+    }
+
     pub(crate) fn has_tiled_pages(&self, viewport: ViewportId) -> bool {
         self.pinned_by_page
             .iter()

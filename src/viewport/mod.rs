@@ -80,6 +80,18 @@ impl Viewport {
         ViewportId(self.imp().id.get())
     }
 
+    // Release this viewport's render work and cache pins. Preserve work that other viewports need.
+    pub(crate) fn release_renders(&self) {
+        let document = self.document();
+        document.remove_render_interests(self.id());
+        document
+            .imp()
+            .render_cache
+            .borrow_mut()
+            .clear_pins(self.id());
+        crate::page::clear_full_renders(self.id());
+    }
+
     // Apply and save a manual zoom.
     pub(crate) fn zoom_to(&self, zoom: f64) {
         let bounded = zoom.clamp(MIN_ZOOM, MAX_ZOOM);

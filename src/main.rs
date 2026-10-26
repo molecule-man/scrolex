@@ -77,6 +77,7 @@ fn main() -> glib::ExitCode {
     });
     setup_dark_mode(&app);
     setup_open_in_tabs(&app);
+    setup_link_previews(&app);
     app.connect_command_line(|app, cmd| {
         let args = cmd.arguments();
         let file = document_arg(&args).map(|arg| cmd.create_file_for_arg(arg));
@@ -137,6 +138,13 @@ fn setup_open_in_tabs(app: &Application) {
         }
     });
     app.add_action(&action);
+}
+
+fn setup_link_previews(app: &Application) {
+    let config = config::load_config();
+    scrolex::link_preview::set_enabled(config.show_link_previews);
+    scrolex::link_preview::set_height_percent(config.link_preview_height_percent);
+    app.add_action(&scrolex::link_preview::preference_action());
 }
 
 // With tabs requested, a second launch adds a tab to the last active window. A full window,

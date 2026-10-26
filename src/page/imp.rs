@@ -8,7 +8,7 @@ use std::sync::OnceLock;
 use futures::channel::oneshot;
 use gtk::cairo::{FontSlant, FontWeight};
 use gtk::gdk::prelude::*;
-use gtk::gdk::{MemoryFormat, MemoryTexture, BUTTON_PRIMARY, RGBA};
+use gtk::gdk::{MemoryFormat, MemoryTexture, ModifierType, BUTTON_PRIMARY, RGBA};
 use gtk::glib;
 use gtk::glib::clone;
 use gtk::glib::subclass::{prelude::*, Signal};
@@ -17,9 +17,9 @@ use gtk::prelude::*;
 use gtk::subclass::prelude::*;
 use once_cell::sync::Lazy;
 
-use super::Rectangle;
+use super::{PageRole, Rectangle};
 use crate::bg_job::{RenderPool, RenderPriority};
-use crate::links::{LinkAction, LinkRequest, LinkTarget};
+use crate::links::{DocumentLocation, LinkAction, LinkHover, LinkRequest, LinkTarget};
 use crate::selection::PageSelection;
 
 // Max bytes in one page buffer. A whole page is rendered at once, so the buffer grows with the
@@ -248,6 +248,9 @@ pub struct Page {
     #[property(get = Self::viewport, set, construct_only, type = crate::viewport::Viewport)]
     viewport: RefCell<Option<crate::viewport::Viewport>>,
 
+    #[property(get, set, construct_only, builder(PageRole::Document))]
+    role: Cell<PageRole>,
+
     #[property(get, set)]
     pub(crate) binding: RefCell<Option<glib::Binding>>,
 
@@ -256,6 +259,9 @@ pub struct Page {
 
     bbox: RefCell<Rectangle>,
     cursor_guard: Cell<bool>,
+    link_cursor: Cell<bool>,
+    link_tooltip: RefCell<Option<String>>,
+    hovered_link: Cell<Option<(DocumentLocation, Rectangle)>>,
 
     // False prevents a discarded render at a provisional display scale.
     scale_known: Cell<bool>,
@@ -278,6 +284,11 @@ enum Paint {
     Preview,
     Placeholder,
     Blank,
+}
+
+pub(super) enum HoverCause {
+    Motion,
+    Scroll,
 }
 
 impl Paint {
@@ -307,8 +318,10 @@ impl ObjectImpl for Page {
 
         self.setup_scale_tracking();
         self.setup_viewport_listeners();
-        self.setup_text_selection();
-        self.setup_link_handling();
+        if self.role.get() == PageRole::Document {
+            self.setup_text_selection();
+            self.setup_link_handling();
+        }
 
         self.obj().connect_unmap(|page| page.imp().unpin_render());
 
@@ -324,9 +337,14 @@ impl ObjectImpl for Page {
     fn signals() -> &'static [Signal] {
         static SIGNALS: OnceLock<Vec<Signal>> = OnceLock::new();
         SIGNALS.get_or_init(|| {
-            vec![Signal::builder("internal-link-clicked")
-                .param_types([LinkRequest::static_type()])
-                .build()]
+            vec![
+                Signal::builder("internal-link-clicked")
+                    .param_types([LinkRequest::static_type()])
+                    .build(),
+                Signal::builder("link-hovered")
+                    .param_types([LinkHover::static_type()])
+                    .build(),
+            ]
         })
     }
 }
@@ -607,50 +625,32 @@ impl Page {
     fn setup_link_handling(&self) {
         let obj = self.obj();
         let motion_controller = gtk::EventControllerMotion::new();
-
-        // indicates that we have "borrowed" global page cursor
-        let cursor = Cell::new(false);
-        let tooltip_visible = Rc::new(Cell::new(false));
-
         motion_controller.connect_motion(clone!(
             #[strong]
             obj,
             #[weak(rename_to = imp)]
             self,
-            #[strong]
-            tooltip_visible,
-            move |_, x, y| {
-                let target = imp.link_at(&obj, x, y);
-                let visible = matches!(target, Some(LinkTarget::Location(_)));
-                if tooltip_visible.replace(visible) != visible {
-                    obj.set_tooltip_text(
-                        visible.then_some("Middle click opens beside. Right click opens a menu."),
-                    );
-                }
-                if target.is_some() {
-                    if !imp.cursor_guard.get() {
-                        obj.set_cursor_from_name(Some("pointer"));
-                        imp.cursor_guard.set(true);
-                        cursor.set(true);
-                    }
-                    return;
-                }
-
-                if Cell::get(&cursor) {
-                    obj.set_cursor(None);
-                    imp.cursor_guard.set(false);
-                    cursor.set(false);
-                }
+            move |motion, x, y| {
+                imp.refresh_link_hover(
+                    &obj,
+                    x,
+                    y,
+                    motion.current_event_state(),
+                    HoverCause::Motion,
+                );
             }
         ));
         motion_controller.connect_leave(clone!(
             #[strong]
             obj,
-            #[strong]
-            tooltip_visible,
+            #[weak(rename_to = imp)]
+            self,
             move |_| {
-                if tooltip_visible.replace(false) {
+                if imp.link_tooltip.take().is_some() {
                     obj.set_tooltip_text(None);
+                }
+                if imp.hovered_link.take().is_some() {
+                    obj.emit_by_name::<()>("link-hovered", &[&LinkHover { link: None }]);
                 }
             }
         ));
@@ -729,18 +729,47 @@ impl Page {
             #[weak(rename_to = imp)]
             self,
             move |gesture, _, x, y| {
-                let target = imp.link_at(&obj, x, y);
-                let Some(LinkTarget::Location(location)) = target else {
+                let Some(target) = imp.link_at(&obj, x, y) else {
                     return;
                 };
                 gesture.set_state(gtk::EventSequenceState::Claimed);
+                type MenuItem = (&'static str, Box<dyn Fn(&super::Page)>);
+                let menu: Vec<MenuItem> = match target {
+                    LinkTarget::Location(location) => vec![
+                        (
+                            "Open Link",
+                            Box::new(move |obj| Self::emit_link(obj, location, LinkAction::Open)),
+                        ),
+                        (
+                            "Open Link in Split View",
+                            Box::new(move |obj| {
+                                Self::emit_link(obj, location, LinkAction::OpenBeside)
+                            }),
+                        ),
+                        (
+                            "Open Link in New Tab",
+                            Box::new(move |obj| {
+                                Self::emit_link(obj, location, LinkAction::OpenInNewTab)
+                            }),
+                        ),
+                    ],
+                    LinkTarget::Uri(uri) => vec![
+                        (
+                            "Open Link",
+                            Box::new({
+                                let uri = uri.clone();
+                                move |_| Self::open_uri(&uri)
+                            }),
+                        ),
+                        (
+                            "Copy Link Address",
+                            Box::new(move |obj| obj.clipboard().set_text(&uri)),
+                        ),
+                    ],
+                };
                 let popover = gtk::Popover::new();
                 let actions = gtk::Box::new(gtk::Orientation::Vertical, 0);
-                for (label, action) in [
-                    ("Open Link", LinkAction::Open),
-                    ("Open Link Beside", LinkAction::OpenBeside),
-                    ("Open Link in New Tab", LinkAction::OpenInNewTab),
-                ] {
+                for (label, run) in menu {
                     let button = gtk::Button::builder()
                         .label(label)
                         .has_frame(false)
@@ -753,7 +782,7 @@ impl Page {
                         popover,
                         move |_| {
                             popover.popdown();
-                            Self::emit_link(&obj, location, action);
+                            run(&obj);
                         }
                     ));
                     actions.append(&button);
@@ -774,11 +803,61 @@ impl Page {
     }
 
     fn link_at(&self, obj: &super::Page, x: f64, y: f64) -> Option<LinkTarget> {
+        self.link_hit_at(obj, x, y).map(|(_, target)| target)
+    }
+
+    pub(super) fn refresh_link_hover(
+        &self,
+        obj: &super::Page,
+        x: f64,
+        y: f64,
+        state: ModifierType,
+        cause: HoverCause,
+    ) {
+        let hit = self.link_hit_at(obj, x, y);
+        let internal = match &hit {
+            Some((rect, LinkTarget::Location(location))) => Some((*location, *rect)),
+            _ => None,
+        };
+        let tooltip = match &hit {
+            Some((_, LinkTarget::Uri(uri))) => Some(shorten_uri(uri)),
+            Some((_, LinkTarget::Location(_))) if !crate::link_preview::enabled() => {
+                Some("Middle click opens in split view. Right click opens a menu.".to_string())
+            }
+            _ => None,
+        };
+        if *self.link_tooltip.borrow() != tooltip {
+            obj.set_tooltip_text(tooltip.as_deref());
+            self.link_tooltip.replace(tooltip);
+        }
+        let buttons =
+            ModifierType::BUTTON1_MASK | ModifierType::BUTTON2_MASK | ModifierType::BUTTON3_MASK;
+        let link = internal.filter(|_| !state.intersects(buttons));
+        if self.hovered_link.replace(link) != link
+            || (matches!(cause, HoverCause::Scroll) && link.is_some())
+        {
+            obj.emit_by_name::<()>("link-hovered", &[&LinkHover { link }]);
+        }
+        if hit.is_some() {
+            if !self.cursor_guard.get() {
+                obj.set_cursor_from_name(Some("pointer"));
+                self.cursor_guard.set(true);
+                self.link_cursor.set(true);
+            }
+        } else if self.link_cursor.replace(false) {
+            obj.set_cursor(None);
+            self.cursor_guard.set(false);
+        }
+    }
+
+    // Both the input point and the result bounds use page widget coordinates.
+    fn link_hit_at(&self, obj: &super::Page, x: f64, y: f64) -> Option<(Rectangle, LinkTarget)> {
         let point = undo_zoom_and_crop(obj, x, y);
         let document = self.document();
         document.request_links(obj.index());
         let links = document.imp().links.borrow();
-        links.get_link(obj.index(), point.x, point.y).cloned()
+        let (rect, target) = links.link_at(obj.index(), point.x, point.y)?;
+        Some((apply_zoom_and_crop(obj, rect), target.clone()))
     }
 
     fn emit_link(obj: &super::Page, location: crate::links::DocumentLocation, action: LinkAction) {
@@ -1034,6 +1113,9 @@ impl Page {
     // Paint match rects for this page: matches yellow, the current match orange. Same zoom/crop
     // transform as the page render, so highlights land on the words.
     fn snapshot_search_overlay(&self, snapshot: &gtk::Snapshot, page: &PageInfo) {
+        if self.role.get() == PageRole::LinkTarget {
+            return;
+        }
         let obj = self.obj();
         let index = obj.index();
         let search = obj.document().search();
@@ -1349,6 +1431,9 @@ impl Page {
     // cached/queued pages; lowest priority, dropped at the queue if the scroll leaves its range.
     // `page_bytes` is the current page's render size, which bounds the depth.
     fn prefetch_next(&self, current: i32, page_bytes: usize) {
+        if self.role.get() == PageRole::LinkTarget {
+            return;
+        }
         let obj = self.obj();
         let viewport = obj.viewport();
         let document = viewport.document();
@@ -1558,6 +1643,9 @@ impl Page {
     // Prefetch low-res previews over a symmetric window (they're cheap and tiny), so scrolling
     // either way shows blurry pages instead of blank ones.
     fn prefetch_previews(&self, current: i32) {
+        if self.role.get() == PageRole::LinkTarget {
+            return;
+        }
         let obj = self.obj();
         if !obj.document().preview_enabled() {
             return;
@@ -2121,6 +2209,22 @@ struct Point {
     y: f64,
 }
 
+fn apply_zoom_and_crop(page: &super::Page, rect: Rectangle) -> Rectangle {
+    let zoom = page.zoom();
+    let (dx, dy) = if page.crop() {
+        let bbox = page.imp().bbox.borrow();
+        (bbox.x1, bbox.y1)
+    } else {
+        (0.0, 0.0)
+    };
+    Rectangle::new(
+        (rect.x1 - dx) * zoom,
+        (rect.y1 - dy) * zoom,
+        (rect.x2 - dx) * zoom,
+        (rect.y2 - dy) * zoom,
+    )
+}
+
 fn undo_zoom_and_crop(page: &super::Page, x: f64, y: f64) -> Point {
     let mut x = x / page.zoom();
     let mut y = y / page.zoom();
@@ -2131,6 +2235,21 @@ fn undo_zoom_and_crop(page: &super::Page, x: f64, y: f64) -> Point {
     }
 
     Point { x, y }
+}
+
+// Long tracking URLs make huge tooltips. Keep the host and the end of the path.
+fn shorten_uri(uri: &str) -> String {
+    const MAX_CHARS: usize = 120;
+    let count = uri.chars().count();
+    if count <= MAX_CHARS {
+        return uri.to_string();
+    }
+    let head = (MAX_CHARS - 1) / 2;
+    let tail = MAX_CHARS - 1 - head;
+    let mut short: String = uri.chars().take(head).collect();
+    short.push('…');
+    short.extend(uri.chars().skip(count - tail));
+    short
 }
 
 // A page's index and size in points - the page facts the widget needs, sourced from MuPDF instead
@@ -2218,6 +2337,20 @@ mod tests {
         crate::test_support::wait_until(|| document.imp().links.borrow().is_requested(0));
 
         window.close();
+    }
+
+    #[test]
+    fn shorten_uri_keeps_short_uris_and_cuts_the_middle_of_long_ones() {
+        assert_eq!(shorten_uri("https://a.example"), "https://a.example");
+        let exact = "x".repeat(120);
+        assert_eq!(shorten_uri(&exact), exact);
+
+        let long = format!("https://host.example/{}end", "é".repeat(200));
+        let short = shorten_uri(&long);
+        assert_eq!(short.chars().count(), 120);
+        assert!(short.starts_with("https://host.example/"));
+        assert!(short.ends_with("end"));
+        assert!(short.contains('…'));
     }
 
     #[test]

@@ -83,8 +83,16 @@ impl DocumentPane {
         self.imp().scrolledwindow.grab_focus();
     }
 
+    pub(crate) fn is_moving(&self) -> bool {
+        self.imp().is_moving()
+    }
+
     pub(crate) fn page_area(&self) -> gtk::ScrolledWindow {
         self.imp().scrolledwindow.clone()
+    }
+
+    pub(crate) fn vertical_scroller(&self) -> gtk::ScrolledWindow {
+        self.imp().vscrolledwindow.clone()
     }
 
     pub(crate) fn close_button(&self) -> gtk::Button {
@@ -141,6 +149,21 @@ impl DocumentPane {
             pane: (f64::from(self.width()) - self.viewport_width()).max(0.0),
             row: (f64::from(row_width) - f64::from(page_width)).max(0.0),
         })
+    }
+
+    pub(crate) fn mapped_page(&self, index: i32) -> Option<crate::page::Page> {
+        self.imp().mapped_page(index)
+    }
+
+    pub(crate) fn refresh_link_hover_at_pointer(&self) {
+        self.imp().refresh_link_hover_at_pointer();
+    }
+
+    pub(crate) fn scroll_position(&self) -> (f64, f64) {
+        (
+            self.imp().scrolledwindow.hadjustment().value(),
+            self.imp().vscrolledwindow.vadjustment().value(),
+        )
     }
 
     pub(crate) fn viewport_width(&self) -> f64 {

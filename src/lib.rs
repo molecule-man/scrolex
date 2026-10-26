@@ -7,6 +7,7 @@ pub(crate) mod document_pane;
 pub mod document_view;
 pub mod emulate;
 pub mod jump_stack;
+pub mod link_preview;
 pub mod links;
 pub mod mupdf_render;
 pub mod outline;

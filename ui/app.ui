@@ -187,6 +187,42 @@
 												</object>
 											</child>
 											<child>
+												<object class="GtkToggleButton" id="btn_link_previews">
+													<property name="action-name">app.show-link-previews</property>
+													<property name="label">Show Link Previews</property>
+													<property name="tooltip-text">Show the link destination when the pointer rests on an internal link</property>
+												</object>
+											</child>
+											<child>
+												<object class="GtkBox">
+													<property name="orientation">horizontal</property>
+													<property name="spacing">8</property>
+													<property name="sensitive" bind-source="btn_link_previews" bind-property="active" bind-flags="sync-create"/>
+													<child>
+														<object class="GtkLabel">
+															<property name="label">Link preview height (%)</property>
+															<property name="halign">start</property>
+															<property name="hexpand">true</property>
+														</object>
+													</child>
+													<child>
+														<object class="GtkSpinButton" id="spin_link_preview_height">
+															<property name="numeric">true</property>
+															<property name="snap-to-ticks">true</property>
+															<property name="tooltip-text">Largest preview height, as a percentage of the destination page height</property>
+															<property name="adjustment">
+																<object class="GtkAdjustment">
+																	<property name="lower">10</property>
+																	<property name="upper">100</property>
+																	<property name="step-increment">10</property>
+																	<property name="page-increment">10</property>
+																</object>
+															</property>
+														</object>
+													</child>
+												</object>
+											</child>
+											<child>
 												<object class="GtkToggleButton" id="btn_fullscreen">
 													<property name="label">Full Screen</property>
 													<property name="tooltip-text">Enter Fullscreen mode (F11)</property>
