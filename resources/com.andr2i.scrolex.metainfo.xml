@@ -85,6 +85,14 @@
     </screenshot>
   </screenshots>
   <releases>
+    <release version="0.13.0" date="2026-10-26">
+      <url>https://github.com/molecule-man/scrolex/releases/tag/0.13.0</url>
+      <description>
+        <ul>
+          <li>Move MuPDF document reads off the main thread</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.12.2" date="2026-10-17">
       <url>https://github.com/molecule-man/scrolex/releases/tag/0.12.2</url>
       <description>
