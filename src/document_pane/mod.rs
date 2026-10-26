@@ -91,6 +91,10 @@ impl DocumentPane {
         self.imp().scrolledwindow.clone()
     }
 
+    pub(crate) fn vertical_scroller(&self) -> gtk::ScrolledWindow {
+        self.imp().vscrolledwindow.clone()
+    }
+
     pub(crate) fn close_button(&self) -> gtk::Button {
         self.imp().close_button.clone()
     }

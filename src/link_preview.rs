@@ -1052,12 +1052,13 @@ impl LinkPreview {
             page.x + (text.x1 - bbox.x1) * zoom,
             page.x + (text.x2 - bbox.x1) * zoom,
         );
-        let view = hover.pane.page_area().compute_bounds(overlay)?;
+        let area = hover.pane.page_area().compute_bounds(overlay)?;
+        let scroller = hover.pane.vertical_scroller().compute_bounds(overlay)?;
         let view = Bounds {
-            x: f64::from(view.x()),
-            y: f64::from(view.y()),
-            width: f64::from(view.width()),
-            height: f64::from(view.height()),
+            x: f64::from(area.x()),
+            y: f64::from(scroller.y()),
+            width: f64::from(area.width()),
+            height: f64::from(scroller.height()),
         };
         let shown = highlight(link, page, content, point, view)?;
         let source = BandSource {
@@ -1807,8 +1808,9 @@ mod widget_tests {
     fn highlight_window() -> TestWindow {
         let window = links_window();
         preview(&window).set_highlights(true);
-        window.set_default_size(1400, crate::test_support::TEST_WINDOW.1);
         let pane = window.pane();
+        pane.viewport()
+            .zoom_to((pane.viewport_width() / 1400.0).min(0.6));
         wait_until(|| {
             let (Some(page), Some(view)) =
                 (pane.mapped_page(1), pane.page_area().compute_bounds(&pane))
@@ -2488,13 +2490,18 @@ mod widget_tests {
     }
 
     #[gtk::test]
-    fn a_resize_closes_the_preview() {
+    fn a_changed_overlay_size_closes_the_preview() {
         let window = links_window();
         let preview = open(&window, TO_LONG_PAGE);
+        let overlay = preview.state.overlay.upgrade().unwrap();
+        let widget = preview.popup_widget().unwrap();
+        let mut popup = preview.state.popup.borrow_mut();
+        Rc::get_mut(popup.as_mut().unwrap()).unwrap().area.0 += 1;
+        drop(popup);
 
-        window.set_default_size(1100, 800);
-
+        overlay.queue_allocate();
         wait_until(|| !preview.is_open());
+        assert!(widget.parent().is_none());
         window.close();
     }
 
@@ -2930,6 +2937,7 @@ mod widget_tests {
 
     // XTest events exercise capture handlers, the native scroller, and popup controllers in event order.
     // Touchpad and pinch tests need real hardware.
+    #[cfg(target_os = "linux")]
     mod routing {
         use std::process::{Command, Stdio};
 
