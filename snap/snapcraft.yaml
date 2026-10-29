@@ -53,7 +53,6 @@ parts:
       - unzip
     override-build: |
       craftctl default
-      # Cargo.toml is the one place ci/bump-version writes the version.
       craftctl set version="$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -1)"
       install -Dm644 resources/com.andr2i.scrolex.desktop \
         "$CRAFT_PART_INSTALL/usr/share/applications/com.andr2i.scrolex.desktop"
