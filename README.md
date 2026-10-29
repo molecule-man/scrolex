@@ -150,8 +150,8 @@ The commands below download the latest release from the [GitHub releases
 page][1] and install it with APT, so that APT resolves its dependencies.
 
 ```bash
-curl -LO "https://github.com/molecule-man/scrolex/releases/download/0.13.0/scrolex_0.13.0.deb"
-sudo apt install ./scrolex_0.13.0.deb
+curl -LO "https://github.com/molecule-man/scrolex/releases/download/0.13.1/scrolex_0.13.1.deb"
+sudo apt install ./scrolex_0.13.1.deb
 ```
 
 ### 5. Download from GitHub Releases (any distribution)
@@ -163,7 +163,7 @@ sudo pacman -S gtk4
 ```
 
 Then download the latest x86-64 pre-built binary archive,
-[`scrolex-0.13.0-x86_64-unknown-linux-gnu.tar.gz`](https://github.com/molecule-man/scrolex/releases/download/0.13.0/scrolex-0.13.0-x86_64-unknown-linux-gnu.tar.gz),
+[`scrolex-0.13.1-x86_64-unknown-linux-gnu.tar.gz`](https://github.com/molecule-man/scrolex/releases/download/0.13.1/scrolex-0.13.1-x86_64-unknown-linux-gnu.tar.gz),
 extract it, and run the `scrolex` executable.
 
 ### 6. Build from source
@@ -205,7 +205,7 @@ winget install --id 9P1K2SZLQQLK --source msstore
 
 ### 2. Download the zip from GitHub Releases
 
-Download `scrolex-0.13.0-x86_64-windows.zip` from the [GitHub releases
+Download `scrolex-0.13.1-x86_64-windows.zip` from the [GitHub releases
 page][1], extract it anywhere, and run `scrolex.exe`.
 
 The zip carries its own GTK runtime, so you need nothing else. It installs

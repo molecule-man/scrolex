@@ -85,6 +85,14 @@
     </screenshot>
   </screenshots>
   <releases>
+    <release version="0.13.1" date="2026-10-29">
+      <url>https://github.com/molecule-man/scrolex/releases/tag/0.13.1</url>
+      <description>
+        <ul>
+          <li>Disable mupdf brotli and unused features</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.13.0" date="2026-10-26">
       <url>https://github.com/molecule-man/scrolex/releases/tag/0.13.0</url>
       <description>
