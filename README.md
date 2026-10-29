@@ -64,6 +64,13 @@ multipage document formats are:
 Single-page formats such as SVG, plain text, and common raster images (PNG,
 JPEG, TIFF, …) open as well. DjVu is not supported.
 
+> [!IMPORTANT]
+> Brotli decoding is disabled for now. The Brotli decoder bundled with MuPDF
+> has a critical vulnerability: [CVE-2026-111497](https://github.com/advisories/GHSA-9v8h-qqgm-4m35).
+> PDF streams that use the `/BrotliDecode` filter do not render. This filter
+> is rare. Scrolex will enable Brotli again when
+> [mupdf-rs](https://github.com/messense/mupdf-rs/issues/278) ships the fix.
+
 ## Shortcuts
 
 | Key / Action    | Description                              |
