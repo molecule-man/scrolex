@@ -17,7 +17,18 @@ log = "0.4"
 # Pinned past 0.8.0 for the process-wide system font cache (mupdf-rs #262, issue #87)
 # and system CJK fonts on Linux (#265).
 # Go back to a crates.io version when one ships with it.
-mupdf = { git = "https://github.com/messense/mupdf-rs", rev = "537d50556ee8e4abf2435f81357dfef3c145d883" }
+# Only the features we use. brotli stays off until mupdf-rs ships MuPDF 1.28
+# (#261): the vendored decoder has CVE-2026-111497 (mupdf-rs #278).
+mupdf = { git = "https://github.com/messense/mupdf-rs", rev = "537d50556ee8e4abf2435f81357dfef3c145d883", default-features = false, features = [
+    "xps",
+    "svg",
+    "cbz",
+    "img",
+    "html",
+    "epub",
+    "system-fonts",
+    "base14-fonts",
+] }
 once_cell = "1.19.0"
 tempfile = "3"
 
